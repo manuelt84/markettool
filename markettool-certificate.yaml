@@ -1,0 +1,7 @@
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: telegram-cert
+spec:
+  domains:
+  - 34.8.35.67  # Esto no funcionará si usas una IP fija; considera usar un dominio

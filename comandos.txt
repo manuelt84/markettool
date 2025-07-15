@@ -1,0 +1,80 @@
+Configurar el Proyecto en PowerShell
+$env:GOOGLE_CLOUD_PROJECT="trading-449607"; gcloud config set project trading-449607
+
+Autenticación con GCP
+gcloud auth login && gcloud auth configure-docker && gcloud auth application-default login
+
+Habilitar la API de Kubernetes Engine
+gcloud services enable container.googleapis.com
+
+Construir y Subir la Imagen a Container Registry
+docker build -t markettool .
+docker tag markettool:latest southamerica-west1-docker.pkg.dev/trading-449607/trading-repo/markettool:latest
+docker push southamerica-west1-docker.pkg.dev/trading-449607/trading-repo/markettool:latest
+
+Crear el Cluster en GKE
+#CREAR CLUSTER c2-standard-8 (8 vCPUs, 32GB RAM) – si quieres más memoria.  Aqui los nodos pueden crecer, por ende los discos tambien
+gcloud container clusters create trading-cluster --zone=southamerica-west1-a --num-nodes=1 --machine-type=c2-standard-8 --enable-autoscaling --min-nodes=1 --max-nodes=5 --enable-ip-alias --preemptible
+
+#Esto es para reducir el numero de nodos (se ve reflejado en menor numero de discos)
+gcloud container clusters resize trading-cluster --node-pool=default-pool --num-nodes=1 --zone=southamerica-west1-a
+
+
+Obtener Credenciales para el Cluster
+gcloud container clusters get-credentials trading-cluster --zone=southamerica-west1-a
+
+
+kubectl get services markettool
+Verificar el Estado del Despliegue
+kubectl get pods && kubectl get services && kubectl get deployments
+
+
+gcloud container clusters list
+gcloud container clusters get-credentials trading-cluster --zone=southamerica-west1-a
+kubectl get nodes
+
+
+docker build -t markettool .
+#LOCAL
+docker run -d -p 8080:8080  -e BOT_TOKEN=7820894723:AAFRp-hzu3aLoZ45rVj--OE9LidPyr4eMd0 --name tradingnow markettool
+
+#WEBHOOK_URL Y SIN WEB SERVER
+docker run -d -p 8080:8080  -e BOT_TOKEN=7820894723:AAFRp-hzu3aLoZ45rVj--OE9LidPyr4eMd0 -e WEBHOOK_URL=<HOST_CLOUD_RUN> -e PUERTO=<PUERTO> --name tradingnow markettool
+docker run -d -p 8080:8080  -e BOT_TOKEN=7820894723:AAFRp-hzu3aLoZ45rVj--OE9LidPyr4eMd0 -e WEBHOOK_URL=localhost:443 -e PUERTO=443 --name tradingnow markettool
+
+#WEBHOOK_URL Y WEB SERVER
+docker run -d -p 8080:8080  -e BOT_TOKEN=7820894723:AAFRp-hzu3aLoZ45rVj--OE9LidPyr4eMd0 -e WEBHOOK_URL=<HOST_CLOUD_RUN> -e PUERTO=<PUERTO> -e SERVER_WEB=true --name tradingnow markettool
+docker run -d -p 8080:8080  -e BOT_TOKEN=7820894723:AAFRp-hzu3aLoZ45rVj--OE9LidPyr4eMd0 -e WEBHOOK_URL=localhost:443 -e PUERTO=443 -e SERVER_WEB=true --name tradingnow markettool
+
+
+
+gcloud projects add-iam-policy-binding trading-449607 --member="serviceAccount:cuenta-firestore-410@trading-449607.iam.gserviceaccount.com" --role="roles/datastore.user"
+
+kubectl create secret generic gcp-service-account-key --from-file=trading-firestore.json
+
+#DETENER LOS NODOS PARA QUE NO FACTURE, EL NUMERO DE NODOS QUE TENGO INICIALMENTE ES 1
+gcloud container clusters resize trading-cluster --num-nodes=0 --region=southamerica-west1-a
+gcloud container clusters resize trading-cluster --num-nodes=1 --region=southamerica-west1-a
+
+
+gcloud container clusters update trading-cluster --enable-autoscaling --min-nodes=0 --max-nodes=0 --region=southamerica-west1-a
+gcloud container clusters update trading-cluster --enable-autoscaling --min-nodes=1 --max-nodes=4 --region=southamerica-west1-a
+
+
+#Cambiar de maquina
+gcloud container node-pools update new-pool --cluster=trading-cluster --zone=southamerica-west1-a --machine-type=e2-highcpu-4
+
+gcloud container node-pools update new-pool --cluster=trading-cluster --zone=southamerica-west1-a --machine-type=e2-standard-4
+
+
+#Generar nuevos certificados para la ip fija (si asignamos otra)
+openssl.exe req -x509 -nodes -days 365 -newkey rsa:2048 -keyout certs/cert.key -out certs/cert.crt -config C:\projects\markettool\san.cnf
+
+
+#Comandos ejecutados repetidamente
+docker build -t markettool .
+docker run --env-file .env markettool  ##Ejecutar Local
+docker tag markettool:latest southamerica-west1-docker.pkg.dev/trading-449607/trading-repo/markettool:latest
+docker push southamerica-west1-docker.pkg.dev/trading-449607/trading-repo/markettool:latest
+kubectl rollout restart deployment/markettool
+

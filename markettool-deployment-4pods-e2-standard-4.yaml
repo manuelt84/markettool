@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: markettool
+spec:
+  replicas: 4  # Mantener 4 réplicas, igual al número de nodos
+  selector:
+    matchLabels:
+      app: markettool
+  template:
+    metadata:
+      labels:
+        app: markettool
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - new-pool  # Asegura que cada Pod esté en un nodo distinto
+      terminationGracePeriodSeconds: 60  # Asegura que el Pod tenga tiempo de finalizar procesos
+      containers:
+      - name: markettool
+        image: southamerica-west1-docker.pkg.dev/trading-449607/trading-repo/markettool:latest
+        env:
+        - name: WEBHOOK_CERT_PATH
+          value: "/certs/tls.crt"
+        - name: API_FMP
+          value: "NRnN8Z4yUQOuqvESjIL8Vny97uLk4G9n"
+        - name: BOT_TOKEN
+          value: "7820894723:AAFRp-hzu3aLoZ45rVj--OE9LidPyr4eMd0"
+        - name: WEBHOOK_URL
+          value: "34.8.35.67"
+        - name: PUERTO
+          value: "8080"
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: "trading-firestore.json"
+        - name: GUNICORN_CMD_ARGS
+          value: "--workers=1 --threads=1"  # Evita que más de una solicitud se procese a la vez
+        volumeMounts:
+        - name: gcp-key-volume
+          mountPath: "/var/secrets/google"
+          readOnly: true
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+          periodSeconds: 120  # Verifica disponibilidad cada 60s
+          failureThreshold: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+          periodSeconds: 120  # Verifica cada 60s si el Pod sigue vivo
+          failureThreshold: 10
+        resources:
+          requests:
+            cpu: "500m"  # Reducir CPU para permitir más Pods
+            memory: "2500Mi"
+          limits:
+            cpu: "900m"  # Mantener un límite sin sobrecargar el nodo
+            memory: "3000Mi"
+        ports:
+        - containerPort: 8080
+      volumes:
+      - name: gcp-key-volume
+        secret:
+          secretName: gcp-service-account-key
