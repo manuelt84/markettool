@@ -5621,7 +5621,7 @@ async def estado_suscripcion(user_chat_id, numero_transacciones = 1):
         transacciones_restantes = suscripcion["transacciones_restantes"]
 
         # Determinar el estado basado en las fechas y el número de transacciones restantes
-        if fin < datetime.now():
+        if fin < datetime.now(pytz.utc):
             estado = "expirada"
         elif transacciones_restantes <= 0:
             estado = "inactiva"
@@ -6469,7 +6469,7 @@ async def initialize_bot():
             if current_webhook.url != full_webhook_url:
                 logger.info(f"Entro a actualizar el Webhook {full_webhook_url}")
                 await application.bot.delete_webhook(drop_pending_updates=True)
-                cert_path = os.getenv("WEBHOOK_CERT_PATH", "tls.crt")
+                cert_path = os.getenv("WEBHOOK_CERT_PATH", "cert.crt")
                 with open(cert_path, "rb") as cert:
                     await application.bot.set_webhook(full_webhook_url, certificate=cert)
                 logger.info(await application.bot.get_webhook_info())
