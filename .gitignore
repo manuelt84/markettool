@@ -23,7 +23,6 @@ pip-wheel-metadata/
 # CONFIGURACIONES DE ENTORNO Y SENSIBLES
 # ===================================
 *.pem
-*.cnf
 *.cfg
 
 # ===================================
