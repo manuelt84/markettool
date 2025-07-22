@@ -6545,23 +6545,8 @@ def ejecutar_analisis_desde_app():
             "bot": application.bot
         })()
 
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        urls_generadas = await ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app")
 
-        if loop.is_running():
-            # Si ya hay un loop corriendo (ej. dentro de uvicorn o gunicorn async workers)
-            urls_generadas = asyncio.run_coroutine_threadsafe(
-                ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app"),
-                loop
-            ).result()
-        else:
-            urls_generadas = loop.run_until_complete(
-                ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app")
-            )
-            
         return jsonify({
             "status": "ok",
             "message": f"Análisis ejecutado para {activo}",
