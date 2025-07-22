@@ -205,7 +205,7 @@ def analizar_con_yolo(ruta_imagen: str) -> tuple[str, str]:
     return imagen_final_path, texto_resultado
 
 
-def subir_a_bucket_y_obtener_url(nombre_local, nombre_remoto=None, carpeta='analisis'):
+async def subir_a_bucket_y_obtener_url(nombre_local, nombre_remoto=None, carpeta='analisis'):
     nombre_remoto = nombre_remoto or os.path.basename(nombre_local)
     bucket_name = "markettool_bucket"  # 🔁 Reemplazar con el nombre real de tu bucket
 
@@ -969,7 +969,7 @@ def obtener_dato_realtime_fmp(symbol, max_reintentos=3, tiempo_espera_inicial=5)
     return pd.DataFrame()
 
 #@profile
-def obtener_dias_habiles_mercado():
+async def obtener_dias_habiles_mercado():
     """
     Obtiene los días hábiles del mercado Forex para determinar el día anterior y el día siguiente.
     """
@@ -1008,8 +1008,8 @@ def obtener_dias_habiles_mercado():
 
 # Función para obtener eventos económicos de los últimos 7 días y ponderarlos por importancia
 #@profile
-def obtener_eventos_economicos(max_reintentos=3, tiempo_espera_inicial=5):
-    dias_habiles = obtener_dias_habiles_mercado()
+async def obtener_eventos_economicos(max_reintentos=3, tiempo_espera_inicial=5):
+    dias_habiles = await obtener_dias_habiles_mercado()
 
     # Obtener la fecha de ayer y de mañana
     fecha_ayer = dias_habiles[0].strftime('%Y-%m-%d')
@@ -3416,7 +3416,7 @@ def generar_nombre_archivo(moneda_filtro, filtro=False, tipo=None):
 
 # Función para enviar el archivo CSV a todos los clientes
 #@profile
-def enviar_csv_telegram(df, context, filename="resultados.csv",  user_chat_id=None, intentos=3):
+async def enviar_csv_telegram(df, context, filename="resultados.csv",  user_chat_id=None, intentos=3):
     """Función para enviar un archivo CSV a todos los clientes."""
 
     chat_ids = [user_chat_id] if user_chat_id else clientes_chat_ids
@@ -3426,11 +3426,11 @@ def enviar_csv_telegram(df, context, filename="resultados.csv",  user_chat_id=No
         for chat_id in chat_ids:
             for intento in range(intentos):
                 try:
-                    context.bot.send_message(chat_id=chat_id, text="No se pudo generar el CSV. El DataFrame está vacío.")
+                    await context.bot.send_message(chat_id=chat_id, text="No se pudo generar el CSV. El DataFrame está vacío.")
                     break
                 except TimedOut:
                     logger.info(f"Intento {intento + 1} fallido. Reintentando...")
-                    asyncio.sleep(2)  # Espera antes de reintentar
+                    await asyncio.sleep(2)  # Espera antes de reintentar
         return
     
     # Crear un buffer en memoria para guardar el archivo CSV
@@ -3443,13 +3443,13 @@ def enviar_csv_telegram(df, context, filename="resultados.csv",  user_chat_id=No
     # Verificar si el buffer no está vacío
     if buffer.getbuffer().nbytes == 0:
         for chat_id in chat_ids:
-            context.bot.send_message(chat_id=chat_id, text="No se pudo generar el CSV. El archivo está vacío.")
+            await context.bot.send_message(chat_id=chat_id, text="No se pudo generar el CSV. El archivo está vacío.")
         return
     
     # Enviar el CSV a todos los clientes
     for chat_id in chat_ids:
         try:
-            context.bot.send_document(chat_id=chat_id, document=buffer, filename=f'{filename}')
+            await context.bot.send_document(chat_id=chat_id, document=buffer, filename=f'{filename}')
             buffer.seek(0)  # Restablecer el buffer para el siguiente cliente
         except Exception as e:
             logger.info(f"Error al enviar CSV a {chat_id}: {e}")
@@ -3517,7 +3517,7 @@ def df_a_imagen(df, max_filas=50):
     
 # Función para enviar la imagen a Telegram
 #@profile
-def enviar_imagen_a_todos(df, context, moneda_filtro=None, user_chat_id=None, intentos=3):
+async def enviar_imagen_a_todos(df, context, moneda_filtro=None, user_chat_id=None, intentos=3):
     imagen = df_a_imagen(df)
 
     chat_ids = [user_chat_id] if user_chat_id else clientes_chat_ids
@@ -3527,21 +3527,21 @@ def enviar_imagen_a_todos(df, context, moneda_filtro=None, user_chat_id=None, in
             total_partes = len(imagen)
             for indice, img in enumerate(imagen, start=1):
                 if img.getbuffer().nbytes > 0:
-                    context.bot.send_photo(chat_id=user_chat_id, photo=img, caption=f"Oportunidades relacionadas a los activos seleccionados. Parte {indice} de {total_partes}")
+                    await context.bot.send_photo(chat_id=user_chat_id, photo=img, caption=f"Oportunidades relacionadas a los activos seleccionados. Parte {indice} de {total_partes}")
     elif imagen is None or imagen.getbuffer().nbytes == 0:
         for chat_id in chat_ids:
-            context.bot.send_message(chat_id=chat_id, text="No se pudo generar la imagen. El archivo está vacío.")
+            await context.bot.send_message(chat_id=chat_id, text="No se pudo generar la imagen. El archivo está vacío.")
     else:
         for chat_id in chat_ids:
             for intento in range(intentos):
                 try:
                     #await context.bot.send_photo(chat_id=chat_id, photo=imagen, caption=f"Oportunidades de {moneda_filtro}")
-                    context.bot.send_photo(chat_id=chat_id, photo=imagen, caption="Oportunidades relacionadas a los activos seleccionados.")
+                    await context.bot.send_photo(chat_id=chat_id, photo=imagen, caption="Oportunidades relacionadas a los activos seleccionados.")
                     imagen.seek(0)  # Restablecer el buffer
                     break
                 except TimedOut:
                     logger.info(f"Intento {intento + 1} fallido. Reintentando...")
-                    asyncio.sleep(2)  # Espera antes de reintentar
+                    await asyncio.sleep(2)  # Espera antes de reintentar
                 except telegram.error.BadRequest as e:
                     logger.info(f"Error al enviar la imagen a {chat_id}: {e}")
 
@@ -4001,7 +4001,7 @@ def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
 
 # Función principal para ejecutar el análisis usando hilos
 #@profile
-def ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_id, context):
+async def ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_id, context):
     resultados = []
     errores = []
 
@@ -4016,7 +4016,7 @@ def ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_id, con
         for symbol in activos_filtrados
     ]
 
-    realtime_results = asyncio.gather(*realtime_tasks, return_exceptions=True)
+    realtime_results = await asyncio.gather(*realtime_tasks, return_exceptions=True)
 
     for idx, result in enumerate(realtime_results):
         if isinstance(result, Exception):
@@ -4044,7 +4044,7 @@ def ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_id, con
             )
             task_to_symbol_temporalidad.append((symbol, temporalidad))
 
-    analisis_results = asyncio.gather(*analisis_tasks, return_exceptions=True)
+    analisis_results = await asyncio.gather(*analisis_tasks, return_exceptions=True)
 
     for idx, result in enumerate(analisis_results):
         symbol, temporalidad = task_to_symbol_temporalidad[idx]
@@ -4066,7 +4066,7 @@ def ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_id, con
 
 # Función para procesar el resultado de cada análisis
 #@profile
-def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram"):
+async def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram"):
 
     urls_generadas = []
 
@@ -4278,11 +4278,11 @@ def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, u
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_principal)
                     df_principal.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                    url_publica = subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_principal)
+                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_principal)
                     urls_generadas.append(url_publica)
 
                 if origen == "app":
-                    enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id)
+                    await enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id)
                 else:
                     asyncio.create_task(enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id))
             else:
@@ -4292,10 +4292,10 @@ def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, u
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_secundaria)
                     df_secundaria.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                    url_publica = subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_secundaria)
+                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_secundaria)
                     urls_generadas.append(url_publica)
                 if origen == "app":
-                    enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id)
+                    await enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id)
                 else:
                     asyncio.create_task(enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id))
             else:
@@ -4317,11 +4317,11 @@ def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, u
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_principal)
                     df_filtrado_principal.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                    url_publica = subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_filtrado_principal)
+                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_filtrado_principal)
                     urls_generadas.append(url_publica)
                 
                 if origen == "app":
-                    enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id)
+                    await enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id)
                 else:
                     asyncio.create_task(enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id))
             else:
@@ -4331,11 +4331,11 @@ def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, u
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_secundaria)
                     df_filtrado_secundaria.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                    url_publica = subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_filtrado_secundaria)
+                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_filtrado_secundaria)
                     urls_generadas.append(url_publica)
 
                 if origen == "app":
-                    enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id)
+                    await enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id)
                 else:
                     asyncio.create_task(enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id))
             else:
@@ -4366,17 +4366,17 @@ def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, u
         user_states[user_chat_id]["imagenes_eventos_enviadas"] = False  # Estado inicial
     
 
-    with user_states[user_chat_id]["lock"]:
+    async with user_states[user_chat_id]["lock"]:
         user_states[user_chat_id]["lock_holder"] = asyncio.current_task()
         # Validar si df_resultados no está vacío antes de enviarlo como CSV
         if not df_resultados.empty:
             if origen == "app":
                 ruta_local = os.path.join("/tmp", nombre_archivo)
                 df_resultados.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                url_publica = subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo)
+                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo)
                 urls_generadas.append(url_publica)
             
-            enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id)
+            await enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id)
         else:
             logger.info(f"El DataFrame df_resultados está vacío. No se enviará el archivo CSV: {nombre_archivo}")
 
@@ -4385,10 +4385,10 @@ def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, u
             if origen == "app":
                 ruta_local = os.path.join("/tmp", nombre_archivo_filtrado)
                 df_filtrado.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                url_publica = subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_filtrado)
+                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_filtrado)
                 urls_generadas.append(url_publica)
             
-            enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id)
+            await enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id)
         else:
             logger.info(f"El DataFrame df_filtrado está vacío. No se enviará el archivo CSV: {nombre_archivo_filtrado}")
 
@@ -4398,7 +4398,7 @@ def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, u
         if user_states[user_chat_id]["archivos_enviados"]:    
             # Verificar si df_filtradoToImage no está vacío antes de enviar la imagen
             if not df_filtradoToImage.empty:
-                enviar_imagen_a_todos(df_filtradoToImage, context, moneda_filtro, user_chat_id)
+                 await enviar_imagen_a_todos(df_filtradoToImage, context, moneda_filtro, user_chat_id)
             else:
                 logger.info(f"El DataFrame df_filtradoToImage está vacío. No se enviará la imagen.")
 
@@ -4407,7 +4407,7 @@ def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, u
             if user_states[user_chat_id]["imagenes_oportunidades_enviadas"]:  
                 if not df_eventos.empty and divisas_oportunidades is not None and len(divisas_oportunidades) > 0:
                     # Aquí irían las tareas que deseas ejecutar si la validación es exitosa
-                    enviar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades, context, user_chat_id)
+                    await enviar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades, context, user_chat_id)
                 else:
                     logger.info("El DataFrame df_eventos está vacío o divisas_oportunidades no contiene elementos válidos.")
                 
@@ -4415,9 +4415,9 @@ def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, u
                 user_states[user_chat_id]["imagenes_eventos_enviadas"] = True
 
             if not es_administrador(user_chat_id):
-                success, mensaje = descontar_transaccion(user_chat_id, user_states[user_chat_id]["numero_transacciones"])
+                success, mensaje = await descontar_transaccion(user_chat_id, user_states[user_chat_id]["numero_transacciones"])
                 if not success:
-                    update.message.reply_text(mensaje)
+                    await update.message.reply_text(mensaje)
             
     logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
     
@@ -5044,7 +5044,7 @@ async def enviar_mensaje_noticias(context, user_chat_id, mensaje):
         
 # Función para manejar el ciclo recurrente del análisis
 #@profile
-def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram"):
+async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram"):
     activos_filtrados = filtrar_activos_por_moneda(activos, moneda_filtro)
     if user_chat_id not in user_states:
             user_states[user_chat_id] = {}
@@ -5052,28 +5052,28 @@ def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opcio
     user_states[user_chat_id]["numero_transacciones"] = len(activos_filtrados)
 
     if not activos_filtrados:
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=user_chat_id,
             text="No se encontraron activos para analizar con el filtro especificado."
         )
         return
 
-    if  estado_suscripcion(user_chat_id, user_states[user_chat_id]["numero_transacciones"]) == 'transacciones_insuficientes' and not es_administrador(user_chat_id):
-        context.bot.send_message(
+    if await estado_suscripcion(user_chat_id, user_states[user_chat_id]["numero_transacciones"]) == 'transacciones_insuficientes' and not es_administrador(user_chat_id):
+        await context.bot.send_message(
             chat_id=user_chat_id,
             text="No cuenta con la cuota de transacciones requerida. Por favor, contacta con un administrador."
         )
         return
     
     if return_state(user_chat_id) == "en ejecución":
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=user_chat_id, 
             text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
         )
         return
 
     user = update.effective_user.first_name
-    context.bot.send_message(chat_id=user_chat_id, text=f"Hola {user}, comenzó el análisis. Por favor, espera un momento...")
+    await context.bot.send_message(chat_id=user_chat_id, text=f"Hola {user}, comenzó el análisis. Por favor, espera un momento...")
 
     actualizar_estado_usuario(user_chat_id, "en ejecución", moneda_filtro)
     mark_user_state(user_chat_id, "en ejecución")
@@ -5086,21 +5086,21 @@ def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opcio
     try:
         start_time = datetime.now()
         try:
-            df_eventos = obtener_eventos_economicos()  # Ensure this function is async
+            df_eventos = await obtener_eventos_economicos()  # Ensure this function is async
         except Exception as e:
             logging.warning(f"Error al obtener eventos económicos: {e}")
             df_eventos = None  # continuar sin eventos
 
-        resultados = ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_id, context)
+        resultados = await ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_id, context)
 
         if not resultados:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=user_chat_id,
                 text="El análisis no produjo resultados. Verifique los datos y vuelva a intentarlo."
             )
             return
 
-        url_generadas =  procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id, opciones_usuario, origen)
+        url_generadas = await procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id, opciones_usuario, origen)
 
         elapsed_time = (datetime.now() - start_time).total_seconds()
         logger.info(f"[{datetime.now()}] Análisis finalizado para usuario {user_chat_id}. Tiempo: {elapsed_time:.2f} segundos.")
@@ -5361,7 +5361,7 @@ async def comando_reset_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_chat_id = update.effective_chat.id
     await resetear_menu_usuario(context, user_chat_id)
 
-def cargar_datos_subscription_user():
+async def cargar_datos_subscription_user():
     """Carga los datos de suscripción de usuarios desde Firestore o devuelve un diccionario vacío si no hay datos."""
     try:
         # Obtén la referencia a la colección "suscripciones"
@@ -5414,7 +5414,7 @@ async def cargar_datos_subscription_type():
         return {}
 
 
-def guardar_datos(data):
+async def guardar_datos(data):
     """Guarda o actualiza los datos de suscripción de usuarios en Firestore."""
     try:
         for user_id, detalles in data.items():
@@ -5428,7 +5428,7 @@ def guardar_datos(data):
 
         # 🔄 **Recargar `subscriptions` en memoria después de guardar en Firestore**
         global subscriptions
-        subscriptions = cargar_datos_subscription_user()
+        subscriptions = await cargar_datos_subscription_user()
 
     except Exception as e:
         print(f"Error al guardar datos de suscripción en Firestore: {e}")
@@ -5609,9 +5609,9 @@ async def verificar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("No tienes una suscripción activa. Por favor, contacta con un administrador.")
 
 
-def estado_suscripcion(user_chat_id, numero_transacciones = 1):
+async def estado_suscripcion(user_chat_id, numero_transacciones = 1):
     global subscriptions
-    subscriptions = cargar_datos_subscription_user()
+    subscriptions = await cargar_datos_subscription_user()
 
     suscripcion = subscriptions.get(user_chat_id)
 
@@ -6002,7 +6002,7 @@ async def listar_pagos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(mensaje)
 
 
-def descontar_transaccion(user_chat_id, numero_transacciones_in=1):
+async def descontar_transaccion(user_chat_id, numero_transacciones_in=1):
     try:
         # Forzar el user_chat_id como string para evitar errores de tipo
         user_chat_id = str(user_chat_id)
@@ -6028,7 +6028,7 @@ def descontar_transaccion(user_chat_id, numero_transacciones_in=1):
             suscripcion["estado"] = "inactiva"
 
         # Guardar cambios
-        guardar_datos(subscriptions)
+        await guardar_datos(subscriptions)
 
         # Actualizar también user_states si existe
         if user_chat_id in user_states:
