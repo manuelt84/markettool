@@ -4088,14 +4088,14 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     df_resultados_ordenado = df_resultados.sort_values(by='Ponderacion', ascending=False)
 
     # Verificar si el usuario tiene acceso a "análisis avanzado"
-    if "analisis avanzado" in opciones_usuario:
+    if "analisis avanzado" in opciones_usuario and not es_administrador(user_chat_id):
         logger.info("El usuario tiene acceso a análisis avanzado.")
-    elif "analisis premium" in opciones_usuario:
+    elif "analisis premium" in opciones_usuario and not es_administrador(user_chat_id):
         df_resultados_ordenado.pop("Soportes Importantes Alcanzados")
         df_resultados_ordenado.pop("Resistencias Importantes Alcanzadas")
         df_resultados_ordenado.pop("Niveles Confirmados (Nivel)")
         logger.info("El usuario tiene acceso a análisis premium.")
-    elif "analisis basico" in opciones_usuario:
+    elif "analisis basico" in opciones_usuario and not es_administrador(user_chat_id):
         df_resultados_ordenado.pop("Patrones Detectados")
         df_resultados_ordenado.pop("Soportes Alcanzados")
         df_resultados_ordenado.pop("Resistencias Alcanzadas")
