@@ -6545,7 +6545,7 @@ def ejecutar_analisis_desde_app():
             "bot": application.bot
         })()
 
-        urls_generadas = asyncio.run(ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app"))
+        urls_generadas =  asyncio.get_event_loop().run_until_complete(ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app"))
 
         return jsonify({
             "status": "ok",
