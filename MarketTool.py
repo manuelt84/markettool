@@ -6498,7 +6498,7 @@ async def initialize_bot():
         
 
 @webhook_app.route('/analisis/ejecutar', methods=['POST'])
-def ejecutar_analisis_desde_app():
+async def ejecutar_analisis_desde_app():
     try:
         if ocupado_lock.locked():
             return "Estoy ocupado", 503
@@ -6512,16 +6512,16 @@ def ejecutar_analisis_desde_app():
             return jsonify({"status": "error", "message": "Faltan parámetros obligatorios"}), 400
 
         # Validar si está registrado
-        chat_ids = cargar_chat_ids()
+        chat_ids = await cargar_chat_ids()
         if chat_id not in chat_ids:
             return jsonify({"status": "error", "message": "Usuario no registrado"}), 403
 
         # Validar suscripción activa o si es admin
-        if estado_suscripcion(chat_id) != "activa" and not es_administrador(chat_id):
+        if await estado_suscripcion(chat_id) != "activa" and not es_administrador(chat_id):
             return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
 
         # Validar opciones habilitadas
-        opciones_usuario = obtener_opciones_usuario(chat_id)
+        opciones_usuario = await obtener_opciones_usuario(chat_id)
         if not es_administrador(chat_id) and not any(
             opcion in opciones_usuario for opcion in ["analisis basico", "analisis premium", "analisis avanzado"]
         ):
@@ -6545,7 +6545,7 @@ def ejecutar_analisis_desde_app():
             "bot": application.bot
         })()
 
-        urls_generadas = ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app")
+        urls_generadas = await ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app")
 
         return jsonify({
             "status": "ok",
