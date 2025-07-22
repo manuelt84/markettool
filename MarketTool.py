@@ -6498,7 +6498,7 @@ async def initialize_bot():
         
 
 @webhook_app.route('/analisis/ejecutar', methods=['POST'])
-def ejecutar_analisis_desde_app():
+async def ejecutar_analisis_desde_app():
     try:
         if ocupado_lock.locked():
             return "Estoy ocupado", 503
