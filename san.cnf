@@ -6,10 +6,10 @@ x509_extensions    = ext
 prompt             = no
 
 [dn]
-CN = 186.104.244.175
+CN = 170.239.86.106
 
 [ext]
 subjectAltName = @alt_names
 
 [alt_names]
-IP.1 = 186.104.244.175
+IP.1 = 170.239.86.106
