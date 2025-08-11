@@ -4675,34 +4675,45 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             mark_user_state(user_chat_id, "disponible")
 
     elif estado_firestore == "esperando_fechas":
-        # Manejar fechas para eventos
         try:
-            await update.message.reply_text(f"Empezamos a obtenerla información, espere un momento por favor.")
+            uid = str(update.effective_user.id)   # usuario de Telegram -> Firestore/user_states
+            chat_id = update.effective_chat.id    # chat para enviar mensajes
+
+            await update.message.reply_text("Empezamos a obtener la información, espere un momento por favor.")
+
+            # Inicializa estructura para evitar KeyError (si no existe)
+            state = user_states.setdefault(uid, {})
+            state.setdefault("estado", "disponible")
+            state.setdefault("links_enviados", False)
+            state.setdefault("imagenes_enviadas", False)
+            state.setdefault("lock", asyncio.Lock())
+            state.setdefault("lock_holder", None)
+            state["fecha_inicio"] = None
+            state["fecha_fin"] = None
 
             fechas = update.message.text.split()
             if len(fechas) != 2:
                 raise ValueError("Debes ingresar dos fechas en formato YYYY-MM-DD YYYY-MM-DD.")
 
             fecha_inicio = pd.to_datetime(fechas[0], format="%Y-%m-%d", errors='coerce')
-            fecha_fin = pd.to_datetime(fechas[1], format="%Y-%m-%d", errors='coerce')
+            fecha_fin    = pd.to_datetime(fechas[1], format="%Y-%m-%d", errors='coerce')
             if pd.isnull(fecha_inicio) or pd.isnull(fecha_fin):
                 raise ValueError("Formato de fecha inválido.")
             if fecha_inicio > fecha_fin:
                 raise ValueError("La fecha de inicio debe ser menor o igual a la fecha de fin.")
 
-            # Fecha actual para validaciones
             fecha_hoy = datetime.now(timezone_country).date()
-            if (fecha_fin.date() - fecha_inicio.date()).days > 7:  # Comparar fechas como objetos date
+            if (fecha_fin.date() - fecha_inicio.date()).days > 7:
                 raise ValueError("El rango de fechas no puede exceder 7 días para eventos.")
-            if fecha_inicio.date() < (fecha_hoy - timedelta(days=14)):  # Convertir a date antes de comparar
+            if fecha_inicio.date() < (fecha_hoy - timedelta(days=14)):
                 raise ValueError("El rango de fechas no puede superar 14 días en el pasado para eventos.")
-            if fecha_fin.date() > (fecha_hoy + timedelta(days=14)):  # Convertir a date antes de comparar
+            if fecha_fin.date() > (fecha_hoy + timedelta(days=14)):
                 raise ValueError("El rango de fechas no puede superar 14 días en el futuro para eventos.")
 
-            user_states[user_chat_id]["fecha_inicio"] = fecha_inicio
-            user_states[user_chat_id]["fecha_fin"] = fecha_fin
-            actualizar_estado_usuario(user_chat_id, "en ejecución")
-            mark_user_state(user_chat_id, "en ejecución")
+            state["fecha_inicio"] = fecha_inicio
+            state["fecha_fin"] = fecha_fin
+            actualizar_estado_usuario(uid, "en ejecución")
+            mark_user_state(uid, "en ejecución")
 
             # Obtener eventos futuros
             df_eventos = await obtener_eventos_guardados_o_futuros(fecha_inicio, fecha_fin)
@@ -4711,38 +4722,30 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                     f"No se encontraron eventos económicos entre {fecha_inicio.strftime('%Y-%m-%d')} y {fecha_fin.strftime('%Y-%m-%d')}."
                 )
             else:
-                # Asegurar que el usuario tiene las claves necesarias en user_states
-                if "lock" not in user_states[user_chat_id]:
-                    user_states[user_chat_id]["lock"] = asyncio.Lock()  # Agregar Lock si no existe
-                    user_states[user_chat_id]["lock_holder"] = None  # Inicializar con None
-                if "links_enviados" not in user_states[user_chat_id]:
-                    user_states[user_chat_id]["links_enviados"] = False  # Estado inicial
-                if "imagenes_enviadas" not in user_states[user_chat_id]:
-                    user_states[user_chat_id]["imagenes_enviadas"] = False  # Estado inicial
-                
-                async with user_states[user_chat_id]["lock"]:
-                    user_states[user_chat_id]["lock_holder"] = asyncio.current_task()
-                    await enviar_imagenes_por_currency_a_usuario(df_eventos, context, user_chat_id)
-                    user_states[user_chat_id]["imagenes_enviadas"] = True
+                # Ya están inicializados en 'state', no revalides claves
+                async with state["lock"]:
+                    state["lock_holder"] = asyncio.current_task()
+                    await enviar_imagenes_por_currency_a_usuario(df_eventos, context, chat_id)
+                    state["imagenes_enviadas"] = True
 
-                    if user_states[user_chat_id]["imagenes_enviadas"]:
-                        asyncio.create_task(enviar_eventos_y_archivo_calendar(df_eventos, context, user_chat_id))
-                        user_states[user_chat_id]["links_enviados"] = True
+                    if state["imagenes_enviadas"]:
+                        asyncio.create_task(enviar_eventos_y_archivo_calendar(df_eventos, context, chat_id))
+                        state["links_enviados"] = True
 
-                    if not es_administrador(user_chat_id):
-                        success, mensaje = await descontar_transaccion(user_chat_id, 1)
+                    if not es_administrador(uid):
+                        success, mensaje = await descontar_transaccion(uid, 1)
                         if not success:
                             await update.message.reply_text(mensaje)
 
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando las fechas: {e}")
         finally:
-            # Limpiar el estado del usuario
-            if user_chat_id in user_states:
-                user_states[user_chat_id]["fecha_inicio"] = None
-                user_states[user_chat_id]["fecha_fin"] = None
-                user_states[user_chat_id]["estado"] = "disponible"
-            mark_user_state(user_chat_id, "disponible")
+            if uid in user_states:
+                user_states[uid]["fecha_inicio"] = None
+                user_states[uid]["fecha_fin"] = None
+                user_states[uid]["estado"] = "disponible"
+            mark_user_state(uid, "disponible")
+
 
     elif estado_firestore == "esperando_fechas_noticias_user":
         try:
