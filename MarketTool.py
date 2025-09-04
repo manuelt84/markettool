@@ -170,31 +170,38 @@ def fs_registrar_archivo_generado(
         "updated_at": firestore.SERVER_TIMESTAMP
     })
 
-def guardar_json_en_storage_y_registrar(
+async def guardar_json_en_storage_y_registrar(
     *,
     exec_id: str,
     chat_id: str,
     nombre_base: str,                     # sin extensión
     data_records: list[dict],
-    subir_a_bucket_y_obtener_url,         # tu función existente
+    subir_a_bucket_y_obtener_url,         # async def que retorna str
     metadata: dict | None = None,
 ) -> str:
     nombre = f"{nombre_base}.json"
     object_path = build_object_path(exec_id, nombre)
     local_json = f"/tmp/{nombre}"
 
+    # escribe el JSON local (sync está bien; es pequeño)
     with open(local_json, "w", encoding="utf-8") as f:
         json.dump(data_records, f, ensure_ascii=False)
 
-    url_publica = subir_a_bucket_y_obtener_url(local_json, object_path)
+    url_publica = await subir_a_bucket_y_obtener_url(local_json, object_path)
 
-    fs_registrar_archivo_generado(
-        exec_id=exec_id,
-        chat_id=chat_id,
+    # sanity check
+    if not isinstance(url_publica, str):
+        raise RuntimeError(f"subir_a_bucket_y_obtener_url devolvió {type(url_publica)}, esperaba str")
+
+    # fs_* son funciones síncronas → ejecútalas en thread
+    await asyncio.to_thread(
+        fs_registrar_archivo_generado,
+        exec_id,
+        chat_id,
         tipo="json",
         nombre=nombre,
         gcs_path=object_path,
-        signed_url=url_publica,          # o None si prefieres no guardar URLs firmadas
+        signed_url=url_publica,          # o None si no quieres guardarla
         content_type="application/json",
         metadata=metadata,
     )
@@ -4164,8 +4171,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     df_resultados = pd.DataFrame(resultados)
     if origen == "app" and exec_id:
         df_json_records = df_resultados.where(pd.notnull(df_resultados), None).to_dict("records")
-        await asyncio.to_thread(
-            guardar_json_en_storage_y_registrar,
+        await guardar_json_en_storage_y_registrar(
             exec_id=exec_id,
             chat_id=user_chat_id,
             nombre_base=f"{moneda_filtro.upper()}_resultados_completos",
@@ -4224,8 +4230,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     # --- JSON oportunidades ---
     if origen == "app" and exec_id:
         df_filtrado_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
-        await asyncio.to_thread(
-            guardar_json_en_storage_y_registrar,
+        await guardar_json_en_storage_y_registrar(
             exec_id=exec_id,
             chat_id=user_chat_id,
             nombre_base=f"{moneda_filtro.upper()}_oportunidades",
