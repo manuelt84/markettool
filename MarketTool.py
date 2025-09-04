@@ -4171,7 +4171,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     df_resultados = pd.DataFrame(resultados)
     if origen == "app" and exec_id:
         df_json_records = df_resultados.where(pd.notnull(df_resultados), None).to_dict("records")
-        await guardar_json_en_storage_y_registrar(
+        json_url = await guardar_json_en_storage_y_registrar(
             exec_id=exec_id,
             chat_id=user_chat_id,
             nombre_base=f"{moneda_filtro.upper()}_resultados_completos",
@@ -4179,7 +4179,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
             metadata={"moneda_filtro": moneda_filtro, "scope": "completo"},
         )
-
+        if json_url:
+            urls_generadas.append(json_url)
+            
     # Convertir la lista de resultados en un DataFrame
     df_resultados = pd.DataFrame(resultados)
 
@@ -4230,7 +4232,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     # --- JSON oportunidades ---
     if origen == "app" and exec_id:
         df_filtrado_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
-        await guardar_json_en_storage_y_registrar(
+        opp_json_url = await guardar_json_en_storage_y_registrar(
             exec_id=exec_id,
             chat_id=user_chat_id,
             nombre_base=f"{moneda_filtro.upper()}_oportunidades",
@@ -4238,6 +4240,8 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
             metadata={"moneda_filtro": moneda_filtro, "scope": "oportunidades"},
         )
+        if opp_json_url:
+            urls_generadas.append(opp_json_url)
 
     df_resultadosToImage = pd.DataFrame(df_filtrado)
 
