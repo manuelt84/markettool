@@ -65,6 +65,7 @@ import easyocr
 import cv2
 import socket
 import torch
+import uuid
 
 print("🔍 GPU habilitada:", torch.cuda.is_available())
 
@@ -110,6 +111,95 @@ ocupado_lock = threading.Lock()
 
 # Inicializar EasyOCR (solo una vez, fuera de la función)
 reader = easyocr.Reader(['en'], gpu=True)
+
+def build_object_path(exec_id: str, nombre: str) -> str:
+    # Estructura uniforme en el bucket por ejecución
+    return f"exec/{exec_id}/{nombre}"
+
+def fs_crear_ejecucion(chat_id: str, activos_solicitados: list[str], origen: str, opciones_usuario: list[str]) -> str:
+    exec_id = uuid.uuid4().hex
+    doc_ref = db.collection("ejecuciones").document(exec_id)
+    doc_ref.set({
+        "exec_id": exec_id,
+        "chat_id": chat_id,
+        "activos_solicitados": activos_solicitados,
+        "origen": origen,
+        "opciones_usuario": opciones_usuario or [],
+        "estado": "en_proceso",
+        "archivos": 0,
+        "created_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": firestore.SERVER_TIMESTAMP,
+    })
+    return exec_id
+
+def fs_actualizar_ejecucion(exec_id: str, **campos):
+    campos["updated_at"] = firestore.SERVER_TIMESTAMP
+    db.collection("ejecuciones").document(exec_id).update({k: v for k, v in campos.items() if v is not None})
+
+def fs_finalizar_ejecucion(exec_id: str, estado: str = "completado", resumen: dict | None = None):
+    db.collection("ejecuciones").document(exec_id).update({
+        "estado": estado,
+        "resumen": resumen or {},
+        "updated_at": firestore.SERVER_TIMESTAMP
+    })
+
+def fs_registrar_archivo_generado(
+    exec_id: str,
+    chat_id: str,
+    *,
+    tipo: str,               # 'csv' | 'json' | 'png' | 'html' | ...
+    nombre: str,             # p.ej. USD_principal.csv
+    gcs_path: str,           # p.ej. exec/<exec_id>/USD_principal.csv
+    signed_url: str | None = None,
+    content_type: str | None = None,
+    metadata: dict | None = None,
+):
+    db.collection("archivos_generados").add({
+        "exec_id": exec_id,
+        "chat_id": chat_id,
+        "tipo": tipo,
+        "nombre": nombre,
+        "gcs_path": gcs_path,     # 👉 SOLO REFERENCIA
+        "signed_url": signed_url, # opcional (puedes dejar None si firmas on-demand)
+        "content_type": content_type,
+        "metadata": metadata or {},
+        "created_at": firestore.SERVER_TIMESTAMP,
+    })
+    db.collection("ejecuciones").document(exec_id).update({
+        "archivos": firestore.Increment(1),
+        "updated_at": firestore.SERVER_TIMESTAMP
+    })
+
+def guardar_json_en_storage_y_registrar(
+    *,
+    exec_id: str,
+    chat_id: str,
+    nombre_base: str,                     # sin extensión
+    data_records: list[dict],
+    subir_a_bucket_y_obtener_url,         # tu función existente
+    metadata: dict | None = None,
+) -> str:
+    nombre = f"{nombre_base}.json"
+    object_path = build_object_path(exec_id, nombre)
+    local_json = f"/tmp/{nombre}"
+
+    with open(local_json, "w", encoding="utf-8") as f:
+        json.dump(data_records, f, ensure_ascii=False)
+
+    url_publica = subir_a_bucket_y_obtener_url(local_json, object_path)
+
+    fs_registrar_archivo_generado(
+        exec_id=exec_id,
+        chat_id=chat_id,
+        tipo="json",
+        nombre=nombre,
+        gcs_path=object_path,
+        signed_url=url_publica,          # o None si prefieres no guardar URLs firmadas
+        content_type="application/json",
+        metadata=metadata,
+    )
+    return url_publica
+
 
 def actualizar_estado_esperando_imagen(chat_id: str):
     db = firestore.client()
@@ -4066,9 +4156,23 @@ async def ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_i
 
 # Función para procesar el resultado de cada análisis
 #@profile
-async def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram"):
+async def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None):
 
     urls_generadas = []
+
+    # --- JSON completo (antes de filtrar) ---
+    df_resultados = pd.DataFrame(resultados)
+    if origen == "app" and exec_id:
+        df_json_records = df_resultados.where(pd.notnull(df_resultados), None).to_dict("records")
+        await asyncio.to_thread(
+            guardar_json_en_storage_y_registrar,
+            exec_id=exec_id,
+            chat_id=user_chat_id,
+            nombre_base=f"{moneda_filtro.upper()}_resultados_completos",
+            data_records=df_json_records,
+            subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
+            metadata={"moneda_filtro": moneda_filtro, "scope": "completo"},
+        )
 
     # Convertir la lista de resultados en un DataFrame
     df_resultados = pd.DataFrame(resultados)
@@ -4116,6 +4220,19 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
         (df_resultados_ordenado['Oportunidad'] == True) &
         (df_resultados_ordenado['Zona No Trading'] == False) 
     ]
+
+    # --- JSON oportunidades ---
+    if origen == "app" and exec_id:
+        df_filtrado_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
+        await asyncio.to_thread(
+            guardar_json_en_storage_y_registrar,
+            exec_id=exec_id,
+            chat_id=user_chat_id,
+            nombre_base=f"{moneda_filtro.upper()}_oportunidades",
+            data_records=df_filtrado_records,
+            subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
+            metadata={"moneda_filtro": moneda_filtro, "scope": "oportunidades"},
+        )
 
     df_resultadosToImage = pd.DataFrame(df_filtrado)
 
@@ -4278,8 +4395,26 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_principal)
                     df_principal.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_principal)
+
+                    if exec_id:
+                        object_path = build_object_path(exec_id, nombre_archivo_principal)
+                    else:
+                        object_path = nombre_archivo_principal  # fallback sin exec_id si fuera necesario
+
+                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                     urls_generadas.append(url_publica)
+
+                    if exec_id:
+                        await asyncio.to_thread(
+                            fs_registrar_archivo_generado,
+                            exec_id, user_chat_id,
+                            tipo="csv",
+                            nombre=nombre_archivo_principal,
+                            gcs_path=object_path,
+                            signed_url=url_publica,     # o None si no quieres guardarla
+                            content_type="text/csv",
+                            metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
+                        )
 
                 if origen == "app":
                     await enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id)
@@ -4292,8 +4427,27 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_secundaria)
                     df_secundaria.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_secundaria)
+
+                    if exec_id:
+                        object_path = build_object_path(exec_id, nombre_archivo_secundaria)
+                    else:
+                        object_path = nombre_archivo_secundaria  # fallback sin exec_id si fuera necesario
+
+                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                     urls_generadas.append(url_publica)
+
+                    if exec_id:
+                        await asyncio.to_thread(
+                            fs_registrar_archivo_generado,
+                            exec_id, user_chat_id,
+                            tipo="csv",
+                            nombre=nombre_archivo_secundaria,
+                            gcs_path=object_path,
+                            signed_url=url_publica,     # o None si no quieres guardarla
+                            content_type="text/csv",
+                            metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
+                        )
+
                 if origen == "app":
                     await enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id)
                 else:
@@ -4317,8 +4471,26 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_principal)
                     df_filtrado_principal.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_filtrado_principal)
+
+                    if exec_id:
+                        object_path = build_object_path(exec_id, nombre_archivo_filtrado_principal)
+                    else:
+                        object_path = nombre_archivo_filtrado_principal  # fallback sin exec_id si fuera necesario
+
+                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                     urls_generadas.append(url_publica)
+
+                    if exec_id:
+                        await asyncio.to_thread(
+                            fs_registrar_archivo_generado,
+                            exec_id, user_chat_id,
+                            tipo="csv",
+                            nombre=nombre_archivo_filtrado_principal,
+                            gcs_path=object_path,
+                            signed_url=url_publica,     # o None si no quieres guardarla
+                            content_type="text/csv",
+                            metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
+                        )
                 
                 if origen == "app":
                     await enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id)
@@ -4331,8 +4503,26 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_secundaria)
                     df_filtrado_secundaria.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_filtrado_secundaria)
+
+                    if exec_id:
+                        object_path = build_object_path(exec_id, nombre_archivo_filtrado_secundaria)
+                    else:
+                        object_path = nombre_archivo_filtrado_secundaria  # fallback sin exec_id si fuera necesario
+
+                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                     urls_generadas.append(url_publica)
+
+                    if exec_id:
+                        await asyncio.to_thread(
+                            fs_registrar_archivo_generado,
+                            exec_id, user_chat_id,
+                            tipo="csv",
+                            nombre=nombre_archivo_filtrado_secundaria,
+                            gcs_path=object_path,
+                            signed_url=url_publica,     # o None si no quieres guardarla
+                            content_type="text/csv",
+                            metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
+                        )
 
                 if origen == "app":
                     await enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id)
@@ -4373,8 +4563,26 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             if origen == "app":
                 ruta_local = os.path.join("/tmp", nombre_archivo)
                 df_resultados.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo)
+
+                if exec_id:
+                    object_path = build_object_path(exec_id, nombre_archivo)
+                else:
+                    object_path = nombre_archivo  # fallback sin exec_id si fuera necesario
+
+                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                 urls_generadas.append(url_publica)
+
+                if exec_id:
+                    await asyncio.to_thread(
+                        fs_registrar_archivo_generado,
+                        exec_id, user_chat_id,
+                        tipo="csv",
+                        nombre=nombre_archivo,
+                        gcs_path=object_path,
+                        signed_url=url_publica,     # o None si no quieres guardarla
+                        content_type="text/csv",
+                        metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
+                    )
             
             await enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id)
         else:
@@ -4385,8 +4593,26 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             if origen == "app":
                 ruta_local = os.path.join("/tmp", nombre_archivo_filtrado)
                 df_filtrado.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
-                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, nombre_archivo_filtrado)
+
+                if exec_id:
+                    object_path = build_object_path(exec_id, nombre_archivo_filtrado)
+                else:
+                    object_path = nombre_archivo_filtrado  # fallback sin exec_id si fuera necesario
+
+                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                 urls_generadas.append(url_publica)
+
+                if exec_id:
+                    await asyncio.to_thread(
+                        fs_registrar_archivo_generado,
+                        exec_id, user_chat_id,
+                        tipo="csv",
+                        nombre=nombre_archivo_filtrado,
+                        gcs_path=object_path,
+                        signed_url=url_publica,     # o None si no quieres guardarla
+                        content_type="text/csv",
+                        metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
+                    )
             
             await enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id)
         else:
@@ -5047,7 +5273,7 @@ async def enviar_mensaje_noticias(context, user_chat_id, mensaje):
         
 # Función para manejar el ciclo recurrente del análisis
 #@profile
-async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram"):
+async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None):
     activos_filtrados = filtrar_activos_por_moneda(activos, moneda_filtro)
     if user_chat_id not in user_states:
             user_states[user_chat_id] = {}
@@ -5086,6 +5312,14 @@ async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None,
 
     logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Ejecutando análisis para el usuario {user_chat_id}...")
 
+    if exec_id:
+        try:
+            await asyncio.to_thread(fs_actualizar_ejecucion, exec_id,
+                                    activos_resueltos=activos_filtrados,
+                                    numero_transacciones=len(activos_filtrados))
+        except Exception as e:
+            logging.warning(f"No se pudo actualizar ejecucion {exec_id}: {e}")
+
     try:
         start_time = datetime.now()
         try:
@@ -5103,7 +5337,7 @@ async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None,
             )
             return
 
-        url_generadas = await procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id, opciones_usuario, origen)
+        url_generadas = await procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id, opciones_usuario, origen, exec_id=exec_id)
 
         elapsed_time = (datetime.now() - start_time).total_seconds()
         logger.info(f"[{datetime.now()}] Análisis finalizado para usuario {user_chat_id}. Tiempo: {elapsed_time:.2f} segundos.")
@@ -6534,6 +6768,9 @@ async def ejecutar_analisis_desde_app():
         if return_state(chat_id) == "en ejecución":
             return jsonify({"status": "error", "message": "Ya hay un análisis en ejecución"}), 409
 
+        # Crear ejecución (usar to_thread para no bloquear)
+        exec_id = await asyncio.to_thread(fs_crear_ejecucion, chat_id, [activo], origen, opciones_usuario)
+
         # Lanzar análisis (sin Telegram)
         dummy_update = type("DummyUpdate", (), {
             "effective_chat": type("DummyChat", (), {"id": chat_id})(),
@@ -6548,16 +6785,25 @@ async def ejecutar_analisis_desde_app():
             "bot": application.bot
         })()
 
-        urls_generadas = await ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app")
+        urls_generadas = await ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app", exec_id=exec_id)
+
+        await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "completado", {"urls": urls_generadas})
 
         return jsonify({
             "status": "ok",
+            "exec_id": exec_id,
             "message": f"Análisis ejecutado para {activo}",
             "download_urls": urls_generadas  
         }), 200
 
     except Exception as e:
         logger.error(f"Error en /analisis/ejecutar: {e}")
+        logging.exception("Error en /analisis/ejecutar")
+        try:
+            if 'exec_id' in locals():
+                await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "fallido", {"error": str(e)})
+        except Exception:
+            pass
         return jsonify({"status": "error", "message": str(e)}), 500
     
     finally:
