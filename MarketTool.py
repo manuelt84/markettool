@@ -66,6 +66,7 @@ import cv2
 import socket
 import torch
 import uuid
+from typing import Any
 
 print("🔍 GPU habilitada:", torch.cuda.is_available())
 
@@ -582,7 +583,7 @@ async def guardar_json_en_storage_y_registrar(
     data_records: list[dict],
     subir_a_bucket_y_obtener_url,         # async def que retorna str
     metadata: dict | None = None,
-) -> str:
+) -> str | None:
     nombre = f"{nombre_base}.json"
     object_path = build_object_path(exec_id, nombre)
     local_json = f"/tmp/{nombre}"
@@ -4655,7 +4656,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
         if urls_enriched:
             urls_generadas.extend(urls_enriched)
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-    
+
     # Convertir la lista de resultados en un DataFrame
     df_resultados = pd.DataFrame(resultados)
 
@@ -5144,8 +5145,29 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             
     logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
     
+    urls_generadas = _solo_strings_urls(urls_generadas)
+    logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
     return urls_generadas
 
+
+def _solo_strings_urls(items: list[Any]) -> list[str]:
+    out: list[str] = []
+    for it in items:
+        if isinstance(it, str):
+            out.append(it)
+        elif isinstance(it, dict):
+            # por si algún helper devuelve {"url": "..."} o {"signed_url": "..."}
+            url = it.get("url") or it.get("signed_url")
+            if isinstance(url, str):
+                out.append(url)
+        else:
+            logger.warning(f"Descartando elemento no serializable en urls: {type(it)}")
+    # deduplicar preservando orden
+    seen, uniq = set(), []
+    for u in out:
+        if u and u not in seen:
+            seen.add(u); uniq.append(u)
+    return uniq
 
 # Función para obtener el estado de un usuario
 def obtener_estado_usuario(user_chat_id):
@@ -7290,7 +7312,7 @@ async def ejecutar_analisis_desde_app():
             "status": "ok",
             "exec_id": exec_id,
             "message": f"Análisis ejecutado para {activo}",
-            "download_urls": urls_generadas  
+            "download_urls": _solo_strings_urls(urls_generadas)
         }), 200
 
     except Exception as e:
