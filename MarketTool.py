@@ -109,8 +109,53 @@ modelo_ruido = YOLO("ruido.pt")
 # Lock global para simular carga
 ocupado_lock = threading.Lock()
 
+_reader = None
+_reader_lock = threading.Lock()
+
+def get_easyocr_reader(prefer_gpu: bool = True):
+    """
+    Inicializa EasyOCR una sola vez con cache de modelos, usa GPU si está disponible,
+    y hace fallback a CPU si falla.
+    """
+    global _reader
+    if _reader is not None:
+        return _reader
+
+    with _reader_lock:
+        if _reader is not None:
+            return _reader
+
+        model_dir = os.environ.get('EASY_OCR_MODEL_DIR', '/app/models/easyocr')
+        os.makedirs(model_dir, exist_ok=True)
+
+        def _try_init(gpu_flag: bool):
+            return easyocr.Reader(
+                ['en'],
+                gpu=gpu_flag,
+                model_storage_directory=model_dir
+            )
+
+        # 1) Intentar con GPU si se prefiere y está disponible
+        use_gpu = (prefer_gpu and torch.cuda.is_available())
+        try:
+            _reader = _try_init(use_gpu)
+            return _reader
+        except Exception as e:
+            logger.error(f"EasyOCR con gpu={use_gpu} falló: {e}")
+            # limpiar zips corruptos antes del fallback
+            try:
+                for f in os.listdir(model_dir):
+                    if f.endswith('.zip'):
+                        os.remove(os.path.join(model_dir, f))
+            except Exception:
+                pass
+
+        # 2) Fallback a CPU
+        _reader = _try_init(False)
+        return _reader
+
 # Inicializar EasyOCR (solo una vez, fuera de la función)
-reader = easyocr.Reader(['en'], gpu=True)
+reader = get_easyocr_reader(prefer_gpu=True) 
 
 def safe_name(s: str) -> str:
     return re.sub(r'[^A-Za-z0-9._-]+', '_', str(s))
