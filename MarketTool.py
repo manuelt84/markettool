@@ -112,6 +112,96 @@ ocupado_lock = threading.Lock()
 # Inicializar EasyOCR (solo una vez, fuera de la función)
 reader = easyocr.Reader(['en'], gpu=True)
 
+
+async def subir_imagenes_eventos_y_registrar(
+    imagen_eventos,                 # BytesIO o list[BytesIO] desde generar_imagen_eventos_oportunidades
+    exec_id: str,
+    chat_id: str,
+    moneda_filtro: str,
+    subir_a_bucket_y_obtener_url,   # tu función async (o sync) que retorna la URL
+) -> list[str]:
+    if imagen_eventos is None:
+        return []
+
+    # Normaliza a lista de buffers
+    buffers = imagen_eventos if isinstance(imagen_eventos, list) else [imagen_eventos]
+
+    urls_subidas: list[str] = []
+    for idx, buf in enumerate(buffers, start=1):
+        nombre = f"{moneda_filtro.upper()}_eventos_oportunidades_{idx:02d}.png"
+        object_path = build_object_path(exec_id, nombre)  # exec/<exec_id>/<nombre>
+        local_path = f"/tmp/{nombre}"
+
+        buf.seek(0)
+        with open(local_path, "wb") as f:
+            f.write(buf.getvalue())
+
+        # 👈 SUBE y espera la URL
+        if asyncio.iscoroutinefunction(subir_a_bucket_y_obtener_url):
+            url = await subir_a_bucket_y_obtener_url(local_path, object_path)
+        else:
+            url = await asyncio.to_thread(subir_a_bucket_y_obtener_url, local_path, object_path)
+
+        urls_subidas.append(url)
+
+        # Registra en Firestore (sync → thread)
+        await asyncio.to_thread(
+            fs_registrar_archivo_generado,
+            exec_id, chat_id,
+            tipo="png",
+            nombre=nombre,
+            gcs_path=object_path,
+            signed_url=url,              # o None si prefieres firmar on-demand
+            content_type="image/png",
+            metadata={"scope": "eventos_oportunidades", "part": idx},
+        )
+
+    return urls_subidas
+
+
+async def subir_json_eventos_filtrados(
+    df_eventos: pd.DataFrame,
+    divisas_oportunidades,
+    exec_id: str,
+    chat_id: str,
+    moneda_filtro: str,
+    timezone_country,                # ya lo usas
+    subir_a_bucket_y_obtener_url,    # tu función (async o sync)
+) -> str | None:
+    if df_eventos.empty or not divisas_oportunidades:
+        return None
+
+    if 'date' not in df_eventos.columns:
+        return None
+
+    df = df_eventos[df_eventos['currency'].isin(divisas_oportunidades)].copy()
+    if df.empty:
+        return None
+
+    # Asegura tz y serializa fecha como string legible
+    if df['date'].dt.tz is None:
+        df['date'] = df['date'].dt.tz_localize('UTC')
+    df['date'] = df['date'].dt.tz_convert(timezone_country).dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+
+    records = df.where(pd.notnull(df), None).to_dict('records')
+
+    # Reusa tu helper de JSON al bucket
+    json_url = await guardar_json_en_storage_y_registrar(
+        exec_id=exec_id,
+        chat_id=chat_id,
+        nombre_base=f"{moneda_filtro.upper()}_eventos_oportunidades",
+        data_records=records,
+        subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
+        metadata={
+            "scope": "eventos_oportunidades",
+            "moneda_filtro": moneda_filtro,
+            "divisas": list(map(str, divisas_oportunidades))
+        },
+    )
+    return json_url
+
+
+
 def build_object_path(exec_id: str, nombre: str) -> str:
     # Estructura uniforme en el bucket por ejecución
     return f"exec/{exec_id}/{nombre}"
@@ -3729,11 +3819,23 @@ def generar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades, max_
         
 # Función para enviar la imagen de los eventos relacionados a las oportunidades
 #@profile
-async def enviar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades, context, user_chat_id=None, intentos=3):
+async def enviar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades, context, user_chat_id=None, intentos=3,
+    *,
+    exec_id: str | None = None,
+    moneda_filtro: str | None = None,
+    subir_a_bucket_y_obtener_url=None,)-> list[str]:
     # Generar la imagen de los eventos relacionados a las oportunidades
     imagen_eventos = generar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades)
 
     chat_ids = [user_chat_id] if user_chat_id else clientes_chat_ids
+
+    urls_subidas: list[str] = []
+
+    # ✅ SUBIR a bucket si corresponde
+    if imagen_eventos is not None and exec_id and moneda_filtro and subir_a_bucket_y_obtener_url:
+        urls_subidas = await subir_imagenes_eventos_y_registrar(
+            imagen_eventos, exec_id, user_chat_id, moneda_filtro, subir_a_bucket_y_obtener_url
+        )
 
     # Verificar si la imagen es None o el buffer está vacío
     if isinstance(imagen_eventos, list):  # Si es una lista de imágenes
@@ -3756,6 +3858,8 @@ async def enviar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades,
                 except telegram.error.BadRequest as e:
                     logger.info(f"Error al enviar la imagen de eventos a {chat_id}: {e}")
                 await asyncio.sleep(2)
+    
+    return urls_subidas
 
 #@profile
 def graficar_serie_temporal(df, symbol, temporalidad):
@@ -4641,8 +4745,22 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
             if user_states[user_chat_id]["imagenes_oportunidades_enviadas"]:  
                 if not df_eventos.empty and divisas_oportunidades is not None and len(divisas_oportunidades) > 0:
-                    # Aquí irían las tareas que deseas ejecutar si la validación es exitosa
-                    await enviar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades, context, user_chat_id)
+                    # 1) JSON de eventos filtrados
+                    if origen == "app" and exec_id:
+                        json_eventos_url = await subir_json_eventos_filtrados(
+                            df_eventos, divisas_oportunidades, exec_id, user_chat_id, moneda_filtro,
+                            timezone_country, subir_a_bucket_y_obtener_url
+                        )
+                        if json_eventos_url:
+                            urls_generadas.append(json_eventos_url)
+                    # 2) Imágenes de eventos (subir y enviar)
+                    urls_imgs = await enviar_imagen_eventos_oportunidades(
+                        df_eventos, divisas_oportunidades, context, user_chat_id,
+                        exec_id=exec_id, moneda_filtro=moneda_filtro,
+                        subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url
+                    )
+                    if urls_imgs:
+                        urls_generadas.extend(urls_imgs)
                 else:
                     logger.info("El DataFrame df_eventos está vacío o divisas_oportunidades no contiene elementos válidos.")
                 
