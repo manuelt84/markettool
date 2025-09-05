@@ -165,27 +165,34 @@ async def subir_json_eventos_filtrados(
     exec_id: str,
     chat_id: str,
     moneda_filtro: str,
-    timezone_country,                # ya lo usas
-    subir_a_bucket_y_obtener_url,    # tu función (async o sync)
+    timezone_country,                # tu tz destino
+    subir_a_bucket_y_obtener_url,    # async o sync
 ) -> str | None:
-    if df_eventos.empty or not divisas_oportunidades:
+
+    # Normaliza divisas a lista plana de strings
+    divs_arr = np.asarray(divisas_oportunidades).ravel() if divisas_oportunidades is not None else np.array([])
+    divs = [str(x) for x in divs_arr.tolist() if pd.notna(x) and str(x).strip() != ""]
+
+    if df_eventos is None or df_eventos.empty or len(divs) == 0:
         return None
 
-    if 'date' not in df_eventos.columns:
+    if 'date' not in df_eventos.columns or 'currency' not in df_eventos.columns:
         return None
 
-    df = df_eventos[df_eventos['currency'].isin(divisas_oportunidades)].copy()
+    df = df_eventos[df_eventos['currency'].isin(divs)].copy()
     if df.empty:
         return None
 
-    # Asegura tz y serializa fecha como string legible
-    if df['date'].dt.tz is None:
-        df['date'] = df['date'].dt.tz_localize('UTC')
+    # Asegura datetime con tz y formatea
+    df['date'] = pd.to_datetime(df['date'], errors='coerce', utc=True)
+    df = df[df['date'].notna()]
+    if df.empty:
+        return None
+
     df['date'] = df['date'].dt.tz_convert(timezone_country).dt.strftime('%Y-%m-%d %H:%M:%S %Z')
 
     records = df.where(pd.notnull(df), None).to_dict('records')
 
-    # Reusa tu helper de JSON al bucket
     json_url = await guardar_json_en_storage_y_registrar(
         exec_id=exec_id,
         chat_id=chat_id,
@@ -195,11 +202,10 @@ async def subir_json_eventos_filtrados(
         metadata={
             "scope": "eventos_oportunidades",
             "moneda_filtro": moneda_filtro,
-            "divisas": list(map(str, divisas_oportunidades))
+            "divisas": divs
         },
     )
     return json_url
-
 
 
 def build_object_path(exec_id: str, nombre: str) -> str:
