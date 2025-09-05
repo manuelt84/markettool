@@ -112,6 +112,269 @@ ocupado_lock = threading.Lock()
 # Inicializar EasyOCR (solo una vez, fuera de la función)
 reader = easyocr.Reader(['en'], gpu=True)
 
+def safe_name(s: str) -> str:
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', str(s))
+
+def _to_epoch_ms(values: pd.Series) -> list[int]:
+    # values debe ser datetime64[ns, tz] o naive; convertimos a UTC y ms
+    ts = pd.to_datetime(values, errors='coerce', utc=True)
+    ts = ts.dropna()
+    return ((ts.view('int64') // 10**6).astype('int64')).tolist()
+
+def _pairs(df: pd.DataFrame, col: str) -> list[list[float]]:
+    if 'time' not in df.columns or col not in df.columns:
+        return []
+    sub = df[['time', col]].dropna()
+    if sub.empty: return []
+    t_ms = _to_epoch_ms(sub['time'])
+    vals = pd.to_numeric(sub[col], errors='coerce').dropna().tolist()
+    # Alinear por índice tras dropna independiente
+    # (más robusto: recalcular sobre sub otra vez)
+    sub = sub.dropna()
+    t_ms = _to_epoch_ms(sub['time'])
+    vals = pd.to_numeric(sub[col], errors='coerce').tolist()
+    out = []
+    for i in range(min(len(t_ms), len(vals))):
+        out.append([int(t_ms[i]), float(vals[i])])
+    return out
+
+def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return pd.DataFrame()
+    d = df.copy()
+
+    # Si viene por índice -> columna time
+    if isinstance(d.index, pd.DatetimeIndex):
+        d = d.reset_index().rename(columns={d.index.name or 'index': 'time'})
+
+    # Renombres comunes
+    colmap_posibles = {
+        'time':   ['time', 'timestamp', 'date', 'datetime'],
+        'open':   ['open', 'o', 'apertura'],
+        'high':   ['high', 'h', 'max', 'maximo'],
+        'low':    ['low', 'l', 'min', 'minimo'],
+        'close':  ['close', 'c', 'cierre', 'close_price'],
+        'volume': ['volume', 'v', 'vol', 'volumen'],
+        # indicadores (si ya vienen)
+        'SMA': ['SMA', 'sma'],
+        'bollinger_upper': ['bollinger_upper', 'bb_upper', 'upper'],
+        'bollinger_lower': ['bollinger_lower', 'bb_lower', 'lower'],
+        'bollinger_signal': ['bollinger_signal'],
+        'ema_12': ['ema_12', 'ema12'],
+        'ema_26': ['ema_26', 'ema26'],
+        'macd': ['macd'],
+        'signal': ['signal', 'macd_signal'],
+        '%K': ['%K', 'stoch_k', 'k'],
+        '%D': ['%D', 'stoch_d', 'd'],
+        'ATR': ['ATR', 'atr'],
+        'rsi': ['rsi', 'RSI']
+    }
+    m = {}
+    for tgt, cands in colmap_posibles.items():
+        for c in cands:
+            if c in d.columns:
+                m[c] = tgt
+                break
+    d = d.rename(columns=m)
+
+    # Requisitos OHLC
+    for c in ['time','open','high','low','close']:
+        if c not in d.columns: return pd.DataFrame()
+
+    d['time'] = pd.to_datetime(d['time'], errors='coerce', utc=True)
+    d = d.dropna(subset=['time', 'open','high','low','close'])
+
+    for c in ['open','high','low','close','volume','SMA','ema_12','ema_26','macd','signal','%K','%D','ATR','rsi','bollinger_upper','bollinger_lower']:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors='coerce')
+
+    d = d.sort_values('time').reset_index(drop=True)
+
+    MAX_VELAS = 1500
+    if len(d) > MAX_VELAS:
+        d = d.tail(MAX_VELAS).reset_index(drop=True)
+
+    return d
+
+def construir_payload_enriquecido(symbol: str, tf: str, d: pd.DataFrame, extra_meta: dict | None = None, niveles: dict | None = None, entradas: dict | None = None) -> dict:
+    """
+    Construye un JSON apto para el front: velas + indicadores + eventos + snapshot + levels.
+    Asume df ya normalizado (tiene 'time', OHLC y, si existen, columnas de indicadores).
+    """
+    payload = {
+        "symbol": str(symbol).upper(),
+        "timeframe": str(tf),
+        "count": int(len(d)),
+        "series": {
+            "ohlcv": _pairs(d, "open") and [  # generamos OHLCV como estructura compacta
+                # Para velas completas prefiero arrays paralelos en el front, pero si quieres
+                # mantener pares, dejamos candlesticks por separado:
+            ],
+            # Mejor: candlesticks compactos con t,o,h,l,c,v
+            "candles": []
+        },
+        "events": [],
+        "last": {},
+        "meta": {
+            "computed_at": pd.Timestamp.utcnow().isoformat(),
+            **(extra_meta or {})
+        },
+        "levels": niveles or {},
+        "entradas": entradas or {}
+    }
+
+    # Candles compactas
+    t_ms = _to_epoch_ms(d['time'])
+    o = d['open'].astype(float).tolist()
+    h = d['high'].astype(float).tolist()
+    l = d['low'].astype(float).tolist()
+    c = d['close'].astype(float).tolist()
+    v = d['volume'].astype(float).tolist() if 'volume' in d.columns else [None]*len(d)
+    candles = []
+    for i in range(len(t_ms)):
+        candles.append({"t": int(t_ms[i]), "o": o[i], "h": h[i], "l": l[i], "c": c[i], "v": v[i]})
+    payload["series"]["candles"] = candles
+
+    # Indicadores -> pares [t, val]
+    if 'SMA' in d.columns:
+        payload["series"]["sma"] = _pairs(d, "SMA")
+    if 'ema_12' in d.columns:
+        payload["series"]["ema12"] = _pairs(d, "ema_12")
+    if 'ema_26' in d.columns:
+        payload["series"]["ema26"] = _pairs(d, "ema_26")
+    if 'bollinger_upper' in d.columns or 'bollinger_lower' in d.columns:
+        payload["series"]["bollinger"] = {
+            "upper": _pairs(d, "bollinger_upper"),
+            "lower": _pairs(d, "bollinger_lower"),
+            "basis": _pairs(d, "SMA") if 'SMA' in d.columns else []
+        }
+    if 'macd' in d.columns:
+        payload["series"]["macd"] = {
+            "macd": _pairs(d, "macd"),
+            "signal": _pairs(d, "signal") if 'signal' in d.columns else [],
+            "hist": []
+        }
+        # hist = macd - signal
+        if 'signal' in d.columns:
+            hist = (d['macd'] - d['signal']).replace([np.inf, -np.inf], np.nan)
+            dd = d[['time']].copy()
+            dd['hist'] = hist
+            payload["series"]["macd"]["hist"] = _pairs(dd, "hist")
+    if 'rsi' in d.columns:
+        payload["series"]["rsi"] = _pairs(d, "rsi")
+    if '%K' in d.columns or '%D' in d.columns:
+        payload["series"]["stoch"] = {
+            "k": _pairs(d, "%K") if '%K' in d.columns else [],
+            "d": _pairs(d, "%D") if '%D' in d.columns else []
+        }
+    if 'ATR' in d.columns:
+        payload["series"]["atr"] = _pairs(d, "ATR")
+
+    # Eventos útiles para markers:
+    # 1) Cruces MACD
+    if 'macd' in d.columns and 'signal' in d.columns:
+        macd_crosses = []
+        for i in range(1, len(d)):
+            prev = d['macd'].iloc[i-1] - d['signal'].iloc[i-1]
+            curr = d['macd'].iloc[i]   - d['signal'].iloc[i]
+            if np.isnan(prev) or np.isnan(curr): 
+                continue
+            if prev < 0 and curr > 0:
+                macd_crosses.append({"t": int(t_ms[i]), "type": "macd_bullish_cross"})
+            elif prev > 0 and curr < 0:
+                macd_crosses.append({"t": int(t_ms[i]), "type": "macd_bearish_cross"})
+        if macd_crosses:
+            payload["events"].append({"kind": "macd_cross", "points": macd_crosses})
+
+    # 2) Toques/rupturas de Bollinger (close > upper / close < lower)
+    if 'bollinger_upper' in d.columns and 'bollinger_lower' in d.columns:
+        bb_points = []
+        for i in range(len(d)):
+            cu = d['bollinger_upper'].iloc[i]
+            cl = d['bollinger_lower'].iloc[i]
+            cc = d['close'].iloc[i]
+            if np.isnan(cu) or np.isnan(cl) or np.isnan(cc):
+                continue
+            if cc > cu:
+                bb_points.append({"t": int(t_ms[i]), "type": "bb_break_up"})
+            elif cc < cl:
+                bb_points.append({"t": int(t_ms[i]), "type": "bb_break_down"})
+        if bb_points:
+            payload["events"].append({"kind": "bollinger_touch", "points": bb_points})
+
+    # Snapshot (última vela / últimos indicadores)
+    last_idx = len(d) - 1
+    if last_idx >= 0:
+        payload["last"] = {
+            "t": int(t_ms[last_idx]),
+            "o": o[last_idx], "h": h[last_idx], "l": l[last_idx], "c": c[last_idx],
+            "v": v[last_idx],
+            "rsi": float(d['rsi'].iloc[last_idx]) if 'rsi' in d.columns and not pd.isna(d['rsi'].iloc[last_idx]) else None,
+            "stochK": float(d['%K'].iloc[last_idx]) if '%K' in d.columns and not pd.isna(d['%K'].iloc[last_idx]) else None,
+            "stochD": float(d['%D'].iloc[last_idx]) if '%D' in d.columns and not pd.isna(d['%D'].iloc[last_idx]) else None,
+            "macd": float(d['macd'].iloc[last_idx]) if 'macd' in d.columns and not pd.isna(d['macd'].iloc[last_idx]) else None,
+            "signal": float(d['signal'].iloc[last_idx]) if 'signal' in d.columns and not pd.isna(d['signal'].iloc[last_idx]) else None,
+            "hist": float((d['macd'].iloc[last_idx] - d['signal'].iloc[last_idx])) if ('macd' in d.columns and 'signal' in d.columns and not pd.isna(d['macd'].iloc[last_idx]) and not pd.isna(d['signal'].iloc[last_idx])) else None,
+            "sma": float(d['SMA'].iloc[last_idx]) if 'SMA' in d.columns and not pd.isna(d['SMA'].iloc[last_idx]) else None,
+            "ema12": float(d['ema_12'].iloc[last_idx]) if 'ema_12' in d.columns and not pd.isna(d['ema_12'].iloc[last_idx]) else None,
+            "ema26": float(d['ema_26'].iloc[last_idx]) if 'ema_26' in d.columns and not pd.isna(d['ema_26'].iloc[last_idx]) else None,
+            "bb_upper": float(d['bollinger_upper'].iloc[last_idx]) if 'bollinger_upper' in d.columns and not pd.isna(d['bollinger_upper'].iloc[last_idx]) else None,
+            "bb_lower": float(d['bollinger_lower'].iloc[last_idx]) if 'bollinger_lower' in d.columns and not pd.isna(d['bollinger_lower'].iloc[last_idx]) else None,
+            "atr": float(d['ATR'].iloc[last_idx]) if 'ATR' in d.columns and not pd.isna(d['ATR'].iloc[last_idx]) else None
+        }
+
+    return payload
+
+async def subir_ohlcv_enriquecido_y_registrar(
+    *,
+    exec_id: str,
+    chat_id: str,
+    symbol: str,
+    temporalidad: str,
+    df_velas: pd.DataFrame,          # df_combinado
+    df_indicadores: pd.DataFrame | None,  # df_indicadores con columnas extra
+    subir_a_bucket_y_obtener_url,    # async o sync
+    niveles: dict | None = None,     # niveles_clave (S1/S2/R1/R2, etc.)
+    entradas: dict | None = None,    # dict original de 'entradas' si lo quieres en payload
+    extra_metadata: dict | None = None,
+) -> str | None:
+    # Preferimos df_indicadores si existe, pues ya trae columnas calculadas
+    base = df_indicadores if (isinstance(df_indicadores, pd.DataFrame) and not df_indicadores.empty) else df_velas
+    d = normalizar_df_ohlcv(base)
+    if d.empty: 
+        return None
+
+    payload = construir_payload_enriquecido(symbol, temporalidad, d, extra_meta=extra_metadata, niveles=niveles, entradas=entradas)
+
+    nombre = f"{safe_name(symbol).upper()}_{safe_name(temporalidad)}_enriched.json"
+    object_path = build_object_path(exec_id, nombre)
+    local_json = f"/tmp/{nombre}"
+
+    with open(local_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+    # sube
+    if asyncio.iscoroutinefunction(subir_a_bucket_y_obtener_url):
+        url = await subir_a_bucket_y_obtener_url(local_json, object_path)
+    else:
+        url = await asyncio.to_thread(subir_a_bucket_y_obtener_url, local_json, object_path)
+
+    # registra en Firestore (sync → thread)
+    await asyncio.to_thread(
+        fs_registrar_archivo_generado,
+        exec_id, chat_id,
+        tipo="json",
+        nombre=nombre,
+        gcs_path=object_path,
+        signed_url=url,                 # o None si prefieres firmar on-demand
+        content_type="application/json",
+        metadata={
+            "scope": "ohlcv_enriched",
+            "symbol": str(symbol).upper(),
+            "timeframe": str(temporalidad),
+            **(extra_metadata or {})
+        },
+    )
+    return url
 
 async def subir_imagenes_eventos_y_registrar(
     imagen_eventos,                 # BytesIO o list[BytesIO] desde generar_imagen_eventos_oportunidades
@@ -4120,7 +4383,7 @@ def procesar_simbolo_temporalidad(symbol, temporalidad, df_eventos, user_chat_id
     
 
     # Devolver los resultados estructurados
-    return {
+    resultado = {
         "Activo": symbol,
         "Temporalidad": temporalidad,
         "Oportunidad": entradas.get('flag_oportunidad'),
@@ -4165,6 +4428,19 @@ def procesar_simbolo_temporalidad(symbol, temporalidad, df_eventos, user_chat_id
         "Probabilidad Fundamental (%)": entradas.get('probabilidad_fundamental'),
         "Probabilidad General (%)": entradas.get('probabilidad_general')
     }
+
+    # --- Adjuntos internos para subir JSON enriquecido/ohlcv (no se guardan en Firestore) ---
+    resultado["_ohlcv_df"] = df_combinado          # velas combinadas (hist + realtime)
+    resultado["_indicadores_df"] = df_indicadores  # trae SMA, BB, MACD, RSI, %K/%D, ATR, etc.
+    resultado["_entradas"] = entradas              # señales/valores calculados
+    resultado["_niveles"]  = {                     # niveles clave para dibujar en el gráfico
+        "soporte_nivel_1": entradas.get("soporte_nivel_1"),
+        "soporte_nivel_2": entradas.get("soporte_nivel_2"),
+        "resistencia_nivel_1": entradas.get("resistencia_nivel_1"),
+        "resistencia_nivel_2": entradas.get("resistencia_nivel_2"),
+    }
+
+    return resultado
 
 
 def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
@@ -4291,7 +4567,50 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
         )
         if json_url:
             urls_generadas.append(json_url)
-            
+    
+     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # --- JSON ENRIQUECIDO por símbolo+temporalidad (candles + indicadores) ---
+    if origen == "app" and exec_id:
+        urls_enriched = []
+        for res in resultados:
+            if not isinstance(res, dict):
+                continue
+
+            sym = res.get("Activo")
+            tf  = res.get("Temporalidad")
+            df_velas = res.get("_ohlcv_df")          # viene de procesar_simbolo_temporalidad
+            df_inds  = res.get("_indicadores_df")    # viene de procesar_simbolo_temporalidad
+            niveles  = res.get("_niveles") or {}
+            entradas = res.get("_entradas") or {}
+
+            # Subimos si hay velas o indicadores válidos
+            tiene_datos = (
+                (isinstance(df_velas, pd.DataFrame) and not df_velas.empty) or
+                (isinstance(df_inds,  pd.DataFrame) and not df_inds.empty)
+            )
+            if sym and tf and tiene_datos:
+                try:
+                    url = await subir_ohlcv_enriquecido_y_registrar(
+                        exec_id=exec_id,
+                        chat_id=user_chat_id,
+                        symbol=sym,
+                        temporalidad=tf,
+                        df_velas=df_velas if isinstance(df_velas, pd.DataFrame) else pd.DataFrame(),
+                        df_indicadores=df_inds if isinstance(df_inds, pd.DataFrame) else None,
+                        subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
+                        niveles=niveles,
+                        entradas=entradas,
+                        extra_metadata={"moneda_filtro": moneda_filtro},
+                    )
+                    if url:
+                        urls_enriched.append(url)
+                except Exception as e:
+                    logger.info(f"No se pudo subir JSON enriquecido de {sym}-{tf}: {e}")
+
+        if urls_enriched:
+            urls_generadas.extend(urls_enriched)
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+    
     # Convertir la lista de resultados en un DataFrame
     df_resultados = pd.DataFrame(resultados)
 
