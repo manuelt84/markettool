@@ -161,6 +161,80 @@ reader = get_easyocr_reader(prefer_gpu=True)
 def safe_name(s: str) -> str:
     return re.sub(r'[^A-Za-z0-9._-]+', '_', str(s))
 
+
+def _es_serializable_basico(v: Any) -> bool:
+    import numpy as np
+    import pandas as pd
+    from datetime import datetime, date
+    if v is None: return True
+    if isinstance(v, (str, int, float, bool)): return True
+    if isinstance(v, (list, tuple)):  # listas anidadas OK si sus elementos lo son
+        return all(_es_serializable_basico(x) for x in v)
+    if isinstance(v, dict):            # dicts anidados OK si claves son str y valores serializables
+        return all(isinstance(k, str) and _es_serializable_basico(val) for k, val in v.items())
+    if isinstance(v, (np.integer,)): return True
+    if isinstance(v, (np.floating,)): return True
+    if isinstance(v, (np.bool_,)):    return True
+    if isinstance(v, (datetime, date, pd.Timestamp)): return True
+    return False
+
+def _sanitize_for_firestore(obj: Any) -> Any:
+    """Devuelve obj sin tipos prohibidos (DataFrame, ndarray, objetos arbitrarios, etc.)."""
+    import numpy as np
+    import pandas as pd
+    from datetime import datetime, date
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (np.integer,)):   return int(obj)
+    if isinstance(obj, (np.floating,)):  return float(obj)
+    if isinstance(obj, (np.bool_,)):     return bool(obj)
+    if isinstance(obj, (datetime, date, pd.Timestamp)):
+        return obj  # Firestore acepta datetime; si prefieres string: obj.isoformat()
+
+    if isinstance(obj, list):
+        return [_sanitize_for_firestore(x) for x in obj if _es_serializable_basico(x)]
+    if isinstance(obj, tuple):
+        return [_sanitize_for_firestore(x) for x in obj if _es_serializable_basico(x)]
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                continue
+            if not _es_serializable_basico(v):
+                continue
+            out[k] = _sanitize_for_firestore(v)
+        return out
+    # todo lo demás (DataFrame, ndarray, objetos…) lo descartamos
+    return None
+
+def _json_default(o):
+    # Por si quedan np/timestamps dentro de tus payloads a archivo (NO para respuesta HTTP)
+    import numpy as np, pandas as pd
+    from datetime import datetime, date
+    if isinstance(o, (np.integer,)): return int(o)
+    if isinstance(o, (np.floating,)): return float(o)
+    if isinstance(o, (np.bool_,)): return bool(o)
+    if isinstance(o, (datetime, date, pd.Timestamp)): return o.isoformat()
+    raise TypeError(f"{type(o).__name__} no es JSON serializable")
+
+def _sanitize_records_for_json(records: list[dict]) -> list[dict]:
+    """
+    Elimina claves internas (_...) y valores no serializables (DataFrame, ndarray, etc).
+    """
+    safe: list[dict] = []
+    for r in records or []:
+        if not isinstance(r, dict):
+            continue
+        clean = {}
+        for k, v in r.items():
+            # descartar adjuntos internos y cualquier clave privada
+            if str(k).startswith('_'):
+                continue
+            if _es_serializable_basico(v):
+                clean[k] = v
+        safe.append(clean)
+    return safe
+
 def _to_epoch_ms(values: pd.Series) -> list[int]:
     # values debe ser datetime64[ns, tz] o naive; convertimos a UTC y ms
     ts = pd.to_datetime(values, errors='coerce', utc=True)
@@ -521,30 +595,35 @@ def build_object_path(exec_id: str, nombre: str) -> str:
     # Estructura uniforme en el bucket por ejecución
     return f"exec/{exec_id}/{nombre}"
 
+
 def fs_crear_ejecucion(chat_id: str, activos_solicitados: list[str], origen: str, opciones_usuario: list[str]) -> str:
     exec_id = uuid.uuid4().hex
     doc_ref = db.collection("ejecuciones").document(exec_id)
-    doc_ref.set({
+    payload = {
         "exec_id": exec_id,
         "chat_id": chat_id,
-        "activos_solicitados": activos_solicitados,
-        "origen": origen,
-        "opciones_usuario": opciones_usuario or [],
+        "activos_solicitados": list(map(str, activos_solicitados or [])),
+        "origen": str(origen),
+        "opciones_usuario": list(map(str, opciones_usuario or [])),
         "estado": "en_proceso",
         "archivos": 0,
         "created_at": firestore.SERVER_TIMESTAMP,
         "updated_at": firestore.SERVER_TIMESTAMP,
-    })
+    }
+    doc_ref.set(payload)
     return exec_id
 
 def fs_actualizar_ejecucion(exec_id: str, **campos):
+    campos = _sanitize_for_firestore({k: v for k, v in campos.items() if v is not None})
+    if not isinstance(campos, dict):
+        campos = {}
     campos["updated_at"] = firestore.SERVER_TIMESTAMP
-    db.collection("ejecuciones").document(exec_id).update({k: v for k, v in campos.items() if v is not None})
+    db.collection("ejecuciones").document(exec_id).update(campos)
 
 def fs_finalizar_ejecucion(exec_id: str, estado: str = "completado", resumen: dict | None = None):
     db.collection("ejecuciones").document(exec_id).update({
-        "estado": estado,
-        "resumen": resumen or {},
+        "estado": str(estado),
+        "resumen": _sanitize_for_firestore(resumen or {}),
         "updated_at": firestore.SERVER_TIMESTAMP
     })
 
@@ -559,17 +638,18 @@ def fs_registrar_archivo_generado(
     content_type: str | None = None,
     metadata: dict | None = None,
 ):
-    db.collection("archivos_generados").add({
-        "exec_id": exec_id,
-        "chat_id": chat_id,
-        "tipo": tipo,
-        "nombre": nombre,
-        "gcs_path": gcs_path,     # 👉 SOLO REFERENCIA
-        "signed_url": signed_url, # opcional (puedes dejar None si firmas on-demand)
-        "content_type": content_type,
-        "metadata": metadata or {},
+    payload = {
+        "exec_id": str(exec_id),
+        "chat_id": str(chat_id),
+        "tipo": str(tipo),
+        "nombre": str(nombre),
+        "gcs_path": str(gcs_path),      # SOLO referencia
+        "signed_url": str(signed_url) if signed_url else None,
+        "content_type": str(content_type) if content_type else None,
+        "metadata": _sanitize_for_firestore(metadata or {}),
         "created_at": firestore.SERVER_TIMESTAMP,
-    })
+    }
+    db.collection("archivos_generados").add(payload)
     db.collection("ejecuciones").document(exec_id).update({
         "archivos": firestore.Increment(1),
         "updated_at": firestore.SERVER_TIMESTAMP
@@ -584,21 +664,23 @@ async def guardar_json_en_storage_y_registrar(
     subir_a_bucket_y_obtener_url,         # async def que retorna str
     metadata: dict | None = None,
 ) -> str | None:
+    # Sanea registros ANTES de dump
+    safe_records = _sanitize_for_firestore(data_records or [])
+    if not isinstance(safe_records, list):
+        safe_records = []
+
     nombre = f"{nombre_base}.json"
     object_path = build_object_path(exec_id, nombre)
     local_json = f"/tmp/{nombre}"
 
-    # escribe el JSON local (sync está bien; es pequeño)
+    # escribe el JSON local
     with open(local_json, "w", encoding="utf-8") as f:
-        json.dump(data_records, f, ensure_ascii=False)
+        json.dump(safe_records, f, ensure_ascii=False, default=_json_default)
 
     url_publica = await subir_a_bucket_y_obtener_url(local_json, object_path)
-
-    # sanity check
     if not isinstance(url_publica, str):
         raise RuntimeError(f"subir_a_bucket_y_obtener_url devolvió {type(url_publica)}, esperaba str")
 
-    # fs_* son funciones síncronas → ejecútalas en thread
     await asyncio.to_thread(
         fs_registrar_archivo_generado,
         exec_id,
@@ -606,12 +688,11 @@ async def guardar_json_en_storage_y_registrar(
         tipo="json",
         nombre=nombre,
         gcs_path=object_path,
-        signed_url=url_publica,          # o None si no quieres guardarla
+        signed_url=url_publica,
         content_type="application/json",
-        metadata=metadata,
+        metadata=_sanitize_for_firestore(metadata or {}),
     )
     return url_publica
-
 
 def actualizar_estado_esperando_imagen(chat_id: str):
     db = firestore.client()
@@ -4599,8 +4680,13 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
     urls_generadas = []
 
+    # >>> registros sin DataFrames ni claves privadas
+    registros_limpios = _sanitize_records_for_json(
+        [r for r in resultados if isinstance(r, dict)]
+    )
+
     # --- JSON completo (antes de filtrar) ---
-    df_resultados = pd.DataFrame(resultados)
+    df_resultados = pd.DataFrame(registros_limpios)
     if origen == "app" and exec_id:
         df_json_records = df_resultados.where(pd.notnull(df_resultados), None).to_dict("records")
         json_url = await guardar_json_en_storage_y_registrar(
