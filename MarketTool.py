@@ -67,6 +67,9 @@ import socket
 import torch
 import uuid
 from typing import Any
+from datetime import timedelta, date, datetime, UTC
+from textwrap import wrap
+
 
 print("🔍 GPU habilitada:", torch.cuda.is_available())
 
@@ -158,6 +161,149 @@ def get_easyocr_reader(prefer_gpu: bool = True):
 # Inicializar EasyOCR (solo una vez, fuera de la función)
 reader = get_easyocr_reader(prefer_gpu=True) 
 
+
+# Constantes de layout (ajústalas si quieres)
+MAX_CELL_CHARS = 60
+WRAP_WIDTH = 24
+DPI = 150
+
+COL_WIDTH_IN = 1.6
+
+WRAP_WIDTH_HEADER = 18      # para cabeceras multilínea
+MAX_FIG_W_IN    = 20.0    # clamp de ancho figura
+MAX_FIG_H_IN    = 15.0    # clamp de alto figura
+MIN_FIG_W_IN    = 6.0
+MIN_FIG_H_IN    = 3.0
+ROW_HEIGHT_IN   = 0.35    # alto por fila (aprox. pulgadas)
+CHAR2IN         = 0.10    # “ancho” en pulgadas por carácter (heurística)
+
+WRAP_WIDTH_HDR  = 18   # cabeceras largas
+WRAP_WIDTH_CELL = 22   # contenido (evento, tipo operación)
+MAX_W_INCH      = 18   # ancho máximo de la figura
+MAX_H_INCH      = 24   # alto máximo de la figura
+DPI_IMG         = 150
+FILAS_POR_IMG_OPPS   = 40
+FILAS_POR_IMG_EVENTO = 40
+WRAP_HDR = 16
+WRAP_CELL = 22
+
+def _fmt_num(x, nd=5):
+    if x is None or (isinstance(x, float) and np.isnan(x)): 
+        return ""
+    try:
+        # evita notación científica y quita ceros innecesarios
+        s = f"{float(x):.{nd}f}".rstrip('0').rstrip('.')
+        return s
+    except Exception:
+        return str(x)
+
+def _fmt_pct(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    try:
+        return _fmt_num(float(x), nd=1)
+    except Exception:
+        return str(x)
+
+def _fmt_apal(x):
+    """Acepta valores 'x2243.0', 2243, '2243', etc y devuelve '2243'."""
+    if x is None or (isinstance(x, float) and np.isnan(x)): 
+        return ""
+    s = str(x).strip()
+    if s.startswith("x"): 
+        s = s[1:]
+    # deja entero si aplica
+    try:
+        f = float(s)
+        return _fmt_num(f, nd=0)
+    except Exception:
+        return s
+
+# --- helpers de texto/medidas ---
+def _wrap_text(s, width):
+    s = "" if s is None else str(s)
+    if not s:
+        return ""
+    return "\n".join(wrap(s, width=width))
+
+def _fmt_num(x, nd=4):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return str(x)
+
+
+def _max_line_len(s: str) -> int:
+    return max((len(x) for x in str(s).split("\n")), default=0)
+
+def _to_list_str_df(df: pd.DataFrame, wrap_cell=WRAP_WIDTH_CELL, wrap_head=WRAP_WIDTH_HEADER):
+    headers = [_wrap_text(c, wrap_head) for c in df.columns]
+    cells   = df.astype(str).applymap(lambda x: _wrap_text(x, wrap_cell))
+    return headers, cells
+
+def _col_char_widths(headers: list[str], cells: pd.DataFrame,
+                     min_chars=6, max_chars=40) -> list[int]:
+    w = []
+    for j, h in enumerate(headers):
+        max_cell = max((_max_line_len(v) for v in cells.iloc[:, j].tolist()), default=0)
+        width_j  = max(_max_line_len(h), max_cell) + 2
+        w.append(min(max(width_j, min_chars), max_chars))
+    return w
+
+def _render_table(headers, cells, col_char_w,
+                  font=12, dpi=180, max_w_in=18, max_h_in=14):
+    # Tamaños basados en caracteres para que respete los wraps
+    CHAR_PX   = 7                 # ~px por carácter a font 12
+    total_ch  = sum(col_char_w)
+    width_in  = min((total_ch * CHAR_PX) / dpi + 1.2, max_w_in)
+
+    rows      = len(cells) + 1
+    row_px    = font * 2.2        # alto de fila generoso para multilínea
+    height_in = min((rows * row_px) / dpi + 0.6, max_h_in)
+
+    fig, ax = plt.subplots(figsize=(width_in, height_in), dpi=dpi)
+    ax.axis('off')
+
+    colWidths = [w / total_ch for w in col_char_w]
+    tbl = ax.table(
+        cellText=cells.values,
+        colLabels=headers,
+        colWidths=colWidths,
+        cellLoc='center',
+        loc='upper left',
+        bbox=[0, 0, 1, 1]
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(font)
+
+    # Aumentar altura de fila global para multilínea
+    base = font * 1.2
+    scale_y = max(1.0, row_px / base)
+    tbl.scale(1.0, scale_y)
+
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=dpi, bbox_inches='tight')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+def _render_table_image(df: pd.DataFrame, max_rows=30, font=12, dpi=180):
+    """Devuelve un BytesIO o una lista de BytesIO si hay varias páginas."""
+    parts = []
+    for i in range(0, len(df), max_rows):
+        part = df.iloc[i:i + max_rows]
+        headers, cells = _to_list_str_df(part)
+        widths = _col_char_widths(headers, cells)
+        parts.append(_render_table(headers, cells, widths, font=font, dpi=dpi))
+    return parts[0] if len(parts) == 1 else parts
+
+def _wrap_header(h: str, width: int) -> str:
+    if h is None:
+        return ""
+    return "\n".join(_tw.wrap(str(h), width=width))
+
 def safe_name(s: str) -> str:
     return re.sub(r'[^A-Za-z0-9._-]+', '_', str(s))
 
@@ -179,43 +325,42 @@ def _es_serializable_basico(v: Any) -> bool:
     return False
 
 def _sanitize_for_firestore(obj: Any) -> Any:
-    """Devuelve obj sin tipos prohibidos (DataFrame, ndarray, objetos arbitrarios, etc.)."""
-    import numpy as np
-    import pandas as pd
-    from datetime import datetime, date
-    if obj is None or isinstance(obj, (str, int, float, bool)):
+    """Deja solo tipos permitidos (str, int, float, bool, None, list/dict de los mismos, datetime)."""
+    if obj is None or isinstance(obj, (str, int, float, bool, datetime)):
         return obj
-    if isinstance(obj, (np.integer,)):   return int(obj)
-    if isinstance(obj, (np.floating,)):  return float(obj)
-    if isinstance(obj, (np.bool_,)):     return bool(obj)
-    if isinstance(obj, (datetime, date, pd.Timestamp)):
-        return obj  # Firestore acepta datetime; si prefieres string: obj.isoformat()
-
-    if isinstance(obj, list):
-        return [_sanitize_for_firestore(x) for x in obj if _es_serializable_basico(x)]
-    if isinstance(obj, tuple):
-        return [_sanitize_for_firestore(x) for x in obj if _es_serializable_basico(x)]
+    if isinstance(obj, (np.integer,)):  return int(obj)
+    if isinstance(obj, (np.floating,)): return float(obj)
+    if isinstance(obj, (np.bool_,)):    return bool(obj)
+    if isinstance(obj, (pd.Timestamp, date)): return datetime.fromisoformat(obj.isoformat())
+    if isinstance(obj, list):  return [_sanitize_for_firestore(x) for x in obj]
+    if isinstance(obj, tuple): return [_sanitize_for_firestore(x) for x in obj]
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            if not isinstance(k, str):
-                continue
-            if not _es_serializable_basico(v):
-                continue
-            out[k] = _sanitize_for_firestore(v)
+            if isinstance(k, str):
+                out[k] = _sanitize_for_firestore(v)
         return out
-    # todo lo demás (DataFrame, ndarray, objetos…) lo descartamos
     return None
 
+
 def _json_default(o):
-    # Por si quedan np/timestamps dentro de tus payloads a archivo (NO para respuesta HTTP)
-    import numpy as np, pandas as pd
-    from datetime import datetime, date
-    if isinstance(o, (np.integer,)): return int(o)
-    if isinstance(o, (np.floating,)): return float(o)
-    if isinstance(o, (np.bool_,)): return bool(o)
-    if isinstance(o, (datetime, date, pd.Timestamp)): return o.isoformat()
+    if isinstance(o, (np.integer,)):        return int(o)
+    if isinstance(o, (np.floating,)):       return float(o)
+    if isinstance(o, (np.bool_, bool)):     return bool(o)
+    if isinstance(o, (pd.Timestamp, datetime, date)):
+        return o.isoformat()
+
+    # 🔧 Soporte explícito para pandas
+    if isinstance(o, pd.DataFrame):
+        d = o.where(pd.notnull(o), None)
+        return d.to_dict(orient="records")
+    if isinstance(o, pd.Series):
+        s = o.where(pd.notnull(o), None)
+        return s.tolist()
+
+    if o is None: return None
     raise TypeError(f"{type(o).__name__} no es JSON serializable")
+
 
 def _sanitize_records_for_json(records: list[dict]) -> list[dict]:
     """
@@ -236,26 +381,25 @@ def _sanitize_records_for_json(records: list[dict]) -> list[dict]:
     return safe
 
 def _to_epoch_ms(values: pd.Series) -> list[int]:
-    # values debe ser datetime64[ns, tz] o naive; convertimos a UTC y ms
-    ts = pd.to_datetime(values, errors='coerce', utc=True)
-    ts = ts.dropna()
-    return ((ts.view('int64') // 10**6).astype('int64')).tolist()
+    # Asegura tz UTC y convierte directo a int64 ns (sin .view)
+    ts = pd.to_datetime(values, errors='coerce', utc=True).dropna()
+    ns = ts.astype('int64')            # ns desde epoch (int64)
+    ms = (ns // 1_000_000).astype('int64')
+    return ms.tolist()
 
 def _pairs(df: pd.DataFrame, col: str) -> list[list[float]]:
-    if 'time' not in df.columns or col not in df.columns:
-        return []
-    sub = df[['time', col]].dropna()
-    if sub.empty: return []
-    t_ms = _to_epoch_ms(sub['time'])
-    vals = pd.to_numeric(sub[col], errors='coerce').dropna().tolist()
-    # Alinear por índice tras dropna independiente
-    # (más robusto: recalcular sobre sub otra vez)
+    if 'time' not in df.columns or col not in df.columns: return []
+    sub = df[['time', col]].copy()
+    sub['time'] = pd.to_datetime(sub['time'], errors='coerce', utc=True)
     sub = sub.dropna()
-    t_ms = _to_epoch_ms(sub['time'])
+    t_ms = (sub['time'].astype('int64') // 10**6).astype('int64').tolist()  # evita .view()
     vals = pd.to_numeric(sub[col], errors='coerce').tolist()
     out = []
     for i in range(min(len(t_ms), len(vals))):
-        out.append([int(t_ms[i]), float(vals[i])])
+        v = vals[i]
+        if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+            continue
+        out.append([int(t_ms[i]), float(v)])
     return out
 
 def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -288,6 +432,16 @@ def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         'ATR': ['ATR', 'atr'],
         'rsi': ['rsi', 'RSI']
     }
+
+    colmap_posibles.update({
+        'divergencia_macd': ['divergencia_macd'],
+        'divergencia_rsi':  ['divergencia_rsi'],
+        'divergencia_macd_bull': ['divergencia_macd_bull'],
+        'divergencia_macd_bear': ['divergencia_macd_bear'],
+        'divergencia_rsi_bull':  ['divergencia_rsi_bull'],
+        'divergencia_rsi_bear':  ['divergencia_rsi_bear'],
+    })
+
     m = {}
     for tgt, cands in colmap_posibles.items():
         for c in cands:
@@ -307,6 +461,13 @@ def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors='coerce')
 
+    # Asegura tipo booleano nativo/pandas para divergencias (útil para serializar)
+    for c in ['divergencia_macd','divergencia_rsi',
+              'divergencia_macd_bull','divergencia_macd_bear',
+              'divergencia_rsi_bull','divergencia_rsi_bear']:
+        if c in d.columns:
+            d[c] = d[c].astype('boolean')  # permite NA
+
     d = d.sort_values('time').reset_index(drop=True)
 
     MAX_VELAS = 1500
@@ -314,6 +475,58 @@ def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         d = d.tail(MAX_VELAS).reset_index(drop=True)
 
     return d
+
+def _to_list_num(s: pd.Series):
+    return [float(x) if pd.notna(x) else None for x in pd.to_numeric(s, errors="coerce")]
+
+def _to_list_bool(s: pd.Series):
+    # convierte np.bool_ → bool, deja None si NaN
+    return [bool(x) if pd.notna(x) else None for x in s.astype("boolean")]
+
+def build_enriched_json_payload(symbol: str, temporalidad: str, df: pd.DataFrame) -> dict:
+    d = normalizar_df_ohlcv(df)  # tu helper que estandariza columnas
+    out = {
+        "symbol": symbol,
+        "temporalidad": temporalidad,
+        "ohlcv": {
+            "time":   _to_epoch_ms(d["time"]) if "time" in d else [],
+            "open":   _to_list_num(d["open"]) if "open" in d else [],
+            "high":   _to_list_num(d["high"]) if "high" in d else [],
+            "low":    _to_list_num(d["low"])  if "low"  in d else [],
+            "close":  _to_list_num(d["close"])if "close" in d else [],
+            "volume": _to_list_num(d["volume"]) if "volume" in d else [],
+        },
+        "indicadores": {
+            "SMA":              _to_list_num(d["SMA"]) if "SMA" in d else [],
+            "bollinger_upper":  _to_list_num(d["bollinger_upper"]) if "bollinger_upper" in d else [],
+            "bollinger_lower":  _to_list_num(d["bollinger_lower"]) if "bollinger_lower" in d else [],
+            "ema_12":           _to_list_num(d["ema_12"]) if "ema_12" in d else [],
+            "ema_26":           _to_list_num(d["ema_26"]) if "ema_26" in d else [],
+            "macd":             _to_list_num(d["macd"]) if "macd" in d else [],
+            "signal":           _to_list_num(d["signal"]) if "signal" in d else [],
+            "rsi":              _to_list_num(d["rsi"]) if "rsi" in d else [],
+            "%K":               _to_list_num(d["%K"]) if "%K" in d else [],
+            "%D":               _to_list_num(d["%D"]) if "%D" in d else [],
+            "ATR":              _to_list_num(d["ATR"]) if "ATR" in d else [],
+            # Si guardas flags booleanas por vela:
+            "divergencia_macd": _to_list_bool(d["divergencia_macd"]) if "divergencia_macd" in d else [],
+            "divergencia_rsi":  _to_list_bool(d["divergencia_rsi"])  if "divergencia_rsi"  in d else [],
+            # si usas bull/bear:
+            "divergencia_macd_bull": _to_list_bool(d["divergencia_macd_bull"]) if "divergencia_macd_bull" in d else [],
+            "divergencia_macd_bear": _to_list_bool(d["divergencia_macd_bear"]) if "divergencia_macd_bear" in d else [],
+            "divergencia_rsi_bull":  _to_list_bool(d["divergencia_rsi_bull"])  if "divergencia_rsi_bull"  in d else [],
+            "divergencia_rsi_bear":  _to_list_bool(d["divergencia_rsi_bear"])  if "divergencia_rsi_bear"  in d else [],
+
+        },
+        # último snapshot útil para UI
+        "ultimo": {
+            "close": float(d["close"].iloc[-1]) if "close" in d and not d.empty else None,
+            "divergencia_macd": bool(d["divergencia_macd"].iloc[-1]) if "divergencia_macd" in d and not d.empty else None,
+            "divergencia_rsi":  bool(d["divergencia_rsi"].iloc[-1])  if "divergencia_rsi"  in d and not d.empty else None,
+        }
+    }
+    return out
+
 
 def construir_payload_enriquecido(symbol: str, tf: str, d: pd.DataFrame, extra_meta: dict | None = None, niveles: dict | None = None, entradas: dict | None = None) -> dict:
     """
@@ -335,7 +548,7 @@ def construir_payload_enriquecido(symbol: str, tf: str, d: pd.DataFrame, extra_m
         "events": [],
         "last": {},
         "meta": {
-            "computed_at": pd.Timestamp.utcnow().isoformat(),
+            "computed_at": pd.Timestamp.now(UTC).isoformat(),
             **(extra_meta or {})
         },
         "levels": niveles or {},
@@ -444,57 +657,77 @@ def construir_payload_enriquecido(symbol: str, tf: str, d: pd.DataFrame, extra_m
 
     return payload
 
+
+def df_to_records_safe(df: pd.DataFrame) -> list[dict]:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    d = df.copy()
+
+    # Normaliza columna de tiempo si existe
+    if 'time' in d.columns:
+        d['time'] = pd.to_datetime(d['time'], errors='coerce', utc=True)
+        d['time'] = d['time'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+    # Reemplaza NaN/NaT por None
+    d = d.where(pd.notnull(d), None)
+
+    # Fuerza tipos nativos para JSON
+    for c in d.columns:
+        if pd.api.types.is_bool_dtype(d[c]):   d[c] = d[c].astype(bool)
+        elif pd.api.types.is_integer_dtype(d[c]): d[c] = d[c].astype(object)
+        elif pd.api.types.is_float_dtype(d[c]):   d[c] = d[c].astype(float)
+
+    return d.to_dict(orient='records')
+
+
 async def subir_ohlcv_enriquecido_y_registrar(
-    *,
-    exec_id: str,
-    chat_id: str,
-    symbol: str,
-    temporalidad: str,
-    df_velas: pd.DataFrame,          # df_combinado
-    df_indicadores: pd.DataFrame | None,  # df_indicadores con columnas extra
-    subir_a_bucket_y_obtener_url,    # async o sync
-    niveles: dict | None = None,     # niveles_clave (S1/S2/R1/R2, etc.)
-    entradas: dict | None = None,    # dict original de 'entradas' si lo quieres en payload
+    *, exec_id: str, chat_id: str, symbol: str, temporalidad: str,
+    df_velas: pd.DataFrame, df_indicadores: pd.DataFrame | None,
+    subir_a_bucket_y_obtener_url,
+    niveles: dict | None = None, entradas: dict | None = None,
     extra_metadata: dict | None = None,
 ) -> str | None:
-    # Preferimos df_indicadores si existe, pues ya trae columnas calculadas
-    base = df_indicadores if (isinstance(df_indicadores, pd.DataFrame) and not df_indicadores.empty) else df_velas
-    d = normalizar_df_ohlcv(base)
-    if d.empty: 
-        return None
 
-    payload = construir_payload_enriquecido(symbol, temporalidad, d, extra_meta=extra_metadata, niveles=niveles, entradas=entradas)
+    # Base OHLCV
+    cols = [c for c in ['time','open','high','low','close','volume'] if c in df_velas.columns]
+    ohlcv_records = df_to_records_safe(df_velas[cols]) if cols else df_to_records_safe(df_velas)
 
-    nombre = f"{safe_name(symbol).upper()}_{safe_name(temporalidad)}_enriched.json"
-    object_path = build_object_path(exec_id, nombre)
-    local_json = f"/tmp/{nombre}"
+    payload = {
+        "symbol": symbol,
+        "temporalidad": temporalidad,
+        "ohlcv": ohlcv_records,
+        "indicadores": {},
+        "niveles": niveles or {},
+        "entradas": entradas or {},
+        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }
 
-    with open(local_json, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
+    # Indicadores (como series pares t,valor o como últimos valores)
+    if isinstance(df_indicadores, pd.DataFrame) and not df_indicadores.empty:
+        for col in ['SMA','bollinger_upper','bollinger_lower','ema_12','ema_26','macd','signal','rsi','%K','%D','ATR']:
+            if col in df_indicadores.columns:
+                payload["indicadores"][col] = {
+                    "series": _pairs(df_indicadores, col),
+                    "ultimo": (float(df_indicadores[col].iloc[-1])
+                               if pd.notna(df_indicadores[col].iloc[-1]) else None)
+                }
 
-    # sube
-    if asyncio.iscoroutinefunction(subir_a_bucket_y_obtener_url):
-        url = await subir_a_bucket_y_obtener_url(local_json, object_path)
-    else:
-        url = await asyncio.to_thread(subir_a_bucket_y_obtener_url, local_json, object_path)
+        # Señales discretas (texto)
+        for col in ['bollinger_signal','macd_cruce','macd_cerca_de_cruzar']:
+            if col in df_indicadores.columns:
+                v = df_indicadores[col].iloc[-1]
+                payload["indicadores"][col] = str(v) if v is not None else None
 
-    # registra en Firestore (sync → thread)
-    await asyncio.to_thread(
-        fs_registrar_archivo_generado,
-        exec_id, chat_id,
-        tipo="json",
-        nombre=nombre,
-        gcs_path=object_path,
-        signed_url=url,                 # o None si prefieres firmar on-demand
-        content_type="application/json",
-        metadata={
-            "scope": "ohlcv_enriched",
-            "symbol": str(symbol).upper(),
-            "timeframe": str(temporalidad),
-            **(extra_metadata or {})
-        },
+    nombre_base = f"{symbol}_{temporalidad}_enriched"
+    return await guardar_json_en_storage_y_registrar(
+        exec_id=exec_id,
+        chat_id=chat_id,
+        nombre_base=nombre_base,
+        data=payload,  # <- usa siempre 'data='
+        subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
+        metadata=extra_metadata or {},
     )
-    return url
+
 
 async def subir_imagenes_eventos_y_registrar(
     imagen_eventos,                 # BytesIO o list[BytesIO] desde generar_imagen_eventos_oportunidades
@@ -580,7 +813,7 @@ async def subir_json_eventos_filtrados(
         exec_id=exec_id,
         chat_id=chat_id,
         nombre_base=f"{moneda_filtro.upper()}_eventos_oportunidades",
-        data_records=records,
+        data=records,
         subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
         metadata={
             "scope": "eventos_oportunidades",
@@ -656,43 +889,33 @@ def fs_registrar_archivo_generado(
     })
 
 async def guardar_json_en_storage_y_registrar(
-    *,
-    exec_id: str,
-    chat_id: str,
-    nombre_base: str,                     # sin extensión
-    data_records: list[dict],
-    subir_a_bucket_y_obtener_url,         # async def que retorna str
-    metadata: dict | None = None,
+    *, exec_id: str, chat_id: str, nombre_base: str,
+    data, subir_a_bucket_y_obtener_url, metadata: dict | None = None,
 ) -> str | None:
-    # Sanea registros ANTES de dump
-    safe_records = _sanitize_for_firestore(data_records or [])
-    if not isinstance(safe_records, list):
-        safe_records = []
-
     nombre = f"{nombre_base}.json"
     object_path = build_object_path(exec_id, nombre)
     local_json = f"/tmp/{nombre}"
 
-    # escribe el JSON local
+    # Si por error llega un DataFrame, lo convertimos aquí
+    if isinstance(data, pd.DataFrame):
+        data = data.where(pd.notnull(data), None).to_dict("records")
+
     with open(local_json, "w", encoding="utf-8") as f:
-        json.dump(safe_records, f, ensure_ascii=False, default=_json_default)
+        json.dump(data, f, ensure_ascii=False, default=_json_default)
 
     url_publica = await subir_a_bucket_y_obtener_url(local_json, object_path)
     if not isinstance(url_publica, str):
-        raise RuntimeError(f"subir_a_bucket_y_obtener_url devolvió {type(url_publica)}, esperaba str")
+        raise RuntimeError(f"subir_a_bucket_y_obtener_url devolvió {type(url_publica)}")
 
     await asyncio.to_thread(
         fs_registrar_archivo_generado,
-        exec_id,
-        chat_id,
-        tipo="json",
-        nombre=nombre,
-        gcs_path=object_path,
-        signed_url=url_publica,
-        content_type="application/json",
-        metadata=_sanitize_for_firestore(metadata or {}),
+        exec_id, chat_id,
+        tipo="json", nombre=nombre, gcs_path=object_path,
+        signed_url=url_publica, content_type="application/json",
+        metadata=metadata or {},
     )
     return url_publica
+
 
 def actualizar_estado_esperando_imagen(chat_id: str):
     db = firestore.client()
@@ -1863,7 +2086,13 @@ def generar_imagen_por_currency(df, currency, max_filas=50):
         ax.axis('off')
 
         # Crear la tabla
-        table = ax.table(cellText=df_parte.values, colLabels=df_parte.columns, cellLoc='center', loc='center')
+        col_labels = [_wrap_header(c, WRAP_WIDTH_HEADER) for c in df_parte.columns]
+        table = ax.table(
+            cellText=df_parte.astype(str).values,
+            colLabels=col_labels,
+            cellLoc='center',
+            loc='center'
+        )
 
         # Ajustar escalas y fuente
         table.auto_set_font_size(False)
@@ -2149,6 +2378,12 @@ def calcular_indicadores(df, temporalidad):
     # Señales de divergencia
     df['divergencia_macd'] = (df['macd'] > df['macd'].shift(1)) & (df['close'] < df['close'].shift(1))
     df['divergencia_rsi'] = (df['rsi'] > df['rsi'].shift(1)) & (df['close'] < df['close'].shift(1))
+
+    df['divergencia_macd_bull'] = (df['macd'] > df['macd'].shift(1)) & (df['close'] < df['close'].shift(1))
+    df['divergencia_macd_bear'] = (df['macd'] < df['macd'].shift(1)) & (df['close'] > df['close'].shift(1))
+    df['divergencia_rsi_bull']  = (df['rsi']  > df['rsi'].shift(1))  & (df['close'] < df['close'].shift(1))
+    df['divergencia_rsi_bear']  = (df['rsi']  < df['rsi'].shift(1))  & (df['close'] > df['close'].shift(1))
+
 
     # Convertir todas las columnas a tipo float
     for col in ['rsi', '%K', '%D', 'ATR', 'macd', 'signal', 'ema_12', 'ema_26']:
@@ -3802,7 +4037,7 @@ def calcular_entradas(df, df_eventos, symbol, temporalidad, user_chat_id):
     # Detección de patrones de velas japonesas
     patrones_detectados =  detectar_patrones_velas(df, window)
 
-    print(f"MTORO - Paso exitosamente la detección de patrones: {patrones_detectados}")
+    print(f"Paso exitosamente la detección de patrones: {patrones_detectados}")
     
     # Predicción de precios futuros con ARIMA
     predicciones_arima =  predecir_arima(df, temporalidad, symbol)
@@ -4037,180 +4272,182 @@ async def enviar_csv_telegram(df, context, filename="resultados.csv",  user_chat
         except Exception as e:
             logger.info(f"Error al enviar CSV a {chat_id}: {e}")
 
-# Función para ajustar dinámicamente el ancho de las columnas basado en el contenido
-#@profile
-def df_a_imagen(df, max_filas=50):
+
+def df_a_imagen(df: pd.DataFrame, max_filas=30):
     """
-    Genera imágenes a partir de un DataFrame con ajustes dinámicos de ancho de columna y contenido.
+    Genera imágenes a partir del DataFrame de oportunidades.
+    Devuelve BytesIO o lista de BytesIO.
     """
-    if df.empty:
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
         logger.info("El DataFrame está vacío, no se puede generar la imagen.")
         return None
 
-    # Dividir el DataFrame en partes si es necesario
-    num_filas = len(df)
-    buffers = []
+    # Si por error te pasan ya un BytesIO, respétalo
+    if isinstance(df, BytesIO):
+        return df
 
-    for inicio in range(0, num_filas, max_filas):
-        df_parte = df.iloc[inicio:inicio + max_filas]
+    df_prep = preparar_df_oportunidades_para_tabla(df)
+    if df_prep.empty:
+        return None
 
-        # Calcular ancho de cada columna basado en el contenido y las cabeceras
-        max_col_widths = [
-            max(len(str(item)) for item in df_parte[col].tolist() + [col]) + 2
-            for col in df_parte.columns
-        ]
+    # fuente un poco mayor para legibilidad
+    return _render_table_image(df_prep, max_rows=max_filas, font=13, dpi=200)
 
-        # Configurar tamaño de la figura dinámicamente
-        fig_width = sum(max_col_widths) * 0.1  # Ajustar el multiplicador según sea necesario
-        fig, ax = plt.subplots(figsize=(min(fig_width, 20), min(len(df_parte) * 0.4, 15)))
-
-        ax.axis('tight')
-        ax.axis('off')
-
-        # Crear la tabla
-        table = ax.table(cellText=df_parte.values, colLabels=df_parte.columns, cellLoc='center', loc='center')
-
-        # Ajustar escalas y fuente
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)  # Ajustar tamaño de fuente
-        table.scale(1.0, 0.7)  # Escala más compacta
-
-        # Ajustar ancho de las columnas
-        for i, col_width in enumerate(max_col_widths):
-            for (row, col), cell in table.get_celld().items():
-                if col == i:  # Ajusta solo las celdas de la columna actual
-                    cell.set_width(col_width * 0.01)
-
-        # Ajustar márgenes
-        fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
-
-        buf = BytesIO()
-        try:
-            plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)  # DPI para mejor claridad
-            buf.seek(0)
-            plt.close(fig)
-            buffers.append(buf)
-        except Exception as e:
-            logger.info(f"Error al generar la imagen: {e}")
-            plt.close(fig)
-            return None
-
-    # Retorna una lista de buffers o un único buffer
-    return buffers if len(buffers) > 1 else buffers[0]
-    
-# Función para enviar la imagen a Telegram
-#@profile
-async def enviar_imagen_a_todos(df, context, moneda_filtro=None, user_chat_id=None, intentos=3):
-    imagen = df_a_imagen(df)
-
-    chat_ids = [user_chat_id] if user_chat_id else clientes_chat_ids
-
-    # Verificar si la imagen es None o el buffer está vacío
-    if isinstance(imagen, list):  # Si es una lista de imágenes
-            total_partes = len(imagen)
-            for indice, img in enumerate(imagen, start=1):
-                if img.getbuffer().nbytes > 0:
-                    await context.bot.send_photo(chat_id=user_chat_id, photo=img, caption=f"Oportunidades relacionadas a los activos seleccionados. Parte {indice} de {total_partes}")
-    elif imagen is None or imagen.getbuffer().nbytes == 0:
-        for chat_id in chat_ids:
-            await context.bot.send_message(chat_id=chat_id, text="No se pudo generar la imagen. El archivo está vacío.")
-    else:
-        for chat_id in chat_ids:
-            for intento in range(intentos):
-                try:
-                    #await context.bot.send_photo(chat_id=chat_id, photo=imagen, caption=f"Oportunidades de {moneda_filtro}")
-                    await context.bot.send_photo(chat_id=chat_id, photo=imagen, caption="Oportunidades relacionadas a los activos seleccionados.")
-                    imagen.seek(0)  # Restablecer el buffer
-                    break
-                except TimedOut:
-                    logger.info(f"Intento {intento + 1} fallido. Reintentando...")
-                    await asyncio.sleep(2)  # Espera antes de reintentar
-                except telegram.error.BadRequest as e:
-                    logger.info(f"Error al enviar la imagen a {chat_id}: {e}")
 
 #@profile
-def generar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades, max_filas=50):
-    """
-    Genera imágenes para eventos económicos filtrados por divisas con ajustes dinámicos de ancho de columna y contenido.
-    """
-    # Verifica si el DataFrame está vacío
-    if df_eventos.empty:
-        logger.info("El DataFrame de eventos está vacío.")
+def generar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades, max_filas=20):
+    if df_eventos is None or df_eventos.empty or divisas_oportunidades is None or len(divisas_oportunidades) == 0:
+        logger.info("Sin eventos/divisas para renderizar.")
         return None
 
-    # Verifica si la columna 'date' existe en el DataFrame
-    if 'date' not in df_eventos.columns:
-        logger.info("La columna 'date' no existe en el DataFrame de eventos.")
+    dfe = df_eventos.copy()
+    if "date" not in dfe.columns:
+        logger.info("La columna 'date' no existe en eventos.")
         return None
 
-    # Asegura que las fechas tengan información de zona horaria
-    if df_eventos['date'].dt.tz is None:
-        df_eventos['date'] = df_eventos['date'].dt.tz_localize('UTC')
-    df_eventos['date'] = df_eventos['date'].dt.tz_convert(timezone_country)
+    # Asegura tz y formato legible
+    if dfe["date"].dt.tz is None:
+        dfe["date"] = dfe["date"].dt.tz_localize("UTC")
+    dfe["date"] = dfe["date"].dt.tz_convert(timezone_country)
 
-    # Filtrar los eventos por las divisas dadas
-    df_eventos_filtrados = df_eventos[df_eventos['currency'].isin(divisas_oportunidades)]
-    df_eventos_filtrados = df_eventos_filtrados.sort_values(by='date', ascending=True)
-
-    # Formatear las fechas para mostrarlas en la tabla
-    df_eventos_filtrados['date'] = df_eventos_filtrados['date'].dt.strftime('%Y-%m-%d %H:%M:%S')
-
-    # Verificar si hay eventos para mostrar
-    if df_eventos_filtrados.empty:
-        logger.info(f"No hay eventos relacionados a las divisas de las oportunidades.")
+    # filtrado por divisas
+    dfe = dfe[dfe["currency"].isin(divisas_oportunidades)].copy()
+    if dfe.empty:
+        logger.info("No hay eventos relacionados a las divisas de las oportunidades.")
         return None
 
-    # Manejar múltiples partes del DataFrame si excede el límite de filas
-    num_filas = len(df_eventos_filtrados)
+    dfe = dfe.sort_values("date")
+    dfe["date"] = dfe["date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    columnas = [c for c in ["date","currency","event","impact","actual","estimate","previous"] if c in dfe.columns]
+    dfe = dfe[columnas].copy()
+
+    # Wrap de la columna larga 'event'
+    if "event" in dfe.columns:
+        dfe["event"] = dfe["event"].apply(lambda s: _wrap_text(s, 28))
+
+    # Renderiza en 1..N imágenes
+    imgs = tabla_a_imagenes(
+        dfe,
+        max_filas_por_imagen=max_filas,
+        dpi=170,
+        font_size=9
+    )
+    if not imgs:
+        return None
+    return imgs if len(imgs) > 1 else imgs[0]
+
+def preparar_df_oportunidades_para_tabla(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Devuelve un DF listo para pintar: columnas seleccionadas + formato + headers multilínea."""
+    if df_in is None or df_in.empty:
+        return pd.DataFrame()
+
+    df = df_in.copy()
+
+    # columnas que queremos mostrar (si existen en df)
+    preferidas = [
+        "Activo",
+        "Temporalidad",
+        "Tipo de Operacion",
+        "Ultimo Valor",
+        "Probabilidad General (%)",
+        "Apalancamiento Compra Nivel 1",
+        "Apalancamiento Compra Nivel 2",
+        "Apalancamiento Venta Nivel 1",
+        "Apalancamiento Venta Nivel 2",
+    ]
+    cols = [c for c in preferidas if c in df.columns]
+    if not cols:
+        # fallback razonable
+        cols = [c for c in ["Activo","Temporalidad","Ultimo Valor"] if c in df.columns]
+
+    df = df[cols].copy()
+
+    # Formato por columna
+    if "Ultimo Valor" in df:
+        df["Ultimo Valor"] = df["Ultimo Valor"].apply(_fmt_num)
+
+    if "Probabilidad General (%)" in df:
+        df["Probabilidad General (%)"] = df["Probabilidad General (%)"].apply(_fmt_pct)
+
+    for c in [
+        "Apalancamiento Compra Nivel 1",
+        "Apalancamiento Compra Nivel 2",
+        "Apalancamiento Venta Nivel 1",
+        "Apalancamiento Venta Nivel 2",
+    ]:
+        if c in df:
+            df[c] = df[c].apply(_fmt_apal)
+
+    # Wrap de contenido para evitar desbordes
+    for c in df.columns:
+        df[c] = df[c].apply(lambda v: _wrap_text(v, WRAP_CELL))
+
+    # Encabezados multilínea (más cortos)
+    ren = {
+        "Tipo de Operacion":          "Tipo de\nOperación",
+        "Probabilidad General (%)":   "Prob.\nGeneral (%)",
+        "Apalancamiento Compra Nivel 1": "Apalancamiento\nCompra N1",
+        "Apalancamiento Compra Nivel 2": "Apalancamiento\nCompra N2",
+        "Apalancamiento Venta Nivel 1":  "Apalancamiento\nVenta N1",
+        "Apalancamiento Venta Nivel 2":  "Apalancamiento\nVenta N2",
+    }
+    df.columns = [ _wrap_text(ren.get(c, c), WRAP_HDR) for c in df.columns ]
+
+    return df
+
+
+def tabla_a_imagenes(
+    df: pd.DataFrame,
+    max_filas_por_imagen: int = 18,
+    dpi: int = 170,
+    font_size: int = 10,
+) -> list[BytesIO]:
+    if df is None or df.empty:
+        return []
+
     buffers = []
+    for start in range(0, len(df), max_filas_por_imagen):
+        parte = df.iloc[start:start+max_filas_por_imagen].copy()
 
-    for inicio in range(0, num_filas, max_filas):
-        df_parte = df_eventos_filtrados.iloc[inicio:inicio + max_filas]
+        # anchura por columna (según longitud del texto)
+        char_w = []
+        for i, c in enumerate(parte.columns):
+            max_len = max([len(str(c))] + [len(str(x)) for x in parte.iloc[:, i].tolist()])
+            char_w.append(max(8, min(28, max_len)))  # entre 8 y 28 chars
 
-        # Calcular ancho de cada columna basado en el contenido y las cabeceras
-        max_col_widths = [
-            max(len(str(item)) for item in df_parte[col].tolist() + [col]) + 2
-            for col in df_parte.columns
-        ]
+        # convertir chars -> pulgadas (aprox 0.12 in por char)
+        col_in = [w * 0.12 for w in char_w]
+        fig_w = sum(col_in) + 0.8
+        # alto: filas + header
+        row_h = 0.55  # cada fila ~0.55 in por el multilínea
+        fig_h = row_h * (len(parte) + 1) + 0.6
 
-        # Configurar tamaño de la figura dinámicamente
-        fig_width = sum(max_col_widths) * 0.1  # Ajustar el multiplicador según sea necesario
-        fig, ax = plt.subplots(figsize=(min(fig_width, 20), min(len(df_parte) * 0.4, 15)))
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+        ax.axis("off")
 
-        ax.axis('tight')
-        ax.axis('off')
+        tbl = ax.table(
+            cellText=parte.values,
+            colLabels=list(parte.columns),
+            cellLoc="center",
+            loc="upper left",
+            bbox=[0, 0, 1, 1],
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(font_size)
 
-        # Crear la tabla
-        table = ax.table(cellText=df_parte.values, colLabels=df_parte.columns, cellLoc='center', loc='center')
+        # grosor de header
+        for (r, c), cell in tbl.get_celld().items():
+            if r == 0:
+                cell.set_text_props(weight="bold")
 
-        # Ajustar escalas y fuente
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1.0, 0.7)
-
-        # Ajustar ancho de las columnas
-        for i, col_width in enumerate(max_col_widths):
-            for (row, col), cell in table.get_celld().items():
-                if col == i:  # Ajusta solo las celdas de la columna actual
-                    cell.set_width(col_width * 0.01)
-
-        # Ajustar márgenes
-        fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
-
-        # Guardar la imagen en memoria
         buf = BytesIO()
-        try:
-            plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
-            buf.seek(0)
-            plt.close(fig)
-            buffers.append(buf)
-        except Exception as e:
-            logger.info(f"Error al generar la imagen: {e}")
-            plt.close(fig)
-            return None
+        plt.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.05)
+        buf.seek(0)
+        plt.close(fig)
+        buffers.append(buf)
 
-    # Retorna una lista de buffers si hay múltiples partes o un único buffer si solo hay una
-    return buffers if len(buffers) > 1 else buffers[0]
+    return buffers
 
         
 # Función para enviar la imagen de los eventos relacionados a las oportunidades
@@ -4689,16 +4926,15 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     df_resultados = pd.DataFrame(registros_limpios)
     if origen == "app" and exec_id:
         df_json_records = df_resultados.where(pd.notnull(df_resultados), None).to_dict("records")
-        json_url = await guardar_json_en_storage_y_registrar(
+        url_full = await guardar_json_en_storage_y_registrar(
             exec_id=exec_id,
             chat_id=user_chat_id,
             nombre_base=f"{moneda_filtro.upper()}_resultados_completos",
-            data_records=df_json_records,
+            data=df_json_records,   # <--- antes data_records
             subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
             metadata={"moneda_filtro": moneda_filtro, "scope": "completo"},
         )
-        if json_url:
-            urls_generadas.append(json_url)
+        if url_full: urls_generadas.append(url_full)
     
      # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     # --- JSON ENRIQUECIDO por símbolo+temporalidad (candles + indicadores) ---
@@ -4792,17 +5028,16 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
     # --- JSON oportunidades ---
     if origen == "app" and exec_id:
-        df_filtrado_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
-        opp_json_url = await guardar_json_en_storage_y_registrar(
+        opp_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
+        url_opp = await guardar_json_en_storage_y_registrar(
             exec_id=exec_id,
             chat_id=user_chat_id,
             nombre_base=f"{moneda_filtro.upper()}_oportunidades",
-            data_records=df_filtrado_records,
+            data=opp_records,  # <- IMPORTANTE
             subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
             metadata={"moneda_filtro": moneda_filtro, "scope": "oportunidades"},
         )
-        if opp_json_url:
-            urls_generadas.append(opp_json_url)
+        if url_opp: urls_generadas.append(url_opp)
 
     df_resultadosToImage = pd.DataFrame(df_filtrado)
 
@@ -5194,7 +5429,24 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
         if user_states[user_chat_id]["archivos_enviados"]:    
             # Verificar si df_filtradoToImage no está vacío antes de enviar la imagen
             if not df_filtradoToImage.empty:
-                 await enviar_imagen_a_todos(df_filtradoToImage, context, moneda_filtro, user_chat_id)
+                df_para_imagen = preparar_df_oportunidades_para_tabla(df_filtradoToImage)
+
+                imagenes = tabla_a_imagenes(
+                    df_para_imagen,
+                    max_filas_por_imagen=18,   # ajusta a gusto
+                    dpi=170,
+                    font_size=9
+                )
+
+                if imagenes:
+                    for i, img in enumerate(imagenes, 1):
+                        try:
+                            caption = "Oportunidades relacionadas a los activos seleccionados."
+                            if len(imagenes) > 1:
+                                caption += f" Parte {i} de {len(imagenes)}"
+                            await context.bot.send_photo(chat_id=user_chat_id, photo=img, caption=caption)
+                        except Exception as e:
+                            logger.info(f"Error enviando imagen de oportunidades: {e}")
             else:
                 logger.info(f"El DataFrame df_filtradoToImage está vacío. No se enviará la imagen.")
 
