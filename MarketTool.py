@@ -7642,9 +7642,14 @@ async def ejecutar_analisis_desde_app():
             "bot": application.bot
         })()
 
-        urls_generadas = await ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app", exec_id=exec_id)
+        task = asyncio.create_task(
+            ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app", exec_id=exec_id)
+        )
+        task = asyncio.shield(task)  # <- evita cancelación por cierre de request
 
+        urls_generadas = await task
         await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "completado", {"urls": urls_generadas})
+
 
         return jsonify({
             "status": "ok",
