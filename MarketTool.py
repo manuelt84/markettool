@@ -66,7 +66,7 @@ import cv2
 import socket
 import torch
 import uuid
-from typing import Any
+from typing import Any, Iterable, Mapping
 from datetime import timedelta, date, datetime, UTC
 from textwrap import wrap
 
@@ -380,27 +380,268 @@ def _sanitize_records_for_json(records: list[dict]) -> list[dict]:
         safe.append(clean)
     return safe
 
-def _to_epoch_ms(values: pd.Series) -> list[int]:
-    # Asegura tz UTC y convierte directo a int64 ns (sin .view)
-    ts = pd.to_datetime(values, errors='coerce', utc=True).dropna()
-    ns = ts.astype('int64')            # ns desde epoch (int64)
-    ms = (ns // 1_000_000).astype('int64')
-    return ms.tolist()
 
-def _pairs(df: pd.DataFrame, col: str) -> list[list[float]]:
-    if 'time' not in df.columns or col not in df.columns: return []
-    sub = df[['time', col]].copy()
-    sub['time'] = pd.to_datetime(sub['time'], errors='coerce', utc=True)
-    sub = sub.dropna()
-    t_ms = (sub['time'].astype('int64') // 10**6).astype('int64').tolist()  # evita .view()
-    vals = pd.to_numeric(sub[col], errors='coerce').tolist()
-    out = []
-    for i in range(min(len(t_ms), len(vals))):
-        v = vals[i]
-        if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
-            continue
-        out.append([int(t_ms[i]), float(v)])
-    return out
+def _to_epoch_ms(s: pd.Series) -> pd.Series:
+    # A datetime (tz-aware en UTC)
+    s = pd.to_datetime(s, errors='coerce', utc=True)
+
+    # ns desde epoch sin usar .view()
+    ns = s.astype('int64', copy=False)          # iNaT para NaT
+
+    # a ms
+    ms = ns // 10**6
+    ms = pd.Series(ms, index=s.index)
+
+    # Preservar NaT como NA (no como iNaT numérico)
+    ms[s.isna()] = pd.NA
+
+    # nullable Int64 (para JSON limpio)
+    return ms.astype('Int64')
+
+
+def _json_sanitize_df(d: pd.DataFrame) -> pd.DataFrame:
+    d = d.where(pd.notnull(d), None)
+    for c in d.columns:
+        if pd.api.types.is_bool_dtype(d[c]):   d[c] = d[c].astype(object)
+        elif pd.api.types.is_integer_dtype(d[c]): d[c] = d[c].astype(object)
+        elif pd.api.types.is_float_dtype(d[c]):   d[c] = d[c].astype(float)
+    return d
+
+#MTORO
+def df_to_ohlcv_records_ext(
+    df: pd.DataFrame,
+    *,
+    include: Iterable[str] | None = None,              # columnas extra a incluir
+    rename_extras: Mapping[str, str] | None = None,    # renombres opcionales
+    put_flags_inside: bool = True,                      # divergencias dentro de "flags"
+) -> list[dict]:
+    """
+    Devuelve lista de velas con: t, date, o,h,l,c,v y, opcionalmente, indicadores/flags por vela.
+    Acepta 'time' o 'date' o índice datetime.
+    """
+    if df is None or df.empty:
+        return []
+
+    d = df.copy()
+
+    # ---- Normalizar tiempo
+    if 'time' not in d.columns:
+        if 'date' in d.columns:
+            d = d.rename(columns={'date': 'time'})
+        elif isinstance(d.index, pd.DatetimeIndex):
+            d = d.reset_index().rename(columns={d.index.name or 'index': 'time'})
+    d['time'] = pd.to_datetime(d['time'], errors='coerce', utc=True)
+    d = d.dropna(subset=['time'])
+
+    # ---- Campos core
+    core_map = {'open':'o', 'high':'h', 'low':'l', 'close':'c', 'volume':'v'}
+    for col in core_map:
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors='coerce')
+
+    d['t'] = _to_epoch_ms(d['time']).astype('Int64')
+    d['date'] = d['time'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+    # salida base
+    out = pd.DataFrame({
+        't': d['t'].astype(object),
+        'date': d['date'],
+        'o': d.get('open'),
+        'h': d.get('high'),
+        'l': d.get('low'),
+        'c': d.get('close'),
+        'v': d.get('volume')
+    })
+
+    # ---- Extras
+    default_extras = [
+        'rsi','SMA','ema_12','ema_26',
+        'bollinger_upper','bollinger_lower',
+        'macd','signal','%K','%D','ATR'
+    ]
+    divergence_cols = [
+        'divergencia_macd','divergencia_rsi',
+        'divergencia_macd_bull','divergencia_macd_bear',
+        'divergencia_rsi_bull','divergencia_rsi_bear',
+    ]
+
+    extras = list(include) if include is not None else default_extras + divergence_cols
+    extras = [c for c in extras if c in d.columns]
+
+    # histogram si hay macd/signal
+    if 'macd' in d.columns and 'signal' in d.columns and ('hist' in (include or []) or include is None):
+        d['hist'] = (pd.to_numeric(d['macd'], errors='coerce') -
+                     pd.to_numeric(d['signal'], errors='coerce'))
+        extras.append('hist')
+
+    # dividir extras en numéricos y flags
+    rename_extras = dict(rename_extras or {})
+    num_extras = [c for c in extras if c not in divergence_cols]
+    flag_extras = [c for c in extras if c in divergence_cols]
+
+    # numéricos boolean/numeric → JSON
+    for c in num_extras:
+        out[ rename_extras.get(c, c) ] = pd.to_numeric(d[c], errors='coerce')
+
+    # flags
+    if flag_extras:
+        if put_flags_inside:
+            flags = d[flag_extras].copy()
+            for c in flags.columns:
+                flags[c] = flags[c].astype('boolean')
+            # construir dict por fila solo con flags True/False (None si NA)
+            flags_dicts = []
+            for _, row in flags.iterrows():
+                fd = {rename_extras.get(k, k): (None if pd.isna(row[k]) else bool(row[k])) for k in flags.columns}
+                flags_dicts.append(fd)
+            out['flags'] = flags_dicts
+        else:
+            for c in flag_extras:
+                out[ rename_extras.get(c, c) ] = d[c].astype('boolean').astype(object)
+
+    out = _json_sanitize_df(out)
+    return out.to_dict('records')
+
+
+def _pairs(df: pd.DataFrame, col: str, t_col: str = 'time') -> list[list]:
+    if col not in df.columns: return []
+    tt = _to_epoch_ms(df[t_col])
+    vv = pd.to_numeric(df[col], errors='coerce')
+    m = (~tt.isna()) & (~vv.isna())
+    return [[int(t), float(v)] for t, v in zip(tt[m].astype(int), vv[m])]
+
+def construir_payload_enriquecido(
+    symbol: str,
+    tf: str,
+    d: pd.DataFrame,
+    *,
+    extra_meta: dict | None = None,
+    niveles: dict | None = None,
+    entradas: dict | None = None,
+    # controla qué extras metes dentro de cada vela; None = todos los que existan
+    include_extras_en_candles: Iterable[str] | None = None,
+    # si quieres un JSON mínimo (solo OHLCV), ponlo en False
+    candles_with_extras: bool = True,
+) -> dict:
+    """
+    JSON apto para el front con 'series' **solo** -> {'candles': [...]}
+    - Las demás series (sma/rsi/macd/...) NO se generan.
+    - Si candles_with_extras=True, los indicadores/flags van embebidos por vela.
+    """
+    if d is None or d.empty:
+        return {
+            "symbol": str(symbol).upper(),
+            "timeframe": str(tf),
+            "count": 0,
+            "series": {"candles": []},
+            "events": [],
+            "last": {},
+            "meta": {"computed_at": pd.Timestamp.now('UTC').isoformat(), **(extra_meta or {})},
+            "levels": niveles or {},
+            "entradas": entradas or {},
+        }
+
+    # --- Candles ---
+    if candles_with_extras:
+        candles = df_to_ohlcv_records_ext(
+            d,
+            include=include_extras_en_candles,  # None = extras por defecto + flags
+            rename_extras={
+                'SMA':'sma','ema_12':'ema12','ema_26':'ema26',
+                'bollinger_upper':'bb_upper','bollinger_lower':'bb_lower',
+                '%K':'stoch_k','%D':'stoch_d'
+            },
+            put_flags_inside=True
+        )
+    else:
+        # solo OHLCV + t/date
+        candles = df_to_ohlcv_records_ext(
+            d,
+            include=[],                 # <- sin extras
+            rename_extras={}, 
+            put_flags_inside=False
+        )
+
+    series = {"candles": candles}      # <-- AQUÍ queda solo candles
+
+    # --- Eventos (igual que antes) ---
+    events = []
+    if 'macd' in d.columns and 'signal' in d.columns:
+        t_ms = _to_epoch_ms(d['time']).astype('Int64')
+        diff = (pd.to_numeric(d['macd'], errors='coerce') -
+                pd.to_numeric(d['signal'], errors='coerce'))
+        macd_crosses = []
+        for i in range(1, len(d)):
+            prev, curr = diff.iat[i-1], diff.iat[i]
+            if pd.isna(prev) or pd.isna(curr): 
+                continue
+            if prev < 0 <= curr:
+                macd_crosses.append({"t": int(t_ms.iat[i]), "type": "macd_bullish_cross"})
+            elif prev > 0 >= curr:
+                macd_crosses.append({"t": int(t_ms.iat[i]), "type": "macd_bearish_cross"})
+        if macd_crosses:
+            events.append({"kind": "macd_cross", "points": macd_crosses})
+
+    if {'bollinger_upper','bollinger_lower','close'}.issubset(d.columns):
+        t_ms = _to_epoch_ms(d['time']).astype('Int64')
+        bb_points = []
+        for i in range(len(d)):
+            cu, cl, cc = d['bollinger_upper'].iat[i], d['bollinger_lower'].iat[i], d['close'].iat[i]
+            if pd.isna(cu) or pd.isna(cl) or pd.isna(cc): 
+                continue
+            if cc > cu: bb_points.append({"t": int(t_ms.iat[i]), "type": "bb_break_up"})
+            elif cc < cl: bb_points.append({"t": int(t_ms.iat[i]), "type": "bb_break_down"})
+        if bb_points:
+            events.append({"kind": "bollinger_touch", "points": bb_points})
+
+    for col in ['divergencia_macd','divergencia_rsi',
+                'divergencia_macd_bull','divergencia_macd_bear',
+                'divergencia_rsi_bull','divergencia_rsi_bear']:
+        if col in d.columns:
+            t_ms = _to_epoch_ms(d['time']).astype('Int64')
+            pts = [{"t": int(t_ms.iat[i])} for i, v in enumerate(d[col]) if pd.notna(v) and bool(v)]
+            if pts:
+                events.append({"kind": col, "points": pts})
+
+    # --- Snapshot (igual que antes) ---
+    last = {}
+    if not d.empty:
+        i = len(d) - 1
+        last = {
+            "t": int(_to_epoch_ms(pd.Series([d['time'].iat[i]])).iat[0]),
+            "o": float(d['open'].iat[i]), "h": float(d['high'].iat[i]),
+            "l": float(d['low'].iat[i]),  "c": float(d['close'].iat[i]),
+            "v": (None if 'volume' not in d.columns or pd.isna(d['volume'].iat[i]) 
+                  else float(d['volume'].iat[i])),
+        }
+        # últimos indicadores si existen (opcionales)
+        for col, key in [('rsi','rsi'),('SMA','sma'),('ema_12','ema12'),('ema_26','ema26'),
+                         ('bollinger_upper','bb_upper'),('bollinger_lower','bb_lower'),
+                         ('ATR','atr'),('%K','stochK'),('%D','stochD'),
+                         ('macd','macd'),('signal','signal')]:
+            if col in d.columns and pd.notna(d[col].iat[i]):
+                last[key] = float(d[col].iat[i])
+        if 'macd' in d.columns and 'signal' in d.columns and \
+           pd.notna(d['macd'].iat[i]) and pd.notna(d['signal'].iat[i]):
+            last['hist'] = float(d['macd'].iat[i] - d['signal'].iat[i])
+        for col in ['divergencia_macd','divergencia_rsi',
+                    'divergencia_macd_bull','divergencia_macd_bear',
+                    'divergencia_rsi_bull','divergencia_rsi_bear']:
+            if col in d.columns and pd.notna(d[col].iat[i]):
+                last[col] = bool(d[col].iat[i])
+
+    return {
+        "symbol": str(symbol).upper(),
+        "timeframe": str(tf),
+        "count": int(len(d)),
+        "series": series,        # <-- solo candles
+        "events": events,
+        "last": last,
+        "meta": {"computed_at": pd.Timestamp.now('UTC').isoformat(), **(extra_meta or {})},
+        "levels": niveles or {},
+        "entradas": entradas or {}
+    }
+
 
 def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return pd.DataFrame()
@@ -476,209 +717,6 @@ def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
     return d
 
-def _to_list_num(s: pd.Series):
-    return [float(x) if pd.notna(x) else None for x in pd.to_numeric(s, errors="coerce")]
-
-def _to_list_bool(s: pd.Series):
-    # convierte np.bool_ → bool, deja None si NaN
-    return [bool(x) if pd.notna(x) else None for x in s.astype("boolean")]
-
-def build_enriched_json_payload(symbol: str, temporalidad: str, df: pd.DataFrame) -> dict:
-    d = normalizar_df_ohlcv(df)  # tu helper que estandariza columnas
-    out = {
-        "symbol": symbol,
-        "temporalidad": temporalidad,
-        "ohlcv": {
-            "time":   _to_epoch_ms(d["time"]) if "time" in d else [],
-            "open":   _to_list_num(d["open"]) if "open" in d else [],
-            "high":   _to_list_num(d["high"]) if "high" in d else [],
-            "low":    _to_list_num(d["low"])  if "low"  in d else [],
-            "close":  _to_list_num(d["close"])if "close" in d else [],
-            "volume": _to_list_num(d["volume"]) if "volume" in d else [],
-        },
-        "indicadores": {
-            "SMA":              _to_list_num(d["SMA"]) if "SMA" in d else [],
-            "bollinger_upper":  _to_list_num(d["bollinger_upper"]) if "bollinger_upper" in d else [],
-            "bollinger_lower":  _to_list_num(d["bollinger_lower"]) if "bollinger_lower" in d else [],
-            "ema_12":           _to_list_num(d["ema_12"]) if "ema_12" in d else [],
-            "ema_26":           _to_list_num(d["ema_26"]) if "ema_26" in d else [],
-            "macd":             _to_list_num(d["macd"]) if "macd" in d else [],
-            "signal":           _to_list_num(d["signal"]) if "signal" in d else [],
-            "rsi":              _to_list_num(d["rsi"]) if "rsi" in d else [],
-            "%K":               _to_list_num(d["%K"]) if "%K" in d else [],
-            "%D":               _to_list_num(d["%D"]) if "%D" in d else [],
-            "ATR":              _to_list_num(d["ATR"]) if "ATR" in d else [],
-            # Si guardas flags booleanas por vela:
-            "divergencia_macd": _to_list_bool(d["divergencia_macd"]) if "divergencia_macd" in d else [],
-            "divergencia_rsi":  _to_list_bool(d["divergencia_rsi"])  if "divergencia_rsi"  in d else [],
-            # si usas bull/bear:
-            "divergencia_macd_bull": _to_list_bool(d["divergencia_macd_bull"]) if "divergencia_macd_bull" in d else [],
-            "divergencia_macd_bear": _to_list_bool(d["divergencia_macd_bear"]) if "divergencia_macd_bear" in d else [],
-            "divergencia_rsi_bull":  _to_list_bool(d["divergencia_rsi_bull"])  if "divergencia_rsi_bull"  in d else [],
-            "divergencia_rsi_bear":  _to_list_bool(d["divergencia_rsi_bear"])  if "divergencia_rsi_bear"  in d else [],
-
-        },
-        # último snapshot útil para UI
-        "ultimo": {
-            "close": float(d["close"].iloc[-1]) if "close" in d and not d.empty else None,
-            "divergencia_macd": bool(d["divergencia_macd"].iloc[-1]) if "divergencia_macd" in d and not d.empty else None,
-            "divergencia_rsi":  bool(d["divergencia_rsi"].iloc[-1])  if "divergencia_rsi"  in d and not d.empty else None,
-        }
-    }
-    return out
-
-
-def construir_payload_enriquecido(symbol: str, tf: str, d: pd.DataFrame, extra_meta: dict | None = None, niveles: dict | None = None, entradas: dict | None = None) -> dict:
-    """
-    Construye un JSON apto para el front: velas + indicadores + eventos + snapshot + levels.
-    Asume df ya normalizado (tiene 'time', OHLC y, si existen, columnas de indicadores).
-    """
-    payload = {
-        "symbol": str(symbol).upper(),
-        "timeframe": str(tf),
-        "count": int(len(d)),
-        "series": {
-            "ohlcv": _pairs(d, "open") and [  # generamos OHLCV como estructura compacta
-                # Para velas completas prefiero arrays paralelos en el front, pero si quieres
-                # mantener pares, dejamos candlesticks por separado:
-            ],
-            # Mejor: candlesticks compactos con t,o,h,l,c,v
-            "candles": []
-        },
-        "events": [],
-        "last": {},
-        "meta": {
-            "computed_at": pd.Timestamp.now(UTC).isoformat(),
-            **(extra_meta or {})
-        },
-        "levels": niveles or {},
-        "entradas": entradas or {}
-    }
-
-    # Candles compactas
-    t_ms = _to_epoch_ms(d['time'])
-    o = d['open'].astype(float).tolist()
-    h = d['high'].astype(float).tolist()
-    l = d['low'].astype(float).tolist()
-    c = d['close'].astype(float).tolist()
-    v = d['volume'].astype(float).tolist() if 'volume' in d.columns else [None]*len(d)
-    candles = []
-    for i in range(len(t_ms)):
-        candles.append({"t": int(t_ms[i]), "o": o[i], "h": h[i], "l": l[i], "c": c[i], "v": v[i]})
-    payload["series"]["candles"] = candles
-
-    # Indicadores -> pares [t, val]
-    if 'SMA' in d.columns:
-        payload["series"]["sma"] = _pairs(d, "SMA")
-    if 'ema_12' in d.columns:
-        payload["series"]["ema12"] = _pairs(d, "ema_12")
-    if 'ema_26' in d.columns:
-        payload["series"]["ema26"] = _pairs(d, "ema_26")
-    if 'bollinger_upper' in d.columns or 'bollinger_lower' in d.columns:
-        payload["series"]["bollinger"] = {
-            "upper": _pairs(d, "bollinger_upper"),
-            "lower": _pairs(d, "bollinger_lower"),
-            "basis": _pairs(d, "SMA") if 'SMA' in d.columns else []
-        }
-    if 'macd' in d.columns:
-        payload["series"]["macd"] = {
-            "macd": _pairs(d, "macd"),
-            "signal": _pairs(d, "signal") if 'signal' in d.columns else [],
-            "hist": []
-        }
-        # hist = macd - signal
-        if 'signal' in d.columns:
-            hist = (d['macd'] - d['signal']).replace([np.inf, -np.inf], np.nan)
-            dd = d[['time']].copy()
-            dd['hist'] = hist
-            payload["series"]["macd"]["hist"] = _pairs(dd, "hist")
-    if 'rsi' in d.columns:
-        payload["series"]["rsi"] = _pairs(d, "rsi")
-    if '%K' in d.columns or '%D' in d.columns:
-        payload["series"]["stoch"] = {
-            "k": _pairs(d, "%K") if '%K' in d.columns else [],
-            "d": _pairs(d, "%D") if '%D' in d.columns else []
-        }
-    if 'ATR' in d.columns:
-        payload["series"]["atr"] = _pairs(d, "ATR")
-
-    # Eventos útiles para markers:
-    # 1) Cruces MACD
-    if 'macd' in d.columns and 'signal' in d.columns:
-        macd_crosses = []
-        for i in range(1, len(d)):
-            prev = d['macd'].iloc[i-1] - d['signal'].iloc[i-1]
-            curr = d['macd'].iloc[i]   - d['signal'].iloc[i]
-            if np.isnan(prev) or np.isnan(curr): 
-                continue
-            if prev < 0 and curr > 0:
-                macd_crosses.append({"t": int(t_ms[i]), "type": "macd_bullish_cross"})
-            elif prev > 0 and curr < 0:
-                macd_crosses.append({"t": int(t_ms[i]), "type": "macd_bearish_cross"})
-        if macd_crosses:
-            payload["events"].append({"kind": "macd_cross", "points": macd_crosses})
-
-    # 2) Toques/rupturas de Bollinger (close > upper / close < lower)
-    if 'bollinger_upper' in d.columns and 'bollinger_lower' in d.columns:
-        bb_points = []
-        for i in range(len(d)):
-            cu = d['bollinger_upper'].iloc[i]
-            cl = d['bollinger_lower'].iloc[i]
-            cc = d['close'].iloc[i]
-            if np.isnan(cu) or np.isnan(cl) or np.isnan(cc):
-                continue
-            if cc > cu:
-                bb_points.append({"t": int(t_ms[i]), "type": "bb_break_up"})
-            elif cc < cl:
-                bb_points.append({"t": int(t_ms[i]), "type": "bb_break_down"})
-        if bb_points:
-            payload["events"].append({"kind": "bollinger_touch", "points": bb_points})
-
-    # Snapshot (última vela / últimos indicadores)
-    last_idx = len(d) - 1
-    if last_idx >= 0:
-        payload["last"] = {
-            "t": int(t_ms[last_idx]),
-            "o": o[last_idx], "h": h[last_idx], "l": l[last_idx], "c": c[last_idx],
-            "v": v[last_idx],
-            "rsi": float(d['rsi'].iloc[last_idx]) if 'rsi' in d.columns and not pd.isna(d['rsi'].iloc[last_idx]) else None,
-            "stochK": float(d['%K'].iloc[last_idx]) if '%K' in d.columns and not pd.isna(d['%K'].iloc[last_idx]) else None,
-            "stochD": float(d['%D'].iloc[last_idx]) if '%D' in d.columns and not pd.isna(d['%D'].iloc[last_idx]) else None,
-            "macd": float(d['macd'].iloc[last_idx]) if 'macd' in d.columns and not pd.isna(d['macd'].iloc[last_idx]) else None,
-            "signal": float(d['signal'].iloc[last_idx]) if 'signal' in d.columns and not pd.isna(d['signal'].iloc[last_idx]) else None,
-            "hist": float((d['macd'].iloc[last_idx] - d['signal'].iloc[last_idx])) if ('macd' in d.columns and 'signal' in d.columns and not pd.isna(d['macd'].iloc[last_idx]) and not pd.isna(d['signal'].iloc[last_idx])) else None,
-            "sma": float(d['SMA'].iloc[last_idx]) if 'SMA' in d.columns and not pd.isna(d['SMA'].iloc[last_idx]) else None,
-            "ema12": float(d['ema_12'].iloc[last_idx]) if 'ema_12' in d.columns and not pd.isna(d['ema_12'].iloc[last_idx]) else None,
-            "ema26": float(d['ema_26'].iloc[last_idx]) if 'ema_26' in d.columns and not pd.isna(d['ema_26'].iloc[last_idx]) else None,
-            "bb_upper": float(d['bollinger_upper'].iloc[last_idx]) if 'bollinger_upper' in d.columns and not pd.isna(d['bollinger_upper'].iloc[last_idx]) else None,
-            "bb_lower": float(d['bollinger_lower'].iloc[last_idx]) if 'bollinger_lower' in d.columns and not pd.isna(d['bollinger_lower'].iloc[last_idx]) else None,
-            "atr": float(d['ATR'].iloc[last_idx]) if 'ATR' in d.columns and not pd.isna(d['ATR'].iloc[last_idx]) else None
-        }
-
-    return payload
-
-
-def df_to_records_safe(df: pd.DataFrame) -> list[dict]:
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return []
-    d = df.copy()
-
-    # Normaliza columna de tiempo si existe
-    if 'time' in d.columns:
-        d['time'] = pd.to_datetime(d['time'], errors='coerce', utc=True)
-        d['time'] = d['time'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-
-    # Reemplaza NaN/NaT por None
-    d = d.where(pd.notnull(d), None)
-
-    # Fuerza tipos nativos para JSON
-    for c in d.columns:
-        if pd.api.types.is_bool_dtype(d[c]):   d[c] = d[c].astype(bool)
-        elif pd.api.types.is_integer_dtype(d[c]): d[c] = d[c].astype(object)
-        elif pd.api.types.is_float_dtype(d[c]):   d[c] = d[c].astype(float)
-
-    return d.to_dict(orient='records')
-
 
 async def subir_ohlcv_enriquecido_y_registrar(
     *, exec_id: str, chat_id: str, symbol: str, temporalidad: str,
@@ -687,43 +725,20 @@ async def subir_ohlcv_enriquecido_y_registrar(
     niveles: dict | None = None, entradas: dict | None = None,
     extra_metadata: dict | None = None,
 ) -> str | None:
+    from datetime import datetime, UTC
 
-    # Base OHLCV
-    cols = [c for c in ['time','open','high','low','close','volume'] if c in df_velas.columns]
-    ohlcv_records = df_to_records_safe(df_velas[cols]) if cols else df_to_records_safe(df_velas)
-
-    payload = {
-        "symbol": symbol,
-        "temporalidad": temporalidad,
-        "ohlcv": ohlcv_records,
-        "indicadores": {},
-        "niveles": niveles or {},
-        "entradas": entradas or {},
-        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-    }
-
-    # Indicadores (como series pares t,valor o como últimos valores)
-    if isinstance(df_indicadores, pd.DataFrame) and not df_indicadores.empty:
-        for col in ['SMA','bollinger_upper','bollinger_lower','ema_12','ema_26','macd','signal','rsi','%K','%D','ATR']:
-            if col in df_indicadores.columns:
-                payload["indicadores"][col] = {
-                    "series": _pairs(df_indicadores, col),
-                    "ultimo": (float(df_indicadores[col].iloc[-1])
-                               if pd.notna(df_indicadores[col].iloc[-1]) else None)
-                }
-
-        # Señales discretas (texto)
-        for col in ['bollinger_signal','macd_cruce','macd_cerca_de_cruzar']:
-            if col in df_indicadores.columns:
-                v = df_indicadores[col].iloc[-1]
-                payload["indicadores"][col] = str(v) if v is not None else None
-
-    nombre_base = f"{symbol}_{temporalidad}_enriched"
+    d_norm = normalizar_df_ohlcv(df_velas)
+    payload = construir_payload_enriquecido(
+        symbol, temporalidad, d_norm,
+        extra_meta=extra_metadata or {},
+        niveles=niveles, entradas=entradas,
+        include_extras_en_candles=None,   # None = incluye extras si existen
+        candles_with_extras=True          # o False si quieres OHLCV puro
+    )
     return await guardar_json_en_storage_y_registrar(
-        exec_id=exec_id,
-        chat_id=chat_id,
-        nombre_base=nombre_base,
-        data=payload,  # <- usa siempre 'data='
+        exec_id=exec_id, chat_id=chat_id,
+        nombre_base=f"{symbol}_{temporalidad}_enriched",
+        data=payload,
         subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
         metadata=extra_metadata or {},
     )
