@@ -70,7 +70,6 @@ from typing import Any, Iterable, Mapping
 from datetime import timedelta, date, datetime, UTC
 from textwrap import wrap
 
-
 print("🔍 GPU habilitada:", torch.cuda.is_available())
 
 # Personalizar los logs
@@ -161,6 +160,108 @@ def get_easyocr_reader(prefer_gpu: bool = True):
 # Inicializar EasyOCR (solo una vez, fuera de la función)
 reader = get_easyocr_reader(prefer_gpu=True) 
 
+# Mapeo de TF frontend -> backend
+def _tf_backend(tf: str) -> str:
+    m = str(tf).strip().lower()
+    mapping = {
+        '1m':'1min', '1min':'1min',
+        '5m':'5min', '5min':'5min',
+        '15m':'15min', '15min':'15min',
+        '30m':'30min', '30min':'30min',
+        '1h':'1hour', 'h1':'1hour', '1hour':'1hour',
+        '4h':'4hour', 'h4':'4hour', '4hour':'4hour',
+        '1d':'1day', 'd1':'1day', '1day':'1day',
+        '1w':'1week', 'w1':'1week', '1week':'1week',
+    }
+    return mapping.get(m, m)
+
+_TF_ALIAS = {
+    '1m':'1min',
+    '5m':'5min',
+    '15m':'15min',
+    '30m':'30min',
+    '1h':'1hour',
+    '4h':'4hour',
+    '1d':'1day',
+    '1w':'1week'
+}
+
+def _num_or_none(x):
+    """Convierte números a tipos nativos y reemplaza NaN/Inf por None."""
+    if x is None:
+        return None
+    # bool primero (np.bool_ es subtipo de np.integer)
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    # enteros
+    if isinstance(x, (int, np.integer)):
+        return int(x)
+    # flotantes
+    if isinstance(x, (float, np.floating)):
+        xf = float(x)
+        return xf if (xf == xf and np.isfinite(xf)) else None  # (xf==xf) filtra NaN
+    return x
+
+def json_safe(obj):
+    """
+    Limpia recursivamente:
+      - np.nan/np.inf → None
+      - numpy.* → tipos Python nativos
+      - pd.Timestamp → ISO 8601
+      - np.ndarray → list
+    Devuelve algo 100% serializable a JSON estándar.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, (pd.Timestamp, )):
+        return obj.isoformat()
+    if isinstance(obj, (np.ndarray, )):
+        return json_safe(obj.tolist())
+    if isinstance(obj, (list, tuple, set)):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, pd.Series):
+        return json_safe(obj.to_dict())
+    # números / booleanos
+    if isinstance(obj, (bool, np.bool_, int, np.integer, float, np.floating)):
+        return _num_or_none(obj)
+    # Como última opción, intenta ver si ya es serializable
+    try:
+        json.dumps(obj, allow_nan=False)
+        return obj
+    except Exception:
+        return str(obj)
+
+def normalize_operatoria_payload(cfg: dict | None) -> dict:
+    cfg = cfg or {}
+    mode = (cfg.get('mode') or 'swing').strip().lower()
+    tfs = cfg.get('tfs') or []
+    tfs = [ _tf_backend(x) for x in tfs if x ]
+
+    return {
+        'mode': mode,
+        'tfs': tfs,
+    }
+
+
+# mapa por-request (en memoria) → { user_chat_id: normalized_cfg }
+REQUEST_OPERATORIA: dict[str, dict] = {}
+
+def set_current_request_cfg(user_chat_id: str, cfg: dict | None):
+    if cfg:
+        REQUEST_OPERATORIA[user_chat_id] = normalize_operatoria_payload(cfg)
+    else:
+        REQUEST_OPERATORIA.pop(user_chat_id, None)
+
+
+def clear_current_request_cfg(user_chat_id: str) -> None:
+    REQUEST_OPERATORIA.pop(user_chat_id, None)
+
+
+def _norm_tf(tf: str) -> str:
+    tf = str(tf).lower().strip()
+    return _TF_ALIAS.get(tf, tf)
 
 # Constantes de layout (ajústalas si quieres)
 MAX_CELL_CHARS = 60
@@ -220,7 +321,7 @@ def _fmt_apal(x):
         return s
 
 # --- helpers de texto/medidas ---
-def _wrap_text(s, width):
+def _wrap_text(s, width: int) -> str:
     s = "" if s is None else str(s)
     if not s:
         return ""
@@ -300,9 +401,7 @@ def _render_table_image(df: pd.DataFrame, max_rows=30, font=12, dpi=180):
     return parts[0] if len(parts) == 1 else parts
 
 def _wrap_header(h: str, width: int) -> str:
-    if h is None:
-        return ""
-    return "\n".join(_tw.wrap(str(h), width=width))
+    return _wrap_text(h, width)
 
 def safe_name(s: str) -> str:
     return re.sub(r'[^A-Za-z0-9._-]+', '_', str(s))
@@ -503,13 +602,6 @@ def df_to_ohlcv_records_ext(
     return out.to_dict('records')
 
 
-def _pairs(df: pd.DataFrame, col: str, t_col: str = 'time') -> list[list]:
-    if col not in df.columns: return []
-    tt = _to_epoch_ms(df[t_col])
-    vv = pd.to_numeric(df[col], errors='coerce')
-    m = (~tt.isna()) & (~vv.isna())
-    return [[int(t), float(v)] for t, v in zip(tt[m].astype(int), vv[m])]
-
 def construir_payload_enriquecido(
     symbol: str,
     tf: str,
@@ -644,14 +736,16 @@ def construir_payload_enriquecido(
 
 
 def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+
     d = df.copy()
 
     # Si viene por índice -> columna time
     if isinstance(d.index, pd.DatetimeIndex):
         d = d.reset_index().rename(columns={d.index.name or 'index': 'time'})
 
-    # Renombres comunes
+    # Mapeo de nombres
     colmap_posibles = {
         'time':   ['time', 'timestamp', 'date', 'datetime'],
         'open':   ['open', 'o', 'apertura'],
@@ -659,7 +753,6 @@ def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         'low':    ['low', 'l', 'min', 'minimo'],
         'close':  ['close', 'c', 'cierre', 'close_price'],
         'volume': ['volume', 'v', 'vol', 'volumen'],
-        # indicadores (si ya vienen)
         'SMA': ['SMA', 'sma'],
         'bollinger_upper': ['bollinger_upper', 'bb_upper', 'upper'],
         'bollinger_lower': ['bollinger_lower', 'bb_lower', 'lower'],
@@ -671,17 +764,14 @@ def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         '%K': ['%K', 'stoch_k', 'k'],
         '%D': ['%D', 'stoch_d', 'd'],
         'ATR': ['ATR', 'atr'],
-        'rsi': ['rsi', 'RSI']
-    }
-
-    colmap_posibles.update({
+        'rsi': ['rsi', 'RSI'],
         'divergencia_macd': ['divergencia_macd'],
         'divergencia_rsi':  ['divergencia_rsi'],
         'divergencia_macd_bull': ['divergencia_macd_bull'],
         'divergencia_macd_bear': ['divergencia_macd_bear'],
         'divergencia_rsi_bull':  ['divergencia_rsi_bull'],
         'divergencia_rsi_bear':  ['divergencia_rsi_bear'],
-    })
+    }
 
     m = {}
     for tgt, cands in colmap_posibles.items():
@@ -1642,6 +1732,7 @@ async def cargar_datos_historicos_inicial():
                 logger.info(f"Error al cargar datos de {archivo}: {e}")
 
     logger.info("Datos históricos cargados en memoria.")
+
 
 def obtener_datos_historicos_fmp(symbol, temporalidad, max_reintentos=5, tiempo_espera_inicial=5):
     try:
@@ -4049,174 +4140,188 @@ def calcular_entradas(df, df_eventos, symbol, temporalidad, user_chat_id):
     soportes_resistencias_cache = estado_usuario["soportes_resistencias_cache"]
     window = min(definir_window(temporalidad), len(df))
 
-    # Detección de patrones de velas japonesas
-    patrones_detectados =  detectar_patrones_velas(df, window)
-
+    # 1) Detección de patrones
+    patrones_detectados = detectar_patrones_velas(df, window)
     print(f"Paso exitosamente la detección de patrones: {patrones_detectados}")
-    
-    # Predicción de precios futuros con ARIMA
-    predicciones_arima =  predecir_arima(df, temporalidad, symbol)
-    
-    predicciones_media_movil =  predecir_media_movil(df, window)
-    
-    # Simulación de Monte Carlo para probabilidad de alza/baja
-    probabilidad_alza, probabilidad_baja =  simulacion_monte_carlo(df, temporalidad,num_simulaciones=100,num_dias=5,seed=42)
+
+    # 2) Predicciones
+    predicciones_arima = predecir_arima(df, temporalidad, symbol)
+    predicciones_media_movil = predecir_media_movil(df, window)
+
+    # 3) Monte Carlo
+    probabilidad_alza, probabilidad_baja = simulacion_monte_carlo(
+        df, temporalidad, num_simulaciones=100, num_dias=5, seed=42
+    )
     probabilidad_alza = probabilidad_alza if probabilidad_alza is not None else 50
     probabilidad_baja = probabilidad_baja if probabilidad_baja is not None else 50
-    
+
     precio_actual = df['close'].iloc[-1]
-   
-    # Calcular soportes y resistencias dinámicos de esta temporalidad
-    df, soportes_dinamicos, resistencias_dinamicas =  ajustar_window_dinamico_optimizado(df, symbol, temporalidad, precio_actual, max_incremento=5, min_factor=2, max_factor=4, min_levels=2, n_jobs=-1)
+
+    # 4) Soportes/Resistencias dinámicos
+    df, soportes_dinamicos, resistencias_dinamicas = ajustar_window_dinamico_optimizado(
+        df, symbol, temporalidad, precio_actual,
+        max_incremento=5, min_factor=2, max_factor=8, min_levels=2, n_jobs=-1
+    )
     if symbol not in soportes_resistencias_cache:
         soportes_resistencias_cache[symbol] = {}
 
-    # Agregar soportes y resistencias de esta temporalidad al caché global
     if temporalidad not in soportes_resistencias_cache[symbol]:
-        # Si la temporalidad no está en el caché, agregar directamente
         soportes_resistencias_cache[symbol][temporalidad] = {
             "soportes": soportes_dinamicos,
             "resistencias": resistencias_dinamicas,
         }
     else:
-        # Si la temporalidad ya existe, combinar o actualizar
         soportes_resistencias_cache[symbol][temporalidad]['soportes'] = list(
             set(soportes_resistencias_cache[symbol][temporalidad]['soportes'] + soportes_dinamicos)
         )
         soportes_resistencias_cache[symbol][temporalidad]['resistencias'] = list(
             set(soportes_resistencias_cache[symbol][temporalidad]['resistencias'] + resistencias_dinamicas)
         )
-    niveles_clave =  obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soportes_resistencias_cache, symbol, temporalidad, umbral_atr=2.0, max_niveles=2)
-    en_rango =  detectar_rango_zigzag(df,ventana_rebotes=140,tolerancia_pct=0.002, min_rebotes=3)
 
-    ATR = df['ATR'].iloc[-1]
+    niveles_clave = obtener_niveles_clave(
+        df, soportes_dinamicos, resistencias_dinamicas, soportes_resistencias_cache,
+        symbol, temporalidad, umbral_atr=2.0, max_niveles=2
+    )
+    en_rango = detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
 
-    # Calcular probabilidades técnica y fundamental
-    probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df,temporalidad,window), 2)
+    # Evitar NaN: ATR puede venir NaN → úsalo como None
+    ATR_val = df['ATR'].iloc[-1]
+    if isinstance(ATR_val, (float, np.floating)) and (np.isnan(ATR_val) or not np.isfinite(ATR_val)):
+        ATR = None
+    else:
+        ATR = float(ATR_val)
+
+    # 5) Probabilidades
+    probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df, temporalidad, window), 2)
     fecha_inicio = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
     fecha_fin = datetime.now().strftime('%Y-%m-%d')
-    probabilidad_fundamental =  ajustar_probabilidad_fundamental(50, df_eventos, symbol, temporalidad, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin)
-    if probabilidad_fundamental is None:
-        probabilidad_fundamental = 50
-    else:
-        probabilidad_fundamental = round(probabilidad_fundamental, 2)
-    # Calcular probabilidad general con la nueva ponderación
+    probabilidad_fundamental = ajustar_probabilidad_fundamental(
+        50, df_eventos, symbol, temporalidad, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin
+    )
+    probabilidad_fundamental = 50 if probabilidad_fundamental is None else round(probabilidad_fundamental, 2)
 
-    probabilidad_general =  calcular_probabilidad_general(probabilidad_tecnica, probabilidad_fundamental)
-    if probabilidad_general is None:
-        probabilidad_general = 50  # Valor predeterminado para evitar errores
-    else:
-        probabilidad_general = round(probabilidad_general, 2)
+    probabilidad_general = calcular_probabilidad_general(probabilidad_tecnica, probabilidad_fundamental)
+    probabilidad_general = 50 if probabilidad_general is None else round(probabilidad_general, 2)
 
-    # Verificar zona de no trading
-    zona_no_trading = verificar_zona_no_trading(df, window)
-    #logger.info(f"Zona de no trading: {zona_no_trading}")
-    
-    zona_sobreventa = verificar_zona_sobreventa(df, window)
-    #logger.info(f"Zona de sobreventa: {zona_sobreventa}")
-    
+    # 6) Zonas
+    zona_no_trading  = verificar_zona_no_trading(df, window)
+    zona_sobreventa  = verificar_zona_sobreventa(df, window)
     zona_sobrecompra = verificar_zona_sobrecompra(df, window)
-    #logger.info(f"Zona de sobrecompra: {zona_sobrecompra}")
-    
-    # Determinación del tipo de operación utilizando las funciones auxiliares
+
+    # 7) Tipo operación
     tipo_operacion = determinar_tipo_operacion(
-        precio_actual, 
-        predicciones_arima[0] if predicciones_arima else None,
-        predicciones_media_movil[0] if predicciones_media_movil else None,
-        probabilidad_alza, 
+        precio_actual,
+        predicciones_arima[0]        if predicciones_arima        else None,
+        predicciones_media_movil[0]  if predicciones_media_movil  else None,
+        probabilidad_alza,
         probabilidad_baja,
-        patrones_detectados, 
-        zona_sobreventa, 
-        zona_sobrecompra, 
-        probabilidad_general, 
+        patrones_detectados,
+        zona_sobreventa,
+        zona_sobrecompra,
+        probabilidad_general,
         zona_no_trading
     )
 
-    if tipo_operacion in señales_compra or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "alcista" or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "indefinida")):
-        precio_entrada = (niveles_clave['resistencia_nivel_1'] + niveles_clave['soporte_nivel_1']) / 2 if niveles_clave['resistencia_nivel_1'] and niveles_clave['soporte_nivel_1'] else precio_actual
-        take_profit = precio_entrada + ATR * 1.5 if not np.isnan(ATR) else np.nan
-        stop_loss = precio_entrada - ATR * 1.5 if not np.isnan(ATR) else np.nan
-        
-        if not (stop_loss < precio_entrada < take_profit):
-            logger.warning(f"Valores incorrectos en EURJPY {temporalidad} (compra): SL={stop_loss}, Entrada={precio_entrada}, TP={take_profit}")
-            stop_loss, take_profit = np.nan, np.nan
-    
-    elif tipo_operacion in señales_venta or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "bajista"):
-        precio_entrada = (niveles_clave['resistencia_nivel_1'] + niveles_clave['soporte_nivel_1']) / 2 if niveles_clave['resistencia_nivel_1'] and niveles_clave['soporte_nivel_1'] else precio_actual
-        take_profit = precio_entrada - ATR * 1.5 if not np.isnan(ATR) else np.nan
-        stop_loss = precio_entrada + ATR * 1.5 if not np.isnan(ATR) else np.nan
-        
-        if not (take_profit < precio_entrada < stop_loss):
-            logger.warning(f"Valores incorrectos en EURJPY {temporalidad} (venta): TP={take_profit}, Entrada={precio_entrada}, SL={stop_loss}")
-            stop_loss, take_profit = np.nan, np.nan
+    # 8) Precio entrada y TP/SL sin NaN
+    def _tp_sl_compra(precio_entrada, ATR):
+        if ATR is None:
+            return None, None
+        take_profit = precio_entrada + ATR * 1.5
+        stop_loss   = precio_entrada - ATR * 1.5
+        return take_profit, stop_loss
 
-    # Verificar si el precio actual está cerca de soportes o resistencias
+    def _tp_sl_venta(precio_entrada, ATR):
+        if ATR is None:
+            return None, None
+        take_profit = precio_entrada - ATR * 1.5
+        stop_loss   = precio_entrada + ATR * 1.5
+        return take_profit, stop_loss
+
+    precio_entrada = ( (niveles_clave.get('resistencia_nivel_1') or 0) + (niveles_clave.get('soporte_nivel_1') or 0) ) / 2 \
+                     if (niveles_clave.get('resistencia_nivel_1') is not None and niveles_clave.get('soporte_nivel_1') is not None) \
+                     else precio_actual
+
+    take_profit = None
+    stop_loss   = None
+
+    if (tipo_operacion in señales_compra) or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] in ("alcista", "indefinida")):
+        take_profit, stop_loss = _tp_sl_compra(precio_entrada, ATR)
+        if not (take_profit is not None and stop_loss is not None and (stop_loss < precio_entrada < take_profit)):
+            logger.warning(f"Valores incorrectos en {symbol} {temporalidad} (compra): SL={stop_loss}, Entrada={precio_entrada}, TP={take_profit}")
+            take_profit, stop_loss = None, None
+
+    elif (tipo_operacion in señales_venta) or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "bajista"):
+        take_profit, stop_loss = _tp_sl_venta(precio_entrada, ATR)
+        if not (take_profit is not None and stop_loss is not None and (take_profit < precio_entrada < stop_loss)):
+            logger.warning(f"Valores incorrectos en {symbol} {temporalidad} (venta): TP={take_profit}, Entrada={precio_entrada}, SL={stop_loss}")
+            take_profit, stop_loss = None, None
+
+    # 9) Cercanía a niveles
     def esta_cerca(precio, nivel, umbral_cercania=0.01):
         if nivel is None:
             return False
-        
-        return abs(precio - nivel) / precio <= umbral_cercania
+        try:
+            return abs(precio - nivel) / precio <= umbral_cercania
+        except ZeroDivisionError:
+            return False
 
     cerca_de_soporte_resistencia = (
-        "Cerca de Soporte Nivel 2" if esta_cerca(precio_actual, niveles_clave['soporte_nivel_2']) else
-        "Cerca de Soporte Nivel 1" if esta_cerca(precio_actual, niveles_clave['soporte_nivel_1']) else
-        "Cerca de Resistencia Nivel 1" if esta_cerca(precio_actual, niveles_clave['resistencia_nivel_1']) else
-        "Cerca de Resistencia Nivel 2" if esta_cerca(precio_actual, niveles_clave['resistencia_nivel_2']) else
+        "Cerca de Soporte Nivel 2" if esta_cerca(precio_actual, niveles_clave.get('soporte_nivel_2')) else
+        "Cerca de Soporte Nivel 1" if esta_cerca(precio_actual, niveles_clave.get('soporte_nivel_1')) else
+        "Cerca de Resistencia Nivel 1" if esta_cerca(precio_actual, niveles_clave.get('resistencia_nivel_1')) else
+        "Cerca de Resistencia Nivel 2" if esta_cerca(precio_actual, niveles_clave.get('resistencia_nivel_2')) else
         "No Cerca"
     )
 
-
-    # Flag de oportunidad: cuando la probabilidad general es mayor de 53 (compra) o menor de 47 (venta), y no está en zona de no trading
-    #flag_oportunidad = True if  (probabilidad_baja > 53 or probabilidad_alza > 53) and not zona_no_trading else False
+    # 10) Flag de oportunidad
     flag_oportunidad = False
     if not zona_no_trading:
-        if probabilidad_general > 53 and not zona_sobrecompra:  # Compra
+        if probabilidad_general > 53 and not zona_sobrecompra:
             flag_oportunidad = True
-        elif probabilidad_general < 47 and not zona_sobreventa:  # Venta
+        elif probabilidad_general < 47 and not zona_sobreventa:
             flag_oportunidad = True
 
-
-    # Agregar predicción de tendencia en tiempo real
+    # 11) Tendencia tiempo real
     tendencia_predicha = predecir_tendencia_en_tiempo_real(df, temporalidad)
-    
-    return {
+
+    # 12) Armar salida y LIMPIARLA antes de devolver
+    salida = {
         "patrones_detectados": patrones_detectados,
         "predicciones_arima": predicciones_arima,
         "predicciones_media_movil": predicciones_media_movil,
         "probabilidad_alza": probabilidad_alza,
         "probabilidad_baja": probabilidad_baja,
-        "macd_cruce": df['macd_cruce'].iloc[-1],
-        "macd_cerca_de_cruzar": df['macd_cerca_de_cruzar'].iloc[-1],
-        "bollinger_signal": df['bollinger_signal'].iloc[-1],
-        "bollinger_upper": df['bollinger_upper'].iloc[-1],
-        "bollinger_lower": df['bollinger_lower'].iloc[-1],
+        "macd_cruce": df['macd_cruce'].iloc[-1] if 'macd_cruce' in df.columns else None,
+        "macd_cerca_de_cruzar": df['macd_cerca_de_cruzar'].iloc[-1] if 'macd_cerca_de_cruzar' in df.columns else None,
+        "bollinger_signal": df['bollinger_signal'].iloc[-1] if 'bollinger_signal' in df.columns else None,
+        "bollinger_upper": df['bollinger_upper'].iloc[-1] if 'bollinger_upper' in df.columns else None,
+        "bollinger_lower": df['bollinger_lower'].iloc[-1] if 'bollinger_lower' in df.columns else None,
         "tendencia_predicha": tendencia_predicha,
         "ultimo_valor": precio_actual,
-        "soporte_nivel_2": niveles_clave['soporte_nivel_2'],
-        "soporte_nivel_1": niveles_clave['soporte_nivel_1'],
-        "resistencia_nivel_1": niveles_clave['resistencia_nivel_1'],
-        "resistencia_nivel_2": niveles_clave['resistencia_nivel_2'],
-        "apalancamiento_compra_nivel_1": niveles_clave["multiplicador"]["apalancamiento_compra_nivel_1"],
-        "apalancamiento_compra_nivel_2": niveles_clave["multiplicador"]["apalancamiento_compra_nivel_2"],
-        "apalancamiento_venta_nivel_1": niveles_clave["multiplicador"]["apalancamiento_venta_nivel_1"],
-        "apalancamiento_venta_nivel_2": niveles_clave["multiplicador"]["apalancamiento_venta_nivel_2"],
+        "soporte_nivel_2": niveles_clave.get('soporte_nivel_2'),
+        "soporte_nivel_1": niveles_clave.get('soporte_nivel_1'),
+        "resistencia_nivel_1": niveles_clave.get('resistencia_nivel_1'),
+        "resistencia_nivel_2": niveles_clave.get('resistencia_nivel_2'),
+        "apalancamiento_compra_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_1"),
+        "apalancamiento_compra_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_2"),
+        "apalancamiento_venta_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_1"),
+        "apalancamiento_venta_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_2"),
         "precio_entrada": precio_entrada,
         "take_profit": take_profit,
         "stop_loss": stop_loss,
-        "es_rango_repetitivo": en_rango["es_rango_repetitivo"],
-        "estructura_tendencia": en_rango['estructura_tendencia'],
-        "rebotes": en_rango["rebotes"],
-        "rango_dinamico": en_rango["rango_dinamico"],
-		"soportes_alcanzados": niveles_clave['niveles_importantes_soportes'], 
-        "resistencias_alcanzadas": niveles_clave['niveles_importantes_resistencias'],
+        "es_rango_repetitivo": en_rango.get("es_rango_repetitivo"),
+        "estructura_tendencia": en_rango.get('estructura_tendencia'),
+        "rebotes": en_rango.get("rebotes"),
+        "rango_dinamico": en_rango.get("rango_dinamico"),
+        "soportes_alcanzados": niveles_clave.get('niveles_importantes_soportes'),
+        "resistencias_alcanzadas": niveles_clave.get('niveles_importantes_resistencias'),
         "cerca_de_soporte_resistencia": cerca_de_soporte_resistencia,
-        "soportes_importantes_alcanzados": niveles_clave['soportes_confirmados_orden'],
-        "resistencias_importantes_alcanzadas": niveles_clave['resistencias_confirmadas_orden'],
-        "niveles_confirmados_orden_toques_all": niveles_clave['niveles_confirmados_orden_toques_all'],
-        "niveles_confirmados_orden_nivel_all": niveles_clave['niveles_confirmados_orden_nivel_all'],
-        "niveles_confirmados_orden_nivel_reduced": niveles_clave['niveles_confirmados_orden_nivel_reduced'],
+        "soportes_importantes_alcanzados": niveles_clave.get('soportes_confirmados_orden'),
+        "resistencias_importantes_alcanzadas": niveles_clave.get('resistencias_confirmadas_orden'),
+        "niveles_confirmados_orden_toques_all": niveles_clave.get('niveles_confirmados_orden_toques_all'),
+        "niveles_confirmados_orden_nivel_all": niveles_clave.get('niveles_confirmados_orden_nivel_all'),
+        "niveles_confirmados_orden_nivel_reduced": niveles_clave.get('niveles_confirmados_orden_nivel_reduced'),
         "probabilidad_tecnica": probabilidad_tecnica,
-		"probabilidad_tecnica": probabilidad_tecnica,
         "probabilidad_fundamental": probabilidad_fundamental,
         "probabilidad_general": probabilidad_general,
         "tipo_operacion": tipo_operacion,
@@ -4225,6 +4330,9 @@ def calcular_entradas(df, df_eventos, symbol, temporalidad, user_chat_id):
         "zona_sobreventa": zona_sobreventa,
         "zona_sobrecompra": zona_sobrecompra
     }
+
+    # <<< clave: limpieza anti-NaN antes de devolver >>>
+    return json_safe(salida)
 
 # Función para generar un archivo con la fecha y hora en el nombre
 def generar_nombre_archivo(moneda_filtro, filtro=False, tipo=None):
@@ -4727,6 +4835,7 @@ def calcular_ponderacion(row):
 
     return float(ponderacion)
 
+
 #@profile
 def procesar_simbolo_temporalidad(symbol, temporalidad, df_eventos, user_chat_id, context):
 
@@ -4863,9 +4972,21 @@ def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
 
 # Función principal para ejecutar el análisis usando hilos
 #@profile
-async def ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_id, context):
+async def ejecutar_analisis_con_hilos(
+    df_eventos,
+    activos_filtrados,
+    user_chat_id,
+    context,
+    overrides=None,           # puede venir tu operatoria normalizada aquí
+):
     resultados = []
     errores = []
+
+    cfg      = overrides or {}
+    temps    = cfg.get('tfs') or temporalidades   # usa tu global `temporalidades` si no viene
+
+    valid = {'1min','5min','15min','30min','1hour','4hour','1day','1week'}
+    temps = [t for t in temps if t in valid]
 
     resultadosReal = []
     erroresReal = []
@@ -4900,7 +5021,7 @@ async def ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_i
     task_to_symbol_temporalidad = []
 
     for symbol in activos_filtrados:
-        for temporalidad in temporalidades:
+        for temporalidad in temps:
             analisis_tasks.append(
                 loop.run_in_executor(None, procesar_simbolo_temporalidad, symbol, temporalidad, df_eventos, user_chat_id, context)
             )
@@ -4961,8 +5082,8 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
             sym = res.get("Activo")
             tf  = res.get("Temporalidad")
-            df_velas = res.get("_ohlcv_df")          # viene de procesar_simbolo_temporalidad
-            df_inds  = res.get("_indicadores_df")    # viene de procesar_simbolo_temporalidad
+            df_velas = res.get("_ohlcv_df")          
+            df_inds  = res.get("_indicadores_df")    
             niveles  = res.get("_niveles") or {}
             entradas = res.get("_entradas") or {}
 
@@ -6145,7 +6266,7 @@ async def enviar_mensaje_noticias(context, user_chat_id, mensaje):
         
 # Función para manejar el ciclo recurrente del análisis
 #@profile
-async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None):
+async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None, operatoria_cfg: dict | None = None):
     activos_filtrados = filtrar_activos_por_moneda(activos, moneda_filtro)
     if user_chat_id not in user_states:
             user_states[user_chat_id] = {}
@@ -6172,6 +6293,12 @@ async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None,
             text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
         )
         return
+    
+    # Pon la config en memoria para esta ejecución
+    if user_chat_id not in user_states:
+        user_states[user_chat_id] = {}
+    user_states[user_chat_id]["operatoria_cfg"] = operatoria_cfg or {}
+
 
     user = update.effective_user.first_name
     await context.bot.send_message(chat_id=user_chat_id, text=f"Hola {user}, comenzó el análisis. Por favor, espera un momento...")
@@ -6200,7 +6327,12 @@ async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None,
             logging.warning(f"Error al obtener eventos económicos: {e}")
             df_eventos = None  # continuar sin eventos
 
-        resultados = await ejecutar_analisis_con_hilos(df_eventos, activos_filtrados, user_chat_id, context)
+        resultados = await ejecutar_analisis_con_hilos(
+            df_eventos, activos_filtrados, user_chat_id, context,
+            overrides={
+                'tfs': (operatoria_cfg or {}).get('tfs')
+            }
+        )
 
         if not resultados:
             await context.bot.send_message(
@@ -7608,14 +7740,22 @@ async def initialize_bot():
 
 @webhook_app.route('/analisis/ejecutar', methods=['POST'])
 async def ejecutar_analisis_desde_app():
+    chat_id_local = None
+    acquired_lock = False
     try:
+        # Si ya hay otro procesando, responde 503
         if ocupado_lock.locked():
             return "Estoy ocupado", 503
-    
-        data = request.json
-        chat_id = str(data.get("chat_id"))
+
+        # A partir de aquí, tomamos el lock
+        await asyncio.to_thread(ocupado_lock.acquire)
+        acquired_lock = True
+
+        data = request.json or {}
+        chat_id = str(data.get("chat_id") or "")
+        chat_id_local = chat_id  # para finally
         activo = data.get("activo")
-        origen = data.get("origen", "telegram").lower()
+        origen = (data.get("origen") or "telegram").lower()
 
         if not chat_id or not activo:
             return jsonify({"status": "error", "message": "Faltan parámetros obligatorios"}), 400
@@ -7625,11 +7765,11 @@ async def ejecutar_analisis_desde_app():
         if chat_id not in chat_ids:
             return jsonify({"status": "error", "message": "Usuario no registrado"}), 403
 
-        # Validar suscripción activa o si es admin
+        # Validar suscripción activa o admin
         if await estado_suscripcion(chat_id) != "activa" and not es_administrador(chat_id):
             return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
 
-        # Validar opciones habilitadas
+        # Validar permisos
         opciones_usuario = await obtener_opciones_usuario(chat_id)
         if not es_administrador(chat_id) and not any(
             opcion in opciones_usuario for opcion in ["analisis basico", "analisis premium", "analisis avanzado"]
@@ -7640,7 +7780,19 @@ async def ejecutar_analisis_desde_app():
         if return_state(chat_id) == "en ejecución":
             return jsonify({"status": "error", "message": "Ya hay un análisis en ejecución"}), 409
 
-        # Crear ejecución (usar to_thread para no bloquear)
+        # -------- leer config enviada desde la app --------
+        # Tu app ahora manda 'setup'; dejamos 'operatoria' por compatibilidad.
+        raw_cfg = None
+        if isinstance(data.get("setup"), dict):
+            raw_cfg = data["setup"]
+        elif isinstance(data.get("operatoria"), dict):
+            op = data["operatoria"]
+            raw_cfg = op.get("config", op)
+
+        op_cfg = normalize_operatoria_payload(raw_cfg) if raw_cfg else None
+        set_current_request_cfg(chat_id, op_cfg)
+
+        # Crear ejecución (to_thread para no bloquear)
         exec_id = await asyncio.to_thread(fs_crear_ejecucion, chat_id, [activo], origen, opciones_usuario)
 
         # Lanzar análisis (sin Telegram)
@@ -7649,22 +7801,31 @@ async def ejecutar_analisis_desde_app():
             "callback_query": None,
             "effective_user": type("DummyUser", (), {
                 "first_name": "AppUser",
-                "id": chat_id  # <-- necesario
+                "id": chat_id
             })()
         })()
 
-        dummy_context = type("DummyContext", (), {
-            "bot": application.bot
-        })()
+        dummy_context = type("DummyContext", (), {"bot": application.bot})()
+
+        logging.info(f"[APP] setup normalizado: {op_cfg}")
+        logging.info(f"[APP] payload bruto: {data}")
 
         task = asyncio.create_task(
-            ejecutar_recurrente(dummy_context, dummy_update, activo, chat_id, opciones_usuario, origen="app", exec_id=exec_id)
+            ejecutar_recurrente(
+                dummy_context,
+                dummy_update,
+                activo,
+                chat_id,
+                opciones_usuario,
+                origen="app",
+                exec_id=exec_id,
+                operatoria_cfg=op_cfg  # <- pasa la config hacia abajo
+            )
         )
-        task = asyncio.shield(task)  # <- evita cancelación por cierre de request
+        task = asyncio.shield(task)
 
         urls_generadas = await task
         await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "completado", {"urls": urls_generadas})
-
 
         return jsonify({
             "status": "ok",
@@ -7682,10 +7843,21 @@ async def ejecutar_analisis_desde_app():
         except Exception:
             pass
         return jsonify({"status": "error", "message": str(e)}), 500
-    
+
     finally:
-        if ocupado_lock.locked():
-            ocupado_lock.release()
+        # Limpia la cfg por-request si alcanzamos a tener chat_id
+        try:
+            if chat_id_local:
+                clear_current_request_cfg(chat_id_local)
+        except Exception:
+            pass
+
+        # Libera el lock solo si lo tomamos aquí
+        if acquired_lock and ocupado_lock.locked():
+            try:
+                ocupado_lock.release()
+            except Exception:
+                pass
     
    
 @webhook_app.route('/analisis/imagen', methods=['POST'])
