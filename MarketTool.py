@@ -69,8 +69,54 @@ import uuid
 from typing import Any, Iterable, Mapping
 from datetime import timedelta, date, datetime, UTC
 from textwrap import wrap
+from functools import partial
+import math
+import statistics
+from collections.abc import Sequence
+from typing import Optional
 
-print("🔍 GPU habilitada:", torch.cuda.is_available())
+
+timezone_country = pytz.timezone('America/Santiago')
+user_states = {}
+timeout_request_global = 2 # Tiempo máximo de espera en segundos
+max_workers_global = min(32, (os.cpu_count() or 1) * 2) #puede tener 64
+cache_noticias = {}
+subscriptions = {}
+subscriptions_type = {}
+admin_ids = {}
+
+matplotlib_lock = threading.Lock()
+
+CARPETA_HISTORICOS = "historicos"
+CARPETA_FOREX_NEWS = "forex_news"
+
+# Archivo JSON para almacenar las suscripciones
+TIME_BETWEEN_MESSAGES = 1  # En segundos
+
+#DIRECCION_USDT_TRC20 = 'TJ5HvX7EfNCrNFXHGCdGYQ59n5H6pcjm6b' #BINANCE
+DIRECCION_USDT_TRC20 = 'TNYdZMs5eGYcwdY8vEAe59utu2RYhdyquh' #UNSTOPPABLE
+
+# Memoria temporal para las noticias
+cache_noticias = defaultdict(pd.DataFrame)  # Diccionario donde la clave es el símbolo
+cache_historicos = {}
+ultima_actualizacion_historicos = {}
+
+señales_compra = ['Compra', 'Compra Fuerte', 'Compra Predicha', 'Compra Predicha con ARIMA', 'Compra Predicha con Media Movil', 'Compra Predicha con ARIMA y Media Movil']
+señales_venta = ['Venta', 'Venta Fuerte', 'Venta Predicha', 'Venta Predicha con ARIMA', 'Venta Predicha con Media Movil', 'Venta Predicha con ARIMA y Media Movil']
+
+file_locks = {}
+guardar_lock = asyncio.Lock()
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(levelname)s:%(message)s')
+logger = logging.getLogger(__name__)
+
+logging.getLogger("httpx").setLevel(logging.WARNING)  # Para httpx
+logging.getLogger("urllib3").setLevel(logging.WARNING)  # Para requests
+
+# API Key de FMP (Premium)
+API_KEY =  os.environ["API_FMP"]
+
+db = firestore.Client()
 
 # Personalizar los logs
 LOGGING_CONFIG["handlers"]["default"] = {
@@ -82,11 +128,6 @@ LOGGING_CONFIG["handlers"]["default"] = {
 #log_file = open('output.log', 'w')
 #sys.stdout = log_file
 #sys.stderr = log_file
-
-# API Key de FMP (Premium)
-API_KEY =  os.environ["API_FMP"]
-
-db = firestore.Client()
 
 # Cargar el diccionario desde el archivo JSON
 with open('palabras_clave_categoria.json', 'r', encoding='utf-8') as file:
@@ -106,6 +147,56 @@ patrones_bajistas = [
     'Harami Bajista', 'Hombro Cabeza Hombro'
 ]
 
+# --- Ventanas por defecto para FMP (cantidad de velas a descargar) ---
+DEFAULT_FMP_WINDOWS: dict[str, int] = {
+    '1min':   2400,
+    '5min':   2000,
+    '15min':  1600,
+    '30min':  1600,
+    '1hour':  1600,
+    '4hour':  2200,
+    '1day':   2000,
+    '1week':  520,
+}
+
+# --- Ventanas por defecto para los cálculos del back ---
+DEFAULT_CALC_WINDOWS: dict[str, int] = {
+    '1min':   14,
+    '5min':   20,
+    '15min':  20,
+    '30min':  25,
+    '1hour':  50,
+    '4hour':  100,
+    '1day':   200,
+    '1week':  52,
+}
+
+_TF_ALIAS = {
+    '1m':'1min',
+    '5m':'5min',
+    '15m':'15min',
+    '30m':'30min',
+    '1h':'1hour',
+    '4h':'4hour',
+    '1d':'1day',
+    '1w':'1week'
+}
+_TF_MINUTES = {
+    '1min': 1,
+    '5min': 5,
+    '15min': 15,
+    '30min': 30,
+    '1hour': 60,
+    '4hour': 240,
+    '1day': 1440,
+    '1week': 10080,
+}
+
+TF_MAP = {
+    '1m':'1min','5m':'5min','15m':'15min','30m':'30min',
+    '1h':'1hour','4h':'4hour','1d':'1day','1w':'1week',
+}
+
 modelo_patrones = YOLO("patrones.pt")
 modelo_ruido = YOLO("ruido.pt")
 
@@ -114,6 +205,36 @@ ocupado_lock = threading.Lock()
 
 _reader = None
 _reader_lock = threading.Lock()
+
+# --- Compatibilidad legacy: evita NameError si algún módulo viejo lo menciona ---
+try:
+    fmp_map  # type: ignore[name-defined]
+except NameError:
+    fmp_map = None  # NO es default; solo evita NameError
+
+try:
+    calc_map  # type: ignore[name-defined]
+except NameError:
+    calc_map = None  # idem
+
+def _sanitize_bars(bars):
+    """Devuelve None o un entero > 0."""
+    return bars if isinstance(bars, int) and bars > 0 else None
+
+def get_bars_for_tf(cfg: dict | None, tf: str) -> int | None:
+    """
+    Si cfg trae fmpWindows/fmp_windows y existe un número para 'tf', úsalo.
+    Si no, devuelve None (o sea, SIN límite).
+    """
+    if not isinstance(cfg, dict) or not cfg:
+        return None
+    fmp_windows = cfg.get('fmpWindows') or cfg.get('fmp_windows')
+    if isinstance(fmp_windows, dict):
+        v = fmp_windows.get(tf)
+        return _sanitize_bars(v)
+    return None
+
+print("🔍 GPU habilitada:", torch.cuda.is_available())
 
 def get_easyocr_reader(prefer_gpu: bool = True):
     """
@@ -175,63 +296,31 @@ def _tf_backend(tf: str) -> str:
     }
     return mapping.get(m, m)
 
-_TF_ALIAS = {
-    '1m':'1min',
-    '5m':'5min',
-    '15m':'15min',
-    '30m':'30min',
-    '1h':'1hour',
-    '4h':'4hour',
-    '1d':'1day',
-    '1w':'1week'
-}
+# Si no las tienes, define estas sugerencias de combinaciones
+if 'RECOMMENDED_TF_OPTIONS' not in globals():
+    RECOMMENDED_TF_OPTIONS = {
+        'swing': [
+            ['1week','1day','4hour'],  # W1 → D1 → 4H
+            ['1day','4hour','1hour'],  # D1 → 4H → 1H
+            ['1week','1day','1hour'],  # Conservadora
+        ],
+        'intra': [
+            ['4hour','15min','5min'],
+            ['1hour','15min','5min'],
+            ['4hour','15min','1min'],
+            ['1hour','15min','1min'],
+            ['4hour','30min','5min'],
+            ['1hour','30min','5min'],
+        ],
+        'scalp': [
+            ['15min','5min','1min'],
+            ['30min','5min','1min'],
+        ],
+    }
+REQUEST_OPERATORIA: dict[str, dict] = {}
 
-def _num_or_none(x):
-    """Convierte números a tipos nativos y reemplaza NaN/Inf por None."""
-    if x is None:
-        return None
-    # bool primero (np.bool_ es subtipo de np.integer)
-    if isinstance(x, (bool, np.bool_)):
-        return bool(x)
-    # enteros
-    if isinstance(x, (int, np.integer)):
-        return int(x)
-    # flotantes
-    if isinstance(x, (float, np.floating)):
-        xf = float(x)
-        return xf if (xf == xf and np.isfinite(xf)) else None  # (xf==xf) filtra NaN
-    return x
-
-def json_safe(obj):
-    """
-    Limpia recursivamente:
-      - np.nan/np.inf → None
-      - numpy.* → tipos Python nativos
-      - pd.Timestamp → ISO 8601
-      - np.ndarray → list
-    Devuelve algo 100% serializable a JSON estándar.
-    """
-    if obj is None:
-        return None
-    if isinstance(obj, (pd.Timestamp, )):
-        return obj.isoformat()
-    if isinstance(obj, (np.ndarray, )):
-        return json_safe(obj.tolist())
-    if isinstance(obj, (list, tuple, set)):
-        return [json_safe(v) for v in obj]
-    if isinstance(obj, dict):
-        return {str(k): json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, pd.Series):
-        return json_safe(obj.to_dict())
-    # números / booleanos
-    if isinstance(obj, (bool, np.bool_, int, np.integer, float, np.floating)):
-        return _num_or_none(obj)
-    # Como última opción, intenta ver si ya es serializable
-    try:
-        json.dumps(obj, allow_nan=False)
-        return obj
-    except Exception:
-        return str(obj)
+def clear_current_request_cfg(user_chat_id: str) -> None:
+    REQUEST_OPERATORIA.pop(user_chat_id, None)
 
 def normalize_operatoria_payload(cfg: dict | None) -> dict:
     cfg = cfg or {}
@@ -239,29 +328,40 @@ def normalize_operatoria_payload(cfg: dict | None) -> dict:
     tfs = cfg.get('tfs') or []
     tfs = [ _tf_backend(x) for x in tfs if x ]
 
+    fmpWindows  = _norm_windows(cfg.get('fmpWindows'), DEFAULT_FMP_WINDOWS)
+    calcWindows = _norm_windows(cfg.get('calcWindows'), DEFAULT_CALC_WINDOWS)
+
     return {
         'mode': mode,
-        'tfs': tfs,
+        'tfs': tfs,                    # ya normalizados al backend
+        'fmpWindows': fmpWindows,
+        'calcWindows': calcWindows,
     }
-
-
-# mapa por-request (en memoria) → { user_chat_id: normalized_cfg }
-REQUEST_OPERATORIA: dict[str, dict] = {}
-
-def set_current_request_cfg(user_chat_id: str, cfg: dict | None):
-    if cfg:
-        REQUEST_OPERATORIA[user_chat_id] = normalize_operatoria_payload(cfg)
-    else:
-        REQUEST_OPERATORIA.pop(user_chat_id, None)
-
-
-def clear_current_request_cfg(user_chat_id: str) -> None:
-    REQUEST_OPERATORIA.pop(user_chat_id, None)
 
 
 def _norm_tf(tf: str) -> str:
     tf = str(tf).lower().strip()
     return _TF_ALIAS.get(tf, tf)
+
+def _fmt_for_tf(tf: str) -> str:
+    # FMP acepta fecha-hora para intradía; para 1d/1w basta YYYY-MM-DD
+    return '%Y-%m-%d' if tf in ('1day', '1week') else '%Y-%m-%d %H:%M:%S'
+
+def _tf_to_backend(tf: str) -> str | None:
+    return TF_MAP.get(str(tf).lower().strip())
+
+def _norm_windows(d: dict | None, defaults: dict[str,int]) -> dict[str,int]:
+    out = dict(defaults)
+    if isinstance(d, dict):
+        for k, v in d.items():
+            k2 = _tf_to_backend(k) or k  # admite ya-normalizadas
+            try:
+                vv = int(v)
+                if vv > 0:
+                    out[k2] = vv
+            except Exception:
+                pass
+    return out
 
 # Constantes de layout (ajústalas si quieres)
 MAX_CELL_CHARS = 60
@@ -334,6 +434,27 @@ def _fmt_num(x, nd=4):
         return f"{float(x):.{nd}f}"
     except Exception:
         return str(x)
+
+def _wrap_text_multiline(s: str, width: int) -> str:
+    """Envuelve texto a 'width' caracteres (sin cortar palabras), respetando saltos existentes."""
+    if s is None:
+        return ""
+    s = str(s)
+    lines = s.splitlines() or [s]
+    wrapped_lines: list[str] = []
+    for ln in lines:
+        if not ln:
+            wrapped_lines.append("")
+            continue
+        wrapped_lines.extend(
+            wrap(
+                ln,
+                width=width,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+        )
+    return "\n".join(wrapped_lines)
 
 
 def _max_line_len(s: str) -> int:
@@ -506,7 +627,6 @@ def _json_sanitize_df(d: pd.DataFrame) -> pd.DataFrame:
         elif pd.api.types.is_float_dtype(d[c]):   d[c] = d[c].astype(float)
     return d
 
-#MTORO
 def df_to_ohlcv_records_ext(
     df: pd.DataFrame,
     *,
@@ -734,6 +854,58 @@ def construir_payload_enriquecido(
         "entradas": entradas or {}
     }
 
+def _num_or_none(x):
+    """Convierte números a tipos nativos y reemplaza NaN/Inf por None."""
+    if x is None:
+        return None
+    # bool primero (np.bool_ es subtipo de np.integer)
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    # enteros
+    if isinstance(x, (int, np.integer)):
+        return int(x)
+    # flotantes
+    if isinstance(x, (float, np.floating)):
+        xf = float(x)
+        return xf if (xf == xf and np.isfinite(xf)) else None  # (xf==xf) filtra NaN
+    return x
+
+def json_safe(obj):
+    """
+    Limpia recursivamente:
+      - np.nan/np.inf → None
+      - numpy.* → tipos Python nativos
+      - pd.Timestamp → ISO 8601
+      - np.ndarray → list
+    Devuelve algo 100% serializable a JSON estándar.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, (pd.Timestamp, )):
+        return obj.isoformat()
+    if isinstance(obj, (np.ndarray, )):
+        return json_safe(obj.tolist())
+    if isinstance(obj, (list, tuple, set)):
+        return [json_safe(v) for v in obj]
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, pd.Series):
+        return json_safe(obj.to_dict())
+    # números / booleanos
+    if isinstance(obj, (bool, np.bool_, int, np.integer, float, np.floating)):
+        return _num_or_none(obj)
+    # Como última opción, intenta ver si ya es serializable
+    try:
+        json.dumps(obj, allow_nan=False)
+        return obj
+    except Exception:
+        return str(obj)
+
+def _json_safe_numeric(s: pd.Series) -> pd.Series:
+    """Convierte a numérico, limpia ±inf/NaN y devuelve None (tipo object) donde falte valor."""
+    s = pd.to_numeric(s, errors='coerce')
+    s = s.replace([np.inf, -np.inf], np.nan)
+    return s.where(s.notna(), None).astype(object)
 
 def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -782,22 +954,36 @@ def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     d = d.rename(columns=m)
 
     # Requisitos OHLC
-    for c in ['time','open','high','low','close']:
-        if c not in d.columns: return pd.DataFrame()
+    for c in ['time', 'open', 'high', 'low', 'close']:
+        if c not in d.columns:
+            return pd.DataFrame()
 
+    # Tiempos a UTC ISO
     d['time'] = pd.to_datetime(d['time'], errors='coerce', utc=True)
-    d = d.dropna(subset=['time', 'open','high','low','close'])
+    d = d.dropna(subset=['time', 'open', 'high', 'low', 'close'])
 
-    for c in ['open','high','low','close','volume','SMA','ema_12','ema_26','macd','signal','%K','%D','ATR','rsi','bollinger_upper','bollinger_lower']:
+    # Columnas numéricas que deben ser JSON-safe (null en lugar de NaN)
+    numeric_cols = [
+        'open','high','low','close','volume','SMA','ema_12','ema_26',
+        'macd','signal','%K','%D','ATR','rsi','bollinger_upper','bollinger_lower'
+    ]
+    for c in numeric_cols:
         if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors='coerce')
+            d[c] = _json_safe_numeric(d[c])
 
-    # Asegura tipo booleano nativo/pandas para divergencias (útil para serializar)
-    for c in ['divergencia_macd','divergencia_rsi',
-              'divergencia_macd_bull','divergencia_macd_bear',
-              'divergencia_rsi_bull','divergencia_rsi_bear']:
+    # Booleans como bool/None (no <NA>)
+    for c in [
+        'divergencia_macd','divergencia_rsi',
+        'divergencia_macd_bull','divergencia_macd_bear',
+        'divergencia_rsi_bull','divergencia_rsi_bear'
+    ]:
         if c in d.columns:
-            d[c] = d[c].astype('boolean')  # permite NA
+            s = d[c]
+            # si ya es boolean nullable, conviértelo a bool/None
+            if str(s.dtype) == 'boolean':
+                d[c] = s.astype(object).where(s.notna(), None)
+            else:
+                d[c] = s.astype(object)
 
     d = d.sort_values('time').reset_index(drop=True)
 
@@ -806,7 +992,6 @@ def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         d = d.tail(MAX_VELAS).reset_index(drop=True)
 
     return d
-
 
 async def subir_ohlcv_enriquecido_y_registrar(
     *, exec_id: str, chat_id: str, symbol: str, temporalidad: str,
@@ -1184,12 +1369,20 @@ def obtener_configuracion():
     except Exception as e:
         print(f"Error obteniendo configuración desde Firestore: {e}")
         return {}, [], []
-
+    
 # Llamar a la función al inicio de la aplicación
 categorias, temporalidades, zonas_horarias = obtener_configuracion()
 
+def definir_window(temporalidad: str, overrides: dict[str,int] | None = None) -> int:
 
-def definir_window(temporalidad):
+    if overrides and temporalidad in overrides:
+        try:
+            v = int(overrides[temporalidad])
+            if v > 0:
+                return v
+        except Exception:
+            pass
+
     # Definir el window según la temporalidad
     if temporalidad == '1min':
         window = 14   # Antes 50
@@ -1210,44 +1403,6 @@ def definir_window(temporalidad):
     else:
         window = 30  # Antes 30 Valor por defecto para otras temporalidades
     return window
-
-timezone_country = pytz.timezone('America/Santiago')
-user_states = {}
-timeout_request_global = 2 # Tiempo máximo de espera en segundos
-max_workers_global = min(32, (os.cpu_count() or 1) * 2) #puede tener 64
-cache_noticias = {}
-subscriptions = {}
-subscriptions_type = {}
-admin_ids = {}
-
-matplotlib_lock = threading.Lock()
-
-CARPETA_HISTORICOS = "historicos"
-CARPETA_FOREX_NEWS = "forex_news"
-
-# Archivo JSON para almacenar las suscripciones
-TIME_BETWEEN_MESSAGES = 1  # En segundos
-
-#DIRECCION_USDT_TRC20 = 'TJ5HvX7EfNCrNFXHGCdGYQ59n5H6pcjm6b' #BINANCE
-DIRECCION_USDT_TRC20 = 'TNYdZMs5eGYcwdY8vEAe59utu2RYhdyquh' #UNSTOPPABLE
-
-# Memoria temporal para las noticias
-cache_noticias = defaultdict(pd.DataFrame)  # Diccionario donde la clave es el símbolo
-cache_historicos = {}
-ultima_actualizacion_historicos = {}
-
-señales_compra = ['Compra', 'Compra Fuerte', 'Compra Predicha', 'Compra Predicha con ARIMA', 'Compra Predicha con Media Movil', 'Compra Predicha con ARIMA y Media Movil']
-señales_venta = ['Venta', 'Venta Fuerte', 'Venta Predicha', 'Venta Predicha con ARIMA', 'Venta Predicha con Media Movil', 'Venta Predicha con ARIMA y Media Movil']
-
-file_locks = {}
-guardar_lock = asyncio.Lock()
-
-logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(levelname)s:%(message)s')
-logger = logging.getLogger(__name__)
-
-logging.getLogger("httpx").setLevel(logging.WARNING)  # Para httpx
-logging.getLogger("urllib3").setLevel(logging.WARNING)  # Para requests
-
 
 def return_state(user_chat_id):
     user_ref = db.collection("user_states").document(user_chat_id)
@@ -1734,52 +1889,136 @@ async def cargar_datos_historicos_inicial():
     logger.info("Datos históricos cargados en memoria.")
 
 
-def obtener_datos_historicos_fmp(symbol, temporalidad, max_reintentos=5, tiempo_espera_inicial=5):
+def obtener_datos_historicos_fmp(
+    symbol: str,
+    temporalidad: str,
+    max_reintentos: int = 5,
+    tiempo_espera_inicial: int = 5,
+    *,
+    bars: int | None = None
+):
+    """
+    - Si 'bars' está definido y > 0:
+        * NO usa ni actualiza caché.
+        * Calcula from/to con base en la TF normalizada y pide a FMP esa ventana.
+        * Devuelve exactamente 'bars' velas ordenadas (siempre que la API lo permita).
+    - Si 'bars' es None:
+        * Comportamiento original incremental usando caché (lee y puede actualizar).
+    """
     try:
-        # Intentar obtener datos desde el cache global
+        tf = _norm_tf(temporalidad)  # '1min','5min','15min','30min','1hour','4hour','1day','1week'
+        use_bars = isinstance(bars, int) and bars > 0 and tf in _TF_MINUTES
+
+        logging.info(f"MTORO9 obtener_datos_historicos_fmp tf: {tf} bars: {bars}, use_bars: {use_bars}")
+
+        # -------------------------
+        # MODO 'bars': sin caché
+        # -------------------------
+        if use_bars:
+            now_utc = datetime.now(pytz.utc)
+            # Márgen extra para evitar off-by-one
+            total_min = _TF_MINUTES[tf] * (bars + 5)
+            logging.info(f"MTORO11 obtener_datos_historicos_fmp total_min: {total_min}")
+            from_dt = now_utc - timedelta(minutes=total_min)
+            to_dt   = now_utc
+
+            fmt = _fmt_for_tf(tf)  # asumes que existe; p.ej. "%Y-%m-%d" o con hora según TF
+            from_str = from_dt.strftime(fmt)
+            to_str   = to_dt.strftime(fmt)
+
+            url = (
+                f"https://financialmodelingprep.com/api/v3/historical-chart/"
+                f"{tf}/{symbol}?from={from_str}&to={to_str}&apikey={API_KEY}"
+            )
+            logging.info(f"MTORO12 obtener_datos_historicos_fmp URL: {url}")
+
+            reintento = 0
+            tiempo_espera = tiempo_espera_inicial
+
+            while reintento < max_reintentos:
+                try:
+                    resp = requests.get(url, timeout=timeout_request_global)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if isinstance(data, list) and len(data) > 0:
+                            df = pd.DataFrame(data)[['date','open','high','low','close','volume']]
+                            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+                            df = df.dropna(subset=['date']).set_index('date')
+                            df = df.sort_index()
+                            # EXACTAMENTE 'bars' al final (por si viene de más)
+                            if len(df) > bars:
+                                df = df.tail(bars)
+                            # Localizar a UTC y convertir a tu zona de salida
+                            out = df.copy()
+                            out.index = out.index.tz_localize(pytz.utc).tz_convert(timezone_country)
+                            return out
+                        else:
+                            logger.info(f"[FMP bars] Sin datos API para {symbol} {tf}.")
+                            return pd.DataFrame()
+                    elif resp.status_code == 429:
+                        retry_after = int(resp.headers.get("Retry-After", tiempo_espera))
+                        logger.info(f"[FMP bars] 429; espero {retry_after}s y reintento.")
+                        time.sleep(retry_after)
+                        reintento += 1
+                    else:
+                        logger.info(f"[FMP bars] Error {resp.status_code} URL: {url}")
+                        return pd.DataFrame()
+                except requests.exceptions.RequestException as e:
+                    logger.info(f"[FMP bars] Error de conexión: {e}")
+                    reintento += 1
+                    if reintento < max_reintentos:
+                        logger.info(f"[FMP bars] Reintento en {tiempo_espera}s…")
+                        time.sleep(tiempo_espera)
+                        tiempo_espera *= 2
+
+            logger.info(f"[FMP bars] Falló tras {max_reintentos} reintentos {symbol} {tf}.")
+            return pd.DataFrame()
+
+        # -------------------------------------------
+        # MODO incremental (sin 'bars'): con caché
+        # -------------------------------------------
+        logging.info(f"MTORO13 obtener_datos_historicos_fmp entro al modo incremental sin bars")
         df_local = None
         ultima_fecha = None
 
-        # Validar si el símbolo y la temporalidad están en el caché
-        if symbol in cache_historicos and temporalidad in cache_historicos[symbol]:
-            df_local = cache_historicos[symbol][temporalidad]
-
+        if symbol in cache_historicos and tf in cache_historicos[symbol]:
+            df_local = cache_historicos[symbol][tf]
             if df_local is not None and not df_local.empty and 'date' in df_local.columns:
+                df_local = df_local.copy()
                 df_local['date'] = pd.to_datetime(df_local['date'], errors='coerce')
-                df_local = df_local.dropna(subset=['date'])
-                df_local.set_index('date', inplace=True)
-
-            ultima_fecha = df_local.index.max() if df_local is not None and not df_local.empty else None
-            logger.info(f"Última fecha disponible en caché para {symbol} en {temporalidad}: {ultima_fecha}")
+                df_local = df_local.dropna(subset=['date']).set_index('date')
+            ultima_fecha = (df_local.index.max() if (df_local is not None and not df_local.empty) else None)
+            logger.info(f"Última fecha en caché {symbol} {tf}: {ultima_fecha}")
         else:
-            logger.info(f"No se encontraron datos en caché para {symbol} en {temporalidad}.")
+            logger.info(f"Sin caché para {symbol} {tf}")
 
-        # Consultar nuevos datos desde la API
-        if ultima_fecha:
-            ultima_fecha_api = ultima_fecha.strftime("%Y-%m-%d")
-            fecha_actual = datetime.now(pytz.utc).strftime("%Y-%m-%d")
-            url = f"https://financialmodelingprep.com/api/v3/historical-chart/{temporalidad}/{symbol}?from={ultima_fecha_api}&to={fecha_actual}&apikey={API_KEY}"
+        if ultima_fecha is not None:
+            from_str = ultima_fecha.strftime("%Y-%m-%d")
+            to_str   = datetime.now(pytz.utc).strftime("%Y-%m-%d")
+            url = (
+                f"https://financialmodelingprep.com/api/v3/historical-chart/"
+                f"{tf}/{symbol}?from={from_str}&to={to_str}&apikey={API_KEY}"
+            )
         else:
-            url = f"https://financialmodelingprep.com/api/v3/historical-chart/{temporalidad}/{symbol}?apikey={API_KEY}"
+            url = (
+                f"https://financialmodelingprep.com/api/v3/historical-chart/"
+                f"{tf}/{symbol}?apikey={API_KEY}"
+            )
 
         reintento = 0
         tiempo_espera = tiempo_espera_inicial
-
         while reintento < max_reintentos:
             try:
                 response = requests.get(url, timeout=timeout_request_global)
-
                 if response.status_code == 200:
-                    # Procesar datos si la respuesta es exitosa
                     data_api = response.json()
                     if isinstance(data_api, list) and len(data_api) > 0:
-                        df_api = pd.DataFrame(data_api)[['date', 'open', 'high', 'low', 'close', 'volume']]
+                        df_api = pd.DataFrame(data_api)[['date','open','high','low','close','volume']]
                         df_api['date'] = pd.to_datetime(df_api['date'], errors='coerce')
-                        df_api = df_api.dropna(subset=['date'])
-                        df_api.set_index('date', inplace=True)
+                        df_api = df_api.dropna(subset=['date']).set_index('date')
 
-                        # Filtrar datos nuevos a partir de la última fecha
-                        if ultima_fecha:
+                        if ultima_fecha is not None:
+                            # Ambos índices "naive" → comparación válida
                             df_api = df_api[df_api.index > ultima_fecha]
 
                         if df_local is not None and not df_local.empty and not df_api.empty:
@@ -1791,45 +2030,43 @@ def obtener_datos_historicos_fmp(symbol, temporalidad, max_reintentos=5, tiempo_
                         else:
                             df_combinado = pd.DataFrame()
 
-                        # Actualizar el cache global
+                        # Actualizar caché (MODO incremental SÍ actualiza)
                         if symbol not in cache_historicos:
                             cache_historicos[symbol] = {}
-                        cache_historicos[symbol][temporalidad] = df_combinado
+                        cache_historicos[symbol][tf] = df_combinado
 
-                        # Aplicar la conversión de zona horaria solo al valor retornado
-                        df_combinado = df_combinado.copy()
-                        df_combinado.index = df_combinado.index.tz_localize(pytz.utc).tz_convert(timezone_country)
-
-                        return df_combinado
+                        out = df_combinado.copy()
+                        out.index = out.index.tz_localize(pytz.utc).tz_convert(timezone_country)
+                        return out
                     else:
                         logger.info("No se encontraron datos nuevos desde la API.")
                         return df_local if df_local is not None else pd.DataFrame()
 
                 elif response.status_code == 429:
-                    # Manejar límite de tasa (429)
                     retry_after = int(response.headers.get("Retry-After", tiempo_espera))
-                    logger.info(f"Se excedió el límite de la API. Esperando {retry_after} segundos antes de reintentar.")
+                    logger.info(f"Se excedió el límite de la API. Esperando {retry_after}s…")
                     time.sleep(retry_after)
                     reintento += 1
                 else:
-                    # Otros errores de la API
-                    logger.info(f"Error al consultar la API de FMP: {response.status_code}, URL: {url}")
+                    logger.info(f"Error API FMP: {response.status_code}, URL: {url}")
                     return df_local if df_local is not None else pd.DataFrame()
 
             except requests.exceptions.RequestException as e:
                 logger.info(f"Error de conexión: {e}")
                 reintento += 1
                 if reintento < max_reintentos:
-                    logger.info(f"Reintentando url:{url} en {tiempo_espera} segundos...")
+                    logger.info(f"Reintentando url:{url} en {tiempo_espera}s…")
                     time.sleep(tiempo_espera)
                     tiempo_espera *= 2
 
-        logger.info(f"Falló la obtención de datos para {symbol} en temporalidad {temporalidad} después de {max_reintentos} reintentos.")
+        logger.info(f"Falló la obtención de datos para {symbol} {tf} tras {max_reintentos} reintentos.")
         return df_local if df_local is not None else pd.DataFrame()
 
     except Exception as e:
         logger.info(f"Error inesperado al procesar datos para {symbol} en temporalidad {temporalidad}: {e}")
         return pd.DataFrame()
+
+
         
 # Función para obtener datos en tiempo real
 #@profile
@@ -2345,56 +2582,180 @@ async def enviar_eventos_y_archivo_calendar(df, context, user_chat_id):
         os.remove(file_path)  # Eliminar el archivo después de enviarlo
 
 #@profile
-def obtener_valor_realtime_unificado(symbol):
-    if "cache_realtime" not in user_states:
-        user_states["cache_realtime"] = {}
+def obtener_valor_realtime_unificado(symbol: str, user_chat_id: str | None = None, *, intentos: int = 1):
+    """
+    Devuelve el último 'close' realtime y lo guarda en:
+      - cache por usuario: user_states[user_chat_id]['cache_realtime']
+      - cache global:      user_states['cache_realtime']
+    Si ya existe en el cache de usuario (o global), lo reutiliza.
+    """
+    # --- preparar caches ---
+    user_states.setdefault("cache_realtime", {})
+    global_cache = user_states["cache_realtime"]
 
-    if symbol in user_states["cache_realtime"]:
-        return user_states["cache_realtime"][symbol]
+    if user_chat_id:
+        user_states.setdefault(user_chat_id, {})
+        user_states[user_chat_id].setdefault("cache_realtime", {})
+        user_cache = user_states[user_chat_id]["cache_realtime"]
+    else:
+        user_cache = global_cache
 
-    valores_realtime = []
-    for _ in range(1):
+    logging.info(f'MTORO14 obtener_valor_realtime_unificado este es user_cache: {user_cache}')
+
+    # --- preferir valor ya cacheado ---
+    v = user_cache.get(symbol)
+    if _is_finite_number(v):
+        return float(v)
+
+    v = global_cache.get(symbol)
+    if _is_finite_number(v):
+        # sembrar en el cache del usuario si es distinto del global
+        if user_cache is not global_cache:
+            user_cache[symbol] = v
+        return float(v)
+
+    # --- consultar a la fuente realtime (FMP) ---
+    muestras = []
+    for _ in range(max(1, int(intentos))):
         try:
-            data_realtime = obtener_dato_realtime_fmp(symbol)
-            if data_realtime is not None and not data_realtime.empty:
-                valores_realtime.append(data_realtime.iloc[0]['close'])
+            df = obtener_dato_realtime_fmp(symbol)
+            if df is not None and not df.empty:
+                val = float(df.iloc[0]['close'])
+                if _is_finite_number(val):
+                    muestras.append(val)
         except Exception as e:
             logger.info(f"Error en realtime para {symbol}: {e}")
-    if valores_realtime:
-        valor_mas_frecuente = Counter(valores_realtime).most_common(1)[0][0]
-        user_states["cache_realtime"][symbol] = valor_mas_frecuente
-        return valor_mas_frecuente
 
+    if not muestras:
+        return None
+
+    # Si hay varias muestras, usa mediana; si no, la última.
+    valor = statistics.median(muestras) if len(muestras) >= 3 else muestras[-1]
+
+    # --- guardar en ambos caches ---
+    user_cache[symbol] = valor
+    global_cache[symbol] = valor
+
+    logger.info(f"[RT] {symbol} = {valor}")
+    return valor
+
+def _is_finite_number(x) -> bool:
+    try:
+        return isinstance(x, (int, float, np.floating)) and math.isfinite(float(x))
+    except Exception:
+        return False
+
+
+def _coerce_float(x):
+    """Devuelve float(x) si es finito; si no, None."""
+    try:
+        if x is None:
+            return None
+        if isinstance(x, str):
+            s = x.strip()
+            if s == "" or s.lower() in {"nan", "none", "null"}:
+                return None
+            x = s
+        v = float(x)
+        return v if math.isfinite(v) else None
+    except Exception:
+        return None
+
+def _lookup_rt_tick(cache_rt: dict, symbol: str):
+    """Busca el último close en varias variantes de clave."""
+    if symbol in cache_rt:
+        return cache_rt[symbol]
+    up = symbol.upper()
+    lo = symbol.lower()
+    if up in cache_rt:
+        return cache_rt[up]
+    if lo in cache_rt:
+        return cache_rt[lo]
+    # soportar prefijos tipo "OANDA:EURUSD"
+    if ":" in symbol:
+        tail = symbol.split(":", 1)[1]
+        if tail in cache_rt:
+            return cache_rt[tail]
+        if tail.upper() in cache_rt:
+            return cache_rt[tail.upper()]
+        if tail.lower() in cache_rt:
+            return cache_rt[tail.lower()]
     return None
 
 # Implementación de hilos para optimizar las solicitudes de datos
 #@profile
-def obtener_datos_con_hilos(symbol, temporalidad):
-    if "cache_realtime" not in user_states:
-        user_states["cache_realtime"] = {}
+def obtener_datos_con_hilos(
+    symbol: str,
+    temporalidad: str,
+    user_chat_id: str | None = None,
+    cfg: dict | None = None
+):
+    """
+    Combina histórico + último tick.
+    Si no hay cfg o no hay valor para esa TF, NO restringe (bars=None).
+    """
+    logging.info(
+        f"MTORO5 obtener_datos_con_hilos: tf={temporalidad}, cfg_keys={list((cfg or {}).keys())}"
+    )
 
     try:
-        # Obtener datos históricos usando `await`
-        df_historico = obtener_datos_historicos_fmp(symbol, temporalidad)
+        # 0) cache realtime por usuario/global
+        if user_chat_id is not None:
+            if user_chat_id not in user_states:
+                user_states[user_chat_id] = {}
+            user_states[user_chat_id].setdefault("cache_realtime", {})
+            cache_rt = user_states[user_chat_id]["cache_realtime"]
+        else:
+            user_states.setdefault("cache_realtime", {})
+            cache_rt = user_states["cache_realtime"]
 
-        # Crear DataFrame para datos en tiempo real
-        df_realtime = pd.DataFrame([{
-            'close': user_states["cache_realtime"].get(symbol, None)
-        }])
+        # 1) normalizar TF a '1min','5min','1hour','1day','1week', etc.
+        tf = _norm_tf(temporalidad)
 
-        if df_historico.empty:
-            logger.info(f"Datos históricos no disponibles para {symbol} en temporalidad {temporalidad}")
+        # 2) resolver bars solo desde cfg; si no hay → None
+        bars = get_bars_for_tf(cfg, tf)  # ← clave
+
+        # 3) histórico (acepta bars=None)
+        df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars)
+        if df_historico is None or df_historico.empty:
+            logger.info(f"Datos históricos no disponibles para {symbol} en {tf}")
             return pd.DataFrame()
-
-        # Ordenar y combinar datos
         df_historico = df_historico.sort_index()
-        df_realtime_vela = actualizar_ultima_vela_con_realtime(df_historico, df_realtime, symbol, temporalidad)
-        df_realtime_vela = df_realtime_vela.sort_index()
 
-        return df_realtime_vela
+        # 4) ajustar última vela con tick realtime si existe
+        raw_tick   = _lookup_rt_tick(cache_rt, symbol)
+        last_close = _coerce_float(raw_tick)
+
+        try:
+            last_hist = float(df_historico['close'].iloc[-1])
+        except Exception:
+            last_hist = None
+
+        logger.info(
+            f"[RT] {symbol}-{tf} tick_cache={raw_tick} -> parsed={last_close} "
+            f"last_hist={last_hist} bars={bars}"
+        )
+
+        if last_close is not None:
+            try:
+                df_mix = actualizar_ultima_vela_con_realtime(
+                    df_historico, pd.DataFrame([{'close': last_close}]), symbol, tf
+                )
+                df_out = df_mix.sort_index()
+            except Exception as e:
+                logger.info(f"actualizar_ultima_vela_con_realtime falló para {symbol}-{tf}: {e}")
+                df_out = df_historico
+        else:
+            df_out = df_historico
+
+        # 5) recorte final si bars es numérico
+        if isinstance(bars, int) and bars > 0 and len(df_out) > bars:
+            df_out = df_out.tail(bars)
+
+        return df_out
 
     except Exception as e:
-        logger.info(f"Se cayo en obtener_datos_con_hilos {symbol} en temporalidad {temporalidad} el error es: {e}")
+        logger.info(f"Se cayó en obtener_datos_con_hilos {symbol}-{temporalidad} – error: {e}")
         return pd.DataFrame()
 
 
@@ -3744,12 +4105,36 @@ def calcular_soportes_resistencias_para_window(window, df, precio_actual, min_le
     )
     return soportes, resistencias
 
+def _clean_levels(L):
+    if not L: return []
+    out=[]
+    for v in L:
+        vv = _tofloat(v)
+        if _finite(vv):
+            out.append(vv)
+    return out
+
 #@profile
 def ajustar_window_dinamico_optimizado(
-    df, symbol, temporalidad, precio_actual, max_incremento=5, min_factor=2, max_factor=5, min_levels=2, n_jobs=-1
+    df: pd.DataFrame,
+    symbol: str,
+    temporalidad: str,
+    precio_actual: float,
+    *,
+    calc_windows: dict[str, int] | None = None,   # 👈 nuevo
+    max_incremento: int = 5,
+    min_factor: int = 2,
+    max_factor: int = 5,
+    min_levels: int = 2,
+    n_jobs: int = -1,
 ):
     # Obtener la ventana inicial
-    window = min(definir_window(temporalidad), len(df))
+    if calc_windows is not None:
+        calc_map = _norm_windows(calc_windows, DEFAULT_CALC_WINDOWS)
+        window = min(definir_window(temporalidad, overrides=calc_map), len(df))
+    else:
+        window = min(definir_window(temporalidad, None), len(df))
+    
     max_window = min(window * min_factor, len(df))
     increment = max_incremento
 
@@ -4133,137 +4518,175 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soport
         "DataFrame Actualizado": df
     }
 
+def _finite(x) -> bool:
+    try:
+        return np.isfinite(float(x))
+    except Exception:
+        return False
+
+def _tofloat(x):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+    
+def calc_tp_sl_compra(entry, atr, mult=1.5):
+    if not (_finite(entry) and _finite(atr)):
+        return None, None
+    tp = entry + atr * mult
+    sl = entry - atr * mult
+    if not (sl < entry < tp):
+        return None, None
+    return tp, sl
+
+def calc_tp_sl_venta(entry, atr, mult=1.5):
+    if not (_finite(entry) and _finite(atr)):
+        return None, None
+    tp = entry - atr * mult
+    sl = entry + atr * mult
+    if not (tp < entry < sl):
+        return None, None
+    return tp, sl
+
 # Función para calcular puntos de entrada ajustando las probabilidades
 #@profile
-def calcular_entradas(df, df_eventos, symbol, temporalidad, user_chat_id):
+def calcular_entradas(
+    df,
+    df_eventos,
+    symbol: str,
+    temporalidad: str,
+    user_chat_id: str,
+    *,
+    calc_windows: dict[str,int] | None = None
+):
     estado_usuario = obtener_estado_usuario(user_chat_id)
     soportes_resistencias_cache = estado_usuario["soportes_resistencias_cache"]
-    window = min(definir_window(temporalidad), len(df))
 
-    # 1) Detección de patrones
-    patrones_detectados = detectar_patrones_velas(df, window)
+    tf = _tf_backend(temporalidad)
+    window = min(definir_window(tf, overrides=calc_windows), len(df))
+
+    # Detección de patrones de velas japonesas
+    patrones_detectados =  detectar_patrones_velas(df, window)
+
     print(f"Paso exitosamente la detección de patrones: {patrones_detectados}")
-
-    # 2) Predicciones
-    predicciones_arima = predecir_arima(df, temporalidad, symbol)
-    predicciones_media_movil = predecir_media_movil(df, window)
-
-    # 3) Monte Carlo
-    probabilidad_alza, probabilidad_baja = simulacion_monte_carlo(
-        df, temporalidad, num_simulaciones=100, num_dias=5, seed=42
-    )
+    
+    # Predicción de precios futuros con ARIMA
+    predicciones_arima =  predecir_arima(df, tf, symbol)
+    
+    predicciones_media_movil =  predecir_media_movil(df, window)
+    
+    # Simulación de Monte Carlo para probabilidad de alza/baja
+    probabilidad_alza, probabilidad_baja =  simulacion_monte_carlo(df, tf,num_simulaciones=100,num_dias=5,seed=42)
     probabilidad_alza = probabilidad_alza if probabilidad_alza is not None else 50
     probabilidad_baja = probabilidad_baja if probabilidad_baja is not None else 50
-
+    
     precio_actual = df['close'].iloc[-1]
-
-    # 4) Soportes/Resistencias dinámicos
+   
+    # Calcular soportes y resistencias dinámicos de esta temporalidad
     df, soportes_dinamicos, resistencias_dinamicas = ajustar_window_dinamico_optimizado(
-        df, symbol, temporalidad, precio_actual,
+        df, symbol, tf, precio_actual,
+        calc_windows=calc_windows,
         max_incremento=5, min_factor=2, max_factor=8, min_levels=2, n_jobs=-1
     )
+
+    soportes_dinamicos     = _clean_levels(soportes_dinamicos)
+    resistencias_dinamicas = _clean_levels(resistencias_dinamicas)
+
     if symbol not in soportes_resistencias_cache:
         soportes_resistencias_cache[symbol] = {}
 
-    if temporalidad not in soportes_resistencias_cache[symbol]:
-        soportes_resistencias_cache[symbol][temporalidad] = {
+    # Agregar soportes y resistencias de esta temporalidad al caché global
+    if tf not in soportes_resistencias_cache[symbol]:
+        # Si la temporalidad no está en el caché, agregar directamente
+        soportes_resistencias_cache[symbol][tf] = {
             "soportes": soportes_dinamicos,
             "resistencias": resistencias_dinamicas,
         }
     else:
-        soportes_resistencias_cache[symbol][temporalidad]['soportes'] = list(
-            set(soportes_resistencias_cache[symbol][temporalidad]['soportes'] + soportes_dinamicos)
+        # Si la temporalidad ya existe, combinar o actualizar
+        soportes_resistencias_cache[symbol][tf]['soportes'] = list(
+            set(soportes_resistencias_cache[symbol][tf]['soportes'] + soportes_dinamicos)
         )
-        soportes_resistencias_cache[symbol][temporalidad]['resistencias'] = list(
-            set(soportes_resistencias_cache[symbol][temporalidad]['resistencias'] + resistencias_dinamicas)
+        soportes_resistencias_cache[symbol][tf]['resistencias'] = list(
+            set(soportes_resistencias_cache[symbol][tf]['resistencias'] + resistencias_dinamicas)
         )
+    niveles_clave =  obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soportes_resistencias_cache, symbol, tf, umbral_atr=2.0, max_niveles=2)
 
-    niveles_clave = obtener_niveles_clave(
-        df, soportes_dinamicos, resistencias_dinamicas, soportes_resistencias_cache,
-        symbol, temporalidad, umbral_atr=2.0, max_niveles=2
-    )
-    en_rango = detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
+    try:
+        en_rango = detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
+    except Exception:
+        en_rango = {"es_rango_repetitivo": False, "estructura_tendencia": "indefinida",
+                    "rebotes": [], "rango_dinamico": [None, None]}
 
-    # Evitar NaN: ATR puede venir NaN → úsalo como None
-    ATR_val = df['ATR'].iloc[-1]
-    if isinstance(ATR_val, (float, np.floating)) and (np.isnan(ATR_val) or not np.isfinite(ATR_val)):
-        ATR = None
-    else:
-        ATR = float(ATR_val)
+    ATR = _tofloat(df['ATR'].iloc[-1]) if 'ATR' in df.columns else None
 
-    # 5) Probabilidades
-    probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df, temporalidad, window), 2)
+    # Calcular probabilidades técnica y fundamental
+    probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df,tf,window), 2)
     fecha_inicio = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
     fecha_fin = datetime.now().strftime('%Y-%m-%d')
-    probabilidad_fundamental = ajustar_probabilidad_fundamental(
-        50, df_eventos, symbol, temporalidad, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin
-    )
-    probabilidad_fundamental = 50 if probabilidad_fundamental is None else round(probabilidad_fundamental, 2)
+    probabilidad_fundamental =  ajustar_probabilidad_fundamental(50, df_eventos, symbol, tf, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin)
+    if probabilidad_fundamental is None:
+        probabilidad_fundamental = 50
+    else:
+        probabilidad_fundamental = round(probabilidad_fundamental, 2)
+    # Calcular probabilidad general con la nueva ponderación
 
-    probabilidad_general = calcular_probabilidad_general(probabilidad_tecnica, probabilidad_fundamental)
-    probabilidad_general = 50 if probabilidad_general is None else round(probabilidad_general, 2)
+    probabilidad_general =  calcular_probabilidad_general(probabilidad_tecnica, probabilidad_fundamental)
+    if probabilidad_general is None:
+        probabilidad_general = 50  # Valor predeterminado para evitar errores
+    else:
+        probabilidad_general = round(probabilidad_general, 2)
 
-    # 6) Zonas
-    zona_no_trading  = verificar_zona_no_trading(df, window)
-    zona_sobreventa  = verificar_zona_sobreventa(df, window)
+    # Verificar zona de no trading
+    zona_no_trading = verificar_zona_no_trading(df, window)
+    #logger.info(f"Zona de no trading: {zona_no_trading}")
+    
+    zona_sobreventa = verificar_zona_sobreventa(df, window)
+    #logger.info(f"Zona de sobreventa: {zona_sobreventa}")
+    
     zona_sobrecompra = verificar_zona_sobrecompra(df, window)
-
-    # 7) Tipo operación
+    #logger.info(f"Zona de sobrecompra: {zona_sobrecompra}")
+    
+    # Determinación del tipo de operación utilizando las funciones auxiliares
     tipo_operacion = determinar_tipo_operacion(
-        precio_actual,
-        predicciones_arima[0]        if predicciones_arima        else None,
-        predicciones_media_movil[0]  if predicciones_media_movil  else None,
-        probabilidad_alza,
+        precio_actual, 
+        predicciones_arima[0] if predicciones_arima else None,
+        predicciones_media_movil[0] if predicciones_media_movil else None,
+        probabilidad_alza, 
         probabilidad_baja,
-        patrones_detectados,
-        zona_sobreventa,
-        zona_sobrecompra,
-        probabilidad_general,
+        patrones_detectados, 
+        zona_sobreventa, 
+        zona_sobrecompra, 
+        probabilidad_general, 
         zona_no_trading
     )
 
-    # 8) Precio entrada y TP/SL sin NaN
-    def _tp_sl_compra(precio_entrada, ATR):
-        if ATR is None:
-            return None, None
-        take_profit = precio_entrada + ATR * 1.5
-        stop_loss   = precio_entrada - ATR * 1.5
-        return take_profit, stop_loss
+    if tipo_operacion in señales_compra or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "alcista" or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "indefinida")):
+        precio_entrada = (niveles_clave['resistencia_nivel_1'] + niveles_clave['soporte_nivel_1']) / 2 if niveles_clave['resistencia_nivel_1'] and niveles_clave['soporte_nivel_1'] else precio_actual
+        take_profit, stop_loss = calc_tp_sl_compra(precio_entrada, ATR)
+        
+        if not (stop_loss < precio_entrada < take_profit):
+            logger.warning(f"Valores incorrectos en {symbol} temporalidad:{tf} (compra): SL={stop_loss}, Entrada={precio_entrada}, TP={take_profit}")
+            stop_loss, take_profit = np.nan, np.nan
+    
+    elif tipo_operacion in señales_venta or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "bajista"):
+        precio_entrada = (niveles_clave['resistencia_nivel_1'] + niveles_clave['soporte_nivel_1']) / 2 if niveles_clave['resistencia_nivel_1'] and niveles_clave['soporte_nivel_1'] else precio_actual
+        take_profit, stop_loss = calc_tp_sl_venta(precio_entrada, ATR)
+        
+        if not (take_profit < precio_entrada < stop_loss):
+            logger.warning(f"Valores incorrectos en {symbol} temporalidad:{tf} (venta): TP={take_profit}, Entrada={precio_entrada}, SL={stop_loss}")
+            stop_loss, take_profit = np.nan, np.nan
+    else:
+        take_profit = None
+        stop_loss = None
 
-    def _tp_sl_venta(precio_entrada, ATR):
-        if ATR is None:
-            return None, None
-        take_profit = precio_entrada - ATR * 1.5
-        stop_loss   = precio_entrada + ATR * 1.5
-        return take_profit, stop_loss
-
-    precio_entrada = ( (niveles_clave.get('resistencia_nivel_1') or 0) + (niveles_clave.get('soporte_nivel_1') or 0) ) / 2 \
-                     if (niveles_clave.get('resistencia_nivel_1') is not None and niveles_clave.get('soporte_nivel_1') is not None) \
-                     else precio_actual
-
-    take_profit = None
-    stop_loss   = None
-
-    if (tipo_operacion in señales_compra) or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] in ("alcista", "indefinida")):
-        take_profit, stop_loss = _tp_sl_compra(precio_entrada, ATR)
-        if not (take_profit is not None and stop_loss is not None and (stop_loss < precio_entrada < take_profit)):
-            logger.warning(f"Valores incorrectos en {symbol} {temporalidad} (compra): SL={stop_loss}, Entrada={precio_entrada}, TP={take_profit}")
-            take_profit, stop_loss = None, None
-
-    elif (tipo_operacion in señales_venta) or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "bajista"):
-        take_profit, stop_loss = _tp_sl_venta(precio_entrada, ATR)
-        if not (take_profit is not None and stop_loss is not None and (take_profit < precio_entrada < stop_loss)):
-            logger.warning(f"Valores incorrectos en {symbol} {temporalidad} (venta): TP={take_profit}, Entrada={precio_entrada}, SL={stop_loss}")
-            take_profit, stop_loss = None, None
-
-    # 9) Cercanía a niveles
+    # Verificar si el precio actual está cerca de soportes o resistencias
     def esta_cerca(precio, nivel, umbral_cercania=0.01):
         if nivel is None:
             return False
-        try:
-            return abs(precio - nivel) / precio <= umbral_cercania
-        except ZeroDivisionError:
-            return False
+        
+        return abs(precio - nivel) / precio <= umbral_cercania
 
     cerca_de_soporte_resistencia = (
         "Cerca de Soporte Nivel 2" if esta_cerca(precio_actual, niveles_clave.get('soporte_nivel_2')) else
@@ -4273,18 +4696,20 @@ def calcular_entradas(df, df_eventos, symbol, temporalidad, user_chat_id):
         "No Cerca"
     )
 
-    # 10) Flag de oportunidad
+
+    # Flag de oportunidad: cuando la probabilidad general es mayor de 53 (compra) o menor de 47 (venta), y no está en zona de no trading
+    #flag_oportunidad = True if  (probabilidad_baja > 53 or probabilidad_alza > 53) and not zona_no_trading else False
     flag_oportunidad = False
     if not zona_no_trading:
-        if probabilidad_general > 53 and not zona_sobrecompra:
+        if probabilidad_general > 53 and not zona_sobrecompra:  # Compra
             flag_oportunidad = True
-        elif probabilidad_general < 47 and not zona_sobreventa:
+        elif probabilidad_general < 47 and not zona_sobreventa:  # Venta
             flag_oportunidad = True
 
-    # 11) Tendencia tiempo real
+
+    # Agregar predicción de tendencia en tiempo real
     tendencia_predicha = predecir_tendencia_en_tiempo_real(df, temporalidad)
-
-    # 12) Armar salida y LIMPIARLA antes de devolver
+    
     salida = {
         "patrones_detectados": patrones_detectados,
         "predicciones_arima": predicciones_arima,
@@ -4331,7 +4756,6 @@ def calcular_entradas(df, df_eventos, symbol, temporalidad, user_chat_id):
         "zona_sobrecompra": zona_sobrecompra
     }
 
-    # <<< clave: limpieza anti-NaN antes de devolver >>>
     return json_safe(salida)
 
 # Función para generar un archivo con la fecha y hora en el nombre
@@ -4418,47 +4842,78 @@ def df_a_imagen(df: pd.DataFrame, max_filas=30):
 
 
 #@profile
-def generar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades, max_filas=20):
-    if df_eventos is None or df_eventos.empty or divisas_oportunidades is None or len(divisas_oportunidades) == 0:
-        logger.info("Sin eventos/divisas para renderizar.")
+def generar_imagen_eventos_oportunidades(
+    df_eventos: pd.DataFrame,
+    divisas_oportunidades: Sequence[str] | None,
+    *,
+    tz_name: str = "America/Santiago",
+    max_filas_por_imagen: int = 22,
+    dpi: int = 170,
+    font_size: int = 9
+):
+    if df_eventos is None or df_eventos.empty:
         return None
 
-    dfe = df_eventos.copy()
-    if "date" not in dfe.columns:
-        logger.info("La columna 'date' no existe en eventos.")
+    df = df_eventos.copy()
+
+    if divisas_oportunidades:
+        divs = set([str(x).upper() for x in divisas_oportunidades if x])
+        if "currency" in df.columns:
+            df = df[df["currency"].astype(str).str.upper().isin(divs)]
+    if df.empty:
         return None
 
-    # Asegura tz y formato legible
-    if dfe["date"].dt.tz is None:
-        dfe["date"] = dfe["date"].dt.tz_localize("UTC")
-    dfe["date"] = dfe["date"].dt.tz_convert(timezone_country)
+    # ordenar por tiempo si existe
+    for cand in ["t", "time", "timestamp", "fecha", "date", "datetime"]:
+        if cand in df.columns:
+            try:
+                df[cand] = pd.to_datetime(df[cand], errors="coerce", utc=True)
+                try:
+                    import pytz
+                    tz = pytz.timezone(tz_name)
+                    df[cand] = df[cand].dt.tz_convert(tz)
+                except Exception:
+                    df[cand] = df[cand].dt.tz_localize(None)
+                df = df.sort_values(cand)
+                df["Fecha/Hora"] = df[cand].dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+            break
 
-    # filtrado por divisas
-    dfe = dfe[dfe["currency"].isin(divisas_oportunidades)].copy()
-    if dfe.empty:
-        logger.info("No hay eventos relacionados a las divisas de las oportunidades.")
-        return None
+    # renombrar
+    rename_map = {
+        "title": "Evento",
+        "event": "Evento",
+        "currency": "Moneda",
+        "impact": "Impacto",
+        "actual": "Actual",
+        "forecast": "Estimado",
+        "previous": "Anterior",
+    }
+    for k, v in rename_map.items():
+        if k in df.columns and v not in df.columns:
+            df[v] = df[k]
 
-    dfe = dfe.sort_values("date")
-    dfe["date"] = dfe["date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    cols_pref = ["Fecha/Hora", "Moneda", "Impacto", "Evento", "Actual", "Estimado", "Anterior"]
+    cols = [c for c in cols_pref if c in df.columns]
+    if not cols:
+        cols = list(df.columns)[:7]
 
-    columnas = [c for c in ["date","currency","event","impact","actual","estimate","previous"] if c in dfe.columns]
-    dfe = dfe[columnas].copy()
+    df = df[cols].fillna("—")
 
-    # Wrap de la columna larga 'event'
-    if "event" in dfe.columns:
-        dfe["event"] = dfe["event"].apply(lambda s: _wrap_text(s, 28))
+    for c in ["Actual", "Estimado", "Anterior"]:
+        if c in df.columns:
+            df[c] = df[c].apply(_fmt_num)
 
-    # Renderiza en 1..N imágenes
     imgs = tabla_a_imagenes(
-        dfe,
-        max_filas_por_imagen=max_filas,
-        dpi=170,
-        font_size=9
+        df,
+        max_filas_por_imagen=max_filas_por_imagen,
+        dpi=dpi,
+        font_size=font_size,
+        wrap_map={"Evento": 15}
     )
-    if not imgs:
-        return None
-    return imgs if len(imgs) > 1 else imgs[0]
+    return imgs if imgs else None
+
 
 def preparar_df_oportunidades_para_tabla(df_in: pd.DataFrame) -> pd.DataFrame:
     """Devuelve un DF listo para pintar: columnas seleccionadas + formato + headers multilínea."""
@@ -4525,44 +4980,90 @@ def tabla_a_imagenes(
     max_filas_por_imagen: int = 18,
     dpi: int = 170,
     font_size: int = 10,
+    *,
+    wrap_map: Optional[dict[str, int]] = None,   # 👈 NUEVO: {columna: ancho_en_chars}
 ) -> list[BytesIO]:
     if df is None or df.empty:
         return []
 
-    buffers = []
-    for start in range(0, len(df), max_filas_por_imagen):
-        parte = df.iloc[start:start+max_filas_por_imagen].copy()
+    buffers: list[BytesIO] = []
 
-        # anchura por columna (según longitud del texto)
+    # Particionar el DF en páginas
+    for start in range(0, len(df), max_filas_por_imagen):
+        parte = df.iloc[start:start + max_filas_por_imagen].copy()
+
+        # ---- 1) Aplicar multilínea por columnas según wrap_map ----
+        if wrap_map:
+            for col, width in wrap_map.items():
+                if col in parte.columns and isinstance(width, int) and width > 0:
+                    parte[col] = parte[col].astype(str).map(lambda x: _wrap_text_multiline(x, width))
+
+        # ---- 2) Calcular anchos de columna tras el wrap ----
+        # Longitud efectiva: máximo de la línea más larga por celda/encabezado (cap a 40)
         char_w = []
         for i, c in enumerate(parte.columns):
-            max_len = max([len(str(c))] + [len(str(x)) for x in parte.iloc[:, i].tolist()])
-            char_w.append(max(8, min(28, max_len)))  # entre 8 y 28 chars
+            header_len = len(str(c))
+            col_vals = parte.iloc[:, i].astype(str).tolist()
+            max_len_cell = 0
+            for txt in col_vals:
+                # línea más larga en el texto multilínea
+                max_len_cell = max(max_len_cell, max((len(ln) for ln in (txt.split("\n") or [""])), default=0))
+            max_len = max(header_len, max_len_cell)
+            max_len = max(8, min(40, max_len))      # entre 8 y 40 chars
+            char_w.append(max_len)
 
-        # convertir chars -> pulgadas (aprox 0.12 in por char)
+        # convertir chars -> pulgadas (aprox 0.12 in/char) y normalizar para colWidths
         col_in = [w * 0.12 for w in char_w]
-        fig_w = sum(col_in) + 0.8
-        # alto: filas + header
-        row_h = 0.55  # cada fila ~0.55 in por el multilínea
-        fig_h = row_h * (len(parte) + 1) + 0.6
+        total_w = sum(col_in) or 1.0
+        col_widths_norm = [w / total_w for w in col_in]
 
+        # ---- 3) Calcular alto de figura según líneas por fila (tras el wrap) ----
+        def _line_count_cell(txt: str) -> int:
+            return max(1, len((str(txt) or "").split("\n")))
+        # Para cada fila, toma el máximo de líneas entre sus celdas
+        lines_per_row = []
+        for r in range(len(parte)):
+            max_lines = 1
+            for c in parte.columns:
+                max_lines = max(max_lines, _line_count_cell(parte.iloc[r][c]))
+            lines_per_row.append(max_lines)
+
+        # Heurística de alto: cada línea ~0.38 in + header ~0.55 in
+        base_line_h = 0.38 * (font_size / 10.0)     # escala suave con font_size
+        header_h = 0.55
+        filas_h = sum(base_line_h * lc for lc in lines_per_row)
+        fig_h = header_h + filas_h + 0.5            # padding inferior
+        fig_w = total_w + 0.8                       # margen lateral
+
+        # ---- 4) Render de la tabla ----
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
         ax.axis("off")
 
         tbl = ax.table(
             cellText=parte.values,
             colLabels=list(parte.columns),
-            cellLoc="center",
+            cellLoc="left",               # por defecto izquierda (mejor para texto multilínea)
             loc="upper left",
             bbox=[0, 0, 1, 1],
+            colWidths=col_widths_norm,    # 👈 respetar anchos relativos
         )
         tbl.auto_set_font_size(False)
         tbl.set_fontsize(font_size)
 
-        # grosor de header
+        # Header en negrita
         for (r, c), cell in tbl.get_celld().items():
             if r == 0:
                 cell.set_text_props(weight="bold")
+
+        # Alineación derecha para celdas que "parezcan" numéricas o porcentajes
+        n_rows, n_cols = parte.shape
+        for r in range(1, n_rows + 1):
+            for c in range(n_cols):
+                txt = str(parte.iat[r - 1, c])
+                if txt.endswith("%") or _parece_numero(txt):
+                    tbl[r, c]._loc = "right"
+                else:
+                    tbl[r, c]._loc = "left"
 
         buf = BytesIO()
         plt.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.05)
@@ -4572,49 +5073,93 @@ def tabla_a_imagenes(
 
     return buffers
 
+def _parece_numero(s: str) -> bool:
+    s = s.strip().replace(",", "")
+    # permite "123", "123.45", "-0.5", "1 234.56"
+    try:
+        float(s)
+        return True
+    except Exception:
+        return False
+
         
 # Función para enviar la imagen de los eventos relacionados a las oportunidades
 #@profile
-async def enviar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades, context, user_chat_id=None, intentos=3,
+async def enviar_imagen_eventos_oportunidades(
+    df_eventos,
+    divisas_oportunidades,
+    context,
+    user_chat_id=None,
+    intentos=3,
     *,
     exec_id: str | None = None,
     moneda_filtro: str | None = None,
-    subir_a_bucket_y_obtener_url=None,)-> list[str]:
-    # Generar la imagen de los eventos relacionados a las oportunidades
+    subir_a_bucket_y_obtener_url=None,
+) -> list[str]:
+    """
+    Genera 1..N imágenes de eventos (estilo tabla), las envía a Telegram,
+    y si corresponde, las sube al bucket registrándolas. Devuelve URLs subidas.
+    """
+    # 1) Generar (puede devolver list[BytesIO] o None)
     imagen_eventos = generar_imagen_eventos_oportunidades(df_eventos, divisas_oportunidades)
 
     chat_ids = [user_chat_id] if user_chat_id else clientes_chat_ids
-
     urls_subidas: list[str] = []
 
-    # ✅ SUBIR a bucket si corresponde
-    if imagen_eventos is not None and exec_id and moneda_filtro and subir_a_bucket_y_obtener_url:
-        urls_subidas = await subir_imagenes_eventos_y_registrar(
-            imagen_eventos, exec_id, user_chat_id, moneda_filtro, subir_a_bucket_y_obtener_url
-        )
-
-    # Verificar si la imagen es None o el buffer está vacío
-    if isinstance(imagen_eventos, list):  # Si es una lista de imágenes
-            total_partes = len(imagen_eventos)
-            for indice, img in enumerate(imagen_eventos, start=1):
-                if img.getbuffer().nbytes > 0:
-                    await context.bot.send_photo(chat_id=user_chat_id, photo=img,caption=f"Eventos relacionados a las oportunidades. Parte {indice} de {total_partes}")
-    elif imagen_eventos is None or imagen_eventos.getbuffer().nbytes == 0:
-        logger.info(f"No se pudo generar la imagen de eventos relacionados a las oportunidades. El archivo está vacío.")
+    # Normalizar a lista
+    if imagen_eventos is None:
+        imgs: list[BytesIO] = []
+    elif isinstance(imagen_eventos, list):
+        imgs = imagen_eventos
     else:
+        imgs = [imagen_eventos]
+
+    # 2) Subir a bucket si corresponde
+    if imgs and exec_id and moneda_filtro and subir_a_bucket_y_obtener_url:
+        try:
+            # Reutiliza tu registrador existente si acepta lista:
+            urls_subidas = await subir_imagenes_eventos_y_registrar(
+                imgs, exec_id, user_chat_id, moneda_filtro, subir_a_bucket_y_obtener_url
+            )
+        except TypeError:
+            # En caso de que tu registrador espere una sola imagen, subimos una a una
+            urls_subidas = []
+            for i, img in enumerate(imgs, 1):
+                img.seek(0)
+                nombre = f"{exec_id}/eventos_oportunidades_{moneda_filtro}_part_{i}.png"
+                url = await subir_a_bucket_y_obtener_url(img, nombre=nombre, content_type="image/png")
+                if url:
+                    urls_subidas.append(url)
+
+    # 3) Enviar a Telegram
+    if not imgs:
+        logger.info("No se generó imagen de eventos (lista vacía).")
+        return urls_subidas
+
+    total = len(imgs)
+    for idx, img in enumerate(imgs, start=1):
+        if img.getbuffer().nbytes <= 0:
+            continue
+        caption_base = "Eventos relacionados a las oportunidades."
+        caption = f"{caption_base} Parte {idx} de {total}" if total > 1 else caption_base
+
         for chat_id in chat_ids:
+            # Reintentos
             for intento in range(intentos):
                 try:
-                    await context.bot.send_photo(chat_id=chat_id, photo=imagen_eventos, caption="Eventos relacionados a las oportunidades.")
-                    imagen_eventos.seek(0)  # Restablecer el buffer para el siguiente envío
+                    img.seek(0)
+                    await context.bot.send_photo(chat_id=chat_id, photo=img, caption=caption)
                     break
                 except TimedOut:
-                    logger.info(f"Intento {intento + 1} fallido. Reintentando...")
+                    logger.info(f"Intento {intento + 1} fallido enviando eventos a {chat_id}. Reintentando…")
                     await asyncio.sleep(2)
                 except telegram.error.BadRequest as e:
-                    logger.info(f"Error al enviar la imagen de eventos a {chat_id}: {e}")
-                await asyncio.sleep(2)
-    
+                    logger.info(f"Error al enviar imagen de eventos a {chat_id}: {e}")
+                    break
+                except Exception as e:
+                    logger.info(f"Error inesperado enviando imagen de eventos a {chat_id}: {e}")
+                    await asyncio.sleep(2)
+
     return urls_subidas
 
 #@profile
@@ -4835,42 +5380,62 @@ def calcular_ponderacion(row):
 
     return float(ponderacion)
 
-
 #@profile
-def procesar_simbolo_temporalidad(symbol, temporalidad, df_eventos, user_chat_id, context):
+def procesar_simbolo_temporalidad(
+    symbol: str,
+    temporalidad: str,
+    df_eventos,
+    user_chat_id: str,
+    context,
+    *,
+    fmp_windows: dict[str,int] | None = None,
+    calc_windows: dict[str,int] | None = None,
+):
+    # Asegurar notación backend de TF (1min, 4hour, 1day, 1week…)
+    tf = _tf_backend(temporalidad)  # <- este es el valor correcto a usar en todo el flujo
 
-    try :
-        df_combinado = obtener_datos_con_hilos(symbol, temporalidad)
-        if df_combinado.empty:
-            logger.info(f"No hay datos combinados para {symbol} en temporalidad {temporalidad}.")
+    # ------------------- OHLCV (hist + realtime) -------------------
+    try:
+        # Solo pasa fmpWindows si viene; si no, deja cfg vacío => bars=None
+        cfg_local = {"fmpWindows": fmp_windows} if isinstance(fmp_windows, dict) and fmp_windows else {}
+        logging.info(
+            f"MTORO3 obtener_datos_con_hilos: tf={tf}, cfg_keys={list(cfg_local.keys())}"
+        )
+
+        df_combinado = obtener_datos_con_hilos(
+            symbol, tf, user_chat_id=user_chat_id, cfg=cfg_local
+        )
+        if df_combinado is None or df_combinado.empty:
+            logger.info(f"No hay datos combinados para {symbol} en {tf}.")
             return None
     except Exception as e:
-        logger.info(f"Se cayo en obtener_datos_con_hilos {symbol} en temporalidad {temporalidad} el error es: {e}")
+        logger.info(f"obtener_datos_con_hilos falló para {symbol}-{tf}: {e}")
+        return None
 
-    
-    try :
-        df_indicadores = calcular_indicadores(df_combinado, temporalidad)
-        if df_indicadores.empty:
-            logger.info(f"No hay indicadores calculados para {symbol} en temporalidad {temporalidad}.")
+    # ------------------- Indicadores -------------------
+    try:
+        df_indicadores = calcular_indicadores(df_combinado, tf)
+        if df_indicadores is None or df_indicadores.empty:
+            logger.info(f"No hay indicadores para {symbol} en {tf}.")
             return None
     except Exception as e:
-        logger.info(f"Se cayo en calcular_indicadores {symbol} en temporalidad {temporalidad} el error es: {e}")
-    
+        logger.info(f"calcular_indicadores falló para {symbol}-{tf}: {e}")
+        return None
 
-    try :
-        entradas = {}
-        entradas = calcular_entradas(df_indicadores, df_eventos, symbol, temporalidad, user_chat_id)
+    # ------------------- Entradas / señales -------------------
+    try:
+        entradas = calcular_entradas(
+            df_indicadores, df_eventos, symbol, tf, user_chat_id,
+            calc_windows=calc_windows
+        )
         if not entradas:
-            logger.info(f"No se pudieron calcular entradas para {symbol} en temporalidad {temporalidad}.")
+            logger.info(f"No se pudieron calcular entradas para {symbol} en {tf}.")
             return None
-        # Aquí se genera el gráfico y se envía
-        # imagen = graficar_serie_temporal(df_indicadores, symbol, temporalidad)
-        
     except Exception as e:
-        logger.info(f"Se cayo en calcular_entradas {symbol} en temporalidad {temporalidad} el error es: {e}")
-    
+        logger.info(f"calcular_entradas falló para {symbol}-{tf}: {e}")
+        return None
 
-    # Devolver los resultados estructurados
+    # Devolver resultados
     resultado = {
         "Activo": symbol,
         "Temporalidad": temporalidad,
@@ -4889,9 +5454,9 @@ def procesar_simbolo_temporalidad(symbol, temporalidad, df_eventos, user_chat_id
         "Precio de Entrada": entradas.get('precio_entrada'),
         "Take Profit": entradas.get('take_profit'),
         "Stop Loss": entradas.get('stop_loss'),
-        "Soportes Alcanzados": entradas.get("soportes_alcanzados"), 
+        "Soportes Alcanzados": entradas.get("soportes_alcanzados"),
         "Resistencias Alcanzadas": entradas.get("resistencias_alcanzadas"),
-        "Cerca de Soporte Resistencia": entradas.get('cerca_de_soporte_resistencia'),    
+        "Cerca de Soporte Resistencia": entradas.get('cerca_de_soporte_resistencia'),
         "Es Rango Repetitivo": entradas.get("es_rango_repetitivo"),
         "Estructura Tendencia": entradas.get('estructura_tendencia'),
         "Rebotes": entradas.get("rebotes"),
@@ -4928,7 +5493,9 @@ def procesar_simbolo_temporalidad(symbol, temporalidad, df_eventos, user_chat_id
         "resistencia_nivel_2": entradas.get("resistencia_nivel_2"),
     }
 
+
     return resultado
+
 
 
 def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
@@ -4977,60 +5544,59 @@ async def ejecutar_analisis_con_hilos(
     activos_filtrados,
     user_chat_id,
     context,
-    overrides=None,           # puede venir tu operatoria normalizada aquí
+    overrides=None,           # operatoria normalizada
 ):
     resultados = []
     errores = []
 
-    cfg      = overrides or {}
-    temps    = cfg.get('tfs') or temporalidades   # usa tu global `temporalidades` si no viene
+    cfg       = overrides or {}
+    fmp_map   = cfg.get('fmpWindows')
+    logger.info(f"MTORO21 fmp_map: {fmp_map}")
+    calc_map  = cfg.get('calcWindows')
+    logger.info(f"MTORO22 calc_map: {calc_map}")
+    temps     = cfg.get('tfs') or temporalidades
 
     valid = {'1min','5min','15min','30min','1hour','4hour','1day','1week'}
     temps = [t for t in temps if t in valid]
 
-    resultadosReal = []
-    erroresReal = []
-
     loop = asyncio.get_running_loop()
 
-    # ----------- Realtime ----------
+    # --- Realtime (opcional) ---
     realtime_tasks = [
-        loop.run_in_executor(None, obtener_valor_realtime_unificado, symbol)
+        loop.run_in_executor(None, obtener_valor_realtime_unificado, symbol, user_chat_id)
         for symbol in activos_filtrados
     ]
-
     realtime_results = await asyncio.gather(*realtime_tasks, return_exceptions=True)
-
     for idx, result in enumerate(realtime_results):
         if isinstance(result, Exception):
             logger.info(f"Error en realtime para símbolo {activos_filtrados[idx]}: {result}")
-            erroresReal.append(str(result))
-        elif result is not None:
-            resultadosReal.append(result)
-        else:
+        elif result is None:
             logger.info(f"Resultado de realtime vacío para símbolo {activos_filtrados[idx]}.")
 
-    if not resultadosReal or erroresReal:
-        logger.info("No se pudieron obtener resultados de realtime debido a errores.")
-        logger.info("Errores registrados:")
-        for error in erroresReal:
-            logger.info(f" - {error}")
-
-    # ----------- Análisis principal ----------
+    # --- Análisis principal ---
     analisis_tasks = []
-    task_to_symbol_temporalidad = []
+    meta = []  # (symbol, temporalidad) alineado con analisis_tasks
 
+    logging.info(
+        f"MTORO2 ejecutar_analisis_con_hilos antes de ir procesar_simbolo_temporalidad "
+        f"Temporalidades: {temps}, ventanas de FMP: {fmp_map}, ventanas de calculo: {calc_map}"
+    )
     for symbol in activos_filtrados:
         for temporalidad in temps:
-            analisis_tasks.append(
-                loop.run_in_executor(None, procesar_simbolo_temporalidad, symbol, temporalidad, df_eventos, user_chat_id, context)
+            fn = partial(
+                procesar_simbolo_temporalidad,
+                symbol, temporalidad, df_eventos, user_chat_id, context,
+                fmp_windows=fmp_map,
+                calc_windows=calc_map,
             )
-            task_to_symbol_temporalidad.append((symbol, temporalidad))
+            fut = loop.run_in_executor(None, fn)
+            analisis_tasks.append(fut)
+            meta.append((symbol, temporalidad))
 
     analisis_results = await asyncio.gather(*analisis_tasks, return_exceptions=True)
 
     for idx, result in enumerate(analisis_results):
-        symbol, temporalidad = task_to_symbol_temporalidad[idx]
+        symbol, temporalidad = meta[idx]
         if isinstance(result, Exception):
             logger.info(f"Error en análisis para símbolo {symbol} y temporalidad {temporalidad}: {result}")
             errores.append(str(result))
@@ -5039,13 +5605,13 @@ async def ejecutar_analisis_con_hilos(
         else:
             logger.info(f"Resultado vacío para símbolo {symbol} y temporalidad {temporalidad}.")
 
-    if not resultados or errores:
+    if not resultados and errores:
         logger.info("No se pudieron obtener resultados debido a errores.")
-        logger.info("Errores registrados:")
         for error in errores:
             logger.info(f" - {error}")
 
     return resultados
+
 
 # Función para procesar el resultado de cada análisis
 #@profile
@@ -5092,6 +5658,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 (isinstance(df_velas, pd.DataFrame) and not df_velas.empty) or
                 (isinstance(df_inds,  pd.DataFrame) and not df_inds.empty)
             )
+
+            logger.info(f'MTORO100 sym:{sum}, tf:{tf}, tiene_datos:{tiene_datos}')
+
             if sym and tf and tiene_datos:
                 try:
                     url = await subir_ohlcv_enriquecido_y_registrar(
@@ -5571,7 +6140,8 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                     df_para_imagen,
                     max_filas_por_imagen=18,   # ajusta a gusto
                     dpi=170,
-                    font_size=9
+                    font_size=9,
+                    wrap_map={"Tipo de Operación": 22}
                 )
 
                 if imagenes:
@@ -6299,7 +6869,6 @@ async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None,
         user_states[user_chat_id] = {}
     user_states[user_chat_id]["operatoria_cfg"] = operatoria_cfg or {}
 
-
     user = update.effective_user.first_name
     await context.bot.send_message(chat_id=user_chat_id, text=f"Hola {user}, comenzó el análisis. Por favor, espera un momento...")
 
@@ -6330,7 +6899,9 @@ async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None,
         resultados = await ejecutar_analisis_con_hilos(
             df_eventos, activos_filtrados, user_chat_id, context,
             overrides={
-                'tfs': (operatoria_cfg or {}).get('tfs')
+                'tfs': (operatoria_cfg or {}).get('tfs'),
+                'fmpWindows':    (operatoria_cfg or {}).get('fmpWindows'),
+                'calcWindows':   (operatoria_cfg or {}).get('calcWindows'),
             }
         )
 
@@ -7790,7 +8361,6 @@ async def ejecutar_analisis_desde_app():
             raw_cfg = op.get("config", op)
 
         op_cfg = normalize_operatoria_payload(raw_cfg) if raw_cfg else None
-        set_current_request_cfg(chat_id, op_cfg)
 
         # Crear ejecución (to_thread para no bloquear)
         exec_id = await asyncio.to_thread(fs_crear_ejecucion, chat_id, [activo], origen, opciones_usuario)
@@ -7808,7 +8378,7 @@ async def ejecutar_analisis_desde_app():
         dummy_context = type("DummyContext", (), {"bot": application.bot})()
 
         logging.info(f"[APP] setup normalizado: {op_cfg}")
-        logging.info(f"[APP] payload bruto: {data}")
+        logging.info(f"MTORO1 [APP] payload bruto: {data}")
 
         task = asyncio.create_task(
             ejecutar_recurrente(
