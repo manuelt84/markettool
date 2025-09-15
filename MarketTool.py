@@ -3325,230 +3325,204 @@ def predecir_tendencia_en_tiempo_real(df, temporalidad):
             return "Bajista debil"
     else:
         return "Neutral"
+
+PRIORIDAD_PATRONES = {
+    "Hombro Cabeza Hombro": 5,
+    "Hombro Cabeza Hombro Invertido": 5,
+    "Estrella del Amanecer": 4,
+    "Estrella de la Noche": 4,
+    "Tres Cuervos Negros": 3,
+    "Tres Soldados Blancos": 3,
+    "Bandera Alcista": 3,
+    "Bandera Bajista": 3,
+    "Harami Bajista": 2,
+    "Envolvente Alcista": 2,
+    "Envolvente Bajista": 2,
+    "Martillo": 1,
+    "Martillo Invertido": 1,
+    "Hombre Colgado": 1,
+    "Estrella Fugaz": 1,
+    "Pinzas de Techo": 1,
+    "Pinzas de Suelo": 1,
+}
     
 # Función para detectar patrones de velas japonesas mejorada con Estrella del Amanecer, Estrella de la Noche y Martillo Invertido
 #@profile
-def detectar_patrones_confirmados_velas(df, window):
-    patrones_detectados = {}
+def detectar_patrones_confirmados_velas(df: pd.DataFrame, window: int = 10):
+    """
+    Core mejorado: detecta patrones con confirmación y devuelve
+    [(start_idx, end_idx, nombre_patron), ...] ya filtrados por prioridad.
+    """
+    # Validaciones rápidas
+    cols = {"open", "high", "low", "close"}
+    if not cols.issubset(df.columns):
+        return []
+    if len(df) < 2:
+        return []
 
-    # -------------------- Pinzas --------------------
+    patrones_detectados_dict = {}
+
+    # -------------------- Pinzas / Envolventes / Harami (2 velas) --------------------
     if len(df) >= 2:
+        c0, o0, h0, l0 = df['close'].iloc[-1], df['open'].iloc[-1], df['high'].iloc[-1], df['low'].iloc[-1]
+        c1, o1, h1, l1 = df['close'].iloc[-2], df['open'].iloc[-2], df['high'].iloc[-2], df['low'].iloc[-2]
 
-        # Patrón de Pinzas de Techo (bajista en tendencia alcista)
-        pinzas_techo = (abs(df['high'].iloc[-1] - df['high'].iloc[-2]) <= (df['high'].iloc[-2] - df['low'].iloc[-2]) * 0.05) & \
-                    (df['close'].iloc[-2] > df['open'].iloc[-2]) & \
-                    (df['close'].iloc[-1] < df['open'].iloc[-1])
-        if pinzas_techo:
-            patrones_detectados['Pinzas de Techo'] = True
+        # Pinzas de Techo
+        if (abs(h0 - h1) <= (h1 - l1) * 0.05) and (c1 > o1) and (c0 < o0):
+            patrones_detectados_dict['Pinzas de Techo'] = True
 
-        # Patrón de Pinzas de Suelo (alcista en tendencia bajista)
-        pinzas_suelo = (abs(df['low'].iloc[-1] - df['low'].iloc[-2]) <= (df['high'].iloc[-2] - df['low'].iloc[-2]) * 0.05) & \
-                    (df['close'].iloc[-2] < df['open'].iloc[-2]) & \
-                    (df['close'].iloc[-1] > df['open'].iloc[-1])
-        if pinzas_suelo:
-            patrones_detectados['Pinzas de Suelo'] = True
+        # Pinzas de Suelo
+        if (abs(l0 - l1) <= (h1 - l1) * 0.05) and (c1 < o1) and (c0 > o0):
+            patrones_detectados_dict['Pinzas de Suelo'] = True
 
-        # Patrón de Envolvente Alcista (tendencia bajista)
-        envolvente_alcista = (df['close'].shift(1) < df['open'].shift(1)) & \
-                            (df['open'] < df['close'].shift(1)) & \
-                            (df['close'] > df['open'].shift(1)) & \
-                            (abs(df['close'] - df['open']) > abs(df['close'].shift(1) - df['open'].shift(1)))
-        if envolvente_alcista.iloc[-1]:
-            patrones_detectados['Envolvente Alcista'] = True
+        # Envolvente Alcista
+        envolvente_alcista = (c1 < o1) and (o0 < c1) and (c0 > o1) and (abs(c0 - o0) > abs(c1 - o1))
+        if envolvente_alcista:
+            patrones_detectados_dict['Envolvente Alcista'] = True
 
-        # Patrón de Envolvente Bajista (tendencia alcista)
-        envolvente_bajista = (df['close'].shift(1) > df['open'].shift(1)) & \
-                            (df['open'] > df['close'].shift(1)) & \
-                            (df['close'] < df['open'].shift(1)) & \
-                            (abs(df['close'] - df['open']) > abs(df['close'].shift(1) - df['open'].shift(1)))
-        if envolvente_bajista.iloc[-1]:
-            patrones_detectados['Envolvente Bajista'] = True
+        # Envolvente Bajista
+        envolvente_bajista = (c1 > o1) and (o0 > c1) and (c0 < o1) and (abs(c0 - o0) > abs(c1 - o1))
+        if envolvente_bajista:
+            patrones_detectados_dict['Envolvente Bajista'] = True
 
-        # Patrón de Harami Bajista (tendencia alcista)
-        harami_bajista = (df['close'].shift(1) > df['open'].shift(1)) & \
-                        (df['open'] > df['open'].shift(1)) & \
-                        (df['close'] < df['close'].shift(1)) & \
-                        (abs(df['close'] - df['open']) < abs(df['close'].shift(1) - df['open'].shift(1)))
-        if harami_bajista.iloc[-1]:
-            patrones_detectados['Harami Bajista'] = True
+        # Harami Bajista
+        harami_bajista = (c1 > o1) and (o0 > o1) and (c0 < c1) and (abs(c0 - o0) < abs(c1 - o1))
+        if harami_bajista:
+            patrones_detectados_dict['Harami Bajista'] = True
 
-    # -------------------- Patrón de 3 velas --------------------
+    # -------------------- Patrones de 3 velas --------------------
     if len(df) >= 3:
-        # Patrón de Tres Soldados Blancos (alcista)
-        tres_soldados_blancos = (
-            (df['close'].iloc[-3] > df['open'].iloc[-3]) and
-            (df['close'].iloc[-2] > df['open'].iloc[-2]) and
-            (df['close'].iloc[-1] > df['open'].iloc[-1]) and
-            (df['open'].iloc[-2] >= df['open'].iloc[-3]) and (df['open'].iloc[-2] <= df['close'].iloc[-3]) and
-            (df['open'].iloc[-1] >= df['open'].iloc[-2]) and (df['open'].iloc[-1] <= df['close'].iloc[-2]) and
-            (df['close'].iloc[-2] > df['close'].iloc[-3]) and
-            (df['close'].iloc[-1] > df['close'].iloc[-2]) and
-            (df['close'].iloc[-3] - df['low'].iloc[-3]) < (df['close'].iloc[-3] - df['open'].iloc[-3]) * 0.5 and
-            (df['close'].iloc[-2] - df['low'].iloc[-2]) < (df['close'].iloc[-2] - df['open'].iloc[-2]) * 0.5 and
-            (df['close'].iloc[-1] - df['low'].iloc[-1]) < (df['close'].iloc[-1] - df['open'].iloc[-1]) * 0.5
-        )
-        if tres_soldados_blancos:
-            patrones_detectados['Tres Soldados Blancos'] = True
+        c2, o2, h2, l2 = df['close'].iloc[-3], df['open'].iloc[-3], df['high'].iloc[-3], df['low'].iloc[-3]
+        c1, o1, h1, l1 = df['close'].iloc[-2], df['open'].iloc[-2], df['high'].iloc[-2], df['low'].iloc[-2]
+        c0, o0, h0, l0 = df['close'].iloc[-1], df['open'].iloc[-1], df['high'].iloc[-1], df['low'].iloc[-1]
 
-        # Patrón de Tres Cuervos Negros (bajista)
-        tres_cuervos_negros = (
-            (df['close'].iloc[-3] < df['open'].iloc[-3]) and
-            (df['close'].iloc[-2] < df['open'].iloc[-2]) and
-            (df['close'].iloc[-1] < df['open'].iloc[-1]) and
-            (df['open'].iloc[-2] <= df['open'].iloc[-3]) and (df['open'].iloc[-2] >= df['close'].iloc[-3]) and
-            (df['open'].iloc[-1] <= df['open'].iloc[-2]) and (df['open'].iloc[-1] >= df['close'].iloc[-2]) and
-            (df['close'].iloc[-2] < df['close'].iloc[-3]) and
-            (df['close'].iloc[-1] < df['close'].iloc[-2]) and
-            (df['high'].iloc[-3] - df['close'].iloc[-3]) < (df['open'].iloc[-3] - df['close'].iloc[-3]) * 0.5 and
-            (df['high'].iloc[-2] - df['close'].iloc[-2]) < (df['open'].iloc[-2] - df['close'].iloc[-2]) * 0.5 and
-            (df['high'].iloc[-1] - df['close'].iloc[-1]) < (df['open'].iloc[-1] - df['close'].iloc[-1]) * 0.5
+        # Tres Soldados Blancos
+        tsb = (
+            (c2 > o2) and (c1 > o1) and (c0 > o0) and
+            (o1 >= o2) and (o1 <= c2) and
+            (o0 >= o1) and (o0 <= c1) and
+            (c1 > c2) and (c0 > c1) and
+            (c2 - l2) < (c2 - o2) * 0.5 and
+            (c1 - l1) < (c1 - o1) * 0.5 and
+            (c0 - l0) < (c0 - o0) * 0.5
         )
-        if tres_cuervos_negros:
-            patrones_detectados['Tres Cuervos Negros'] = True
+        if tsb:
+            patrones_detectados_dict['Tres Soldados Blancos'] = True
+
+        # Tres Cuervos Negros
+        tcn = (
+            (c2 < o2) and (c1 < o1) and (c0 < o0) and
+            (o1 <= o2) and (o1 >= c2) and
+            (o0 <= o1) and (o0 >= c1) and
+            (c1 < c2) and (c0 < c1) and
+            (h2 - c2) < (o2 - c2) * 0.5 and
+            (h1 - c1) < (o1 - c1) * 0.5 and
+            (h0 - c0) < (o0 - c0) * 0.5
+        )
+        if tcn:
+            patrones_detectados_dict['Tres Cuervos Negros'] = True
 
         # Estrella del Amanecer
-        if (df['close'].shift(2).iloc[-1] < df['open'].shift(2).iloc[-1]) and \
-           (abs(df['close'].shift(1).iloc[-1] - df['open'].shift(1).iloc[-1]) <= (df['high'].shift(1).iloc[-1] - df['low'].shift(1).iloc[-1]) * 0.3) and \
-           (df['close'].iloc[-1] > df['open'].iloc[-1]) and \
-           (df['close'].iloc[-1] > (df['open'].shift(2).iloc[-1] + df['close'].shift(2).iloc[-1]) / 2):
-            patrones_detectados['Estrella del Amanecer'] = True
+        ea = (
+            (c2 < o2) and
+            (abs(c1 - o1) <= (h1 - l1) * 0.3) and
+            (c0 > o0) and
+            (c0 > (o2 + c2) / 2.0)
+        )
+        if ea:
+            patrones_detectados_dict['Estrella del Amanecer'] = True
 
         # Estrella de la Noche
-        if (df['close'].shift(2).iloc[-1] > df['open'].shift(2).iloc[-1]) and \
-           (abs(df['close'].shift(1).iloc[-1] - df['open'].shift(1).iloc[-1]) <= (df['high'].shift(1).iloc[-1] - df['low'].shift(1).iloc[-1]) * 0.3) and \
-           (df['close'].iloc[-1] < df['open'].iloc[-1]) and \
-           (df['close'].iloc[-1] < (df['open'].shift(2).iloc[-1] + df['close'].shift(2).iloc[-1]) / 2):
-            patrones_detectados['Estrella de la Noche'] = True
+        enoche = (
+            (c2 > o2) and
+            (abs(c1 - o1) <= (h1 - l1) * 0.3) and
+            (c0 < o0) and
+            (c0 < (o2 + c2) / 2.0)
+        )
+        if enoche:
+            patrones_detectados_dict['Estrella de la Noche'] = True
 
-    # -------------------- Martillo --------------------
+    # -------------------- Martillo / Colgado / Invertidos (2+1 confirmación) --------------------
     if len(df) >= 5:
-        # Patrón de Martillo (alcista en tendencia bajista)
-        martillo = (df['close'].iloc[-2] > df['open'].iloc[-2]) & \
-                ((df['low'].iloc[-2] < df['open'].iloc[-2]) & (df['low'].iloc[-2] < df['close'].iloc[-2])) & \
-                ((df['close'].iloc[-2] - df['low'].iloc[-2]) >= (df['high'].iloc[-2] - df['close'].iloc[-2]) * 2) & \
-                ((df['high'].iloc[-2] - df['close'].iloc[-2]) <= (df['close'].iloc[-2] - df['low'].iloc[-2]) * 0.3)
+        c1, o1, h1, l1 = df['close'].iloc[-2], df['open'].iloc[-2], df['high'].iloc[-2], df['low'].iloc[-2]
+        c0, o0 = df['close'].iloc[-1], df['open'].iloc[-1]
 
-        confirmacion_martillo = df['close'].iloc[-1] > df['open'].iloc[-1]
+        cuerpo = abs(c1 - o1)
+        if cuerpo > 0:
+            mecha_sup = h1 - max(c1, o1)
+            mecha_inf = min(c1, o1) - l1
 
-        if martillo and confirmacion_martillo:
-            patrones_detectados['Martillo'] = True
+            # Martillo (confirmación alcista)
+            if (mecha_inf >= cuerpo * 2) and (mecha_sup <= cuerpo * 0.3) and (c0 > o0):
+                patrones_detectados_dict['Martillo'] = True
 
-        # Patrón de Martillo Invertido (alcista en tendencia bajista)
-        martillo_invertido = (df['close'].iloc[-2] > df['open'].iloc[-2]) & \
-                            ((df['high'].iloc[-2] > df['open'].iloc[-2]) & (df['high'].iloc[-2] > df['close'].iloc[-2])) & \
-                            ((df['high'].iloc[-2] - df['close'].iloc[-2]) >= (df['close'].iloc[-2] - df['low'].iloc[-2]) * 2) & \
-                            ((df['close'].iloc[-2] - df['low'].iloc[-2]) <= (df['high'].iloc[-2] - df['close'].iloc[-2]) * 0.3)
+            # Martillo Invertido (confirmación alcista)
+            if (mecha_sup >= cuerpo * 2) and (mecha_inf <= cuerpo * 0.3) and (c0 > o0):
+                patrones_detectados_dict['Martillo Invertido'] = True
 
-        confirmacion_martillo_inv = df['close'].iloc[-1] > df['open'].iloc[-1]
+            # Hombre Colgado (confirmación bajista)
+            if (mecha_inf >= cuerpo * 2) and (mecha_sup <= cuerpo * 0.3) and (c1 < o1) and (c0 < o0):
+                patrones_detectados_dict['Hombre Colgado'] = True
 
-        if martillo_invertido and confirmacion_martillo_inv:
-            patrones_detectados['Martillo Invertido'] = True
+            # Estrella Fugaz (confirmación bajista)
+            if (mecha_sup >= cuerpo * 2) and (mecha_inf <= cuerpo * 0.3) and (c1 < o1) and (c0 < o0):
+                patrones_detectados_dict['Estrella Fugaz'] = True
 
-        # Patrón de Hombre Colgado (bajista en tendencia alcista)
-        hombre_colgado = (df['close'].iloc[-2] < df['open'].iloc[-2]) & \
-                        ((df['low'].iloc[-2] < df['open'].iloc[-2]) & (df['low'].iloc[-2] < df['close'].iloc[-2])) & \
-                        ((df['close'].iloc[-2] - df['low'].iloc[-2]) >= (df['high'].iloc[-2] - df['close'].iloc[-2]) * 2) & \
-                        ((df['high'].iloc[-2] - df['close'].iloc[-2]) <= (df['close'].iloc[-2] - df['low'].iloc[-2]) * 0.3)
-
-        confirmacion_colgado = df['close'].iloc[-1] < df['open'].iloc[-1]
-
-        if hombre_colgado and confirmacion_colgado:
-            patrones_detectados['Hombre Colgado'] = True
-
-        # Patrón de Estrella Fugaz (bajista en tendencia alcista)
-        estrella_fugaz = (df['close'].iloc[-2] < df['open'].iloc[-2]) & \
-                        ((df['high'].iloc[-2] > df['open'].iloc[-2]) & (df['high'].iloc[-2] > df['close'].iloc[-2])) & \
-                        ((df['high'].iloc[-2] - df['close'].iloc[-2]) >= (df['close'].iloc[-2] - df['low'].iloc[-2]) * 2) & \
-                        ((df['close'].iloc[-2] - df['low'].iloc[-2]) <= (df['high'].iloc[-2] - df['close'].iloc[-2]) * 0.3)
-
-        confirmacion_estrella = df['close'].iloc[-1] < df['open'].iloc[-1]
-
-        if estrella_fugaz and confirmacion_estrella:
-            patrones_detectados['Estrella Fugaz'] = True
-
-
-    # -------------------- Hombro Cabeza Hombro --------------------
+    # -------------------- Hombro-Cabeza-Hombro (7 velas) --------------------
     if len(df) >= 7:
         highs = df['high'].iloc[-7:].values
-        o = df['open'].iloc[-7:].values
-        c = df['close'].iloc[-7:].values
-        l = df['low'].iloc[-7:].values
+        lows  = df['low'].iloc[-7:].values
+        o     = df['open'].iloc[-7:].values
+        c     = df['close'].iloc[-7:].values
 
-        h1, h2, h3, cabeza, h4, h5, h6 = highs
-
+        # HCH
         i_cabeza = np.argmax(highs)
-        hombros_simetricos = abs(h1 - h6) / max(h1, h6, 1e-6) < 0.15 and abs(h2 - h5) / max(h2, h5, 1e-6) < 0.15
-        cuerpo = abs(c[3] - o[3])
-        mecha_sup = highs[3] - max(c[3], o[3])
-        mecha_inf = min(c[3], o[3]) - l[3]
-        cabeza_definida = cuerpo > 0 and mecha_sup < cuerpo * 1.5 and mecha_inf < cuerpo * 1.5
+        h1, h2, h3, cabeza, h4, h5, h6 = highs
+        hombros_simetricos = (abs(h1 - h6) / max(h1, h6, 1e-6) < 0.15) and (abs(h2 - h5) / max(h2, h5, 1e-6) < 0.15)
+        cuerpo_cabeza = abs(c[3] - o[3])
+        mecha_sup_cabeza = highs[3] - max(c[3], o[3])
+        mecha_inf_cabeza = min(c[3], o[3]) - lows[3]
+        cabeza_definida = (cuerpo_cabeza > 0) and (mecha_sup_cabeza < cuerpo_cabeza * 1.5) and (mecha_inf_cabeza < cuerpo_cabeza * 1.5)
+        if (i_cabeza == 3) and hombros_simetricos and (cabeza > h2) and (h4 < cabeza) and cabeza_definida:
+            patrones_detectados_dict['Hombro Cabeza Hombro'] = True
 
-        if i_cabeza == 3 and hombros_simetricos and cabeza > h2 and h4 < cabeza and cabeza_definida:
-            patrones_detectados['Hombro Cabeza Hombro'] = True
-
-        lows = df['low'].iloc[-7:].values
-        l1, l2, l3, cabeza_inv, l4, l5, l6 = lows
+        # HCH Invertido
         i_cabeza_inv = np.argmin(lows)
-        hombros_simetricos_inv = abs(l1 - l6) / max(l1, l6, 1e-6) < 0.15 and abs(l2 - l5) / max(l2, l5, 1e-6) < 0.15
-        if i_cabeza_inv == 3 and hombros_simetricos_inv and cabeza_inv < l2 and l4 > cabeza_inv:
-            patrones_detectados['Hombro Cabeza Hombro Invertido'] = True
-    
-    # -------------------- Banderas --------------------
-    if len(df) >= window: 
+        l1, l2, l3, cabeza_inv, l4, l5, l6 = lows
+        hombros_simetricos_inv = (abs(l1 - l6) / max(l1, l6, 1e-6) < 0.15) and (abs(l2 - l5) / max(l2, l5, 1e-6) < 0.15)
+        if (i_cabeza_inv == 3) and hombros_simetricos_inv and (cabeza_inv < l2) and (l4 > cabeza_inv):
+            patrones_detectados_dict['Hombro Cabeza Hombro Invertido'] = True
 
-        # Patrón de Bandera Alcista
+    # -------------------- Banderas (rolling window) --------------------
+    if len(df) >= window:
         bandera_alcista = (df['high'] > df['high'].rolling(window).max().shift(1)) & \
-                        (df['low'] > df['low'].rolling(window).min().shift(1)) & \
-                        (df['close'] > df['open'])
-        if bandera_alcista.iloc[-1]:
-            patrones_detectados['Bandera Alcista'] = True
+                          (df['low']  > df['low'].rolling(window).min().shift(1))  & \
+                          (df['close'] > df['open'])
+        if bool(bandera_alcista.iloc[-1]):
+            patrones_detectados_dict['Bandera Alcista'] = True
 
-        # Patrón de Bandera Bajista
-        bandera_bajista = (df['low'] < df['low'].rolling(window).min().shift(1)) & \
-                        (df['high'] < df['high'].rolling(window).max().shift(1)) & \
-                        (df['close'] < df['open'])
-        if bandera_bajista.iloc[-1]:
-            patrones_detectados['Bandera Bajista'] = True
+        bandera_bajista = (df['low']  < df['low'].rolling(window).min().shift(1)) & \
+                          (df['high'] < df['high'].rolling(window).max().shift(1)) & \
+                          (df['close'] < df['open'])
+        if bool(bandera_bajista.iloc[-1]):
+            patrones_detectados_dict['Bandera Bajista'] = True
 
-    patrones_encontrados = []
-    for patron in patrones_detectados:
-        patrones_encontrados.append((len(df) - window, len(df), patron))
+    # --- Normaliza a lista de (start, end, nombre) y resuelve conflictos por prioridad ---
+    patrones_encontrados = [(len(df) - window, len(df), nombre) for nombre in patrones_detectados_dict.keys()]
 
-
-    # Aplicar resolución de conflictos
     patrones_filtrados = []
-    for idx, (start1, end1, patron1) in enumerate(patrones_encontrados):
-        solapado = False
-        for jdx, (start2, end2, patron2) in enumerate(patrones_filtrados):
-            if max(start1, start2) <= min(end1, end2):  # solapan
-                prioridad = {
-                    "Hombro Cabeza Hombro": 5,
-                    "Hombro Cabeza Hombro Invertido": 5,
-                    "Estrella del Amanecer": 4,
-                    "Estrella de la Noche": 4,
-                    "Tres Cuervos Negros": 3,
-                    "Tres Soldados Blancos": 3,
-                    "Harami Bajista": 2,
-                    "Envolvente Alcista": 2,
-                    "Envolvente Bajista": 2,
-                    "Martillo": 1,
-                    "Martillo Invertido": 1,
-                    "Hombre Colgado": 1,
-                    "Estrella Fugaz": 1,
-                    "Pinzas de Techo": 1,
-                    "Pinzas de Suelo": 1,
-                    "Bandera Alcista": 3,
-                    "Bandera Bajista": 3
-                }
-                if prioridad.get(patron1, 0) > prioridad.get(patron2, 0):
-                    patrones_filtrados[jdx] = (start1, end1, patron1)
-                solapado = True
+    for start1, end1, patron1 in patrones_encontrados:
+        solapa = False
+        for j, (start2, end2, patron2) in enumerate(patrones_filtrados):
+            if max(start1, start2) <= min(end1, end2):  # hay solape
+                if PRIORIDAD_PATRONES.get(patron1, 0) > PRIORIDAD_PATRONES.get(patron2, 0):
+                    patrones_filtrados[j] = (start1, end1, patron1)
+                solapa = True
                 break
-        if not solapado:
+        if not solapa:
             patrones_filtrados.append((start1, end1, patron1))
 
     return patrones_filtrados
-
 
 # Función para predicción con ARIMA
 #@profile
