@@ -66,15 +66,13 @@ import cv2
 import socket
 import torch
 import uuid
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Optional, Callable
 from datetime import timedelta, date, datetime, UTC
 from textwrap import wrap
 from functools import partial
 import math
 import statistics
 from collections.abc import Sequence
-from typing import Optional
-
 
 timezone_country = pytz.timezone('America/Santiago')
 user_states = {}
@@ -3345,7 +3343,197 @@ PRIORIDAD_PATRONES = {
     "Pinzas de Techo": 1,
     "Pinzas de Suelo": 1,
 }
+
+#MTORO Antiguo (detecta mas patrones porque no tiene confirmación)
+#@profile
+def detectar_patrones_velas(df, window):
+    patrones_detectados = {}
+
+    # -------------------- Hombro Cabeza Hombro --------------------
+    if len(df) >= 7:
+        highs = df['high'].iloc[-7:].values
+        o = df['open'].iloc[-7:].values
+        c = df['close'].iloc[-7:].values
+        l = df['low'].iloc[-7:].values
+
+        h1, h2, h3, cabeza, h4, h5, h6 = highs
+
+        i_cabeza = np.argmax(highs)
+        hombros_simetricos = abs(h1 - h6) / max(h1, h6, 1e-6) < 0.15 and abs(h2 - h5) / max(h2, h5, 1e-6) < 0.15
+        cuerpo = abs(c[3] - o[3])
+        mecha_sup = highs[3] - max(c[3], o[3])
+        mecha_inf = min(c[3], o[3]) - l[3]
+        cabeza_definida = cuerpo > 0 and mecha_sup < cuerpo * 1.5 and mecha_inf < cuerpo * 1.5
+
+        if i_cabeza == 3 and hombros_simetricos and cabeza > h2 and h4 < cabeza and cabeza_definida:
+            patrones_detectados['Hombro Cabeza Hombro'] = True
+
+        lows = df['low'].iloc[-7:].values
+        l1, l2, l3, cabeza_inv, l4, l5, l6 = lows
+        i_cabeza_inv = np.argmin(lows)
+        hombros_simetricos_inv = abs(l1 - l6) / max(l1, l6, 1e-6) < 0.15 and abs(l2 - l5) / max(l2, l5, 1e-6) < 0.15
+        if i_cabeza_inv == 3 and hombros_simetricos_inv and cabeza_inv < l2 and l4 > cabeza_inv:
+            patrones_detectados['Hombro Cabeza Hombro Invertido'] = True
+
     
+    # -------------------- Conflicto con patrones mayores --------------------
+    conflicto_mayor = any(p in patrones_detectados for p in ["Hombro Cabeza Hombro", "Hombro Cabeza Hombro Invertido"])
+
+    # -------------------- Martillo --------------------
+    if not conflicto_mayor and len(df) >= 5:
+        # Patrón de Martillo (alcista en tendencia bajista)
+        martillo = (df['close'].iloc[-2] > df['open'].iloc[-2]) & \
+                ((df['low'].iloc[-2] < df['open'].iloc[-2]) & (df['low'].iloc[-2] < df['close'].iloc[-2])) & \
+                ((df['close'].iloc[-2] - df['low'].iloc[-2]) >= (df['high'].iloc[-2] - df['close'].iloc[-2]) * 2) & \
+                ((df['high'].iloc[-2] - df['close'].iloc[-2]) <= (df['close'].iloc[-2] - df['low'].iloc[-2]) * 0.3)
+
+        confirmacion_martillo = df['close'].iloc[-1] > df['open'].iloc[-1]
+
+        if martillo and confirmacion_martillo:
+            patrones_detectados['Martillo'] = True
+
+        # Patrón de Martillo Invertido (alcista en tendencia bajista)
+        martillo_invertido = (df['close'].iloc[-2] > df['open'].iloc[-2]) & \
+                            ((df['high'].iloc[-2] > df['open'].iloc[-2]) & (df['high'].iloc[-2] > df['close'].iloc[-2])) & \
+                            ((df['high'].iloc[-2] - df['close'].iloc[-2]) >= (df['close'].iloc[-2] - df['low'].iloc[-2]) * 2) & \
+                            ((df['close'].iloc[-2] - df['low'].iloc[-2]) <= (df['high'].iloc[-2] - df['close'].iloc[-2]) * 0.3)
+
+        confirmacion_martillo_inv = df['close'].iloc[-1] > df['open'].iloc[-1]
+
+        if martillo_invertido and confirmacion_martillo_inv:
+            patrones_detectados['Martillo Invertido'] = True
+
+        # Patrón de Hombre Colgado (bajista en tendencia alcista)
+        hombre_colgado = (df['close'].iloc[-2] < df['open'].iloc[-2]) & \
+                        ((df['low'].iloc[-2] < df['open'].iloc[-2]) & (df['low'].iloc[-2] < df['close'].iloc[-2])) & \
+                        ((df['close'].iloc[-2] - df['low'].iloc[-2]) >= (df['high'].iloc[-2] - df['close'].iloc[-2]) * 2) & \
+                        ((df['high'].iloc[-2] - df['close'].iloc[-2]) <= (df['close'].iloc[-2] - df['low'].iloc[-2]) * 0.3)
+
+        confirmacion_colgado = df['close'].iloc[-1] < df['open'].iloc[-1]
+
+        if hombre_colgado and confirmacion_colgado:
+            patrones_detectados['Hombre Colgado'] = True
+
+        # Patrón de Estrella Fugaz (bajista en tendencia alcista)
+        estrella_fugaz = (df['close'].iloc[-2] < df['open'].iloc[-2]) & \
+                        ((df['high'].iloc[-2] > df['open'].iloc[-2]) & (df['high'].iloc[-2] > df['close'].iloc[-2])) & \
+                        ((df['high'].iloc[-2] - df['close'].iloc[-2]) >= (df['close'].iloc[-2] - df['low'].iloc[-2]) * 2) & \
+                        ((df['close'].iloc[-2] - df['low'].iloc[-2]) <= (df['high'].iloc[-2] - df['close'].iloc[-2]) * 0.3)
+
+        confirmacion_estrella = df['close'].iloc[-1] < df['open'].iloc[-1]
+
+        if estrella_fugaz and confirmacion_estrella:
+            patrones_detectados['Estrella Fugaz'] = True
+
+
+    # -------------------- Patrón de 3 velas --------------------
+    if not conflicto_mayor and len(df) >= 3:
+        # Patrón de Tres Soldados Blancos (alcista)
+        tres_soldados_blancos = (
+            (df['close'].iloc[-3] > df['open'].iloc[-3]) and
+            (df['close'].iloc[-2] > df['open'].iloc[-2]) and
+            (df['close'].iloc[-1] > df['open'].iloc[-1]) and
+            (df['open'].iloc[-2] >= df['open'].iloc[-3]) and (df['open'].iloc[-2] <= df['close'].iloc[-3]) and
+            (df['open'].iloc[-1] >= df['open'].iloc[-2]) and (df['open'].iloc[-1] <= df['close'].iloc[-2]) and
+            (df['close'].iloc[-2] > df['close'].iloc[-3]) and
+            (df['close'].iloc[-1] > df['close'].iloc[-2]) and
+            (df['close'].iloc[-3] - df['low'].iloc[-3]) < (df['close'].iloc[-3] - df['open'].iloc[-3]) * 0.5 and
+            (df['close'].iloc[-2] - df['low'].iloc[-2]) < (df['close'].iloc[-2] - df['open'].iloc[-2]) * 0.5 and
+            (df['close'].iloc[-1] - df['low'].iloc[-1]) < (df['close'].iloc[-1] - df['open'].iloc[-1]) * 0.5
+        )
+        if tres_soldados_blancos:
+            patrones_detectados['Tres Soldados Blancos'] = True
+
+        # Patrón de Tres Cuervos Negros (bajista)
+        tres_cuervos_negros = (
+            (df['close'].iloc[-3] < df['open'].iloc[-3]) and
+            (df['close'].iloc[-2] < df['open'].iloc[-2]) and
+            (df['close'].iloc[-1] < df['open'].iloc[-1]) and
+            (df['open'].iloc[-2] <= df['open'].iloc[-3]) and (df['open'].iloc[-2] >= df['close'].iloc[-3]) and
+            (df['open'].iloc[-1] <= df['open'].iloc[-2]) and (df['open'].iloc[-1] >= df['close'].iloc[-2]) and
+            (df['close'].iloc[-2] < df['close'].iloc[-3]) and
+            (df['close'].iloc[-1] < df['close'].iloc[-2]) and
+            (df['high'].iloc[-3] - df['close'].iloc[-3]) < (df['open'].iloc[-3] - df['close'].iloc[-3]) * 0.5 and
+            (df['high'].iloc[-2] - df['close'].iloc[-2]) < (df['open'].iloc[-2] - df['close'].iloc[-2]) * 0.5 and
+            (df['high'].iloc[-1] - df['close'].iloc[-1]) < (df['open'].iloc[-1] - df['close'].iloc[-1]) * 0.5
+        )
+        if tres_cuervos_negros:
+            patrones_detectados['Tres Cuervos Negros'] = True
+
+        # Estrella del Amanecer
+        if (df['close'].shift(2).iloc[-1] < df['open'].shift(2).iloc[-1]) and \
+           (abs(df['close'].shift(1).iloc[-1] - df['open'].shift(1).iloc[-1]) <= (df['high'].shift(1).iloc[-1] - df['low'].shift(1).iloc[-1]) * 0.3) and \
+           (df['close'].iloc[-1] > df['open'].iloc[-1]) and \
+           (df['close'].iloc[-1] > (df['open'].shift(2).iloc[-1] + df['close'].shift(2).iloc[-1]) / 2):
+            patrones_detectados['Estrella del Amanecer'] = True
+
+        # Estrella de la Noche
+        if (df['close'].shift(2).iloc[-1] > df['open'].shift(2).iloc[-1]) and \
+           (abs(df['close'].shift(1).iloc[-1] - df['open'].shift(1).iloc[-1]) <= (df['high'].shift(1).iloc[-1] - df['low'].shift(1).iloc[-1]) * 0.3) and \
+           (df['close'].iloc[-1] < df['open'].iloc[-1]) and \
+           (df['close'].iloc[-1] < (df['open'].shift(2).iloc[-1] + df['close'].shift(2).iloc[-1]) / 2):
+            patrones_detectados['Estrella de la Noche'] = True
+
+    # -------------------- Pinzas --------------------
+    if not conflicto_mayor and len(df) >= 2:
+
+        # Patrón de Pinzas de Techo (bajista en tendencia alcista)
+        pinzas_techo = (abs(df['high'].iloc[-1] - df['high'].iloc[-2]) <= (df['high'].iloc[-2] - df['low'].iloc[-2]) * 0.05) & \
+                    (df['close'].iloc[-2] > df['open'].iloc[-2]) & \
+                    (df['close'].iloc[-1] < df['open'].iloc[-1])
+        if pinzas_techo:
+            patrones_detectados['Pinzas de Techo'] = True
+
+        # Patrón de Pinzas de Suelo (alcista en tendencia bajista)
+        pinzas_suelo = (abs(df['low'].iloc[-1] - df['low'].iloc[-2]) <= (df['high'].iloc[-2] - df['low'].iloc[-2]) * 0.05) & \
+                    (df['close'].iloc[-2] < df['open'].iloc[-2]) & \
+                    (df['close'].iloc[-1] > df['open'].iloc[-1])
+        if pinzas_suelo:
+            patrones_detectados['Pinzas de Suelo'] = True
+
+        # Patrón de Envolvente Alcista (tendencia bajista)
+        envolvente_alcista = (df['close'].shift(1) < df['open'].shift(1)) & \
+                            (df['open'] < df['close'].shift(1)) & \
+                            (df['close'] > df['open'].shift(1)) & \
+                            (abs(df['close'] - df['open']) > abs(df['close'].shift(1) - df['open'].shift(1)))
+        if envolvente_alcista.iloc[-1]:
+            patrones_detectados['Envolvente Alcista'] = True
+
+        # Patrón de Envolvente Bajista (tendencia alcista)
+        envolvente_bajista = (df['close'].shift(1) > df['open'].shift(1)) & \
+                            (df['open'] > df['close'].shift(1)) & \
+                            (df['close'] < df['open'].shift(1)) & \
+                            (abs(df['close'] - df['open']) > abs(df['close'].shift(1) - df['open'].shift(1)))
+        if envolvente_bajista.iloc[-1]:
+            patrones_detectados['Envolvente Bajista'] = True
+
+        # Patrón de Harami Bajista (tendencia alcista)
+        harami_bajista = (df['close'].shift(1) > df['open'].shift(1)) & \
+                        (df['open'] > df['open'].shift(1)) & \
+                        (df['close'] < df['close'].shift(1)) & \
+                        (abs(df['close'] - df['open']) < abs(df['close'].shift(1) - df['open'].shift(1)))
+        if harami_bajista.iloc[-1]:
+            patrones_detectados['Harami Bajista'] = True
+
+    # -------------------- Banderas --------------------
+    if len(df) >= window: 
+
+        # Patrón de Bandera Alcista
+        bandera_alcista = (df['high'] > df['high'].rolling(window).max().shift(1)) & \
+                        (df['low'] > df['low'].rolling(window).min().shift(1)) & \
+                        (df['close'] > df['open'])
+        if bandera_alcista.iloc[-1]:
+            patrones_detectados['Bandera Alcista'] = True
+
+        # Patrón de Bandera Bajista
+        bandera_bajista = (df['low'] < df['low'].rolling(window).min().shift(1)) & \
+                        (df['high'] < df['high'].rolling(window).max().shift(1)) & \
+                        (df['close'] < df['open'])
+        if bandera_bajista.iloc[-1]:
+            patrones_detectados['Bandera Bajista'] = True
+
+    return patrones_detectados
+
 # Función para detectar patrones de velas japonesas mejorada con Estrella del Amanecer, Estrella de la Noche y Martillo Invertido
 #@profile
 def detectar_patrones_confirmados_velas(df: pd.DataFrame, window: int = 10):
@@ -4315,6 +4503,298 @@ def calc_tp_sl_venta(entry, atr, mult=1.5):
         return None, None
     return tp, sl
 
+def calc_tp_sl_compra_asym(entry: float, atr: float, tp_mult: float, sl_mult: float):
+    if not (_finite(entry) and _finite(atr)):
+        return None, None
+    tp = entry + atr * tp_mult
+    sl = entry - atr * sl_mult
+    if not (sl < entry < tp):
+        return None, None
+    return tp, sl
+
+def calc_tp_sl_venta_asym(entry: float, atr: float, tp_mult: float, sl_mult: float):
+    if not (_finite(entry) and _finite(atr)):
+        return None, None
+    tp = entry - atr * tp_mult
+    sl = entry + atr * sl_mult
+    if not (tp < entry < sl):
+        return None, None
+    return tp, sl
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers para múltiples entradas con rango dinámico, niveles confirmados y RRR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _finite(x) -> bool:
+    try:
+        return x is not None and math.isfinite(float(x))
+    except Exception:
+        return False
+
+def _rrr(entry: float, tp: float, sl: float, side: str) -> Optional[float]:
+    """Risk-Reward Ratio."""
+    if not (_finite(entry) and _finite(tp) and _finite(sl)):
+        return None
+    if side == "long":
+        risk = entry - sl
+        reward = tp - entry
+    else:
+        risk = sl - entry
+        reward = entry - tp
+    if risk <= 0 or reward <= 0:
+        return None
+    return reward / risk
+
+def _add_entry(
+    entries: list[dict],
+    *,
+    side: str,                       # "long" | "short"
+    entry: float,
+    atr: float,
+    mult_tp_sl,                      # float  ó  (tp_mult, sl_mult)
+    make_tp_sl: Callable[..., tuple[Optional[float], Optional[float]]],
+    basado_en: str,
+    precio_actual: float,
+    niveles: dict,
+    rango_dinamico: Iterable[Optional[float]] = (None, None),
+    min_rrr: float = 1.2
+):
+    """Calcula TP/SL, RRR y agrega la entrada si pasa validaciones."""
+    if not (_finite(entry) and _finite(atr) and atr > 0):
+        logging.info(" - DESCARTADA: entry/ATR no finitos")
+        return
+
+    # Soportar multiplicadores asimétricos (tp_mult, sl_mult)
+    if isinstance(mult_tp_sl, (tuple, list)) and len(mult_tp_sl) == 2:
+        tp_mult, sl_mult = float(mult_tp_sl[0]), float(mult_tp_sl[1])
+        if side == "long":
+            tp, sl = calc_tp_sl_compra_asym(entry, atr, tp_mult, sl_mult)
+        else:
+            tp, sl = calc_tp_sl_venta_asym(entry, atr, tp_mult, sl_mult)
+    else:
+        # Compat con tus calc_tp_sl_* (simétricas)
+        tp, sl = make_tp_sl(entry, atr, mult_tp_sl)
+
+    if not (_finite(tp) and _finite(sl)):
+        logging.info(f" - DESCARTADA: tp/sl inválidos (entry={entry:.6f}, atr={atr:.6f})")
+        return
+
+    if side == "long" and not (sl < entry < tp):
+        logging.info(" - DESCARTADA: no cumple sl<entry<tp (long)")
+        return
+    if side == "short" and not (tp < entry < sl):
+        logging.info(" - DESCARTADA: no cumple tp<entry<sl (short)")
+        return
+
+    rrr = _rrr(entry, tp, sl, side)
+    if rrr is None or rrr < min_rrr:
+        logging.info(f" - DESCARTADA: RRR={rrr if rrr is not None else 'None'} < min_rrr={min_rrr}")
+        return
+
+    # Score: distancia al precio actual en unidades de ATR (menor = mejor)
+    try:
+        lo, hi = rango_dinamico
+    except Exception:
+        lo, hi = None, None
+    score = abs(entry - (precio_actual or entry)) / (atr or 1e-9)
+    if _finite(lo) and _finite(hi):
+        # penaliza si “se sale” del rango en estrategias de rango
+        if side == "long" and entry > hi: score += 1.0
+        if side == "short" and entry < lo: score += 1.0
+
+    entries.append({
+        "side": side,
+        "basado_en": basado_en,
+        "precio_entrada": float(entry),
+        "take_profit": float(tp),
+        "stop_loss": float(sl),
+        "rrr": float(rrr),
+        "score": float(score),
+        "meta": {
+            "atr": float(atr),
+            "precio_actual": float(precio_actual),
+            "rango_dinamico": [lo, hi] if (_finite(lo) and _finite(hi)) else None,
+            "niveles": {
+                "s1": niveles.get("soporte_nivel_1"),
+                "s2": niveles.get("soporte_nivel_2"),
+                "r1": niveles.get("resistencia_nivel_1"),
+                "r2": niveles.get("resistencia_nivel_2"),
+            }
+        }
+    })
+    logging.info(f" + AGREGADA {side.upper()} [{basado_en}] entry={entry:.6f} tp={tp:.6f} sl={sl:.6f} RRR={rrr:.3f} score={score:.3f}")
+
+
+def generar_entradas_multiples(
+    *,
+    precio_actual: float,
+    ATR: float | None,
+    niveles: dict,
+    tipo_operacion: str,
+    en_rango: dict,
+    prob_general: float | None,
+    bollinger_upper: float | None = None,
+    bollinger_lower: float | None = None,
+    señales_compra: set[str],
+    señales_venta: set[str],
+    # --- parámetros tunables (ahora asimétricos por defecto) ---
+    mult_mid=(1.8, 1.2),
+    mult_pullback_s1=(2.0, 1.2),
+    mult_pullback_s2=(2.2, 1.2),
+    mult_pullback_r1=(2.0, 1.2),
+    mult_pullback_r2=(2.2, 1.2),
+    mult_breakout=(1.6, 1.1),
+    mult_scale_hi=(1.6, 1.1),
+    mult_scale_lo=(2.0, 1.3),
+    breakout_offset_atr=0.2,
+    scale_offset_atr=0.5,
+    boll_offset_atr=0.1,
+    min_rrr=1.2
+):
+    """
+    Crea múltiples candidatos (long/short) usando niveles, rango, Bollinger y ATR.
+    Filtra por coherencia y RRR >= min_rrr. Ordena por score (menor=mejor).
+    """
+    entries: list[dict] = []
+
+    logging.info("===== INPUT =====")
+    logging.info(f"precio_actual={precio_actual:.6f}, ATR={ATR if ATR is not None else None}")
+    logging.info(f"niveles: S1={niveles.get('soporte_nivel_1')}, S2={niveles.get('soporte_nivel_2')}, "
+                f"R1={niveles.get('resistencia_nivel_1')}, R2={niveles.get('resistencia_nivel_2')}")
+    logging.info(f"tipo_operacion={tipo_operacion}, estructura={(en_rango or {}).get('estructura_tendencia')}, "
+                f"es_rango={bool((en_rango or {}).get('es_rango_repetitivo'))}")
+    logging.info(f"rango_dinamico={(en_rango or {}).get('rango_dinamico')}")
+    logging.info("=================")
+
+    if precio_actual is None or not _finite(precio_actual):
+        return entries
+    if ATR is None or not _finite(ATR) or ATR <= 0:
+        logging.info("ATR inválido: no se generan entradas")
+        return entries
+
+    s1 = niveles.get("soporte_nivel_1")
+    s2 = niveles.get("soporte_nivel_2")
+    r1 = niveles.get("resistencia_nivel_1")
+    r2 = niveles.get("resistencia_nivel_2")
+
+    estructura = (en_rango or {}).get("estructura_tendencia", "indefinida")
+    es_rango = bool((en_rango or {}).get("es_rango_repetitivo"))
+    rango_dinamico = (en_rango or {}).get("rango_dinamico") or (None, None)
+
+    sesgo_long = (tipo_operacion in señales_compra) or (tipo_operacion == "Neutral" and estructura in ("alcista", "indefinida"))
+    sesgo_short = (tipo_operacion in señales_venta)  or (tipo_operacion == "Neutral" and estructura == "bajista")
+
+    logging.info(f"sesgo_long={sesgo_long}, sesgo_short={sesgo_short}, min_rrr={min_rrr}")
+
+    midpoint = ((r1 + s1) / 2.0) if _finite(r1) and _finite(s1) else precio_actual
+
+    # LONG
+    if sesgo_long:
+        if _finite(s1):
+            logging.info(f"INTENTO LONG [pullback_S1] entry={s1}")
+            _add_entry(entries, side="long", entry=s1, atr=ATR, mult_tp_sl=mult_pullback_s1,
+                       make_tp_sl=calc_tp_sl_compra, basado_en="pullback_S1",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+        if _finite(s2):
+            logging.info(f"INTENTO LONG [pullback_S2] entry={s2}")
+            _add_entry(entries, side="long", entry=s2, atr=ATR, mult_tp_sl=mult_pullback_s2,
+                       make_tp_sl=calc_tp_sl_compra, basado_en="pullback_S2",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+        if _finite(r1):
+            br = r1 + breakout_offset_atr * ATR
+            logging.info(f"INTENTO LONG [breakout_R1] entry={br}")
+            _add_entry(entries, side="long", entry=br, atr=ATR, mult_tp_sl=mult_breakout,
+                       make_tp_sl=calc_tp_sl_compra, basado_en="breakout_R1",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+        if _finite(midpoint):
+            logging.info(f"INTENTO LONG [midpoint] entry={midpoint}")
+            _add_entry(entries, side="long", entry=midpoint, atr=ATR, mult_tp_sl=mult_mid,
+                       make_tp_sl=calc_tp_sl_compra, basado_en="midpoint",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+            e1 = midpoint - scale_offset_atr * ATR
+            e2 = midpoint + scale_offset_atr * ATR
+            logging.info(f"INTENTO LONG [scale_in_midpoint_-0.5ATR] entry={e1}")
+            _add_entry(entries, side="long", entry=e1, atr=ATR, mult_tp_sl=mult_scale_lo,
+                       make_tp_sl=calc_tp_sl_compra, basado_en="scale_in_midpoint_-0.5ATR",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+            logging.info(f"INTENTO LONG [scale_in_midpoint_+0.5ATR] entry={e2}")
+            _add_entry(entries, side="long", entry=e2, atr=ATR, mult_tp_sl=mult_scale_hi,
+                       make_tp_sl=calc_tp_sl_compra, basado_en="scale_in_midpoint_+0.5ATR",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+        if es_rango and _finite(bollinger_lower):
+            e = bollinger_lower + boll_offset_atr * ATR
+            logging.info(f"INTENTO LONG [bollinger_lower_reversion] entry={e}")
+            _add_entry(entries, side="long", entry=e, atr=ATR, mult_tp_sl=mult_mid,
+                       make_tp_sl=calc_tp_sl_compra, basado_en="bollinger_lower_reversion",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+
+    # SHORT
+    if sesgo_short:
+        if _finite(r1):
+            logging.info(f"INTENTO SHORT [pullback_R1] entry={r1}")
+            _add_entry(entries, side="short", entry=r1, atr=ATR, mult_tp_sl=mult_pullback_r1,
+                       make_tp_sl=calc_tp_sl_venta, basado_en="pullback_R1",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+        if _finite(r2):
+            logging.info(f"INTENTO SHORT [pullback_R2] entry={r2}")
+            _add_entry(entries, side="short", entry=r2, atr=ATR, mult_tp_sl=mult_pullback_r2,
+                       make_tp_sl=calc_tp_sl_venta, basado_en="pullback_R2",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+        if _finite(s1):
+            brk = s1 - breakout_offset_atr * ATR
+            logging.info(f"INTENTO SHORT [breakdown_S1] entry={brk}")
+            _add_entry(entries, side="short", entry=brk, atr=ATR, mult_tp_sl=mult_breakout,
+                       make_tp_sl=calc_tp_sl_venta, basado_en="breakdown_S1",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+        if _finite(midpoint):
+            logging.info(f"INTENTO SHORT [midpoint] entry={midpoint}")
+            _add_entry(entries, side="short", entry=midpoint, atr=ATR, mult_tp_sl=mult_mid,
+                       make_tp_sl=calc_tp_sl_venta, basado_en="midpoint",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+            e1 = midpoint + scale_offset_atr * ATR
+            e2 = midpoint - scale_offset_atr * ATR
+            logging.info(f"INTENTO SHORT [scale_in_midpoint_+0.5ATR] entry={e1}")
+            _add_entry(entries, side="short", entry=e1, atr=ATR, mult_tp_sl=mult_scale_lo,
+                       make_tp_sl=calc_tp_sl_venta, basado_en="scale_in_midpoint_+0.5ATR",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+            logging.info(f"INTENTO SHORT [scale_in_midpoint_-0.5ATR] entry={e2}")
+            _add_entry(entries, side="short", entry=e2, atr=ATR, mult_tp_sl=mult_scale_hi,
+                       make_tp_sl=calc_tp_sl_venta, basado_en="scale_in_midpoint_-0.5ATR",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+        if es_rango and _finite(bollinger_upper):
+            e = bollinger_upper - boll_offset_atr * ATR
+            logging.info(f"INTENTO SHORT [bollinger_upper_reversion] entry={e}")
+            _add_entry(entries, side="short", entry=e, atr=ATR, mult_tp_sl=mult_mid,
+                       make_tp_sl=calc_tp_sl_venta, basado_en="bollinger_upper_reversion",
+                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                       min_rrr=min_rrr)
+
+    
+    logging.info("===== RESUMEN =====")
+    logging.info(f"Intentos totales: {len(entries)} (antes de ordenar)")
+    entries.sort(key=lambda e: e.get("score", 1e9))
+
+    for i, e in enumerate(entries[:10], 1):
+        logging.info(f"{i:02d}) {e['side'].upper()} {e['basado_en']} "
+                    f"entry={e['precio_entrada']:.6f} tp={e['take_profit']:.6f} "
+                    f"sl={e['stop_loss']:.6f} RRR={e['rrr']:.3f} score={e['score']:.3f}")
+
+    return entries
+
+
 # Función para calcular puntos de entrada ajustando las probabilidades
 #@profile
 def calcular_entradas(
@@ -4326,203 +4806,246 @@ def calcular_entradas(
     *,
     calc_windows: dict[str,int] | None = None
 ):
-    estado_usuario = obtener_estado_usuario(user_chat_id)
-    soportes_resistencias_cache = estado_usuario["soportes_resistencias_cache"]
-
-    tf = _tf_backend(temporalidad)
-    window = min(definir_window(tf, overrides=calc_windows), len(df))
-
-    # Detección de patrones de velas japonesas
-    patrones_detectados =  detectar_patrones_confirmados_velas(df, window)
-
-    print(f"Paso exitosamente la detección de patrones: {patrones_detectados}")
-    
-    # Predicción de precios futuros con ARIMA
-    predicciones_arima =  predecir_arima(df, tf, symbol)
-    
-    predicciones_media_movil =  predecir_media_movil(df, window)
-    
-    # Simulación de Monte Carlo para probabilidad de alza/baja
-    probabilidad_alza, probabilidad_baja =  simulacion_monte_carlo(df, tf,num_simulaciones=100,num_dias=5,seed=42)
-    probabilidad_alza = probabilidad_alza if probabilidad_alza is not None else 50
-    probabilidad_baja = probabilidad_baja if probabilidad_baja is not None else 50
-    
-    precio_actual = df['close'].iloc[-1]
-   
-    # Calcular soportes y resistencias dinámicos de esta temporalidad
-    df, soportes_dinamicos, resistencias_dinamicas = ajustar_window_dinamico_optimizado(
-        df, symbol, tf, precio_actual,
-        calc_windows=calc_windows,
-        max_incremento=5, min_factor=2, max_factor=8, min_levels=2, n_jobs=-1
-    )
-
-    soportes_dinamicos     = _clean_levels(soportes_dinamicos)
-    resistencias_dinamicas = _clean_levels(resistencias_dinamicas)
-
-    if symbol not in soportes_resistencias_cache:
-        soportes_resistencias_cache[symbol] = {}
-
-    # Agregar soportes y resistencias de esta temporalidad al caché global
-    if tf not in soportes_resistencias_cache[symbol]:
-        # Si la temporalidad no está en el caché, agregar directamente
-        soportes_resistencias_cache[symbol][tf] = {
-            "soportes": soportes_dinamicos,
-            "resistencias": resistencias_dinamicas,
-        }
-    else:
-        # Si la temporalidad ya existe, combinar o actualizar
-        soportes_resistencias_cache[symbol][tf]['soportes'] = list(
-            set(soportes_resistencias_cache[symbol][tf]['soportes'] + soportes_dinamicos)
-        )
-        soportes_resistencias_cache[symbol][tf]['resistencias'] = list(
-            set(soportes_resistencias_cache[symbol][tf]['resistencias'] + resistencias_dinamicas)
-        )
-    niveles_clave =  obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soportes_resistencias_cache, symbol, tf, umbral_atr=2.0, max_niveles=2)
-
+    salida = {}
     try:
-        en_rango = detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
-    except Exception:
-        en_rango = {"es_rango_repetitivo": False, "estructura_tendencia": "indefinida",
-                    "rebotes": [], "rango_dinamico": [None, None]}
+        estado_usuario = obtener_estado_usuario(user_chat_id)
+        soportes_resistencias_cache = estado_usuario["soportes_resistencias_cache"]
 
-    ATR = _tofloat(df['ATR'].iloc[-1]) if 'ATR' in df.columns else None
+        tf = _tf_backend(temporalidad)
+        window = min(definir_window(tf, overrides=calc_windows), len(df))
 
-    # Calcular probabilidades técnica y fundamental
-    probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df,tf,window), 2)
-    fecha_inicio = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-    fecha_fin = datetime.now().strftime('%Y-%m-%d')
-    probabilidad_fundamental =  ajustar_probabilidad_fundamental(50, df_eventos, symbol, tf, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin)
-    if probabilidad_fundamental is None:
-        probabilidad_fundamental = 50
-    else:
-        probabilidad_fundamental = round(probabilidad_fundamental, 2)
-    # Calcular probabilidad general con la nueva ponderación
+        # Detección de patrones de velas japonesas
+        patrones_detectados = {}
+        resultados = detectar_patrones_confirmados_velas(df, window)
 
-    probabilidad_general =  calcular_probabilidad_general(probabilidad_tecnica, probabilidad_fundamental)
-    if probabilidad_general is None:
-        probabilidad_general = 50  # Valor predeterminado para evitar errores
-    else:
-        probabilidad_general = round(probabilidad_general, 2)
+        for _, _, nombre in resultados:
+            patrones_detectados[nombre] = True
 
-    # Verificar zona de no trading
-    zona_no_trading = verificar_zona_no_trading(df, window)
-    #logger.info(f"Zona de no trading: {zona_no_trading}")
-    
-    zona_sobreventa = verificar_zona_sobreventa(df, window)
-    #logger.info(f"Zona de sobreventa: {zona_sobreventa}")
-    
-    zona_sobrecompra = verificar_zona_sobrecompra(df, window)
-    #logger.info(f"Zona de sobrecompra: {zona_sobrecompra}")
-    
-    # Determinación del tipo de operación utilizando las funciones auxiliares
-    tipo_operacion = determinar_tipo_operacion(
-        precio_actual, 
-        predicciones_arima[0] if predicciones_arima else None,
-        predicciones_media_movil[0] if predicciones_media_movil else None,
-        probabilidad_alza, 
-        probabilidad_baja,
-        patrones_detectados, 
-        zona_sobreventa, 
-        zona_sobrecompra, 
-        probabilidad_general, 
-        zona_no_trading
-    )
+        #patrones_detectados =  detectar_patrones_velas(df, window) #MTORO antiguo
 
-    if tipo_operacion in señales_compra or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "alcista" or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "indefinida")):
-        precio_entrada = (niveles_clave['resistencia_nivel_1'] + niveles_clave['soporte_nivel_1']) / 2 if niveles_clave['resistencia_nivel_1'] and niveles_clave['soporte_nivel_1'] else precio_actual
-        take_profit, stop_loss = calc_tp_sl_compra(precio_entrada, ATR)
+        print(f"Paso exitosamente la detección de patrones: {patrones_detectados}")
         
-        if not (stop_loss < precio_entrada < take_profit):
-            logger.warning(f"Valores incorrectos en {symbol} temporalidad:{tf} (compra): SL={stop_loss}, Entrada={precio_entrada}, TP={take_profit}")
-            stop_loss, take_profit = np.nan, np.nan
-    
-    elif tipo_operacion in señales_venta or (tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "bajista"):
-        precio_entrada = (niveles_clave['resistencia_nivel_1'] + niveles_clave['soporte_nivel_1']) / 2 if niveles_clave['resistencia_nivel_1'] and niveles_clave['soporte_nivel_1'] else precio_actual
-        take_profit, stop_loss = calc_tp_sl_venta(precio_entrada, ATR)
+        # Predicción de precios futuros con ARIMA
+        predicciones_arima =  predecir_arima(df, tf, symbol)
         
-        if not (take_profit < precio_entrada < stop_loss):
-            logger.warning(f"Valores incorrectos en {symbol} temporalidad:{tf} (venta): TP={take_profit}, Entrada={precio_entrada}, SL={stop_loss}")
-            stop_loss, take_profit = np.nan, np.nan
-    else:
-        take_profit = None
-        stop_loss = None
-
-    # Verificar si el precio actual está cerca de soportes o resistencias
-    def esta_cerca(precio, nivel, umbral_cercania=0.01):
-        if nivel is None:
-            return False
+        predicciones_media_movil =  predecir_media_movil(df, window)
         
-        return abs(precio - nivel) / precio <= umbral_cercania
-
-    cerca_de_soporte_resistencia = (
-        "Cerca de Soporte Nivel 2" if esta_cerca(precio_actual, niveles_clave.get('soporte_nivel_2')) else
-        "Cerca de Soporte Nivel 1" if esta_cerca(precio_actual, niveles_clave.get('soporte_nivel_1')) else
-        "Cerca de Resistencia Nivel 1" if esta_cerca(precio_actual, niveles_clave.get('resistencia_nivel_1')) else
-        "Cerca de Resistencia Nivel 2" if esta_cerca(precio_actual, niveles_clave.get('resistencia_nivel_2')) else
-        "No Cerca"
-    )
-
-
-    # Flag de oportunidad: cuando la probabilidad general es mayor de 53 (compra) o menor de 47 (venta), y no está en zona de no trading
-    #flag_oportunidad = True if  (probabilidad_baja > 53 or probabilidad_alza > 53) and not zona_no_trading else False
-    flag_oportunidad = False
-    if not zona_no_trading:
-        if probabilidad_general > 53 and not zona_sobrecompra:  # Compra
-            flag_oportunidad = True
-        elif probabilidad_general < 47 and not zona_sobreventa:  # Venta
-            flag_oportunidad = True
-
-
-    # Agregar predicción de tendencia en tiempo real
-    tendencia_predicha = predecir_tendencia_en_tiempo_real(df, temporalidad)
+        # Simulación de Monte Carlo para probabilidad de alza/baja
+        probabilidad_alza, probabilidad_baja =  simulacion_monte_carlo(df, tf,num_simulaciones=100,num_dias=5,seed=42)
+        probabilidad_alza = probabilidad_alza if probabilidad_alza is not None else 50
+        probabilidad_baja = probabilidad_baja if probabilidad_baja is not None else 50
+        
+        precio_actual = df['close'].iloc[-1]
     
-    salida = {
-        "patrones_detectados": patrones_detectados,
-        "predicciones_arima": predicciones_arima,
-        "predicciones_media_movil": predicciones_media_movil,
-        "probabilidad_alza": probabilidad_alza,
-        "probabilidad_baja": probabilidad_baja,
-        "macd_cruce": df['macd_cruce'].iloc[-1] if 'macd_cruce' in df.columns else None,
-        "macd_cerca_de_cruzar": df['macd_cerca_de_cruzar'].iloc[-1] if 'macd_cerca_de_cruzar' in df.columns else None,
-        "bollinger_signal": df['bollinger_signal'].iloc[-1] if 'bollinger_signal' in df.columns else None,
-        "bollinger_upper": df['bollinger_upper'].iloc[-1] if 'bollinger_upper' in df.columns else None,
-        "bollinger_lower": df['bollinger_lower'].iloc[-1] if 'bollinger_lower' in df.columns else None,
-        "tendencia_predicha": tendencia_predicha,
-        "ultimo_valor": precio_actual,
-        "soporte_nivel_2": niveles_clave.get('soporte_nivel_2'),
-        "soporte_nivel_1": niveles_clave.get('soporte_nivel_1'),
-        "resistencia_nivel_1": niveles_clave.get('resistencia_nivel_1'),
-        "resistencia_nivel_2": niveles_clave.get('resistencia_nivel_2'),
-        "apalancamiento_compra_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_1"),
-        "apalancamiento_compra_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_2"),
-        "apalancamiento_venta_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_1"),
-        "apalancamiento_venta_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_2"),
-        "precio_entrada": precio_entrada,
-        "take_profit": take_profit,
-        "stop_loss": stop_loss,
-        "es_rango_repetitivo": en_rango.get("es_rango_repetitivo"),
-        "estructura_tendencia": en_rango.get('estructura_tendencia'),
-        "rebotes": en_rango.get("rebotes"),
-        "rango_dinamico": en_rango.get("rango_dinamico"),
-        "soportes_alcanzados": niveles_clave.get('niveles_importantes_soportes'),
-        "resistencias_alcanzadas": niveles_clave.get('niveles_importantes_resistencias'),
-        "cerca_de_soporte_resistencia": cerca_de_soporte_resistencia,
-        "soportes_importantes_alcanzados": niveles_clave.get('soportes_confirmados_orden'),
-        "resistencias_importantes_alcanzadas": niveles_clave.get('resistencias_confirmadas_orden'),
-        "niveles_confirmados_orden_toques_all": niveles_clave.get('niveles_confirmados_orden_toques_all'),
-        "niveles_confirmados_orden_nivel_all": niveles_clave.get('niveles_confirmados_orden_nivel_all'),
-        "niveles_confirmados_orden_nivel_reduced": niveles_clave.get('niveles_confirmados_orden_nivel_reduced'),
-        "probabilidad_tecnica": probabilidad_tecnica,
-        "probabilidad_fundamental": probabilidad_fundamental,
-        "probabilidad_general": probabilidad_general,
-        "tipo_operacion": tipo_operacion,
-        "flag_oportunidad": flag_oportunidad,
-        "zona_no_trading": zona_no_trading,
-        "zona_sobreventa": zona_sobreventa,
-        "zona_sobrecompra": zona_sobrecompra
-    }
+        # Calcular soportes y resistencias dinámicos de esta temporalidad
+        df, soportes_dinamicos, resistencias_dinamicas = ajustar_window_dinamico_optimizado(
+            df, symbol, tf, precio_actual,
+            calc_windows=calc_windows,
+            max_incremento=5, min_factor=2, max_factor=8, min_levels=2, n_jobs=-1
+        )
 
-    return json_safe(salida)
+        soportes_dinamicos     = _clean_levels(soportes_dinamicos)
+        resistencias_dinamicas = _clean_levels(resistencias_dinamicas)
+
+        if symbol not in soportes_resistencias_cache:
+            soportes_resistencias_cache[symbol] = {}
+
+        # Agregar soportes y resistencias de esta temporalidad al caché global
+        if tf not in soportes_resistencias_cache[symbol]:
+            # Si la temporalidad no está en el caché, agregar directamente
+            soportes_resistencias_cache[symbol][tf] = {
+                "soportes": soportes_dinamicos,
+                "resistencias": resistencias_dinamicas,
+            }
+        else:
+            # Si la temporalidad ya existe, combinar o actualizar
+            soportes_resistencias_cache[symbol][tf]['soportes'] = list(
+                set(soportes_resistencias_cache[symbol][tf]['soportes'] + soportes_dinamicos)
+            )
+            soportes_resistencias_cache[symbol][tf]['resistencias'] = list(
+                set(soportes_resistencias_cache[symbol][tf]['resistencias'] + resistencias_dinamicas)
+            )
+        niveles_clave =  obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soportes_resistencias_cache, symbol, tf, umbral_atr=2.0, max_niveles=2)
+
+        try:
+            en_rango = detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
+        except Exception:
+            en_rango = {"es_rango_repetitivo": False, "estructura_tendencia": "indefinida",
+                        "rebotes": [], "rango_dinamico": [None, None]}
+
+        ATR = _tofloat(df['ATR'].iloc[-1]) if 'ATR' in df.columns else None
+
+        # Calcular probabilidades técnica y fundamental
+        probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df,tf,window), 2)
+        fecha_inicio = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        fecha_fin = datetime.now().strftime('%Y-%m-%d')
+        probabilidad_fundamental =  ajustar_probabilidad_fundamental(50, df_eventos, symbol, tf, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin)
+        if probabilidad_fundamental is None:
+            probabilidad_fundamental = 50
+        else:
+            probabilidad_fundamental = round(probabilidad_fundamental, 2)
+        # Calcular probabilidad general con la nueva ponderación
+
+        probabilidad_general =  calcular_probabilidad_general(probabilidad_tecnica, probabilidad_fundamental)
+        if probabilidad_general is None:
+            probabilidad_general = 50  # Valor predeterminado para evitar errores
+        else:
+            probabilidad_general = round(probabilidad_general, 2)
+
+        # Verificar zona de no trading
+        zona_no_trading = verificar_zona_no_trading(df, window)
+        #logger.info(f"Zona de no trading: {zona_no_trading}")
+        
+        zona_sobreventa = verificar_zona_sobreventa(df, window)
+        #logger.info(f"Zona de sobreventa: {zona_sobreventa}")
+        
+        zona_sobrecompra = verificar_zona_sobrecompra(df, window)
+        #logger.info(f"Zona de sobrecompra: {zona_sobrecompra}")
+        
+        # Determinación del tipo de operación utilizando las funciones auxiliares
+        tipo_operacion = determinar_tipo_operacion(
+            precio_actual, 
+            predicciones_arima[0] if predicciones_arima else None,
+            predicciones_media_movil[0] if predicciones_media_movil else None,
+            probabilidad_alza, 
+            probabilidad_baja,
+            patrones_detectados, 
+            zona_sobreventa, 
+            zona_sobrecompra, 
+            probabilidad_general, 
+            zona_no_trading
+        )
+
+        # --- NUEVO: generar múltiples entradas candidatas ---
+        entradas_mult = generar_entradas_multiples(
+            precio_actual=precio_actual,
+            ATR=ATR,
+            niveles=niveles_clave,
+            tipo_operacion=tipo_operacion,
+            en_rango=en_rango,
+            prob_general=probabilidad_general,
+            bollinger_upper=salida.get("bollinger_upper") or df.get('bollinger_upper', [None])[-1],
+            bollinger_lower=salida.get("bollinger_lower") or df.get('bollinger_lower', [None])[-1],
+            señales_compra=señales_compra,
+            señales_venta=señales_venta
+        )
+
+        # “legacy” (mantén los campos individuales usando la mejor entrada)
+        best = entradas_mult[0] if entradas_mult else None
+        if best:
+            precio_entrada = best.get("precio_entrada")
+            take_profit     = best.get("take_profit")
+            stop_loss       = best.get("stop_loss")
+        else:
+            # Fallback a tu lógica anterior (por si algo quedó sin ATR o niveles)
+            if tipo_operacion in señales_compra or (
+                tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] in ("alcista", "indefinida")
+            ):
+                precio_entrada = (niveles_clave['resistencia_nivel_1'] + niveles_clave['soporte_nivel_1']) / 2 if niveles_clave['resistencia_nivel_1'] and niveles_clave['soporte_nivel_1'] else precio_actual
+                take_profit, stop_loss = calc_tp_sl_compra(precio_entrada, ATR)
+                if not (stop_loss and take_profit and (stop_loss < precio_entrada < take_profit)):
+                    logger.warning(f"Valores incorrectos en {symbol} temporalidad:{tf} (compra): SL={stop_loss}, Entrada={precio_entrada}, TP={take_profit}")
+                    stop_loss, take_profit = np.nan, np.nan
+
+            elif tipo_operacion in señales_venta or (
+                tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "bajista"
+            ):
+                precio_entrada = (niveles_clave['resistencia_nivel_1'] + niveles_clave['soporte_nivel_1']) / 2 if niveles_clave['resistencia_nivel_1'] and niveles_clave['soporte_nivel_1'] else precio_actual
+                take_profit, stop_loss = calc_tp_sl_venta(precio_entrada, ATR)
+                if not (take_profit and stop_loss and (take_profit < precio_entrada < stop_loss)):
+                    logger.warning(f"Valores incorrectos en {symbol} temporalidad:{tf} (venta): TP={take_profit}, Entrada={precio_entrada}, SL={stop_loss}")
+                    stop_loss, take_profit = np.nan, np.nan
+            else:
+                take_profit = None
+                stop_loss = None
+
+        # Verificar si el precio actual está cerca de soportes o resistencias
+        def esta_cerca(precio, nivel, umbral_cercania=0.01):
+            if nivel is None:
+                return False
+            
+            return abs(precio - nivel) / precio <= umbral_cercania
+
+        cerca_de_soporte_resistencia = (
+            "Cerca de Soporte Nivel 2" if esta_cerca(precio_actual, niveles_clave.get('soporte_nivel_2')) else
+            "Cerca de Soporte Nivel 1" if esta_cerca(precio_actual, niveles_clave.get('soporte_nivel_1')) else
+            "Cerca de Resistencia Nivel 1" if esta_cerca(precio_actual, niveles_clave.get('resistencia_nivel_1')) else
+            "Cerca de Resistencia Nivel 2" if esta_cerca(precio_actual, niveles_clave.get('resistencia_nivel_2')) else
+            "No Cerca"
+        )
+
+
+        # Flag de oportunidad: cuando la probabilidad general es mayor de 53 (compra) o menor de 47 (venta), y no está en zona de no trading
+        #flag_oportunidad = True if  (probabilidad_baja > 53 or probabilidad_alza > 53) and not zona_no_trading else False
+        flag_oportunidad = False
+        if not zona_no_trading:
+            if probabilidad_general > 53 and not zona_sobrecompra:  # Compra
+                flag_oportunidad = True
+            elif probabilidad_general < 47 and not zona_sobreventa:  # Venta
+                flag_oportunidad = True
+
+
+        # Agregar predicción de tendencia en tiempo real
+        tendencia_predicha = predecir_tendencia_en_tiempo_real(df, temporalidad)
+
+        logging.info(f'MTORO200: estas son las entradas: {entradas_mult}')
+        
+        salida = {
+            "patrones_detectados": patrones_detectados,
+            "predicciones_arima": predicciones_arima,
+            "predicciones_media_movil": predicciones_media_movil,
+            "probabilidad_alza": probabilidad_alza,
+            "probabilidad_baja": probabilidad_baja,
+            "macd_cruce": df['macd_cruce'].iloc[-1] if 'macd_cruce' in df.columns else None,
+            "macd_cerca_de_cruzar": df['macd_cerca_de_cruzar'].iloc[-1] if 'macd_cerca_de_cruzar' in df.columns else None,
+            "bollinger_signal": df['bollinger_signal'].iloc[-1] if 'bollinger_signal' in df.columns else None,
+            "bollinger_upper": df['bollinger_upper'].iloc[-1] if 'bollinger_upper' in df.columns else None,
+            "bollinger_lower": df['bollinger_lower'].iloc[-1] if 'bollinger_lower' in df.columns else None,
+            "tendencia_predicha": tendencia_predicha,
+            "ultimo_valor": precio_actual,
+            "soporte_nivel_2": niveles_clave.get('soporte_nivel_2'),
+            "soporte_nivel_1": niveles_clave.get('soporte_nivel_1'),
+            "resistencia_nivel_1": niveles_clave.get('resistencia_nivel_1'),
+            "resistencia_nivel_2": niveles_clave.get('resistencia_nivel_2'),
+            "apalancamiento_compra_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_1"),
+            "apalancamiento_compra_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_2"),
+            "apalancamiento_venta_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_1"),
+            "apalancamiento_venta_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_2"),
+            "precio_entrada": precio_entrada,
+            "take_profit": take_profit,
+            "stop_loss": stop_loss,
+            "es_rango_repetitivo": en_rango.get("es_rango_repetitivo"),
+            "estructura_tendencia": en_rango.get('estructura_tendencia'),
+            "rebotes": en_rango.get("rebotes"),
+            "rango_dinamico": en_rango.get("rango_dinamico"),
+            "soportes_alcanzados": niveles_clave.get('niveles_importantes_soportes'),
+            "resistencias_alcanzadas": niveles_clave.get('niveles_importantes_resistencias'),
+            "cerca_de_soporte_resistencia": cerca_de_soporte_resistencia,
+            "soportes_importantes_alcanzados": niveles_clave.get('soportes_confirmados_orden'),
+            "resistencias_importantes_alcanzadas": niveles_clave.get('resistencias_confirmadas_orden'),
+            "niveles_confirmados_orden_toques_all": niveles_clave.get('niveles_confirmados_orden_toques_all'),
+            "niveles_confirmados_orden_nivel_all": niveles_clave.get('niveles_confirmados_orden_nivel_all'),
+            "niveles_confirmados_orden_nivel_reduced": niveles_clave.get('niveles_confirmados_orden_nivel_reduced'),
+            "probabilidad_tecnica": probabilidad_tecnica,
+            "probabilidad_fundamental": probabilidad_fundamental,
+            "probabilidad_general": probabilidad_general,
+            "tipo_operacion": tipo_operacion,
+            "flag_oportunidad": flag_oportunidad,
+            "zona_no_trading": zona_no_trading,
+            "zona_sobreventa": zona_sobreventa,
+            "zona_sobrecompra": zona_sobrecompra,
+            "entradas": entradas_mult, 
+        }
+        return json_safe(salida)
+
+    except Exception as e:
+        logger.exception("calcular_entradas falló: %s", e)
+        # devuelve algo mínimo para que nada más truene
+        if not salida:
+            salida = {}
+        salida.setdefault("entradas_multiples", [])
+        salida.setdefault("entradas", {"lista": []})
+        return json_safe(salida)
 
 # Función para generar un archivo con la fecha y hora en el nombre
 def generar_nombre_archivo(moneda_filtro, filtro=False, tipo=None):
