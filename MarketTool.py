@@ -10,6 +10,7 @@ import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
 import numpy as np
 from datetime import datetime, timedelta
+import datetime as _dt
 from statsmodels.tsa.arima.model import ARIMA
 import concurrent.futures
 import telegram
@@ -625,6 +626,78 @@ def _json_sanitize_df(d: pd.DataFrame) -> pd.DataFrame:
         elif pd.api.types.is_float_dtype(d[c]):   d[c] = d[c].astype(float)
     return d
 
+def sanitize_for_json(x):
+    """
+    Convierte NaN/±Inf a None, castea tipos numpy/pandas a tipos Python
+    y sanea recursivamente colecciones. Evita usar pd.isna sobre arrays.
+    """
+
+    # --- Colecciones primero (para no pasar arrays a pd.isna) ---
+    # ndarrays (incluye 0-D)
+    if isinstance(x, np.ndarray):
+        # 0-D array -> escalar Python
+        if x.ndim == 0:
+            return sanitize_for_json(x.item())
+        # arrays 1-D+ -> lista
+        return [sanitize_for_json(v) for v in x.tolist()]
+
+    # listas/tuplas/conjuntos
+    if isinstance(x, (list, tuple, set)):
+        return [sanitize_for_json(v) for v in x]
+
+    # diccionarios
+    if isinstance(x, dict):
+        return {str(k): sanitize_for_json(v) for k, v in x.items()}
+
+    # DataFrame / Series
+    if isinstance(x, pd.DataFrame):
+        df = x.replace([np.inf, -np.inf], np.nan)
+        df = df.where(pd.notnull(df), None)
+        return [sanitize_for_json(rec) for rec in df.to_dict("records")]
+
+    if isinstance(x, pd.Series):
+        s = x.replace([np.inf, -np.inf], np.nan)
+        s = s.where(pd.notnull(s), None)
+        return sanitize_for_json(s.to_dict())
+
+    # --- Escalares y tipos básicos ---
+    # None
+    if x is None:
+        return None
+
+    # booleanos
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+
+    # enteros
+    if isinstance(x, (int, np.integer)):
+        return int(x)
+
+    # floats
+    if isinstance(x, (float, np.floating)):
+        fx = float(x)
+        if math.isnan(fx) or math.isinf(fx):
+            return None
+        return fx
+
+    # fechas/horas
+    if isinstance(x, (pd.Timestamp, np.datetime64, _dt.datetime, _dt.date)):
+        try:
+            return str(pd.Timestamp(x).isoformat())
+        except Exception:
+            return str(x)
+
+    # --- Solo ahora: chequeo NA para escalares verdaderos ---
+    try:
+        # En este punto no llegan arrays/listas/dicts/Series/DF
+        if pd.isna(x):          # NaN, NaT, pd.NA
+            return None
+    except Exception:
+        pass
+
+    # strings u otros tipos serializables
+    return x
+    
 def df_to_ohlcv_records_ext(
     df: pd.DataFrame,
     *,
@@ -1184,12 +1257,16 @@ async def guardar_json_en_storage_y_registrar(
     object_path = build_object_path(exec_id, nombre)
     local_json = f"/tmp/{nombre}"
 
-    # Si por error llega un DataFrame, lo convertimos aquí
+    # Normaliza si llega DataFrame
     if isinstance(data, pd.DataFrame):
-        data = data.where(pd.notnull(data), None).to_dict("records")
+        data = data.replace([np.inf, -np.inf], np.nan).where(pd.notnull(data), None).to_dict("records")
 
+    # 🔒 Sanitiza SIEMPRE (recursivo)
+    data = sanitize_for_json(data)
+
+    # Si quedara algo, esto lanzará ValueError -> lo verás en logs
     with open(local_json, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, default=_json_default)
+        json.dump(data, f, ensure_ascii=False, allow_nan=False)
 
     url_publica = await subir_a_bucket_y_obtener_url(local_json, object_path)
     if not isinstance(url_publica, str):
@@ -5140,8 +5217,20 @@ def generar_imagen_eventos_oportunidades(
     dpi: int = 170,
     font_size: int = 9
 ):
-    if df_eventos is None or df_eventos.empty:
-        return None
+    try:
+        divisas = (
+            pd.Series(list(divisas_oportunidades) if divisas_oportunidades is not None else [])
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+    except Exception:
+        divisas = []
+
+    # Corta temprano si no hay nada que mostrar
+    if df_eventos is None or getattr(df_eventos, "empty", True) or len(divisas) == 0:
+        return None  # o [] según tu contrato de retorno
 
     df = df_eventos.copy()
 
@@ -5915,20 +6004,47 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
     # --- JSON completo (antes de filtrar) ---
     df_resultados = pd.DataFrame(registros_limpios)
-    if origen == "app" and exec_id:
-        df_json_records = df_resultados.where(pd.notnull(df_resultados), None).to_dict("records")
-        url_full = await guardar_json_en_storage_y_registrar(
-            exec_id=exec_id,
-            chat_id=user_chat_id,
-            nombre_base=f"{moneda_filtro.upper()}_resultados_completos",
-            data=df_json_records,   # <--- antes data_records
-            subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
-            metadata={"moneda_filtro": moneda_filtro, "scope": "completo"},
-        )
-        if url_full: urls_generadas.append(url_full)
+
+    # Aplicar la función de ponderación incremental al DataFrame `df_filtrado` en memoria
+    df_resultados = df_resultados.copy()
+    df_resultados = calcular_ponderacion_incremental_por_divisa(df_resultados)
     
-     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # --- JSON ENRIQUECIDO por símbolo+temporalidad (candles + indicadores) ---
+    # Aplicar la función de ponderación al DataFrame `df_filtrado` en memoria
+    df_resultados = df_resultados.copy()
+    df_resultados['Ponderacion'] = df_resultados.apply(lambda row: calcular_ponderacion(row), axis=1).astype(float)
+
+    df_resultados.pop('bollinger_lower')
+    df_resultados.pop('bollinger_upper')
+    # Ordenar el DataFrame por la columna de ponderación
+    df_resultados = df_resultados.copy()
+    
+    # Verificar si el usuario tiene acceso a "análisis avanzado"
+    if "analisis avanzado" in opciones_usuario and not es_administrador(user_chat_id):
+        logger.info("El usuario tiene acceso a análisis avanzado.")
+    elif "analisis premium" in opciones_usuario and not es_administrador(user_chat_id):
+        df_resultados.pop("Soportes Importantes Alcanzados")
+        df_resultados.pop("Resistencias Importantes Alcanzadas")
+        df_resultados.pop("Niveles Confirmados (Nivel)")
+        logger.info("El usuario tiene acceso a análisis premium.")
+    elif "analisis basico" in opciones_usuario and not es_administrador(user_chat_id):
+        df_resultados.pop("Patrones Detectados")
+        df_resultados.pop("Soportes Alcanzados")
+        df_resultados.pop("Resistencias Alcanzadas")
+        df_resultados.pop("Cerca de Soporte Resistencia")
+        df_resultados.pop("Es Rango Repetitivo")
+        df_resultados.pop("Estructura Tendencia")
+        df_resultados.pop("Rebotes")
+        df_resultados.pop("Rango Dinamico")
+        df_resultados.pop("Soportes Importantes Alcanzados")
+        df_resultados.pop("Resistencias Importantes Alcanzadas")
+        df_resultados.pop("Niveles Confirmados (Nivel)")
+        df_resultados.pop("Probabilidad Alza (Montecarlo)")
+        df_resultados.pop("Probabilidad Baja (Montecarlo)")
+        logger.info("El usuario tiene acceso a análisis basico.")  
+
+    df_resultados_ordenado = df_resultados.sort_values(by='Ponderacion', ascending=False)  
+
+    # 7) (Solo app) Subir enriquecidos por símbolo/TF — se mantiene
     if origen == "app" and exec_id:
         urls_enriched = []
         for res in resultados:
@@ -5936,22 +6052,38 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 continue
 
             sym = res.get("Activo")
-            tf  = res.get("Temporalidad")
-            df_velas = res.get("_ohlcv_df")          
-            df_inds  = res.get("_indicadores_df")    
-            niveles  = res.get("_niveles") or {}
+            tf = res.get("Temporalidad")
+            df_velas = res.get("_ohlcv_df")
+            df_inds = res.get("_indicadores_df")
+            niveles = res.get("_niveles") or {}
             entradas = res.get("_entradas") or {}
 
-            # Subimos si hay velas o indicadores válidos
             tiene_datos = (
-                (isinstance(df_velas, pd.DataFrame) and not df_velas.empty) or
-                (isinstance(df_inds,  pd.DataFrame) and not df_inds.empty)
-            )
-
-            logger.info(f'MTORO100 sym:{sum}, tf:{tf}, tiene_datos:{tiene_datos}')
+                isinstance(df_velas, pd.DataFrame) and not df_velas.empty
+            ) or (isinstance(df_inds, pd.DataFrame) and not df_inds.empty)
 
             if sym and tf and tiene_datos:
                 try:
+                    #if isinstance(df_resultados, dict):
+                    #    entradas = dict(df_resultados)  # copy
+                    #    if df_resultados['Ponderacion'] is not None:
+                    #        entradas["ponderacion"] = df_resultados['Ponderacion']
+                    #    if df_resultados['Ponderacion Incremental'] is not None:
+                    #        entradas["ponderacion_incremental"] = int(round(float(df_resultados["Ponderacion Incremental"])))
+                    #elif isinstance(df_resultados, list):
+                    #    # Si 'entradas' es una lista, la envolvemos para poder agregar campos
+                    #    entradas = {"entradas": df_resultados}
+                    #    if df_resultados['Ponderacion'] is not None:
+                    #        entradas["ponderacion"] = df_resultados['Ponderacion']
+                    #    if df_resultados['Ponderacion Incremental'] is not None:
+                    #        entradas["ponderacion_incremental"] = int(round(float(df_resultados["Ponderacion Incremental"])))
+                    #else:
+                    #    entradas = {}
+                    #    if df_resultados['Ponderacion'] is not None:
+                    #        entradas["ponderacion"] = df_resultados['Ponderacion']
+                    #    if df_resultados['Ponderacion Incremental'] is not None:
+                    #        entradas["ponderacion_incremental"] = int(round(float(df_resultados["Ponderacion Incremental"])))
+
                     url = await subir_ohlcv_enriquecido_y_registrar(
                         exec_id=exec_id,
                         chat_id=user_chat_id,
@@ -5968,51 +6100,36 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                         urls_enriched.append(url)
                 except Exception as e:
                     logger.info(f"No se pudo subir JSON enriquecido de {sym}-{tf}: {e}")
-
         if urls_enriched:
             urls_generadas.extend(urls_enriched)
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
-    # Convertir la lista de resultados en un DataFrame
-    df_resultados = pd.DataFrame(resultados)
+    # 8) (Solo app) Subir **ordenado** saneado (reemplaza al “resultados_completos”)
+    if origen == "app" and exec_id:
+        # Limpieza escalar (NaN/±Inf -> None) y anidados
+        df_ord = (
+            df_resultados_ordenado
+            .replace([np.inf, -np.inf], np.nan)
+            .where(pd.notnull(df_resultados_ordenado), None)
+            .copy()
+        )
+        # Sanea celdas anidadas si las hubiera
+        for col in df_ord.columns:
+            if df_ord[col].apply(lambda v: isinstance(v, (dict, list, tuple, set, pd.Series))).any():
+                df_ord[col] = df_ord[col].apply(sanitize_for_json)
 
-    # Aplicar la función de ponderación incremental al DataFrame `df_filtrado` en memoria
-    df_resultados = df_resultados.copy()
-    df_resultados = calcular_ponderacion_incremental_por_divisa(df_resultados)
-    
-    # Aplicar la función de ponderación al DataFrame `df_filtrado` en memoria
-    df_resultados = df_resultados.copy()
-    df_resultados['Ponderacion'] = df_resultados.apply(lambda row: calcular_ponderacion(row), axis=1).astype(float)
+        # Convierte a records y (ligeramente redundante) sanea por si acaso
+        ordered_records = sanitize_for_json(df_ord.to_dict("records"))
 
-    df_resultados.pop('bollinger_lower')
-    df_resultados.pop('bollinger_upper')
-    # Ordenar el DataFrame por la columna de ponderación
-    df_resultados = df_resultados.copy()
-    df_resultados_ordenado = df_resultados.sort_values(by='Ponderacion', ascending=False)
-
-    # Verificar si el usuario tiene acceso a "análisis avanzado"
-    if "analisis avanzado" in opciones_usuario and not es_administrador(user_chat_id):
-        logger.info("El usuario tiene acceso a análisis avanzado.")
-    elif "analisis premium" in opciones_usuario and not es_administrador(user_chat_id):
-        df_resultados_ordenado.pop("Soportes Importantes Alcanzados")
-        df_resultados_ordenado.pop("Resistencias Importantes Alcanzadas")
-        df_resultados_ordenado.pop("Niveles Confirmados (Nivel)")
-        logger.info("El usuario tiene acceso a análisis premium.")
-    elif "analisis basico" in opciones_usuario and not es_administrador(user_chat_id):
-        df_resultados_ordenado.pop("Patrones Detectados")
-        df_resultados_ordenado.pop("Soportes Alcanzados")
-        df_resultados_ordenado.pop("Resistencias Alcanzadas")
-        df_resultados_ordenado.pop("Cerca de Soporte Resistencia")
-        df_resultados_ordenado.pop("Es Rango Repetitivo")
-        df_resultados_ordenado.pop("Estructura Tendencia")
-        df_resultados_ordenado.pop("Rebotes")
-        df_resultados_ordenado.pop("Rango Dinamico")
-        df_resultados_ordenado.pop("Soportes Importantes Alcanzados")
-        df_resultados_ordenado.pop("Resistencias Importantes Alcanzadas")
-        df_resultados_ordenado.pop("Niveles Confirmados (Nivel)")
-        df_resultados_ordenado.pop("Probabilidad Alza (Montecarlo)")
-        df_resultados_ordenado.pop("Probabilidad Baja (Montecarlo)")
-        logger.info("El usuario tiene acceso a análisis basico.")    
+        url_ordenado = await guardar_json_en_storage_y_registrar(
+            exec_id=exec_id,
+            chat_id=user_chat_id,
+            nombre_base=f"{moneda_filtro.upper()}_resultados_ordenados",
+            data=ordered_records,  # DataFrame ya serializable
+            subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
+            metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado"},
+        )
+        if url_ordenado:
+            urls_generadas.append(url_ordenado)        
     
     # Filtrar solo las oportunidades donde flag_oportunidad es True, Zona No Trading es False y el tipo de operación no es "Neutral"
     df_filtrado = df_resultados_ordenado[
@@ -6036,7 +6153,19 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     df_resultadosToImage = pd.DataFrame(df_filtrado)
 
     # Extraer divisas de los símbolos de las oportunidades
-    divisas_oportunidades = df_filtrado['Activo'].str[:3].unique()
+    if 'Activo' in df_filtrado.columns and not df_filtrado.empty:
+        divisas_oportunidades = (
+            df_filtrado['Activo']
+            .astype(str)              # por si viene algún tipo no-string
+            .str.slice(0, 3)
+            .dropna()
+            .unique()
+            .tolist()                 # <- clave: pásalo a list para que el truth value no sea ambiguo
+        )
+    else:
+        divisas_oportunidades = []
+
+    logging.info(f'MTORO Estas son las divisas oportunidades: {divisas_oportunidades} de df_filtrado: {df_filtrado}, modena_filtro: {moneda_filtro}')
 
     df_filtradoToImage = df_resultadosToImage[
         (df_resultadosToImage['Oportunidad'] == True) &
