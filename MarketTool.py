@@ -1638,6 +1638,38 @@ async def actualizar_timezone(user_chat_id, nueva_timezone):
     """Actualiza la zona horaria de un chat_id."""
     await guardar_chat_id(user_chat_id, timezone=nueva_timezone)
 
+
+def last_of(df, col, default=None):
+    """Devuelve el último valor de df[col] de forma robusta (sin warnings),
+    o default si no existe o está vacío."""
+    try:
+        s = df[col]
+    except Exception:
+        return default
+
+    # Serie/ndarray/list vacío
+    try:
+        if getattr(s, "empty", False) or len(s) == 0:
+            return default
+    except Exception:
+        return default
+
+    # Preferir posición por .iloc para evitar FutureWarning
+    try:
+        return s.iloc[-1] if hasattr(s, "iloc") else s[-1]
+    except Exception:
+        try:
+            vals = getattr(s, "values", None)
+            return vals[-1] if vals is not None and len(vals) else default
+        except Exception:
+            return default
+
+def _coerce_float_safe(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
 def obtener_monedas(symbol):
     """
     Identifica si un símbolo es un par de divisas o un símbolo que no tiene divisa secundaria.
@@ -1914,54 +1946,97 @@ def calcular_impacto_noticias(df_noticias):
 
 # Función para obtener precios históricos por temporalidad
 #@profile
+import os, json, logging, aiofiles
+import pandas as pd
+
+# CARPETA_HISTORICOS debe estar definido en tu módulo
+# cache_historicos es global
+
 async def cargar_datos_historicos_inicial():
     """
     Carga inicial de los datos históricos en un diccionario global desde los archivos locales.
+    Permite JSON estándar (lista), NDJSON (una fila JSON por línea) y envoltura {"data": [...]}.
     """
     global cache_historicos
-    cache_historicos = {}
+    nuevo_cache = {}
 
     for archivo in os.listdir(CARPETA_HISTORICOS):
-        if archivo.endswith(".json"):
+        # Soporta .json y opcionalmente .jsonl (NDJSON)
+        if not (archivo.endswith(".json") or archivo.endswith(".jsonl")):
+            continue
+
+        ruta = os.path.join(CARPETA_HISTORICOS, archivo)
+
+        try:
+            # 1) Leer archivo (maneja BOM con utf-8-sig)
+            async with aiofiles.open(ruta, mode="r", encoding="utf-8-sig", errors="ignore") as f:
+                contenido = await f.read()
+
+            if not contenido or not contenido.strip():
+                logging.info("Archivo vacío: %s. Saltando.", ruta)
+                continue
+
+            # 2) Parseo JSON robusto
+            data_local = None
             try:
-                # Extraer el símbolo y la temporalidad del archivo
-                partes_archivo = archivo.replace(".json", "").split("_")
-                if len(partes_archivo) != 2:
-                    logger.info(f"Formato inesperado del archivo: {archivo}. Saltando.")
+                data_local = json.loads(contenido)
+            except json.JSONDecodeError as je:
+                # Intentar NDJSON (una fila por línea)
+                lineas = [ln for ln in contenido.splitlines() if ln.strip()]
+                try:
+                    data_local = [json.loads(ln) for ln in lineas]
+                    logging.info("Parseado como NDJSON: %s (%d filas)", archivo, len(data_local))
+                except Exception:
+                    logging.info("JSON inválido en %s: %s; inicio=%r", archivo, je, contenido[:120])
                     continue
 
-                symbol, temporalidad = partes_archivo
+            # 3) Normalizar a lista de registros
+            if isinstance(data_local, dict) and "data" in data_local and isinstance(data_local["data"], list):
+                data_local = data_local["data"]
 
-                archivo_cache = os.path.join(CARPETA_HISTORICOS, archivo)
-                async with aiofiles.open(archivo_cache, mode="r", encoding="utf-8") as file:
-                    contenido = await file.read()
-                    data_local = json.loads(contenido)
+            if not isinstance(data_local, list) or len(data_local) == 0:
+                logging.info("%s no contiene lista de registros válida. Saltando.", archivo)
+                continue
 
-                if isinstance(data_local, list) and len(data_local) > 0:
-                    df_local = pd.DataFrame(data_local)
+            df_local = pd.DataFrame(data_local)
 
-                    # Validar y procesar la columna 'date'
-                    if 'date' in df_local.columns:
-                        df_local['date'] = pd.to_datetime(df_local['date'], errors='coerce')
-                        df_local = df_local.dropna(subset=['date'])
-                        df_local.set_index('date', inplace=True)
-                        df_local.index = pd.to_datetime(df_local.index)
+            # 4) Validar/normalizar index datetime
+            if "date" in df_local.columns:
+                # Convierte con tolerancia y fuerza a tz-aware si quieres
+                df_local["date"] = pd.to_datetime(df_local["date"], errors="coerce", utc=True)
+                df_local = df_local.dropna(subset=["date"]).set_index("date").sort_index()
+            else:
+                logging.info("Archivo %s no tiene columna 'date'. Saltando.", archivo)
+                continue
 
-                    if df_local.empty or not isinstance(df_local.index, pd.DatetimeIndex):
-                        logger.info(f"Advertencia: El DataFrame cargado desde {archivo} es inválido o está vacío.")
-                        continue
+            if df_local.empty or not isinstance(df_local.index, pd.DatetimeIndex):
+                logging.info("Advertencia: DataFrame inválido o vacío en %s.", archivo)
+                continue
 
-                    # Guardar en el cache para el símbolo y temporalidad
-                    if symbol not in cache_historicos:
-                        cache_historicos[symbol] = {}
-                    cache_historicos[symbol][temporalidad] = df_local
-                    logger.info(f"Cargados datos históricos para {symbol} en {temporalidad}.")
-                else:
-                    logger.info(f"Archivo {archivo_cache} está vacío o no contiene datos válidos.")
-            except Exception as e:
-                logger.info(f"Error al cargar datos de {archivo}: {e}")
+            # 5) Extraer symbol/temporalidad desde nombre archivo
+            base = archivo
+            if base.endswith(".jsonl"):
+                base = base[:-6]
+            elif base.endswith(".json"):
+                base = base[:-5]
+            partes = base.split("_")
+            if len(partes) != 2:
+                logging.info("Formato de nombre inesperado: %s. Esperaba 'SYMBOL_TF.json'.", archivo)
+                continue
 
-    logger.info("Datos históricos cargados en memoria.")
+            symbol, temporalidad = partes[0], partes[1]
+
+            # 6) Guardar en cache local
+            nuevo_cache.setdefault(symbol, {})[temporalidad] = df_local
+            logging.info("Cargados datos históricos para %s en %s (%d filas).", symbol, temporalidad, len(df_local))
+
+        except Exception as e:
+            logging.info("Error al cargar datos de %s: %s", archivo, e)
+
+    # 7) Swap atómico del cache
+    cache_historicos = nuevo_cache
+    logging.info("Datos históricos cargados en memoria: %d símbolos.", len(cache_historicos))
+
 
 
 def obtener_datos_historicos_fmp(
@@ -1984,8 +2059,6 @@ def obtener_datos_historicos_fmp(
         tf = _norm_tf(temporalidad)  # '1min','5min','15min','30min','1hour','4hour','1day','1week'
         use_bars = isinstance(bars, int) and bars > 0 and tf in _TF_MINUTES
 
-        logging.info(f"MTORO9 obtener_datos_historicos_fmp tf: {tf} bars: {bars}, use_bars: {use_bars}")
-
         # -------------------------
         # MODO 'bars': sin caché
         # -------------------------
@@ -1993,7 +2066,6 @@ def obtener_datos_historicos_fmp(
             now_utc = datetime.now(pytz.utc)
             # Márgen extra para evitar off-by-one
             total_min = _TF_MINUTES[tf] * (bars + 5)
-            logging.info(f"MTORO11 obtener_datos_historicos_fmp total_min: {total_min}")
             from_dt = now_utc - timedelta(minutes=total_min)
             to_dt   = now_utc
 
@@ -2005,7 +2077,6 @@ def obtener_datos_historicos_fmp(
                 f"https://financialmodelingprep.com/api/v3/historical-chart/"
                 f"{tf}/{symbol}?from={from_str}&to={to_str}&apikey={API_KEY}"
             )
-            logging.info(f"MTORO12 obtener_datos_historicos_fmp URL: {url}")
 
             reintento = 0
             tiempo_espera = tiempo_espera_inicial
@@ -2052,7 +2123,6 @@ def obtener_datos_historicos_fmp(
         # -------------------------------------------
         # MODO incremental (sin 'bars'): con caché
         # -------------------------------------------
-        logging.info(f"MTORO13 obtener_datos_historicos_fmp entro al modo incremental sin bars")
         df_local = None
         ultima_fecha = None
 
@@ -2656,62 +2726,70 @@ async def enviar_eventos_y_archivo_calendar(df, context, user_chat_id):
     finally:
         os.remove(file_path)  # Eliminar el archivo después de enviarlo
 
+
+
 #@profile
 def obtener_valor_realtime_unificado(symbol: str, user_chat_id: str | None = None, *, intentos: int = 1):
-    """
-    Devuelve el último 'close' realtime y lo guarda en:
-      - cache por usuario: user_states[user_chat_id]['cache_realtime']
-      - cache global:      user_states['cache_realtime']
-    Si ya existe en el cache de usuario (o global), lo reutiliza.
-    """
-    # --- preparar caches ---
-    user_states.setdefault("cache_realtime", {})
-    global_cache = user_states["cache_realtime"]
 
+    logging.info(f"[RT][IN] symbol={symbol!r} user_chat_id={user_chat_id!r} intentos={intentos}")
+
+    # --- preparar caches (global hermano + bucket de usuario) ---
+    global_cache = user_states.setdefault("cache_realtime", {})
     if user_chat_id:
-        user_states.setdefault(user_chat_id, {})
-        user_states[user_chat_id].setdefault("cache_realtime", {})
-        user_cache = user_states[user_chat_id]["cache_realtime"]
+        user_bucket = user_states.setdefault(user_chat_id, {})
+        user_cache  = user_bucket.setdefault("cache_realtime", {})
     else:
-        user_cache = global_cache
+        user_cache  = global_cache
 
-    logging.info(f'MTORO14 obtener_valor_realtime_unificado este es user_cache: {user_cache}')
+    # Logs de estado inicial
+    logging.info("[RT][STATE] keys(user_states)=%s", list(user_states.keys())[:10])
 
-    # --- preferir valor ya cacheado ---
+    # --- preferir valor ya cacheado (usuario -> global) ---
     v = user_cache.get(symbol)
     if _is_finite_number(v):
+        logging.info("[RT][HIT] user_cache[%s]=%s", symbol, v)
         return float(v)
 
     v = global_cache.get(symbol)
     if _is_finite_number(v):
-        # sembrar en el cache del usuario si es distinto del global
+        logging.info("[RT][HIT] global_cache[%s]=%s", symbol, v)
         if user_cache is not global_cache:
-            user_cache[symbol] = v
+            user_cache[symbol] = v        # seed al cache del usuario
+            logging.info("[RT][SEED] user_cache[%s] <- %s (desde global)", symbol, v)
         return float(v)
 
     # --- consultar a la fuente realtime (FMP) ---
     muestras = []
-    for _ in range(max(1, int(intentos))):
+    for i in range(max(1, int(intentos))):
         try:
             df = obtener_dato_realtime_fmp(symbol)
+            logging.info("[RT][FMP] intento=%d df_none=%s df_empty=%s",
+                         i+1, df is None, (getattr(df, "empty", True) if df is not None else True))
             if df is not None and not df.empty:
-                val = float(df.iloc[0]['close'])
+                val = float(df.iloc[0]["close"])
                 if _is_finite_number(val):
                     muestras.append(val)
+                    logging.info("[RT][FMP] intento=%d close=%s (acum=%d)", i+1, val, len(muestras))
+                else:
+                    logging.info("[RT][FMP] intento=%d close inválido=%s", i+1, val)
         except Exception as e:
-            logger.info(f"Error en realtime para {symbol}: {e}")
+            logging.exception("[RT][ERR] fallo FMP %s intento %d", symbol, i+1)
 
     if not muestras:
+        logging.info("[RT][MISS] Sin muestras válidas para %s -> None", symbol)
         return None
 
     # Si hay varias muestras, usa mediana; si no, la última.
     valor = statistics.median(muestras) if len(muestras) >= 3 else muestras[-1]
+    logging.info("[RT][RESOLVE] muestras=%s -> valor=%s", muestras, valor)
 
     # --- guardar en ambos caches ---
-    user_cache[symbol] = valor
+    user_cache[symbol]   = valor
     global_cache[symbol] = valor
+    logging.info("[RT][SAVE] user_cache[%s]=%s | global_cache[%s]=%s",
+                 symbol, user_cache.get(symbol), symbol, global_cache.get(symbol))
 
-    logger.info(f"[RT] {symbol} = {valor}")
+    logging.info(f"[RT] {symbol} = {valor}")
     return valor
 
 def _is_finite_number(x) -> bool:
@@ -2765,72 +2843,90 @@ def obtener_datos_con_hilos(
     user_chat_id: str | None = None,
     cfg: dict | None = None
 ):
-    """
-    Combina histórico + último tick.
-    Si no hay cfg o no hay valor para esa TF, NO restringe (bars=None).
-    """
-    logging.info(
-        f"MTORO5 obtener_datos_con_hilos: tf={temporalidad}, cfg_keys={list((cfg or {}).keys())}"
-    )
 
     try:
-        # 0) cache realtime por usuario/global
-        if user_chat_id is not None:
-            if user_chat_id not in user_states:
-                user_states[user_chat_id] = {}
-            user_states[user_chat_id].setdefault("cache_realtime", {})
-            cache_rt = user_states[user_chat_id]["cache_realtime"]
-        else:
-            user_states.setdefault("cache_realtime", {})
-            cache_rt = user_states["cache_realtime"]
+        # --- preparar caches: global (hermano) y usuario ---
+        global_cache = user_states.setdefault("cache_realtime", {})
 
-        # 1) normalizar TF a '1min','5min','1hour','1day','1week', etc.
+        if user_chat_id is not None:
+            user_bucket = user_states.setdefault(user_chat_id, {})
+            cache_rt = user_bucket.setdefault("cache_realtime", {})  # cache del usuario
+        else:
+            cache_rt = global_cache  # cache global
+
+        logging.info(
+            "[RT][CACHE] users=%d global_size=%d user_size=%d is_global=%s",
+            sum(1 for k in user_states if k != "cache_realtime"),
+            len(global_cache),
+            len(cache_rt),
+            cache_rt is global_cache
+        )
+
+        # 1) normalizar TF
         tf = _norm_tf(temporalidad)
 
-        # 2) resolver bars solo desde cfg; si no hay → None
-        bars = get_bars_for_tf(cfg, tf)  # ← clave
+        # 2) resolver bars desde cfg; si no hay → None
+        bars = get_bars_for_tf(cfg, tf)
 
         # 3) histórico (acepta bars=None)
         df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars)
         if df_historico is None or df_historico.empty:
-            logger.info(f"Datos históricos no disponibles para {symbol} en {tf}")
+            logger.info("Datos históricos no disponibles para %s en %s", symbol, tf)
             return pd.DataFrame()
         df_historico = df_historico.sort_index()
 
-        # 4) ajustar última vela con tick realtime si existe
-        raw_tick   = _lookup_rt_tick(cache_rt, symbol)
+        # 4) tick realtime: primero user, luego global (y sembrar si aplica)
+        raw_tick = _lookup_rt_tick(cache_rt, symbol)
+        tick_src = "user"
+        if raw_tick is None and cache_rt is not global_cache:
+            raw_tick = _lookup_rt_tick(global_cache, symbol)
+            if raw_tick is not None:
+                cache_rt[symbol] = raw_tick  # siembra al cache del usuario
+                tick_src = "global->seeded"
+            else:
+                tick_src = "none"
+
         last_close = _coerce_float(raw_tick)
 
         try:
-            last_hist = float(df_historico['close'].iloc[-1])
+            last_hist = float(df_historico["close"].iloc[-1])
         except Exception:
             last_hist = None
 
-        logger.info(
-            f"[RT] {symbol}-{tf} tick_cache={raw_tick} -> parsed={last_close} "
-            f"last_hist={last_hist} bars={bars}"
+        logging.info(
+            "[RT][TICK] %s-%s src=%s tick_cache=%r parsed=%s last_hist=%s bars=%s",
+            symbol, tf, tick_src, raw_tick, last_close, last_hist, bars
         )
 
         if last_close is not None:
             try:
                 df_mix = actualizar_ultima_vela_con_realtime(
-                    df_historico, pd.DataFrame([{'close': last_close}]), symbol, tf
+                    df_historico, pd.DataFrame([{"close": last_close}]), symbol, tf
                 )
                 df_out = df_mix.sort_index()
             except Exception as e:
-                logger.info(f"actualizar_ultima_vela_con_realtime falló para {symbol}-{tf}: {e}")
+                logger.info("actualizar_ultima_vela_con_realtime falló para %s-%s: %s", symbol, tf, e)
                 df_out = df_historico
         else:
             df_out = df_historico
 
         # 5) recorte final si bars es numérico
         if isinstance(bars, int) and bars > 0 and len(df_out) > bars:
+            before = len(df_out)
             df_out = df_out.tail(bars)
+            logging.info("[RT][TAIL] recortado de %d a %d por bars=%d", before, len(df_out), bars)
 
+        logging.info(
+            "[RT][RETURN] %s-%s len=%d last_ts=%s last_close=%s tick_aplicado=%s",
+            symbol, tf, len(df_out),
+            (df_out.index[-1] if not df_out.empty else None),
+            (df_out["close"].iloc[-1] if not df_out.empty else None),
+            last_close is not None
+        )
         return df_out
 
     except Exception as e:
-        logger.info(f"Se cayó en obtener_datos_con_hilos {symbol}-{temporalidad} – error: {e}")
+        logger.info("Se cayó en obtener_datos_con_hilos %s-%s – error: %s", symbol, temporalidad, e)
         return pd.DataFrame()
 
 
@@ -4993,6 +5089,16 @@ def calcular_entradas(
             zona_no_trading
         )
 
+        bollinger_upper = salida.get("bollinger_upper")
+        if bollinger_upper is None:
+            bollinger_upper = last_of(df, "bollinger_upper", default=None)
+        bollinger_upper = _coerce_float_safe(bollinger_upper)
+
+        bollinger_lower = salida.get("bollinger_lower")
+        if bollinger_lower is None:
+            bollinger_lower = last_of(df, "bollinger_lower", default=None)
+        bollinger_lower = _coerce_float_safe(bollinger_lower)
+
         # --- NUEVO: generar múltiples entradas candidatas ---
         entradas_mult = generar_entradas_multiples(
             precio_actual=precio_actual,
@@ -5001,8 +5107,8 @@ def calcular_entradas(
             tipo_operacion=tipo_operacion,
             en_rango=en_rango,
             prob_general=probabilidad_general,
-            bollinger_upper=salida.get("bollinger_upper") or df.get('bollinger_upper', [None])[-1],
-            bollinger_lower=salida.get("bollinger_lower") or df.get('bollinger_lower', [None])[-1],
+            bollinger_upper=bollinger_upper,
+            bollinger_lower=bollinger_lower,
             señales_compra=señales_compra,
             señales_venta=señales_venta
         )
@@ -5064,8 +5170,6 @@ def calcular_entradas(
 
         # Agregar predicción de tendencia en tiempo real
         tendencia_predicha = predecir_tendencia_en_tiempo_real(df, temporalidad)
-
-        logging.info(f'MTORO200: estas son las entradas: {entradas_mult}')
         
         salida = {
             "patrones_detectados": patrones_detectados,
@@ -5776,9 +5880,6 @@ def procesar_simbolo_temporalidad(
     try:
         # Solo pasa fmpWindows si viene; si no, deja cfg vacío => bars=None
         cfg_local = {"fmpWindows": fmp_windows} if isinstance(fmp_windows, dict) and fmp_windows else {}
-        logging.info(
-            f"MTORO3 obtener_datos_con_hilos: tf={tf}, cfg_keys={list(cfg_local.keys())}"
-        )
 
         df_combinado = obtener_datos_con_hilos(
             symbol, tf, user_chat_id=user_chat_id, cfg=cfg_local
@@ -5929,9 +6030,7 @@ async def ejecutar_analisis_con_hilos(
 
     cfg       = overrides or {}
     fmp_map   = cfg.get('fmpWindows')
-    logger.info(f"MTORO21 fmp_map: {fmp_map}")
     calc_map  = cfg.get('calcWindows')
-    logger.info(f"MTORO22 calc_map: {calc_map}")
     temps     = cfg.get('tfs') or temporalidades
 
     valid = {'1min','5min','15min','30min','1hour','4hour','1day','1week'}
@@ -5955,10 +6054,6 @@ async def ejecutar_analisis_con_hilos(
     analisis_tasks = []
     meta = []  # (symbol, temporalidad) alineado con analisis_tasks
 
-    logging.info(
-        f"MTORO2 ejecutar_analisis_con_hilos antes de ir procesar_simbolo_temporalidad "
-        f"Temporalidades: {temps}, ventanas de FMP: {fmp_map}, ventanas de calculo: {calc_map}"
-    )
     for symbol in activos_filtrados:
         for temporalidad in temps:
             fn = partial(
@@ -6164,8 +6259,6 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
         )
     else:
         divisas_oportunidades = []
-
-    logging.info(f'MTORO Estas son las divisas oportunidades: {divisas_oportunidades} de df_filtrado: {df_filtrado}, modena_filtro: {moneda_filtro}')
 
     df_filtradoToImage = df_resultadosToImage[
         (df_resultadosToImage['Oportunidad'] == True) &
@@ -8769,6 +8862,9 @@ async def ejecutar_analisis_desde_app():
         if return_state(chat_id) == "en ejecución":
             return jsonify({"status": "error", "message": "Ya hay un análisis en ejecución"}), 409
 
+        #MTORO
+        cfg = firestore_get(f"user_ids/{user_id}/user_config/current")
+
         # -------- leer config enviada desde la app --------
         # Tu app ahora manda 'setup'; dejamos 'operatoria' por compatibilidad.
         raw_cfg = None
@@ -8794,9 +8890,6 @@ async def ejecutar_analisis_desde_app():
         })()
 
         dummy_context = type("DummyContext", (), {"bot": application.bot})()
-
-        logging.info(f"[APP] setup normalizado: {op_cfg}")
-        logging.info(f"MTORO1 [APP] payload bruto: {data}")
 
         task = asyncio.create_task(
             ejecutar_recurrente(
