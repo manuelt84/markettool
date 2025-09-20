@@ -3045,81 +3045,144 @@ def limitar_probabilidad(probabilidad_exito):
 
 # Función para ajustar la probabilidad técnica con incrementos controlados
 #@profile
-def ajustar_probabilidad_tecnica(df, temporalidad, window):
+def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] = None):
+    """
+    Calcula la probabilidad técnica usando:
+      - flags de activación y magnitudes desde cfg.tecnica si existen
+      - en caso contrario usa los valores “en duro” (defaults)
+    """
+    # ---- defaults (mismos que vives en la UI) ----
+    FLAGS_DEF = dict(
+        ponderacion_macd=True,
+        cruce_reciente_macd=True,
+        ponderacion_rsi=True,
+        ponderacion_estocastico=True,
+        divergencias=True,
+        atr_baja_vol=True,
+        senal_alcista_soporte=True,
+        senal_bajista_resistencia=True,
+        bonus_triple_signal=True,
+    )
+    MAG_DEF = dict(
+        macd_base=10,                # ±10
+        macd_cruce_reciente=7,       # ±7
+        rsi_base=3,                  # ±3
+        estoc_base=3,                # ±3
+        divergencias_bonus=10,       # +10
+        atr_penalizacion=-5,         # -5
+        near_support_bonus=3,        # +3
+        near_resistance_penalty=-3,  # -3
+        triple_signal_bonus=10,      # +10
+    )
 
-    # Verificar que el DataFrame tiene al menos dos filas
+    # Umbrales “de libro” iguales a tu lógica original
+    RSI_LOW, RSI_HIGH = 25, 75
+    STOCH_LOW, STOCH_HIGH = 25, 75
+    ATR_LOW_FACTOR = 0.8
+    NEAR_LEVEL_ATR_MULT = 0.5
+
+    # ---- extrae cfg segura ----
+    tcfg = (cfg or {}).get("tecnica", {})
+    flags = {k: bool(tcfg.get(k, v)) for k, v in FLAGS_DEF.items()}
+    mag   = {k: float(tcfg.get(k, v)) for k, v in MAG_DEF.items()}
+
+    # ---- datos mínimos ----
     if len(df) < 2:
         logger.info("No hay suficientes datos para calcular la probabilidad técnica.")
-        return 50  # Devolver un valor base (por ejemplo, 50) si no hay suficientes datos
+        return 50.0
 
     ultima_fila = df.iloc[-1]
     penultima_fila = df.iloc[-2]
+    probabilidad_tecnica = 50.0
 
-    probabilidad_tecnica = 50  # Valor base
+    # Soportes / resistencias sobre ventana
+    soporte_nivel_1 = df["low"].rolling(window=window).min().iloc[-1]
+    resistencia_nivel_1 = df["high"].rolling(window=window).max().iloc[-1]
 
-    # Cálculo de soportes y resistencias dentro de la función
-    soporte_nivel_1 = df['low'].rolling(window=window).min().iloc[-1]
-    resistencia_nivel_1 = df['high'].rolling(window=window).max().iloc[-1]
-
-    # Verificar señales individuales
+    # Señales detectadas para el bono triple
     senal_macd = False
     senal_rsi = False
     senal_estocastico = False
 
-    # Ponderación basada en si el MACD está por encima o por debajo de la señal
-    if ultima_fila['macd'] > ultima_fila['signal']:
-        if ultima_fila['macd'] < penultima_fila['macd']:  # MACD retrocediendo
-            probabilidad_tecnica += 5  # Aumento moderado por señal débil
+    # ---------- MACD base ----------
+    if flags["ponderacion_macd"]:
+        if ultima_fila["macd"] > ultima_fila["signal"]:
+            # MACD > señal → sesgo alcista
+            if ultima_fila["macd"] < penultima_fila["macd"]:
+                probabilidad_tecnica += mag["macd_base"] * 0.5   # tu “+5” cuando base=10
+            else:
+                probabilidad_tecnica += mag["macd_base"]         # tu “+10”
+            senal_macd = True
         else:
-            probabilidad_tecnica += 10  # Ponderación más controlada para señal de compra
-        senal_macd = True  # Señal de compra por MACD
+            # MACD < señal → sesgo bajista
+            if ultima_fila["macd"] > penultima_fila["macd"]:
+                probabilidad_tecnica -= abs(mag["macd_base"]) * 0.5  # tu “-5”
+            else:
+                probabilidad_tecnica -= abs(mag["macd_base"])        # tu “-10”
+
+    # ---------- Cruce reciente MACD ----------
+    if flags["cruce_reciente_macd"]:
+        if penultima_fila["macd"] < penultima_fila["signal"] and ultima_fila["macd"] > ultima_fila["signal"]:
+            probabilidad_tecnica += mag["macd_cruce_reciente"]   # tu “+7”
+        elif penultima_fila["macd"] > penultima_fila["signal"] and ultima_fila["macd"] < ultima_fila["signal"]:
+            probabilidad_tecnica -= abs(mag["macd_cruce_reciente"])  # tu “-7”
+
+    # ---------- RSI ----------
+    if flags["ponderacion_rsi"]:
+        rsi = float(ultima_fila["rsi"])
+        if rsi < RSI_LOW:
+            probabilidad_tecnica += mag["rsi_base"]   # “+3”
+            senal_rsi = True
+        elif rsi > RSI_HIGH:
+            probabilidad_tecnica -= abs(mag["rsi_base"])  # “-3”
+
+    # ---------- Estocástico (%K/%D) ----------
+    if flags["ponderacion_estocastico"]:
+        k, d = float(ultima_fila["%K"]), float(ultima_fila["%D"])
+        if k > d and k < STOCH_LOW:
+            probabilidad_tecnica += mag["estoc_base"]   # “+3”
+            senal_estocastico = True
+        elif k < d and k > STOCH_HIGH:
+            probabilidad_tecnica -= abs(mag["estoc_base"])  # “-3”
+
+    # ---------- Divergencias (MACD/RSI) ----------
+    if flags["divergencias"]:
+        try:
+            if df["divergencia_macd"].tail(3).sum() > 1 or df["divergencia_rsi"].tail(3).sum() > 1:
+                probabilidad_tecnica += mag["divergencias_bonus"]  # “+10”
+        except Exception:
+            pass  # columnas ausentes → no afecta
+
+    # ---------- ATR bajo (filtra señales) ----------
+    if flags["atr_baja_vol"]:
+        atr = ultima_fila.get("ATR")
+        if pd.notna(atr):
+            atr_media = df["ATR"].rolling(window).mean().iloc[-1]
+            if pd.notna(atr_media) and atr < atr_media * ATR_LOW_FACTOR:
+                probabilidad_tecnica += mag["atr_penalizacion"]  # “-5”
+
+    # ---------- Cercanía a niveles ----------
+    if pd.notna(ultima_fila.get("ATR")):
+        near_thresh = ultima_fila["ATR"] * NEAR_LEVEL_ATR_MULT
     else:
-        if ultima_fila['macd'] > penultima_fila['macd']:  # MACD acercándose a cruce alcista
-            probabilidad_tecnica -= 5  # Reducción moderada por señal débil
-        else:
-            probabilidad_tecnica -= 10  # Ponderación más controlada para señal de venta
+        near_thresh = (resistencia_nivel_1 - soporte_nivel_1) * 0.02  # fallback
 
-    # Cruce reciente del MACD con la señal
-    if penultima_fila['macd'] < penultima_fila['signal'] and ultima_fila['macd'] > ultima_fila['signal']:
-        probabilidad_tecnica += 7  # Cruce alcista reciente
-    elif penultima_fila['macd'] > penultima_fila['signal'] and ultima_fila['macd'] < ultima_fila['signal']:
-        probabilidad_tecnica -= 7  # Cruce bajista reciente
+    if flags["senal_alcista_soporte"]:
+        if abs(ultima_fila["close"] - soporte_nivel_1) < near_thresh:
+            probabilidad_tecnica += mag["near_support_bonus"]  # “+3”
 
-    # Ajustes por RSI
-    if ultima_fila['rsi'] < 25:  # Zona de sobreventa
-        probabilidad_tecnica += 3  # Señal alcista
-        senal_rsi = True  # Señal de compra por RSI
-    elif ultima_fila['rsi'] > 75:  # Zona de sobrecompra
-        probabilidad_tecnica -= 3  # Señal bajista
+    if flags["senal_bajista_resistencia"]:
+        if abs(ultima_fila["close"] - resistencia_nivel_1) < near_thresh:
+            probabilidad_tecnica += mag["near_resistance_penalty"]  # “-3”
 
-    # Ajustes por Estocástico
-    if ultima_fila['%K'] > ultima_fila['%D'] and ultima_fila['%K'] < 25:  # Señal alcista en sobreventa
-        probabilidad_tecnica += 3
-        senal_estocastico = True  # Señal de compra por Estocástico
-    elif ultima_fila['%K'] < ultima_fila['%D'] and ultima_fila['%K'] > 75:  # Señal bajista en sobrecompra
-        probabilidad_tecnica -= 3
+    # ---------- Bono triple señal ----------
+    if flags["bonus_triple_signal"]:
+        if senal_macd and senal_rsi and senal_estocastico:
+            probabilidad_tecnica += mag["triple_signal_bonus"]  # “+10”
 
-    # Ajuste por divergencias
-    if df['divergencia_macd'].tail(3).sum() > 1 or df['divergencia_rsi'].tail(3).sum() > 1:
-        probabilidad_tecnica += 10  # Aumento por divergencias confirmadas
-
-    # Filtrar señales débiles si el ATR es bajo (baja volatilidad)
-    if not pd.isna(ultima_fila['ATR']) and ultima_fila['ATR'] < df['ATR'].rolling(window).mean().iloc[-1] * 0.8:
-        probabilidad_tecnica -= 5  # Disminuir probabilidad en mercados de baja volatilidad
-
-    # **Ajustes por niveles de soporte y resistencia**
-    # Comparar el precio actual con los niveles de soporte y resistencia
-    if abs(ultima_fila['close'] - soporte_nivel_1) < (ultima_fila['ATR'] * 0.5):
-        probabilidad_tecnica += 3  # Señal alcista reforzada cerca del soporte
-    elif abs(ultima_fila['close'] - resistencia_nivel_1) < (ultima_fila['ATR'] * 0.5):
-        probabilidad_tecnica -= 3  # Señal bajista reforzada cerca de la resistencia
-
-    # **Bonificación extra si las señales de compra coinciden en MACD, RSI y Estocástico**
-    if senal_macd and senal_rsi and senal_estocastico:
-        probabilidad_tecnica += 10  # Bonificación más controlada si todas las señales son alcistas
-
-    # Limitar la probabilidad técnica entre 0 y 100
+    # Limitar al rango [0,100]
     return limitar_probabilidad(probabilidad_tecnica)
+
 
 def limpiar_valores(val):
     """Limpia y convierte los valores que contienen 'K' y '%'."""
@@ -3154,277 +3217,272 @@ def analizar_sentimiento(texto):
     else:
         return 0  # Sentimiento neutro
 
+def _fget(cfg: Optional[dict], path: list, default):
+    cur = (cfg or {}).get("fundamental", {})
+    for k in path:
+        cur = cur.get(k, {}) if isinstance(cur, dict) else {}
+    return (cfg or {}).get("fundamental", {}).get(path[0], default) if len(path)==1 else (cur or default)
+
 #@profile
-def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, temporalidad, fecha_inicio=None, fecha_fin=None):
-    global cache_noticias
+def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, temporalidad,
+                                     fecha_inicio=None, fecha_fin=None, cfg: Optional[dict]=None):
 
-    # Análisis de noticias
-    if symbol not in cache_noticias:
-        df_noticias =  obtener_noticias(symbol, fecha_inicio, fecha_fin)
-    else:
-        df_noticias = cache_noticias[symbol]
-        
-    impacto_noticias =  calcular_impacto_noticias(df_noticias)
+    FUND_DEFAULTS = {
+        "obtener_noticias": True,
+        "calcular_impacto_noticias": True,
+        "impacto_noticias_factor": 0.10,
+        "consider_events_hours": 72,
+        "recency_recent_minutes": 15,
+        "recency_recent_boost": 1.5,
+        "recency_decay_floor": 0.30,
+        "impact_weights": {"high": 2.0, "medium": 1.5, "low": 1.0},
+        "flip_secondary_currency": True,
+        "cat_weights": {
+            "unemployment": {"good": 0.3, "bad": -0.2},
+            "employment":   {"good": 0.3, "bad": -0.2},
+            "inflation":    {"good": 0.3, "bad": -0.3},
+            "gdp":          {"good": 0.3, "bad": -0.3},
+            "retail":       {"good": 0.3, "bad": -0.2},
+            "rates":        {"good": 0.3, "bad": -0.3},
+            "generic": {"better_both": 0.25, "better_estimate": 0.15, "better_prev": 0.10, "worse": -0.25},
+        },
+        "per_event_cap": 0.35,
+        "return_on_no_events": 50.0,
+    }
 
-    # Ajustar probabilidad con base en el impacto de noticias
-    if impacto_noticias is not None:
-        probabilidad_exito += impacto_noticias * 0.1  # Ajustar peso según relevancia
+    # Mezclar defaults con cfg
+    fund = {**FUND_DEFAULTS, **(cfg or {}).get("fundamental", {})}
+    impact_weights = {**FUND_DEFAULTS["impact_weights"], **fund.get("impact_weights", {})}
+    catw = FUND_DEFAULTS["cat_weights"].copy()
+    for k, v in fund.get("cat_weights", {}).items():
+        catw[k] = {**catw.get(k, {}), **v}
 
+    # --- Noticias (igual que antes pero con factor configurable) ---
+    try:
+        if fund["obtener_noticias"]:
+            global cache_noticias
+            if "cache_noticias" not in globals() or cache_noticias is None:
+                cache_noticias = {}
+            df_noticias = cache_noticias.get(symbol) or obtener_noticias(symbol, fecha_inicio, fecha_fin)
+            cache_noticias[symbol] = df_noticias
+        else:
+            df_noticias = None
 
-    # Validación: DataFrame vacío o columnas críticas ausentes
-    columnas_necesarias = {'date', 'actual', 'estimate', 'previous', 'currency', 'event', 'impact'}
-    if df_eventos.empty or not columnas_necesarias.issubset(df_eventos.columns):
-        logging.info(f"No se encontraron eventos válidos para {symbol}. Usando probabilidad por defecto.")
-        return limitar_probabilidad(50)
-        
-    if df_eventos.empty:
-        logging.info(f"No se encontraron eventos pasados para {symbol}. Usando probabilidades por defecto.")
-        return limitar_probabilidad(50)
-    else:
-        # Asegurarse de que la columna 'date' esté en formato datetime
-        df_eventos['date'] = pd.to_datetime(df_eventos['date'], errors='coerce')
+        if fund["calcular_impacto_noticias"] and df_noticias is not None:
+            imp = calcular_impacto_noticias(df_noticias)
+            if imp is not None:
+                probabilidad_exito += imp * float(fund["impacto_noticias_factor"])
+    except Exception as e:
+        logging.info(f"Noticias/impacto omitidos: {e}")
 
-        # Convertir las columnas 'actual', 'estimate' y 'previous' a tipo float
-        df_eventos['actual'] = pd.to_numeric(df_eventos['actual'].apply(limpiar_valores), errors='coerce')
-        df_eventos['estimate'] = pd.to_numeric(df_eventos['estimate'].apply(limpiar_valores), errors='coerce')
-        df_eventos['previous'] = pd.to_numeric(df_eventos['previous'].apply(limpiar_valores), errors='coerce')
+    # --- Validación de eventos ---
+    cols = {'date','actual','estimate','previous','currency','event','impact'}
+    if df_eventos is None or df_eventos.empty or not cols.issubset(df_eventos.columns):
+        return limitar_probabilidad(float(fund["return_on_no_events"]))
 
-        divisa_principal, divisa_secundaria = obtener_monedas(symbol)
+    df = df_eventos.copy()
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df['actual']   = pd.to_numeric(df['actual'].apply(limpiar_valores),   errors='coerce')
+    df['estimate'] = pd.to_numeric(df['estimate'].apply(limpiar_valores), errors='coerce')
+    df['previous'] = pd.to_numeric(df['previous'].apply(limpiar_valores), errors='coerce')
 
-        df_eventos_temp = df_eventos[(df_eventos['currency'].isin([divisa_principal, divisa_secundaria]))]
+    # Filtrar por ventana temporal
+    now = datetime.now(timezone_country)
+    if fund["consider_events_hours"] is not None:
+        cutoff = now - timedelta(hours=int(fund["consider_events_hours"]))
+        df = df[df['date'] >= cutoff]
 
-        # Verificar si el DataFrame no está vacío antes de continuar
-        if df_eventos_temp.empty:
-            logger.info(f"No se encontraron eventos pasados para el símbolo {symbol}.")
-            return probabilidad_exito  # Retornar la probabilidad actual si no hay eventos
-        
-        # Ordenar por fecha en orden ascendente
-        df_eventos_temp = df_eventos_temp.sort_values(by='date', ascending=True)
+    base_empty_return = float(fund["return_on_no_events"])
+    if df.empty:
+        return limitar_probabilidad(base_empty_return)
 
-        # Obtener el evento más reciente
-        ahora = datetime.now(timezone_country)
-        evento_reciente = df_eventos_temp.iloc[-1]
-        
-        
-        # Ponderar más las noticias recientes
-        tiempo_transcurrido = (ahora - evento_reciente['date']).total_seconds() / 60
-        ponderacion_reciente = 1.5 if tiempo_transcurrido < 15 else 1.0
-        
-        # Ordenar por fecha en orden ascendente (del más antiguo al más reciente)
-        df_eventos_temp = df_eventos_temp.sort_values(by='date', ascending=True)
+    # Orden + recencia
+    df = df.sort_values('date')
+    reciente = df.iloc[-1]
+    recent_minutes = (now - reciente['date']).total_seconds()/60.0
+    recent_boost = float(fund["recency_recent_boost"]) if recent_minutes < int(fund["recency_recent_minutes"]) else 1.0
+    tmax = max((now - df['date'].min()).total_seconds(), 1.0)
 
-        # Obtener el tiempo máximo de diferencia entre el evento más antiguo y ahora (para normalizar)
-        tiempo_maximo = (ahora - df_eventos_temp['date'].min()).total_seconds()
-        
+    div_p, div_s = obtener_monedas(symbol)
 
-        if df_eventos_temp.empty:
-            logger.info(f"No se encontraron eventos relevantes para {symbol}.")
-            return limitar_probabilidad(probabilidad_exito)
+    for _, ev in df.iterrows():
+        if any(pd.isna(ev[k]) for k in ['actual','estimate','previous']):
+            continue
 
-    
-        for idx, evento in df_eventos_temp.iterrows():
+        # impacto base
+        iw = impact_weights.get(str(ev.get('impact','')).lower(), 1.0)
+        mult = iw
 
-            ajuste = 0  # Variable para ajustar la probabilidad
+        if ev['date'] == reciente['date']:
+            mult *= recent_boost
 
-            # Calcular el tiempo transcurrido desde el evento hasta ahora
-            tiempo_transcurrido = (ahora - evento['date']).total_seconds()
+        # decaimiento por antigüedad
+        age = max((now - ev['date']).total_seconds(), 0.0)
+        decay = max(1.0 - (age / tmax), float(fund["recency_decay_floor"]))
+        mult *= decay
 
-            # Normalizar la ponderación (los eventos más recientes tendrán ponderación más alta)
-            ponderacion_antiguedad = 1 - (tiempo_transcurrido / tiempo_maximo)
+        # signo por moneda secundaria
+        if fund["flip_secondary_currency"] and ev['currency'] == div_s:
+            mult *= -1.0
 
-            if evento['actual'] is not None and evento['estimate'] is not None and evento['previous'] is not None:
-                categoria = detectar_categoria(evento['event'])
+        cat = detectar_categoria(ev['event'])
+        adj = 0.0
 
-                # Ajuste basado en el análisis de sentimiento
-                texto_evento = evento.get('event', '')
-                
-                # Ajuste según el impacto del evento
-                if evento['impact'] == 'High':
-                    multiplicador_impacto = 2
-                elif evento['impact'] == 'Medium':
-                    multiplicador_impacto = 1.5
+        def _cap(x):  # limitar por evento
+            cap = float(fund["per_event_cap"])
+            return max(min(x, cap), -cap)
+
+        # helpers cat weights
+        cw = catw
+        if symbol in ['WTI','BRENT'] and cat == 'Crude Oil Inventories':
+            # misma lógica; usa 0.3/0.2 pero capea
+            if pd.isna(ev['estimate']):
+                adj = (0.3 if ev['actual'] < ev['previous'] else -0.3) * mult
+            else:
+                if ev['actual'] < ev['estimate'] and ev['actual'] < ev['previous']:
+                    adj = 0.3 * mult
+                elif ev['actual'] < ev['estimate']:
+                    adj = 0.2 * mult
                 else:
-                    multiplicador_impacto = 1
-                
-                # Ponderar más la última noticia si es la más reciente
-                if evento['date'] == evento_reciente['date']:
-                    multiplicador_impacto *= ponderacion_reciente
-                
-                # Aplicar la ponderación de antigüedad
-                multiplicador_impacto *= ponderacion_antiguedad
+                    adj = -0.3 * mult
 
-                # Petróleo
-                if symbol in ['WTI', 'BRENT']:
-                    if categoria == 'Crude Oil Inventories':
-                        if pd.isna(evento['estimate']):
-                            if evento['actual'] < evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            else:
-                                ajuste = -0.3 * multiplicador_impacto
-                        else:
-                            if evento['actual'] < evento['estimate'] and evento['actual'] < evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            elif evento['actual'] < evento['estimate']:
-                                ajuste = 0.2 * multiplicador_impacto
-                            else:
-                                ajuste = -0.3 * multiplicador_impacto
-                    elif categoria in ['OPEC Meeting', 'OPEC Decision']:
-                        if 'cut' in evento['event'].lower():
-                            ajuste = 0.3 * multiplicador_impacto
-                        elif 'increase' in evento['event'].lower():
-                            ajuste = -0.3 * multiplicador_impacto
-
-                # Soja
-                elif symbol == 'SOYB':
-                    if categoria == 'Crop Production Report':
-                        if pd.isna(evento['estimate']):
-                            if evento['actual'] < evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            else:
-                                ajuste = -0.3 * multiplicador_impacto
-                        else:
-                            if evento['actual'] < evento['estimate'] and evento['actual'] < evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            elif evento['actual'] < evento['estimate']:
-                                ajuste = 0.2 * multiplicador_impacto
-                            else:
-                                ajuste = -0.3 * multiplicador_impacto
-                    elif categoria == 'Weather Report':
-                        if 'drought' in evento['event'].lower() or 'storm' in evento['event'].lower():
-                            ajuste = 0.3 * multiplicador_impacto
-                        else:
-                            ajuste = -0.2 * multiplicador_impacto
-                            
-                # Lógica para ajustar según si es divisa principal o secundaria
-                if evento['currency'] == divisa_secundaria:
-                    multiplicador_impacto = multiplicador_impacto*-1
-
-                if categoria is not None:
-                    if categoria == 'Unemployment Rate':
-                        if pd.isna(evento['estimate']):
-                            if evento['actual'] < evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            else:
-                                ajuste = -0.2 * multiplicador_impacto
-                        else:
-                            if evento['actual'] < evento['estimate'] and evento['actual'] < evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            elif evento['actual'] < evento['estimate']:
-                                ajuste = 0.2 * multiplicador_impacto
-                            else:
-                                ajuste = -0.2 * multiplicador_impacto
-
-                    elif categoria == 'Employment Report':
-                        if pd.isna(evento['estimate']):
-                            if evento['actual'] > evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            else:
-                                ajuste = -0.2 * multiplicador_impacto
-                        else:
-                            if evento['actual'] > evento['estimate'] and evento['actual'] > evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            elif evento['actual'] > evento['estimate']:
-                                ajuste = 0.2 * multiplicador_impacto
-                            else:
-                                ajuste = -0.2 * multiplicador_impacto  # Si los datos son peores que el estimado y el anterior, es negativo
-
-                    elif categoria == 'Inflation Rate':
-                        if pd.isna(evento['estimate']):
-                            if evento['actual'] < evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            else:
-                                ajuste = -0.3 * multiplicador_impacto
-                        else:
-                            if evento['actual'] < evento['estimate'] and evento['actual'] < evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            elif evento['actual'] < evento['estimate']:
-                                ajuste = 0.2 * multiplicador_impacto
-                            else:
-                                ajuste = -0.3 * multiplicador_impacto
-
-                    elif categoria == 'GDP':
-                        if pd.isna(evento['estimate']):
-                            if evento['actual'] > evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            else:
-                                ajuste = -0.3 * multiplicador_impacto
-                        else:
-                            if evento['actual'] > evento['estimate'] and evento['actual'] > evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            elif evento['actual'] > evento['estimate']:
-                                ajuste = 0.2 * multiplicador_impacto
-                            else:
-                                ajuste = -0.2 * multiplicador_impacto
-
-                    elif categoria == 'Retail Sales':
-                        if pd.isna(evento['estimate']):
-                            if evento['actual'] > evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            else:
-                                ajuste = -0.2 * multiplicador_impacto
-                        else:
-                            if evento['actual'] > evento['estimate'] and evento['actual'] > evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            elif evento['actual'] > evento['estimate']:
-                                ajuste = 0.2 * multiplicador_impacto
-                            else:
-                                ajuste = -0.2 * multiplicador_impacto
-
-                    elif categoria == 'Interest Rate':
-                        if pd.isna(evento['estimate']):
-                            if evento['actual'] < evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            else:
-                                ajuste = -0.3 * multiplicador_impacto
-                        else:
-                            if evento['actual'] < evento['estimate'] and evento['actual'] < evento['previous']:
-                                ajuste = 0.3 * multiplicador_impacto
-                            elif evento['actual'] < evento['estimate']:
-                                ajuste = 0.2 * multiplicador_impacto
-                            else:
-                                ajuste = -0.3 * multiplicador_impacto
-                    else:
-                        if pd.isna(evento['estimate']):
-                            if evento['actual'] > evento['previous']:
-                                ajuste = 0.25 * multiplicador_impacto
-                            else:
-                                ajuste = -0.25 * multiplicador_impacto
-                        else:
-                            # Comparar los valores actual, estimado y anterior para decidir el ajuste
-                            if evento['actual'] > evento['estimate'] and evento['actual'] > evento['previous']:
-                                ajuste = 0.25 * multiplicador_impacto  # Ajuste positivo mayor si actual es mejor que estimate y previous
-                            elif evento['actual'] > evento['estimate']:
-                                ajuste = 0.15 * multiplicador_impacto  # Ajuste positivo si actual es mejor que estimate pero no previous
-                            elif evento['actual'] > evento['previous']:
-                                ajuste = 0.1 * multiplicador_impacto  # Ajuste menor si actual es mejor que previous pero no estimate
-                            else:
-                                ajuste = -0.25 * multiplicador_impacto  # Ajuste negativo si actual es peor que estimate y previous
+        elif symbol == 'SOYB' and cat in ['Crop Production Report','Weather Report']:
+            if cat == 'Crop Production Report':
+                if pd.isna(ev['estimate']):
+                    adj = (0.3 if ev['actual'] < ev['previous'] else -0.3) * mult
                 else:
-                    if pd.isna(evento['estimate']):
-                            if evento['actual'] > evento['previous']:
-                                ajuste = 0.25 * multiplicador_impacto
-                            else:
-                                ajuste = -0.25 * multiplicador_impacto
+                    if ev['actual'] < ev['estimate'] and ev['actual'] < ev['previous']:
+                        adj = 0.3 * mult
+                    elif ev['actual'] < ev['estimate']:
+                        adj = 0.2 * mult
                     else:
-                        # Comparar los valores actual, estimado y anterior para decidir el ajuste
-                        if evento['actual'] > evento['estimate'] and evento['actual'] > evento['previous']:
-                            ajuste = 0.25 * multiplicador_impacto  # Ajuste positivo mayor si actual es mejor que estimate y previous
-                        elif evento['actual'] > evento['estimate']:
-                            ajuste = 0.15 * multiplicador_impacto  # Ajuste positivo si actual es mejor que estimate pero no previous
-                        elif evento['actual'] > evento['previous']:
-                            ajuste = 0.1 * multiplicador_impacto  # Ajuste menor si actual es mejor que previous pero no estimate
-                        else:
-                            ajuste = -0.25 * multiplicador_impacto  # Ajuste negativo si actual es peor que estimate y previous
+                        adj = -0.3 * mult
+            else:
+                txt = str(ev['event']).lower()
+                adj = (0.3 if ('drought' in txt or 'storm' in txt) else -0.2) * mult
 
-            # Ajustar la probabilidad de éxito con el nuevo ajuste
-            probabilidad_exito += ajuste
-    
-    return  limitar_probabilidad(probabilidad_exito) 
+        else:
+            # categorías macro generales
+            if cat == 'Unemployment Rate':
+                g,b = cw['unemployment']['good'], cw['unemployment']['bad']
+                if pd.isna(ev['estimate']):
+                    adj = (g if ev['actual'] < ev['previous'] else b) * mult
+                else:
+                    if ev['actual'] < ev['estimate'] and ev['actual'] < ev['previous']:
+                        adj = g * mult
+                    elif ev['actual'] < ev['estimate']:
+                        adj = 0.2 * mult
+                    else:
+                        adj = b * mult
+
+            elif cat == 'Employment Report':
+                g,b = cw['employment']['good'], cw['employment']['bad']
+                if pd.isna(ev['estimate']):
+                    adj = (g if ev['actual'] > ev['previous'] else b) * mult
+                else:
+                    if ev['actual'] > ev['estimate'] and ev['actual'] > ev['previous']:
+                        adj = g * mult
+                    elif ev['actual'] > ev['estimate']:
+                        adj = 0.2 * mult
+                    else:
+                        adj = b * mult
+
+            elif cat == 'Inflation Rate':
+                g,b = cw['inflation']['good'], cw['inflation']['bad']
+                if pd.isna(ev['estimate']):
+                    adj = (g if ev['actual'] < ev['previous'] else b) * mult
+                else:
+                    if ev['actual'] < ev['estimate'] and ev['actual'] < ev['previous']:
+                        adj = g * mult
+                    elif ev['actual'] < ev['estimate']:
+                        adj = 0.2 * mult
+                    else:
+                        adj = b * mult
+
+            elif cat == 'GDP':
+                g,b = cw['gdp']['good'], cw['gdp']['bad']
+                if pd.isna(ev['estimate']):
+                    adj = (g if ev['actual'] > ev['previous'] else b) * mult
+                else:
+                    if ev['actual'] > ev['estimate'] and ev['actual'] > ev['previous']:
+                        adj = g * mult
+                    elif ev['actual'] > ev['estimate']:
+                        adj = 0.2 * mult
+                    else:
+                        adj = -0.2 * mult
+
+            elif cat == 'Retail Sales':
+                g,b = cw['retail']['good'], cw['retail']['bad']
+                if pd.isna(ev['estimate']):
+                    adj = (g if ev['actual'] > ev['previous'] else b) * mult
+                else:
+                    if ev['actual'] > ev['estimate'] and ev['actual'] > ev['previous']:
+                        adj = g * mult
+                    elif ev['actual'] > ev['estimate']:
+                        adj = 0.2 * mult
+                    else:
+                        adj = b * mult
+
+            elif cat == 'Interest Rate':
+                g,b = cw['rates']['good'], cw['rates']['bad']
+                if pd.isna(ev['estimate']):
+                    adj = (g if ev['actual'] < ev['previous'] else b) * mult
+                else:
+                    if ev['actual'] < ev['estimate'] and ev['actual'] < ev['previous']:
+                        adj = g * mult
+                    elif ev['actual'] < ev['estimate']:
+                        adj = 0.2 * mult
+                    else:
+                        adj = b * mult
+
+            else:
+                # genérico
+                gg = cw['generic']
+                if pd.isna(ev['estimate']):
+                    adj = (gg['better_prev'] if ev['actual'] > ev['previous'] else gg['worse']) * mult
+                else:
+                    if ev['actual'] > ev['estimate'] and ev['actual'] > ev['previous']:
+                        adj = gg['better_both'] * mult
+                    elif ev['actual'] > ev['estimate']:
+                        adj = gg['better_estimate'] * mult
+                    elif ev['actual'] > ev['previous']:
+                        adj = gg['better_prev'] * mult
+                    else:
+                        adj = gg['worse'] * mult
+
+        probabilidad_exito += _cap(adj)
+
+    return limitar_probabilidad(probabilidad_exito)
 
 # Función para calcular la probabilidad general ponderando más la probabilidad fundamental
-def calcular_probabilidad_general(probabilidad_tecnica, probabilidad_fundamental):
-    # Ponderar más la probabilidad fundamental (50%) y menos la probabilidad técnica (50%)
-    return (probabilidad_tecnica * 0.5) + (probabilidad_fundamental * 0.5)
+def calcular_probabilidad_general(probabilidad_tecnica: float,
+                                  probabilidad_fundamental: float,
+                                  cfg: dict | None = None) -> float:
+    """
+    Combina prob. técnica y fundamental usando pesos de cfg.general
+    (prob_tecnica_pct y prob_fundamental_pct). Si no hay cfg, usa 50/50.
+    Devuelve [0..100].
+    """
+    # fallbacks si no viene cfg o vienen valores raros
+    try:
+      g = (cfg or {}).get("general", {})
+      w_t = float(g.get("prob_tecnica_pct", 50.0))
+      w_f = float(g.get("prob_fundamental_pct", 50.0))
+    except Exception:
+      w_t, w_f = 50.0, 50.0
+
+    # normaliza (evita división por cero y pesos negativos)
+    w_t = max(0.0, w_t)
+    w_f = max(0.0, w_f)
+    s = (w_t + w_f) or 1.0
+    w_t /= s
+    w_f /= s
+
+    out = probabilidad_tecnica * w_t + probabilidad_fundamental * w_f
+    # clamp
+    if out < 0: out = 0
+    if out > 100: out = 100
+    return float(out)
 
 # Implementación de la zona de no trading
 def verificar_zona_no_trading(df, window):
@@ -4977,7 +5035,8 @@ def calcular_entradas(
     temporalidad: str,
     user_chat_id: str,
     *,
-    calc_windows: dict[str,int] | None = None
+    calc_windows: dict[str, int] | None = None,
+    cfg: dict | None = None,
 ):
     salida = {}
     try:
@@ -4987,119 +5046,130 @@ def calcular_entradas(
         tf = _tf_backend(temporalidad)
         window = min(definir_window(tf, overrides=calc_windows), len(df))
 
-        # Detección de patrones de velas japonesas
+        # --- Patrones ---
         patrones_detectados = {}
         resultados = detectar_patrones_confirmados_velas(df, window)
-
         for _, _, nombre in resultados:
             patrones_detectados[nombre] = True
+        # print(f"Paso exitosamente la detección de patrones: {patrones_detectados}")
 
-        #patrones_detectados =  detectar_patrones_velas(df, window) #MTORO antiguo
+        # --- Predicciones/MC ---
+        predicciones_arima = predecir_arima(df, tf, symbol)
+        predicciones_media_movil = predecir_media_movil(df, window)
 
-        print(f"Paso exitosamente la detección de patrones: {patrones_detectados}")
-        
-        # Predicción de precios futuros con ARIMA
-        predicciones_arima =  predecir_arima(df, tf, symbol)
-        
-        predicciones_media_movil =  predecir_media_movil(df, window)
-        
-        # Simulación de Monte Carlo para probabilidad de alza/baja
-        probabilidad_alza, probabilidad_baja =  simulacion_monte_carlo(df, tf,num_simulaciones=100,num_dias=5,seed=42)
+        probabilidad_alza, probabilidad_baja = simulacion_monte_carlo(
+            df, tf, num_simulaciones=100, num_dias=5, seed=42
+        )
         probabilidad_alza = probabilidad_alza if probabilidad_alza is not None else 50
         probabilidad_baja = probabilidad_baja if probabilidad_baja is not None else 50
-        
-        precio_actual = df['close'].iloc[-1]
-    
-        # Calcular soportes y resistencias dinámicos de esta temporalidad
+
+        precio_actual = df["close"].iloc[-1]
+
+        # --- Soportes/Resistencias dinámicos ---
         df, soportes_dinamicos, resistencias_dinamicas = ajustar_window_dinamico_optimizado(
-            df, symbol, tf, precio_actual,
+            df,
+            symbol,
+            tf,
+            precio_actual,
             calc_windows=calc_windows,
-            max_incremento=5, min_factor=2, max_factor=8, min_levels=2, n_jobs=-1
+            max_incremento=5,
+            min_factor=2,
+            max_factor=8,
+            min_levels=2,
+            n_jobs=-1,
         )
 
-        soportes_dinamicos     = _clean_levels(soportes_dinamicos)
+        soportes_dinamicos = _clean_levels(soportes_dinamicos)
         resistencias_dinamicas = _clean_levels(resistencias_dinamicas)
 
         if symbol not in soportes_resistencias_cache:
             soportes_resistencias_cache[symbol] = {}
 
-        # Agregar soportes y resistencias de esta temporalidad al caché global
         if tf not in soportes_resistencias_cache[symbol]:
-            # Si la temporalidad no está en el caché, agregar directamente
             soportes_resistencias_cache[symbol][tf] = {
                 "soportes": soportes_dinamicos,
                 "resistencias": resistencias_dinamicas,
             }
         else:
-            # Si la temporalidad ya existe, combinar o actualizar
-            soportes_resistencias_cache[symbol][tf]['soportes'] = list(
-                set(soportes_resistencias_cache[symbol][tf]['soportes'] + soportes_dinamicos)
-            )
-            soportes_resistencias_cache[symbol][tf]['resistencias'] = list(
-                set(soportes_resistencias_cache[symbol][tf]['resistencias'] + resistencias_dinamicas)
-            )
-        niveles_clave =  obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soportes_resistencias_cache, symbol, tf, umbral_atr=2.0, max_niveles=2)
+            s = soportes_resistencias_cache[symbol][tf]
+            s["soportes"] = list(set(s["soportes"] + soportes_dinamicos))
+            s["resistencias"] = list(set(s["resistencias"] + resistencias_dinamicas))
 
-        try:
-            en_rango = detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
-        except Exception:
-            en_rango = {"es_rango_repetitivo": False, "estructura_tendencia": "indefinida",
-                        "rebotes": [], "rango_dinamico": [None, None]}
-
-        ATR = _tofloat(df['ATR'].iloc[-1]) if 'ATR' in df.columns else None
-
-        # Calcular probabilidades técnica y fundamental
-        probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df,tf,window), 2)
-        fecha_inicio = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-        fecha_fin = datetime.now().strftime('%Y-%m-%d')
-        probabilidad_fundamental =  ajustar_probabilidad_fundamental(50, df_eventos, symbol, tf, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin)
-        if probabilidad_fundamental is None:
-            probabilidad_fundamental = 50
-        else:
-            probabilidad_fundamental = round(probabilidad_fundamental, 2)
-        # Calcular probabilidad general con la nueva ponderación
-
-        probabilidad_general =  calcular_probabilidad_general(probabilidad_tecnica, probabilidad_fundamental)
-        if probabilidad_general is None:
-            probabilidad_general = 50  # Valor predeterminado para evitar errores
-        else:
-            probabilidad_general = round(probabilidad_general, 2)
-
-        # Verificar zona de no trading
-        zona_no_trading = verificar_zona_no_trading(df, window)
-        #logger.info(f"Zona de no trading: {zona_no_trading}")
-        
-        zona_sobreventa = verificar_zona_sobreventa(df, window)
-        #logger.info(f"Zona de sobreventa: {zona_sobreventa}")
-        
-        zona_sobrecompra = verificar_zona_sobrecompra(df, window)
-        #logger.info(f"Zona de sobrecompra: {zona_sobrecompra}")
-        
-        # Determinación del tipo de operación utilizando las funciones auxiliares
-        tipo_operacion = determinar_tipo_operacion(
-            precio_actual, 
-            predicciones_arima[0] if predicciones_arima else None,
-            predicciones_media_movil[0] if predicciones_media_movil else None,
-            probabilidad_alza, 
-            probabilidad_baja,
-            patrones_detectados, 
-            zona_sobreventa, 
-            zona_sobrecompra, 
-            probabilidad_general, 
-            zona_no_trading
+        niveles_clave = obtener_niveles_clave(
+            df,
+            soportes_dinamicos,
+            resistencias_dinamicas,
+            soportes_resistencias_cache,
+            symbol,
+            tf,
+            umbral_atr=2.0,
+            max_niveles=2,
         )
 
-        bollinger_upper = salida.get("bollinger_upper")
-        if bollinger_upper is None:
-            bollinger_upper = last_of(df, "bollinger_upper", default=None)
-        bollinger_upper = _coerce_float_safe(bollinger_upper)
+        try:
+            en_rango = detectar_rango_zigzag(
+                df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3
+            )
+        except Exception:
+            en_rango = {
+                "es_rango_repetitivo": False,
+                "estructura_tendencia": "indefinida",
+                "rebotes": [],
+                "rango_dinamico": [None, None],
+            }
 
-        bollinger_lower = salida.get("bollinger_lower")
-        if bollinger_lower is None:
-            bollinger_lower = last_of(df, "bollinger_lower", default=None)
-        bollinger_lower = _coerce_float_safe(bollinger_lower)
+        ATR = _tofloat(df["ATR"].iloc[-1]) if "ATR" in df.columns else None
 
-        # --- NUEVO: generar múltiples entradas candidatas ---
+        # --- Prob. técnica y fundamental (usan cfg) ---
+        probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df, tf, window, cfg), 2)
+
+        fecha_inicio = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        fecha_fin = datetime.now().strftime("%Y-%m-%d")
+        prob_funda = ajustar_probabilidad_fundamental(
+            50, df_eventos, symbol, tf, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin, cfg=cfg
+        )
+        probabilidad_fundamental = round(prob_funda if prob_funda is not None else 50, 2)
+
+        # --- Prob. general (con pesos desde cfg.general) ---
+        probabilidad_general = calcular_probabilidad_general(
+            probabilidad_tecnica, probabilidad_fundamental, cfg
+        )
+        probabilidad_general = round(probabilidad_general if probabilidad_general is not None else 50, 2)
+
+        # --- Zona no trading (condicionada por cfg.entrada.verificar_zona_no_trading) ---
+        verificar_znt = True
+        try:
+            verificar_znt = bool((cfg or {}).get("entrada", {}).get("verificar_zona_no_trading", True))
+        except Exception:
+            verificar_znt = True
+
+        zona_no_trading = verificar_zona_no_trading(df, window) if verificar_znt else False
+        zona_sobreventa = verificar_zona_sobreventa(df, window)
+        zona_sobrecompra = verificar_zona_sobrecompra(df, window)
+
+        # --- Tipo de operación ---
+        tipo_operacion = determinar_tipo_operacion(
+            precio_actual,
+            predicciones_arima[0] if predicciones_arima else None,
+            predicciones_media_movil[0] if predicciones_media_movil else None,
+            probabilidad_alza,
+            probabilidad_baja,
+            patrones_detectados,
+            zona_sobreventa,
+            zona_sobrecompra,
+            probabilidad_general,
+            zona_no_trading,
+        )
+
+        # Bollinger (último)
+        bollinger_upper = _coerce_float_safe(salida.get("bollinger_upper")) or _coerce_float_safe(
+            last_of(df, "bollinger_upper", default=None)
+        )
+        bollinger_lower = _coerce_float_safe(salida.get("bollinger_lower")) or _coerce_float_safe(
+            last_of(df, "bollinger_lower", default=None)
+        )
+
+        # --- Entradas múltiples ---
         entradas_mult = generar_entradas_multiples(
             precio_actual=precio_actual,
             ATR=ATR,
@@ -5110,84 +5180,93 @@ def calcular_entradas(
             bollinger_upper=bollinger_upper,
             bollinger_lower=bollinger_lower,
             señales_compra=señales_compra,
-            señales_venta=señales_venta
+            señales_venta=señales_venta,
         )
 
-        # “legacy” (mantén los campos individuales usando la mejor entrada)
+        # “legacy” (mejor entrada)
         best = entradas_mult[0] if entradas_mult else None
         if best:
             precio_entrada = best.get("precio_entrada")
-            take_profit     = best.get("take_profit")
-            stop_loss       = best.get("stop_loss")
+            take_profit = best.get("take_profit")
+            stop_loss = best.get("stop_loss")
         else:
-            # Fallback a tu lógica anterior (por si algo quedó sin ATR o niveles)
             if tipo_operacion in señales_compra or (
-                tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] in ("alcista", "indefinida")
+                tipo_operacion == "Neutral" and en_rango["estructura_tendencia"] in ("alcista", "indefinida")
             ):
-                precio_entrada = (niveles_clave['resistencia_nivel_1'] + niveles_clave['soporte_nivel_1']) / 2 if niveles_clave['resistencia_nivel_1'] and niveles_clave['soporte_nivel_1'] else precio_actual
+                precio_entrada = (
+                    (niveles_clave["resistencia_nivel_1"] + niveles_clave["soporte_nivel_1"]) / 2
+                    if niveles_clave["resistencia_nivel_1"] and niveles_clave["soporte_nivel_1"]
+                    else precio_actual
+                )
                 take_profit, stop_loss = calc_tp_sl_compra(precio_entrada, ATR)
                 if not (stop_loss and take_profit and (stop_loss < precio_entrada < take_profit)):
-                    logger.warning(f"Valores incorrectos en {symbol} temporalidad:{tf} (compra): SL={stop_loss}, Entrada={precio_entrada}, TP={take_profit}")
+                    logger.warning(
+                        f"Valores incorrectos en {symbol} temporalidad:{tf} (compra): SL={stop_loss}, Entrada={precio_entrada}, TP={take_profit}"
+                    )
                     stop_loss, take_profit = np.nan, np.nan
 
             elif tipo_operacion in señales_venta or (
-                tipo_operacion == "Neutral" and en_rango['estructura_tendencia'] == "bajista"
+                tipo_operacion == "Neutral" and en_rango["estructura_tendencia"] == "bajista"
             ):
-                precio_entrada = (niveles_clave['resistencia_nivel_1'] + niveles_clave['soporte_nivel_1']) / 2 if niveles_clave['resistencia_nivel_1'] and niveles_clave['soporte_nivel_1'] else precio_actual
+                precio_entrada = (
+                    (niveles_clave["resistencia_nivel_1"] + niveles_clave["soporte_nivel_1"]) / 2
+                    if niveles_clave["resistencia_nivel_1"] and niveles_clave["soporte_nivel_1"]
+                    else precio_actual
+                )
                 take_profit, stop_loss = calc_tp_sl_venta(precio_entrada, ATR)
                 if not (take_profit and stop_loss and (take_profit < precio_entrada < stop_loss)):
-                    logger.warning(f"Valores incorrectos en {symbol} temporalidad:{tf} (venta): TP={take_profit}, Entrada={precio_entrada}, SL={stop_loss}")
+                    logger.warning(
+                        f"Valores incorrectos en {symbol} temporalidad:{tf} (venta): TP={take_profit}, Entrada={precio_entrada}, SL={stop_loss}"
+                    )
                     stop_loss, take_profit = np.nan, np.nan
             else:
                 take_profit = None
                 stop_loss = None
 
-        # Verificar si el precio actual está cerca de soportes o resistencias
+        # Cercanía a niveles
         def esta_cerca(precio, nivel, umbral_cercania=0.01):
-            if nivel is None:
-                return False
-            
-            return abs(precio - nivel) / precio <= umbral_cercania
+            return False if nivel is None else abs(precio - nivel) / precio <= umbral_cercania
 
         cerca_de_soporte_resistencia = (
-            "Cerca de Soporte Nivel 2" if esta_cerca(precio_actual, niveles_clave.get('soporte_nivel_2')) else
-            "Cerca de Soporte Nivel 1" if esta_cerca(precio_actual, niveles_clave.get('soporte_nivel_1')) else
-            "Cerca de Resistencia Nivel 1" if esta_cerca(precio_actual, niveles_clave.get('resistencia_nivel_1')) else
-            "Cerca de Resistencia Nivel 2" if esta_cerca(precio_actual, niveles_clave.get('resistencia_nivel_2')) else
-            "No Cerca"
+            "Cerca de Soporte Nivel 2"
+            if esta_cerca(precio_actual, niveles_clave.get("soporte_nivel_2"))
+            else "Cerca de Soporte Nivel 1"
+            if esta_cerca(precio_actual, niveles_clave.get("soporte_nivel_1"))
+            else "Cerca de Resistencia Nivel 1"
+            if esta_cerca(precio_actual, niveles_clave.get("resistencia_nivel_1"))
+            else "Cerca de Resistencia Nivel 2"
+            if esta_cerca(precio_actual, niveles_clave.get("resistencia_nivel_2"))
+            else "No Cerca"
         )
 
-
-        # Flag de oportunidad: cuando la probabilidad general es mayor de 53 (compra) o menor de 47 (venta), y no está en zona de no trading
-        #flag_oportunidad = True if  (probabilidad_baja > 53 or probabilidad_alza > 53) and not zona_no_trading else False
+        # Flag oportunidad (respetando zonas)
         flag_oportunidad = False
         if not zona_no_trading:
-            if probabilidad_general > 53 and not zona_sobrecompra:  # Compra
+            if probabilidad_general > 53 and not zona_sobrecompra:
                 flag_oportunidad = True
-            elif probabilidad_general < 47 and not zona_sobreventa:  # Venta
+            elif probabilidad_general < 47 and not zona_sobreventa:
                 flag_oportunidad = True
 
-
-        # Agregar predicción de tendencia en tiempo real
+        # Tendencia en tiempo real
         tendencia_predicha = predecir_tendencia_en_tiempo_real(df, temporalidad)
-        
+
         salida = {
             "patrones_detectados": patrones_detectados,
             "predicciones_arima": predicciones_arima,
             "predicciones_media_movil": predicciones_media_movil,
             "probabilidad_alza": probabilidad_alza,
             "probabilidad_baja": probabilidad_baja,
-            "macd_cruce": df['macd_cruce'].iloc[-1] if 'macd_cruce' in df.columns else None,
-            "macd_cerca_de_cruzar": df['macd_cerca_de_cruzar'].iloc[-1] if 'macd_cerca_de_cruzar' in df.columns else None,
-            "bollinger_signal": df['bollinger_signal'].iloc[-1] if 'bollinger_signal' in df.columns else None,
-            "bollinger_upper": df['bollinger_upper'].iloc[-1] if 'bollinger_upper' in df.columns else None,
-            "bollinger_lower": df['bollinger_lower'].iloc[-1] if 'bollinger_lower' in df.columns else None,
+            "macd_cruce": df["macd_cruce"].iloc[-1] if "macd_cruce" in df.columns else None,
+            "macd_cerca_de_cruzar": df["macd_cerca_de_cruzar"].iloc[-1] if "macd_cerca_de_cruzar" in df.columns else None,
+            "bollinger_signal": df["bollinger_signal"].iloc[-1] if "bollinger_signal" in df.columns else None,
+            "bollinger_upper": last_of(df, "bollinger_upper", default=None) if "bollinger_upper" in df.columns else None,
+            "bollinger_lower": last_of(df, "bollinger_lower", default=None) if "bollinger_lower" in df.columns else None,
             "tendencia_predicha": tendencia_predicha,
             "ultimo_valor": precio_actual,
-            "soporte_nivel_2": niveles_clave.get('soporte_nivel_2'),
-            "soporte_nivel_1": niveles_clave.get('soporte_nivel_1'),
-            "resistencia_nivel_1": niveles_clave.get('resistencia_nivel_1'),
-            "resistencia_nivel_2": niveles_clave.get('resistencia_nivel_2'),
+            "soporte_nivel_2": niveles_clave.get("soporte_nivel_2"),
+            "soporte_nivel_1": niveles_clave.get("soporte_nivel_1"),
+            "resistencia_nivel_1": niveles_clave.get("resistencia_nivel_1"),
+            "resistencia_nivel_2": niveles_clave.get("resistencia_nivel_2"),
             "apalancamiento_compra_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_1"),
             "apalancamiento_compra_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_2"),
             "apalancamiento_venta_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_1"),
@@ -5196,17 +5275,17 @@ def calcular_entradas(
             "take_profit": take_profit,
             "stop_loss": stop_loss,
             "es_rango_repetitivo": en_rango.get("es_rango_repetitivo"),
-            "estructura_tendencia": en_rango.get('estructura_tendencia'),
+            "estructura_tendencia": en_rango.get("estructura_tendencia"),
             "rebotes": en_rango.get("rebotes"),
             "rango_dinamico": en_rango.get("rango_dinamico"),
-            "soportes_alcanzados": niveles_clave.get('niveles_importantes_soportes'),
-            "resistencias_alcanzadas": niveles_clave.get('niveles_importantes_resistencias'),
+            "soportes_alcanzados": niveles_clave.get("niveles_importantes_soportes"),
+            "resistencias_alcanzadas": niveles_clave.get("niveles_importantes_resistencias"),
             "cerca_de_soporte_resistencia": cerca_de_soporte_resistencia,
-            "soportes_importantes_alcanzados": niveles_clave.get('soportes_confirmados_orden'),
-            "resistencias_importantes_alcanzadas": niveles_clave.get('resistencias_confirmadas_orden'),
-            "niveles_confirmados_orden_toques_all": niveles_clave.get('niveles_confirmados_orden_toques_all'),
-            "niveles_confirmados_orden_nivel_all": niveles_clave.get('niveles_confirmados_orden_nivel_all'),
-            "niveles_confirmados_orden_nivel_reduced": niveles_clave.get('niveles_confirmados_orden_nivel_reduced'),
+            "soportes_importantes_alcanzados": niveles_clave.get("soportes_confirmados_orden"),
+            "resistencias_importantes_alcanzadas": niveles_clave.get("resistencias_confirmadas_orden"),
+            "niveles_confirmados_orden_toques_all": niveles_clave.get("niveles_confirmados_orden_toques_all"),
+            "niveles_confirmados_orden_nivel_all": niveles_clave.get("niveles_confirmados_orden_nivel_all"),
+            "niveles_confirmados_orden_nivel_reduced": niveles_clave.get("niveles_confirmados_orden_nivel_reduced"),
             "probabilidad_tecnica": probabilidad_tecnica,
             "probabilidad_fundamental": probabilidad_fundamental,
             "probabilidad_general": probabilidad_general,
@@ -5215,18 +5294,18 @@ def calcular_entradas(
             "zona_no_trading": zona_no_trading,
             "zona_sobreventa": zona_sobreventa,
             "zona_sobrecompra": zona_sobrecompra,
-            "entradas": entradas_mult, 
+            "entradas": entradas_mult,
         }
         return json_safe(salida)
 
     except Exception as e:
         logger.exception("calcular_entradas falló: %s", e)
-        # devuelve algo mínimo para que nada más truene
         if not salida:
             salida = {}
         salida.setdefault("entradas_multiples", [])
         salida.setdefault("entradas", {"lista": []})
         return json_safe(salida)
+
 
 # Función para generar un archivo con la fecha y hora en el nombre
 def generar_nombre_archivo(moneda_filtro, filtro=False, tipo=None):
@@ -5693,172 +5772,237 @@ def graficar_serie_temporal(df, symbol, temporalidad):
             plt.close(fig)  # Cierra la figura para liberar recursos
 
 #@profile
-def calcular_ponderacion_incremental_por_divisa(df):
-    
-    peso_base = 1
+def calcular_ponderacion_incremental_por_divisa(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
+    """
+    Suma/Restar PI por 'Activo' según señales y orden de temporalidades.
+    Usa cfg.ponderacion_inc: enable, peso_base, temporalidades (CSV).
+    Si está desactivado o faltan columnas, devuelve PI=0.
+    """
+    inc = _norm_ponder_inc_cfg(cfg)
 
-    # Crear una nueva columna para ponderación incremental
-    df['Ponderacion Incremental'] = 0
+    # crea columna si no existe
+    if "Ponderacion Incremental" not in df.columns:
+        df["Ponderacion Incremental"] = 0
 
-    # Iterar por cada activo (divisa)
-    for activo, data in df.groupby('Activo'):
-        ponderacion = 0
-        # Iterar por cada fila del activo
-        for index, row in data.iterrows():
-            tipo_operacion = row['Tipo de Operacion']
+    # validaciones mínimas
+    need_cols = {"Activo", "Tipo de Operacion", "Temporalidad"}
+    if not inc.get("enable", True) or not need_cols.issubset(set(df.columns)):
+        df["Ponderacion Incremental"] = 0
+        return df
 
-            # Verificar señales de compra y aplicar ponderación incremental
-            if tipo_operacion in señales_compra:
-                temporalidad = row['Temporalidad']
-                if temporalidad in temporalidades:
-                    i = temporalidades.index(temporalidad)
-                    ponderacion += peso_base * (2 ** i)
+    peso_base = max(1, int(inc.get("peso_base", 1)))
+    tfs = inc.get("_tfs_list", [])
+    if not tfs:
+        tfs = [t.strip() for t in DEFAULT_PONDER_INC_CFG["temporalidades"].split(",")]
 
-            # Verificar señales de venta y aplicar ponderación incremental
-            elif tipo_operacion in señales_venta:
-                temporalidad = row['Temporalidad']
-                if temporalidad in temporalidades:
-                    i = temporalidades.index(temporalidad)
-                    ponderacion -= peso_base * (2 ** i)
+    # mapa temporalidad -> índice
+    idx = {tf.lower(): i for i, tf in enumerate(tfs)}
 
-        # Asignar la ponderación incremental al DataFrame
-        df.loc[df['Activo'] == activo, 'Ponderacion Incremental'] = ponderacion
+    def _tf_index(tf_val: str) -> int | None:
+        if not tf_val:
+            return None
+        t = str(tf_val).strip().lower()
+        # intenta normalizar equivalencias comunes
+        aliases = {
+            "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m",
+            "1hour": "1h", "4hour": "4h", "1day": "1d", "1week": "1w"
+        }
+        t = aliases.get(t, t)
+        return idx.get(t)
+
+    # agrupar por activo
+    for activo, data in df.groupby("Activo"):
+        ponder = 0
+        for _, row in data.iterrows():
+            tipo = row.get("Tipo de Operacion")
+            tf_v = row.get("Temporalidad")
+            i = _tf_index(tf_v)
+            if i is None:
+                continue
+            try:
+                if tipo in señales_compra:
+                    ponder += peso_base * (2 ** i)
+                elif tipo in señales_venta:
+                    ponder -= peso_base * (2 ** i)
+            except NameError:
+                # si las listas de señales no están en el scope, no aplica
+                pass
+
+        df.loc[df["Activo"] == activo, "Ponderacion Incremental"] = ponder
 
     return df
 
+
+# ---- DEFAULTS para cfg.ponderacion y cfg.ponderacion_inc ----
+DEFAULT_PONDER_CFG = {
+    "enable": True,
+    "prob_high": 60, "prob_low": 40, "neutral_min": 47, "neutral_max": 53,
+    "prob_high_delta": 2, "prob_low_delta": -2, "neutral_delta": -1,
+    "patrones_alcistas_delta": 3, "patrones_bajistas_delta": -3,
+    "concordancia_bull_delta": 2, "concordancia_bear_delta": -2,
+    "near_s1_delta": 2, "near_r1_delta": -2, "near_s2_delta": 1, "near_r2_delta": -1,
+    "macd_cruce_alcista_delta": 1, "macd_cruce_bajista_delta": -1,
+    "bollinger_bajo_delta": 2, "bollinger_alto_delta": -2,
+    "tendencia_alcista_delta": 2, "tendencia_bajista_delta": -2,
+    "senal_compra_delta": 3, "senal_venta_delta": -3,
+    "ponder_inc_threshold": 10, "ponder_inc_pos_delta": 3, "ponder_inc_neg_delta": -3,
+    "mult_1m_5m": 1.10, "mult_15m_30m": 1.05, "mult_1h_4h": 1.00, "mult_1d_1w": 0.90,
+    "clamp_min": -20, "clamp_max": 20,
+}
+
+DEFAULT_PONDER_INC_CFG = {
+    "enable": True,
+    "peso_base": 1,
+    # orden de mayor a menor peso (i=0,1,2...) -> 2**i
+    "temporalidades": "1w,1d,4h,1h,30m,15m,5m,1m",
+}
+
+def _norm_ponder_cfg(cfg: dict | None) -> dict:
+    try:
+        user = ((cfg or {}).get("ponderacion") or {})
+        return {**DEFAULT_PONDER_CFG, **user}
+    except Exception:
+        return DEFAULT_PONDER_CFG.copy()
+
+def _norm_ponder_inc_cfg(cfg: dict | None) -> dict:
+    try:
+        user = ((cfg or {}).get("ponderacion_inc") or {})
+        base = {**DEFAULT_PONDER_INC_CFG, **user}
+        # normaliza CSV -> lista ordenada
+        tfs = [t.strip() for t in str(base.get("temporalidades", "")).split(",") if t.strip()]
+        base["_tfs_list"] = tfs if tfs else [t.strip() for t in DEFAULT_PONDER_INC_CFG["temporalidades"].split(",")]
+        return base
+    except Exception:
+        out = DEFAULT_PONDER_INC_CFG.copy()
+        out["_tfs_list"] = [t.strip() for t in out["temporalidades"].split(",")]
+        return out
+
 #@profile
-def calcular_ponderacion(row):
-    ponderacion = 0
+def calcular_ponderacion(row: dict, cfg: dict | None = None) -> float:
+    p = _norm_ponder_cfg(cfg)
+    if not p.get("enable", True):
+        return 0.0
 
-    # Ponderar por Probabilidad General
-    probabilidad_general = row.get('Probabilidad General (%)', None)
-    if probabilidad_general is not None:
-        if probabilidad_general > 60:
-            ponderacion += 2
-        elif probabilidad_general < 40:
-            ponderacion -= 2
-        elif 47 <= probabilidad_general <= 53:
-            ponderacion -= 1
+    ponderacion = 0.0
 
-    # Ponderar por Patrones de Velas
-    patrones = row['Patrones Detectados']
-    if patrones is None:
-        patrones = []  # Inicializar con una lista vacía
+    # --- Probabilidad general ---
+    pg = row.get('Probabilidad General (%)')
+    if pg is not None:
+        if pg > p["prob_high"]:
+            ponderacion += p["prob_high_delta"]
+        elif pg < p["prob_low"]:
+            ponderacion += p["prob_low_delta"]
+        elif p["neutral_min"] <= pg <= p["neutral_max"]:
+            ponderacion += p["neutral_delta"]
 
-    if any(pat in patrones for pat in patrones_alcistas):
-        ponderacion += 3
-    elif any(pat in patrones for pat in patrones_bajistas):
-        ponderacion -= 3
+    # --- Patrones ---
+    patrones = row.get('Patrones Detectados') or []
+    try:
+        if any(pat in patrones for pat in patrones_alcistas):
+            ponderacion += p["patrones_alcistas_delta"]
+        elif any(pat in patrones for pat in patrones_bajistas):
+            ponderacion += p["patrones_bajistas_delta"]
+    except NameError:
+        # si no existen las listas en este scope, no penaliza/bonifica
+        pass
 
-    # Concordancia entre Probabilidad Técnica y Fundamental
-    probabilidad_tecnica = row.get('Probabilidad Tecnica (%)', None)
-    probabilidad_fundamental = row.get('Probabilidad Fundamental (%)', None)
-    if probabilidad_tecnica is None:
-        probabilidad_tecnica = 50  # Valor neutral por defecto
-    if probabilidad_fundamental is None:
-        probabilidad_fundamental = 50  # Valor neutral por defecto
+    # --- Concordancia Tec + Fund ---
+    pt = row.get('Probabilidad Tecnica (%)', 50)
+    pf = row.get('Probabilidad Fundamental (%)', 50)
+    if pt > 60 and pf > 60:
+        ponderacion += p["concordancia_bull_delta"]
+    elif pt < 40 and pf < 40:
+        ponderacion += p["concordancia_bear_delta"]
 
-    if probabilidad_tecnica > 60 and probabilidad_fundamental > 60:
-        ponderacion += 2
-    elif probabilidad_tecnica < 40 and probabilidad_fundamental < 40:
-        ponderacion -= 2
+    # --- Niveles / cercanías ---
+    precio = row.get('Ultimo Valor')
+    s1 = row.get('Soporte Nivel 1')
+    r1 = row.get('Resistencia Nivel 1')
+    s2 = row.get('Soporte Nivel 2')
+    r2 = row.get('Resistencia Nivel 2')
 
-    # Proximidad a Soportes y Resistencias
-    precio_actual = row.get('Ultimo Valor', None)
-    soporte_nivel_1 = row.get('Soporte Nivel 1', None)
-    resistencia_nivel_1 = row.get('Resistencia Nivel 1', None)
-    soporte_nivel_2 = row.get('Soporte Nivel 2', None)
-    resistencia_nivel_2 = row.get('Resistencia Nivel 2', None)
+    # Distancias relativas (si hay datos)
+    if precio is None or s1 is None or r1 is None:
+        logger.info(f"Valores no válidos para niveles: precio={precio}, s1={s1}, r1={r1}")
+    else:
+        try:
+            if abs(precio - s1) / s1 < 0.01:
+                ponderacion += p["near_s1_delta"]
+        except ZeroDivisionError:
+            pass
+        try:
+            if abs(r1 - precio) / r1 < 0.01:
+                ponderacion += p["near_r1_delta"]
+        except ZeroDivisionError:
+            pass
 
-    # Validar que no sean None antes de operar
-    if precio_actual is None or soporte_nivel_1 is None:
-        logger.info(f"Valores no válidos: precio_actual={precio_actual}, soporte_nivel_1={soporte_nivel_1}")
-        return 0  # Asignar una ponderación neutral en caso de datos faltantes
+        # Ventanas 1% sobre/under
+        if precio is not None and s1 is not None and precio <= s1 * 1.01:
+            ponderacion += max(0, p["near_s1_delta"])  # refuerzo
+        if precio is not None and r1 is not None and precio >= r1 * 0.99:
+            ponderacion += min(0, p["near_r1_delta"])  # refuerzo hacia negativo
 
-    try: 
-        distancia_soporte = abs(precio_actual - soporte_nivel_1) / soporte_nivel_1
-    except ZeroDivisionError:
-        logger.info(f"Error de división por cero con soporte_nivel_1={soporte_nivel_1}")
-        distancia_soporte = float('inf')  # Manejar el caso de división por cero
+    if s2 is not None and precio is not None and precio <= s2 * 1.01:
+        ponderacion += p["near_s2_delta"]
+    if r2 is not None and precio is not None and precio >= r2 * 0.99:
+        ponderacion += p["near_r2_delta"]
 
-    try:    
-        distancia_resistencia = abs(resistencia_nivel_1 - precio_actual) / resistencia_nivel_1
-    except ZeroDivisionError:
-        logger.info(f"Error de división por cero con resistencia_superior={resistencia_nivel_1}")
-        resistencia_nivel_1 = float('inf')  # Manejar el caso de división por cero
-
-    if distancia_soporte < 0.01:
-        ponderacion += 2
-    if distancia_resistencia < 0.01:
-        ponderacion -= 2
-
-    # Cerca del soporte actual para compras
-    if precio_actual <= soporte_nivel_1 * 1.01:
-        ponderacion += 2
-
-    # Cerca de la resistencia actual para ventas
-    elif precio_actual >= resistencia_nivel_1 * 0.99:
-        ponderacion -= 2
-
-    # Cerca del soporte nivel 2 (rebote alcista)
-    if soporte_nivel_2 is not None and precio_actual <= soporte_nivel_2 * 1.01:
-        ponderacion += 1
-
-    # Cerca de la resistencia nivel 2 (rebote bajista)
-    if resistencia_nivel_2 is not None and precio_actual >= resistencia_nivel_2 * 0.99:
-        ponderacion -= 1
-
-    # MACD
-    macd_cruce = row['Cruce MACD']
+    # --- MACD cruce ---
+    macd_cruce = row.get('Cruce MACD')
     if macd_cruce == 'Cruce Alcista':
-        ponderacion += 1
+        ponderacion += p["macd_cruce_alcista_delta"]
     elif macd_cruce == 'Cruce Bajista':
-        ponderacion -= 1
+        ponderacion += p["macd_cruce_bajista_delta"]
 
-    # Bandas de Bollinger
-    bollinger_upper = row['bollinger_upper']
-    bollinger_lower = row['bollinger_lower']
+    # --- Bollinger ---
+    bup = row.get('bollinger_upper')
+    blo = row.get('bollinger_lower')
+    if pd.notna(bup) and pd.notna(blo) and precio is not None:
+        if precio < blo:
+            ponderacion += p["bollinger_bajo_delta"]
+        elif precio > bup:
+            ponderacion += p["bollinger_alto_delta"]
 
-    if pd.notna(bollinger_upper) and pd.notna(bollinger_lower):
-        if precio_actual < bollinger_lower:  # Señal de sobreventa (compra)
-            ponderacion += 2
-        elif precio_actual > bollinger_upper:  # Señal de sobrecompra (venta)
-            ponderacion -= 2
+    # --- Tendencia predicha ---
+    tend = row.get('Tendencia Predicha', 'Neutral')
+    if tend == 'Alcista':
+        ponderacion += p["tendencia_alcista_delta"]
+    elif tend == 'Bajista':
+        ponderacion += p["tendencia_bajista_delta"]
 
-    # Ajustar por Tendencia Predicha
-    tendencia_predicha = row.get('Tendencia Predicha', 'Neutral')
-    if tendencia_predicha == 'Alcista':
-        ponderacion += 2
-    elif tendencia_predicha == 'Bajista':
-        ponderacion -= 2
+    # --- Señal detectada (compra/venta) ---
+    signal = row.get('Tipo de Operacion', 'Neutral')
+    try:
+        if signal in señales_compra:
+            ponderacion += p["senal_compra_delta"]
+        elif signal in señales_venta:
+            ponderacion += p["senal_venta_delta"]
+    except NameError:
+        pass
 
-    # Ajuste según la señal detectada
-    señal_detectada = row.get('Tipo de Operacion', 'Neutral')
-    if señal_detectada in señales_compra:
-        ponderacion += 3
-    elif señal_detectada in señales_venta:
-        ponderacion -= 3
+    # --- Ponderación incremental (columna previa del DF) ---
+    pi = row.get('Ponderacion Incremental', 0)
+    th = p["ponder_inc_threshold"]
+    if isinstance(pi, (int, float)) and th is not None:
+        if pi >= th:
+            ponderacion += p["ponder_inc_pos_delta"]
+        elif pi <= -th:
+            ponderacion += p["ponder_inc_neg_delta"]
 
-    # Ajustar por Ponderación Incremental
-    ponderacion_incremental = row.get('Ponderacion Incremental', 0)
-    if ponderacion_incremental > 10:
-        ponderacion += 3
-    elif ponderacion_incremental < -10:
-        ponderacion -= 3
+    # --- Multiplicador por temporalidad ---
+    tf = str(row.get('Temporalidad', '')).lower()
+    if any(k in tf for k in ('1min', '5min', '1m', '5m')):
+        ponderacion *= p["mult_1m_5m"]
+    elif any(k in tf for k in ('15min', '30min', '15m', '30m')):
+        ponderacion *= p["mult_15m_30m"]
+    elif any(k in tf for k in ('1hour', '4hour', '1h', '4h')):
+        ponderacion *= p["mult_1h_4h"]
+    elif any(k in tf for k in ('1day', '1week', '1d', '1w')):
+        ponderacion *= p["mult_1d_1w"]
 
-    # **Ajustar pesos según temporalidad**
-    temporalidad = row.get('Temporalidad', '').lower()
-    if '1min' in temporalidad or '5min' in temporalidad:  # Temporalidades muy cortas
-        ponderacion *= 1.1  # Aumentar peso en un 10%
-    elif '15min' in temporalidad or '30min' in temporalidad:  # Temporalidades cortas a medias
-        ponderacion *= 1.05  # Aumentar peso en un 5%
-    elif '1hour' in temporalidad or '4hour' in temporalidad:  # Temporalidades medias
-        ponderacion *= 1  # Mantener peso igual
-    elif '1day' in temporalidad or '1week' in temporalidad:  # Temporalidades largas
-        ponderacion *= 0.9  # Reducir peso en un 10%
-
-    # Normalizar ponderación final
-    ponderacion = max(min(ponderacion, 20), -20)
+    # --- Clamp final ---
+    lo, hi = p["clamp_min"], p["clamp_max"]
+    ponderacion = max(min(ponderacion, hi), lo)
 
     return float(ponderacion)
 
@@ -5872,6 +6016,7 @@ def procesar_simbolo_temporalidad(
     *,
     fmp_windows: dict[str,int] | None = None,
     calc_windows: dict[str,int] | None = None,
+    cfg: dict | None = None
 ):
     # Asegurar notación backend de TF (1min, 4hour, 1day, 1week…)
     tf = _tf_backend(temporalidad)  # <- este es el valor correcto a usar en todo el flujo
@@ -6023,15 +6168,16 @@ async def ejecutar_analisis_con_hilos(
     activos_filtrados,
     user_chat_id,
     context,
-    overrides=None,           # operatoria normalizada
+    overrides: dict | None = None,           # operatoria normalizada
+    cfg: dict | None = None
 ):
     resultados = []
     errores = []
 
-    cfg       = overrides or {}
-    fmp_map   = cfg.get('fmpWindows')
-    calc_map  = cfg.get('calcWindows')
-    temps     = cfg.get('tfs') or temporalidades
+    cfg_overrides       = overrides or {}
+    fmp_map   = cfg_overrides.get('fmpWindows')
+    calc_map  = cfg_overrides.get('calcWindows')
+    temps     = cfg_overrides.get('tfs') or temporalidades
 
     valid = {'1min','5min','15min','30min','1hour','4hour','1day','1week'}
     temps = [t for t in temps if t in valid]
@@ -6061,6 +6207,7 @@ async def ejecutar_analisis_con_hilos(
                 symbol, temporalidad, df_eventos, user_chat_id, context,
                 fmp_windows=fmp_map,
                 calc_windows=calc_map,
+                cfg=cfg
             )
             fut = loop.run_in_executor(None, fn)
             analisis_tasks.append(fut)
@@ -6088,7 +6235,7 @@ async def ejecutar_analisis_con_hilos(
 
 # Función para procesar el resultado de cada análisis
 #@profile
-async def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None):
+async def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None, cfg: dict | None = None):
 
     urls_generadas = []
 
@@ -6102,11 +6249,11 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
     # Aplicar la función de ponderación incremental al DataFrame `df_filtrado` en memoria
     df_resultados = df_resultados.copy()
-    df_resultados = calcular_ponderacion_incremental_por_divisa(df_resultados)
+    df_resultados = calcular_ponderacion_incremental_por_divisa(df_resultados, cfg)
     
     # Aplicar la función de ponderación al DataFrame `df_filtrado` en memoria
     df_resultados = df_resultados.copy()
-    df_resultados['Ponderacion'] = df_resultados.apply(lambda row: calcular_ponderacion(row), axis=1).astype(float)
+    df_resultados['Ponderacion'] = df_resultados.apply(lambda row: calcular_ponderacion(row, cfg), axis=1).astype(float)
 
     df_resultados.pop('bollinger_lower')
     df_resultados.pop('bollinger_upper')
@@ -7347,7 +7494,7 @@ async def enviar_mensaje_noticias(context, user_chat_id, mensaje):
         
 # Función para manejar el ciclo recurrente del análisis
 #@profile
-async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None, operatoria_cfg: dict | None = None):
+async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None, operatoria_cfg: dict | None = None, cfg: dict | None = None):
     activos_filtrados = filtrar_activos_por_moneda(activos, moneda_filtro)
     if user_chat_id not in user_states:
             user_states[user_chat_id] = {}
@@ -7413,7 +7560,8 @@ async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None,
                 'tfs': (operatoria_cfg or {}).get('tfs'),
                 'fmpWindows':    (operatoria_cfg or {}).get('fmpWindows'),
                 'calcWindows':   (operatoria_cfg or {}).get('calcWindows'),
-            }
+            },
+            cfg=cfg
         )
 
         if not resultados:
@@ -7423,7 +7571,7 @@ async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None,
             )
             return
 
-        url_generadas = await procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id, opciones_usuario, origen, exec_id=exec_id)
+        url_generadas = await procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id, opciones_usuario, origen, exec_id=exec_id, cfg=cfg)
 
         elapsed_time = (datetime.now() - start_time).total_seconds()
         logger.info(f"[{datetime.now()}] Análisis finalizado para usuario {user_chat_id}. Tiempo: {elapsed_time:.2f} segundos.")
@@ -8834,10 +8982,19 @@ async def ejecutar_analisis_desde_app():
         acquired_lock = True
 
         data = request.json or {}
-        chat_id = str(data.get("chat_id") or "")
+        chat_id = str(data.get("chat_id") or "")           # preferido
         chat_id_local = chat_id  # para finally
-        activo = data.get("activo")
-        origen = (data.get("origen") or "telegram").lower()
+        user_id = str(data.get("user_id") or "")           # alternativo
+        activo  = data.get("activo")
+        origen  = (data.get("origen") or "telegram").lower()
+
+        # si no viene chat_id, intenta resolverlo con user_id
+        if not chat_id and user_id:
+            try:
+                doc = db.collection('user_ids').document(user_id).get()
+                chat_id = (doc.to_dict() or {}).get('telegram_id') or ""
+            except Exception:
+                chat_id = ""
 
         if not chat_id or not activo:
             return jsonify({"status": "error", "message": "Faltan parámetros obligatorios"}), 400
@@ -8861,9 +9018,6 @@ async def ejecutar_analisis_desde_app():
         # Validar que no haya un análisis en ejecución
         if return_state(chat_id) == "en ejecución":
             return jsonify({"status": "error", "message": "Ya hay un análisis en ejecución"}), 409
-
-        #MTORO
-        cfg = firestore_get(f"user_ids/{user_id}/user_config/current")
 
         # -------- leer config enviada desde la app --------
         # Tu app ahora manda 'setup'; dejamos 'operatoria' por compatibilidad.
@@ -8891,6 +9045,13 @@ async def ejecutar_analisis_desde_app():
 
         dummy_context = type("DummyContext", (), {"bot": application.bot})()
 
+        cfg = (db.collection('user_ids')
+          .document(user_id)
+          .collection('user_config')
+          .document('current')
+          .get()
+          .to_dict() or {})
+
         task = asyncio.create_task(
             ejecutar_recurrente(
                 dummy_context,
@@ -8900,7 +9061,8 @@ async def ejecutar_analisis_desde_app():
                 opciones_usuario,
                 origen="app",
                 exec_id=exec_id,
-                operatoria_cfg=op_cfg  # <- pasa la config hacia abajo
+                operatoria_cfg=op_cfg,  # <- pasa la config hacia abajo
+                cfg=cfg
             )
         )
         task = asyncio.shield(task)
