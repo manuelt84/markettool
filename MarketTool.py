@@ -68,7 +68,7 @@ import socket
 import torch
 import uuid
 from typing import Any, Iterable, Mapping, Optional, Callable
-from datetime import timedelta, date, datetime, UTC
+from datetime import timedelta, date, datetime, timezone, UTC
 from textwrap import wrap
 from functools import partial
 import math
@@ -279,6 +279,69 @@ def get_easyocr_reader(prefer_gpu: bool = True):
 
 # Inicializar EasyOCR (solo una vez, fuera de la función)
 reader = get_easyocr_reader(prefer_gpu=True) 
+
+# --- claves / helpers ---------------------
+def _state_key(user_id: str | None = None, chat_id: str | None = None) -> str | None:
+    uid = (user_id or "").strip()
+    cid = (chat_id or "").strip()
+    return uid or cid or None
+
+def _user_state_doc(user_id: str | None, chat_id: str | None):
+    """
+    Devuelve la referencia al doc en user_states.
+    Prefiere user_id; si no hay, usa chat_id. Si no hay ninguno, None.
+    """
+    doc_id = (user_id or chat_id or "").strip()
+    if not doc_id:
+        return None
+    return db.collection("user_states").document(doc_id)
+
+
+# --- API de estado ------------------------
+def return_state(user_id: str | None = None, chat_id: str | None = None) -> str:
+    ref = _user_state_doc(user_id, chat_id)
+    if not ref:
+        return "disponible"
+    try:
+        snap = ref.get()
+        return (snap.to_dict() or {}).get("estado", "disponible") if snap.exists else "disponible"
+    except Exception as e:
+        logger.warning(f"return_state falló: {e}")
+        return "disponible"
+
+def set_state(estado: str, *, user_id: str | None = None, chat_id: str | None = None) -> None:
+    """
+    Marca estado del usuario ('en ejecución', 'disponible', etc).
+    """
+    ref = _user_state_doc(user_id, chat_id)
+    if not ref:
+        return
+    try:
+        ref.set({"estado": str(estado), "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+    except Exception as e:
+        logger.warning(f"set_state falló: {e}")
+
+def _drop_nones(obj):
+    if isinstance(obj, dict):
+        return {k: _drop_nones(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, (list, tuple)):
+        return [_drop_nones(v) for v in obj if v is not None]
+    return obj
+
+def _user_id_from_chat(chat_id: str | None) -> str | None:
+    """Devuelve user_id desde chat_ids. Si chat_id está vacío, devuelve None y no toca Firestore."""
+    if not chat_id:
+        return None
+    try:
+        doc = db.collection("chat_ids").document(str(chat_id)).get()
+        return (doc.to_dict() or {}).get("user_id") if doc.exists else None
+    except Exception as e:
+        logger.warning(f"_user_id_from_chat falló: {e}")
+        return None
+
+
+def _subscription_doc(user_id: str):
+    return db.collection("suscripciones_user").document(str(user_id))
 
 # Mapeo de TF frontend -> backend
 def _tf_backend(tf: str) -> str:
@@ -1065,7 +1128,7 @@ def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 async def subir_ohlcv_enriquecido_y_registrar(
-    *, exec_id: str, chat_id: str, symbol: str, temporalidad: str,
+    *, exec_id: str, chat_id: str, user_id: str, symbol: str, temporalidad: str,
     df_velas: pd.DataFrame, df_indicadores: pd.DataFrame | None,
     subir_a_bucket_y_obtener_url,
     niveles: dict | None = None, entradas: dict | None = None,
@@ -1082,7 +1145,7 @@ async def subir_ohlcv_enriquecido_y_registrar(
         candles_with_extras=True          # o False si quieres OHLCV puro
     )
     return await guardar_json_en_storage_y_registrar(
-        exec_id=exec_id, chat_id=chat_id,
+        exec_id=exec_id, chat_id=chat_id, user_id=user_id,
         nombre_base=f"{symbol}_{temporalidad}_enriched",
         data=payload,
         subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
@@ -1090,112 +1153,20 @@ async def subir_ohlcv_enriquecido_y_registrar(
     )
 
 
-async def subir_imagenes_eventos_y_registrar(
-    imagen_eventos,                 # BytesIO o list[BytesIO] desde generar_imagen_eventos_oportunidades
-    exec_id: str,
-    chat_id: str,
-    moneda_filtro: str,
-    subir_a_bucket_y_obtener_url,   # tu función async (o sync) que retorna la URL
-) -> list[str]:
-    if imagen_eventos is None:
-        return []
-
-    # Normaliza a lista de buffers
-    buffers = imagen_eventos if isinstance(imagen_eventos, list) else [imagen_eventos]
-
-    urls_subidas: list[str] = []
-    for idx, buf in enumerate(buffers, start=1):
-        nombre = f"{moneda_filtro.upper()}_eventos_oportunidades_{idx:02d}.png"
-        object_path = build_object_path(exec_id, nombre)  # exec/<exec_id>/<nombre>
-        local_path = f"/tmp/{nombre}"
-
-        buf.seek(0)
-        with open(local_path, "wb") as f:
-            f.write(buf.getvalue())
-
-        # 👈 SUBE y espera la URL
-        if asyncio.iscoroutinefunction(subir_a_bucket_y_obtener_url):
-            url = await subir_a_bucket_y_obtener_url(local_path, object_path)
-        else:
-            url = await asyncio.to_thread(subir_a_bucket_y_obtener_url, local_path, object_path)
-
-        urls_subidas.append(url)
-
-        # Registra en Firestore (sync → thread)
-        await asyncio.to_thread(
-            fs_registrar_archivo_generado,
-            exec_id, chat_id,
-            tipo="png",
-            nombre=nombre,
-            gcs_path=object_path,
-            signed_url=url,              # o None si prefieres firmar on-demand
-            content_type="image/png",
-            metadata={"scope": "eventos_oportunidades", "part": idx},
-        )
-
-    return urls_subidas
-
-
-async def subir_json_eventos_filtrados(
-    df_eventos: pd.DataFrame,
-    divisas_oportunidades,
-    exec_id: str,
-    chat_id: str,
-    moneda_filtro: str,
-    timezone_country,                # tu tz destino
-    subir_a_bucket_y_obtener_url,    # async o sync
-) -> str | None:
-
-    # Normaliza divisas a lista plana de strings
-    divs_arr = np.asarray(divisas_oportunidades).ravel() if divisas_oportunidades is not None else np.array([])
-    divs = [str(x) for x in divs_arr.tolist() if pd.notna(x) and str(x).strip() != ""]
-
-    if df_eventos is None or df_eventos.empty or len(divs) == 0:
-        return None
-
-    if 'date' not in df_eventos.columns or 'currency' not in df_eventos.columns:
-        return None
-
-    df = df_eventos[df_eventos['currency'].isin(divs)].copy()
-    if df.empty:
-        return None
-
-    # Asegura datetime con tz y formatea
-    df['date'] = pd.to_datetime(df['date'], errors='coerce', utc=True)
-    df = df[df['date'].notna()]
-    if df.empty:
-        return None
-
-    df['date'] = df['date'].dt.tz_convert(timezone_country).dt.strftime('%Y-%m-%d %H:%M:%S %Z')
-
-    records = df.where(pd.notnull(df), None).to_dict('records')
-
-    json_url = await guardar_json_en_storage_y_registrar(
-        exec_id=exec_id,
-        chat_id=chat_id,
-        nombre_base=f"{moneda_filtro.upper()}_eventos_oportunidades",
-        data=records,
-        subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
-        metadata={
-            "scope": "eventos_oportunidades",
-            "moneda_filtro": moneda_filtro,
-            "divisas": divs
-        },
-    )
-    return json_url
-
-
 def build_object_path(exec_id: str, nombre: str) -> str:
     # Estructura uniforme en el bucket por ejecución
     return f"exec/{exec_id}/{nombre}"
 
 
-def fs_crear_ejecucion(chat_id: str, activos_solicitados: list[str], origen: str, opciones_usuario: list[str]) -> str:
+def fs_crear_ejecucion(
+    *, user_id: str | None, chat_id: str | None,
+    activos_solicitados: list[str], origen: str, opciones_usuario: list[str]
+) -> str:
     exec_id = uuid.uuid4().hex
-    doc_ref = db.collection("ejecuciones").document(exec_id)
-    payload = {
+    payload = _drop_nones({
         "exec_id": exec_id,
-        "chat_id": chat_id,
+        "user_id": user_id,          # <— NUEVO (principal)
+        "chat_id": chat_id,          # <— opcional (solo si viene)
         "activos_solicitados": list(map(str, activos_solicitados or [])),
         "origen": str(origen),
         "opciones_usuario": list(map(str, opciones_usuario or [])),
@@ -1203,8 +1174,8 @@ def fs_crear_ejecucion(chat_id: str, activos_solicitados: list[str], origen: str
         "archivos": 0,
         "created_at": firestore.SERVER_TIMESTAMP,
         "updated_at": firestore.SERVER_TIMESTAMP,
-    }
-    doc_ref.set(payload)
+    })
+    db.collection("ejecuciones").document(exec_id).set(payload)
     return exec_id
 
 def fs_actualizar_ejecucion(exec_id: str, **campos):
@@ -1223,26 +1194,23 @@ def fs_finalizar_ejecucion(exec_id: str, estado: str = "completado", resumen: di
 
 def fs_registrar_archivo_generado(
     exec_id: str,
-    chat_id: str,
-    *,
-    tipo: str,               # 'csv' | 'json' | 'png' | 'html' | ...
-    nombre: str,             # p.ej. USD_principal.csv
-    gcs_path: str,           # p.ej. exec/<exec_id>/USD_principal.csv
-    signed_url: str | None = None,
-    content_type: str | None = None,
+    *, user_id: str | None, chat_id: str | None,
+    tipo: str, nombre: str, gcs_path: str,
+    signed_url: str | None = None, content_type: str | None = None,
     metadata: dict | None = None,
 ):
-    payload = {
+    payload = _drop_nones({
         "exec_id": str(exec_id),
-        "chat_id": str(chat_id),
+        "user_id": user_id,          
+        "chat_id": chat_id,          
         "tipo": str(tipo),
         "nombre": str(nombre),
-        "gcs_path": str(gcs_path),      # SOLO referencia
-        "signed_url": str(signed_url) if signed_url else None,
-        "content_type": str(content_type) if content_type else None,
-        "metadata": _sanitize_for_firestore(metadata or {}),
+        "gcs_path": str(gcs_path),
+        "signed_url": signed_url,
+        "content_type": content_type,
+        "metadata": metadata or {},
         "created_at": firestore.SERVER_TIMESTAMP,
-    }
+    })
     db.collection("archivos_generados").add(payload)
     db.collection("ejecuciones").document(exec_id).update({
         "archivos": firestore.Increment(1),
@@ -1250,7 +1218,7 @@ def fs_registrar_archivo_generado(
     })
 
 async def guardar_json_en_storage_y_registrar(
-    *, exec_id: str, chat_id: str, nombre_base: str,
+    *, exec_id: str, chat_id: str, user_id:str, nombre_base: str,
     data, subir_a_bucket_y_obtener_url, metadata: dict | None = None,
 ) -> str | None:
     nombre = f"{nombre_base}.json"
@@ -1274,9 +1242,14 @@ async def guardar_json_en_storage_y_registrar(
 
     await asyncio.to_thread(
         fs_registrar_archivo_generado,
-        exec_id, chat_id,
-        tipo="json", nombre=nombre, gcs_path=object_path,
-        signed_url=url_publica, content_type="application/json",
+        exec_id=exec_id, 
+        user_id=user_id, 
+        chat_id=chat_id, 
+        tipo="json", 
+        nombre=nombre, 
+        gcs_path=object_path,
+        signed_url=url_publica, 
+        content_type="application/json",
         metadata=metadata or {},
     )
     return url_publica
@@ -1479,28 +1452,60 @@ def definir_window(temporalidad: str, overrides: dict[str,int] | None = None) ->
         window = 30  # Antes 30 Valor por defecto para otras temporalidades
     return window
 
-def return_state(user_chat_id):
-    user_ref = db.collection("user_states").document(user_chat_id)
-    user_data = user_ref.get()
 
-    if user_data.exists:
-        return user_data.to_dict().get("estado")
+def _user_state_doc_by_uuid(uuid: str):
+    return db.collection("user_states").document(uuid)
 
-
-def mark_user_state(user_chat_id, state, destinatarios=None):
+def _find_uuid_by_telegram_id(tg_id: str) -> Optional[str]:
     """
-    Marca el estado del usuario en Firestore.
-    Si 'destinatarios' no es None, también los guarda.
+    Busca el UUID canónico a partir de un telegram_id.
+    Intenta primero en chat_ids/{tg_id} con campos típicos,
+    y si no, consulta user_ids por igualdad.
     """
-    user_ref = db.collection("user_states").document(user_chat_id)
+    # 1) chat_ids/{tg_id}
+    snap = db.collection("chat_ids").document(str(tg_id)).get()
+    if snap.exists:
+        data = snap.to_dict() or {}
+        for k in ("uuid", "user_uuid", "user_id", "uuid_user"):
+            if data.get(k):
+                return str(data[k])
 
-    # Construir el diccionario de actualización
-    update_data = {"estado": state}
+    # 2) user_ids where telegram_id == tg_id (si lo guardas así)
+    q = db.collection("user_ids").where("telegram_id", "==", str(tg_id)).limit(1).get()
+    if q:
+        # el doc.id de user_ids es el UUID canónico
+        return q[0].id
 
-    if destinatarios is not None:
-        update_data["destinatarios"] = destinatarios
+    return None
 
-    user_ref.set(update_data, merge=True)  # Merge=True evita sobrescribir otros datos existentes
+def resolve_user_uuid(*, user_id: Optional[str] = None, chat_id: Optional[str] = None) -> Optional[str]:
+    """
+    Regresa el UUID canónico para user_states:
+    - Si viene user_id (UUID) => úsalo.
+    - Si viene chat_id (telegram_id) => mapea a UUID.
+    """
+    if user_id:
+        return str(user_id)
+    if chat_id:
+        return _find_uuid_by_telegram_id(str(chat_id))
+    return None
+
+def mark_user_state(*, user_id: Optional[str] = None, chat_id: Optional[str] = None,
+                    estado: str = "disponible", extra: Optional[dict] = None) -> None:
+    """
+    Actualiza user_states/{UUID}. Soporta ambas entradas por compatibilidad.
+    """
+    uuid = resolve_user_uuid(user_id=user_id, chat_id=chat_id)
+    if not uuid:
+        # loguea y no revientes la ejecución
+        print(f"[mark_user_state] No se pudo resolver UUID (user_id={user_id}, chat_id={chat_id})")
+        return
+
+    payload = {"estado": estado}
+    if extra:
+        payload.update(extra)
+
+    _user_state_doc_by_uuid(uuid).set(payload, merge=True)
 
 
 
@@ -1850,7 +1855,7 @@ async def obtener_noticias_generales(update, context):
     user_chat_id = str(update.effective_chat.id)
     noticias = []
     actualizar_estado_usuario(user_chat_id, "en ejecución")
-    mark_user_state(user_chat_id, "en ejecución")
+    mark_user_state(chat_id=user_chat_id, estado="en ejecución")
 
     try:
         # Construir la URL del endpoint
@@ -1926,7 +1931,7 @@ async def obtener_noticias_generales(update, context):
     except Exception as e:
         logger.info(f"Error en obtener_noticias_generales: {e}")
     finally:
-        mark_user_state(user_chat_id, "disponible")
+        mark_user_state(user_id=user_chat_id, estado="disponible")
 
 #@profile
 def calcular_impacto_noticias(df_noticias):
@@ -2048,12 +2053,8 @@ def obtener_datos_historicos_fmp(
     bars: int | None = None
 ):
     """
-    - Si 'bars' está definido y > 0:
-        * NO usa ni actualiza caché.
-        * Calcula from/to con base en la TF normalizada y pide a FMP esa ventana.
-        * Devuelve exactamente 'bars' velas ordenadas (siempre que la API lo permita).
-    - Si 'bars' es None:
-        * Comportamiento original incremental usando caché (lee y puede actualizar).
+    - Si 'bars' > 0: NO usa caché; pide ventana exacta y devuelve 'bars' velas.
+    - Si 'bars' es None: modo incremental con caché.
     """
     try:
         tf = _norm_tf(temporalidad)  # '1min','5min','15min','30min','1hour','4hour','1day','1week'
@@ -2064,12 +2065,11 @@ def obtener_datos_historicos_fmp(
         # -------------------------
         if use_bars:
             now_utc = datetime.now(pytz.utc)
-            # Márgen extra para evitar off-by-one
-            total_min = _TF_MINUTES[tf] * (bars + 5)
+            total_min = _TF_MINUTES[tf] * (bars + 5)  # margen
             from_dt = now_utc - timedelta(minutes=total_min)
             to_dt   = now_utc
 
-            fmt = _fmt_for_tf(tf)  # asumes que existe; p.ej. "%Y-%m-%d" o con hora según TF
+            fmt = _fmt_for_tf(tf)
             from_str = from_dt.strftime(fmt)
             to_str   = to_dt.strftime(fmt)
 
@@ -2080,7 +2080,6 @@ def obtener_datos_historicos_fmp(
 
             reintento = 0
             tiempo_espera = tiempo_espera_inicial
-
             while reintento < max_reintentos:
                 try:
                     resp = requests.get(url, timeout=timeout_request_global)
@@ -2089,12 +2088,9 @@ def obtener_datos_historicos_fmp(
                         if isinstance(data, list) and len(data) > 0:
                             df = pd.DataFrame(data)[['date','open','high','low','close','volume']]
                             df['date'] = pd.to_datetime(df['date'], errors='coerce')
-                            df = df.dropna(subset=['date']).set_index('date')
-                            df = df.sort_index()
-                            # EXACTAMENTE 'bars' al final (por si viene de más)
+                            df = df.dropna(subset=['date']).set_index('date').sort_index()
                             if len(df) > bars:
                                 df = df.tail(bars)
-                            # Localizar a UTC y convertir a tu zona de salida
                             out = df.copy()
                             out.index = out.index.tz_localize(pytz.utc).tz_convert(timezone_country)
                             return out
@@ -2128,17 +2124,27 @@ def obtener_datos_historicos_fmp(
 
         if symbol in cache_historicos and tf in cache_historicos[symbol]:
             df_local = cache_historicos[symbol][tf]
-            if df_local is not None and not df_local.empty and 'date' in df_local.columns:
+
+            if df_local is not None and not df_local.empty:
                 df_local = df_local.copy()
-                df_local['date'] = pd.to_datetime(df_local['date'], errors='coerce')
-                df_local = df_local.dropna(subset=['date']).set_index('date')
+
+                if 'date' in df_local.columns:
+                    # ⬇ Normaliza serie a UTC y luego quita tz → índice naive
+                    df_local['date'] = pd.to_datetime(df_local['date'], errors='coerce', utc=True).dt.tz_convert(None)
+                    df_local = df_local.dropna(subset=['date']).set_index('date')
+                else:
+                    # ⬇ Caso en que ya venía con índice datetime (posible tz-aware)
+                    idx = pd.to_datetime(df_local.index, utc=True).tz_convert(None)
+                    df_local.index = idx
+
             ultima_fecha = (df_local.index.max() if (df_local is not None and not df_local.empty) else None)
             logger.info(f"Última fecha en caché {symbol} {tf}: {ultima_fecha}")
         else:
             logger.info(f"Sin caché para {symbol} {tf}")
 
         if ultima_fecha is not None:
-            from_str = ultima_fecha.strftime("%Y-%m-%d")
+            # ultima_fecha ya es naive UTC
+            from_str = pd.Timestamp(ultima_fecha).strftime("%Y-%m-%d")
             to_str   = datetime.now(pytz.utc).strftime("%Y-%m-%d")
             url = (
                 f"https://financialmodelingprep.com/api/v3/historical-chart/"
@@ -2159,11 +2165,12 @@ def obtener_datos_historicos_fmp(
                     data_api = response.json()
                     if isinstance(data_api, list) and len(data_api) > 0:
                         df_api = pd.DataFrame(data_api)[['date','open','high','low','close','volume']]
-                        df_api['date'] = pd.to_datetime(df_api['date'], errors='coerce')
+                        # ⬇ Normaliza a UTC y luego sin tz → índice naive
+                        df_api['date'] = pd.to_datetime(df_api['date'], errors='coerce', utc=True).dt.tz_convert(None)
                         df_api = df_api.dropna(subset=['date']).set_index('date')
 
                         if ultima_fecha is not None:
-                            # Ambos índices "naive" → comparación válida
+                            # Ambas partes naive → comparación válida
                             df_api = df_api[df_api.index > ultima_fecha]
 
                         if df_local is not None and not df_local.empty and not df_api.empty:
@@ -2175,11 +2182,12 @@ def obtener_datos_historicos_fmp(
                         else:
                             df_combinado = pd.DataFrame()
 
-                        # Actualizar caché (MODO incremental SÍ actualiza)
+                        # Guarda en caché con índice naive (UTC sin tz)
                         if symbol not in cache_historicos:
                             cache_historicos[symbol] = {}
                         cache_historicos[symbol][tf] = df_combinado
 
+                        # Al devolver: localiza a UTC y convierte a timezone_country
                         out = df_combinado.copy()
                         out.index = out.index.tz_localize(pytz.utc).tz_convert(timezone_country)
                         return out
@@ -5653,9 +5661,7 @@ async def enviar_imagen_eventos_oportunidades(
     user_chat_id=None,
     intentos=3,
     *,
-    exec_id: str | None = None,
-    moneda_filtro: str | None = None,
-    subir_a_bucket_y_obtener_url=None,
+    moneda_filtro: str | None = None
 ) -> list[str]:
     """
     Genera 1..N imágenes de eventos (estilo tabla), las envía a Telegram,
@@ -5675,24 +5681,7 @@ async def enviar_imagen_eventos_oportunidades(
     else:
         imgs = [imagen_eventos]
 
-    # 2) Subir a bucket si corresponde
-    if imgs and exec_id and moneda_filtro and subir_a_bucket_y_obtener_url:
-        try:
-            # Reutiliza tu registrador existente si acepta lista:
-            urls_subidas = await subir_imagenes_eventos_y_registrar(
-                imgs, exec_id, user_chat_id, moneda_filtro, subir_a_bucket_y_obtener_url
-            )
-        except TypeError:
-            # En caso de que tu registrador espere una sola imagen, subimos una a una
-            urls_subidas = []
-            for i, img in enumerate(imgs, 1):
-                img.seek(0)
-                nombre = f"{exec_id}/eventos_oportunidades_{moneda_filtro}_part_{i}.png"
-                url = await subir_a_bucket_y_obtener_url(img, nombre=nombre, content_type="image/png")
-                if url:
-                    urls_subidas.append(url)
-
-    # 3) Enviar a Telegram
+    # 2) Enviar a Telegram
     if not imgs:
         logger.info("No se generó imagen de eventos (lista vacía).")
         return urls_subidas
@@ -5720,8 +5709,6 @@ async def enviar_imagen_eventos_oportunidades(
                 except Exception as e:
                     logger.info(f"Error inesperado enviando imagen de eventos a {chat_id}: {e}")
                     await asyncio.sleep(2)
-
-    return urls_subidas
 
 #@profile
 def graficar_serie_temporal(df, symbol, temporalidad):
@@ -6235,7 +6222,16 @@ async def ejecutar_analisis_con_hilos(
 
 # Función para procesar el resultado de cada análisis
 #@profile
-async def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None, cfg: dict | None = None):
+async def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_id, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None, cfg: dict | None = None):
+
+    origen_norm  = (origen or "app").lower()
+    send_results = bool(((cfg or {}).get("notifications") or {}).get("send_results_telegram"))
+    has_chat     = bool(str(user_chat_id or "").strip())
+
+    send_to_tg = has_chat and (
+        (origen_norm == "telegram") or
+        (origen_norm == "app" and send_results)
+    )
 
     urls_generadas = []
 
@@ -6337,6 +6333,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                         niveles=niveles,
                         entradas=entradas,
                         extra_metadata={"moneda_filtro": moneda_filtro},
+                        user_id=user_id
                     )
                     if url:
                         urls_enriched.append(url)
@@ -6365,6 +6362,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
         url_ordenado = await guardar_json_en_storage_y_registrar(
             exec_id=exec_id,
             chat_id=user_chat_id,
+            user_id=user_id,
             nombre_base=f"{moneda_filtro.upper()}_resultados_ordenados",
             data=ordered_records,  # DataFrame ya serializable
             subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
@@ -6385,6 +6383,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
         url_opp = await guardar_json_en_storage_y_registrar(
             exec_id=exec_id,
             chat_id=user_chat_id,
+            user_id=user_id,
             nombre_base=f"{moneda_filtro.upper()}_oportunidades",
             data=opp_records,  # <- IMPORTANTE
             subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
@@ -6575,7 +6574,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                     if exec_id:
                         await asyncio.to_thread(
                             fs_registrar_archivo_generado,
-                            exec_id, user_chat_id,
+                            exec_id=exec_id, 
+                            user_id=user_id, 
+                            chat_id=user_chat_id,
                             tipo="csv",
                             nombre=nombre_archivo_principal,
                             gcs_path=object_path,
@@ -6584,10 +6585,12 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                             metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
                         )
 
-                if origen == "app":
-                    await enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id)
-                else:
-                    asyncio.create_task(enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id))
+                if send_to_tg:
+                    if origen == "telegram":
+                        asyncio.create_task(enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id))
+                    else:
+                        await enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id)
+
             else:
                 logger.info(f"El DataFrame principal está vacío. No se enviará el archivo: {nombre_archivo_principal}")
 
@@ -6607,7 +6610,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                     if exec_id:
                         await asyncio.to_thread(
                             fs_registrar_archivo_generado,
-                            exec_id, user_chat_id,
+                            exec_id=exec_id, 
+                            user_id=user_id, 
+                            chat_id=user_chat_id,
                             tipo="csv",
                             nombre=nombre_archivo_secundaria,
                             gcs_path=object_path,
@@ -6616,10 +6621,12 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                             metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
                         )
 
-                if origen == "app":
-                    await enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id)
-                else:
-                    asyncio.create_task(enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id))
+                if send_to_tg:
+                    if origen == "telegram":
+                        asyncio.create_task(enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id))
+                    else:
+                        await enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id)
+
             else:
                 logger.info(f"El DataFrame secundario está vacío. No se enviará el archivo: {nombre_archivo_secundaria}")
 
@@ -6651,7 +6658,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                     if exec_id:
                         await asyncio.to_thread(
                             fs_registrar_archivo_generado,
-                            exec_id, user_chat_id,
+                            exec_id=exec_id, 
+                            user_id=user_id, 
+                            chat_id=user_chat_id, 
                             tipo="csv",
                             nombre=nombre_archivo_filtrado_principal,
                             gcs_path=object_path,
@@ -6659,11 +6668,12 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                             content_type="text/csv",
                             metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
                         )
-                
-                if origen == "app":
-                    await enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id)
-                else:
-                    asyncio.create_task(enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id))
+
+                if send_to_tg:
+                    if origen == "telegram":
+                        asyncio.create_task(enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id))
+                    else:
+                        await enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id)
             else:
                 logger.info(f"El DataFrame filtrado principal está vacío. No se enviará el archivo: {nombre_archivo_filtrado_principal}")
 
@@ -6683,7 +6693,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                     if exec_id:
                         await asyncio.to_thread(
                             fs_registrar_archivo_generado,
-                            exec_id, user_chat_id,
+                            exec_id=exec_id, 
+                            user_id=user_id, 
+                            chat_id=user_chat_id, 
                             tipo="csv",
                             nombre=nombre_archivo_filtrado_secundaria,
                             gcs_path=object_path,
@@ -6692,10 +6704,12 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                             metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
                         )
 
-                if origen == "app":
-                    await enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id)
-                else:
-                    asyncio.create_task(enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id))
+                if send_to_tg:
+                    if origen == "telegram":
+                        asyncio.create_task(enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id))
+                    else:
+                        await enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id)
+
             else:
                 logger.info(f"El DataFrame filtrado secundario está vacío. No se enviará el archivo: {nombre_archivo_filtrado_secundaria}")
         
@@ -6743,7 +6757,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 if exec_id:
                     await asyncio.to_thread(
                         fs_registrar_archivo_generado,
-                        exec_id, user_chat_id,
+                        exec_id=exec_id, 
+                        user_id=user_id, 
+                        chat_id=user_chat_id, 
                         tipo="csv",
                         nombre=nombre_archivo,
                         gcs_path=object_path,
@@ -6751,8 +6767,12 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                         content_type="text/csv",
                         metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
                     )
-            
-            await enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id)
+
+            if send_to_tg:
+                    if origen == "telegram":
+                        asyncio.create_task(enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id))
+                    else:
+                        await enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id)
         else:
             logger.info(f"El DataFrame df_resultados está vacío. No se enviará el archivo CSV: {nombre_archivo}")
 
@@ -6771,18 +6791,31 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 urls_generadas.append(url_publica)
 
                 if exec_id:
+                    # usa chat_id solo si existe (origen telegram o lo tengas disponible)
+                    chat_id_opt = user_chat_id or None
+
                     await asyncio.to_thread(
                         fs_registrar_archivo_generado,
-                        exec_id, user_chat_id,
+                        exec_id=exec_id,
+                        user_id=user_id,            # <— obligatorio (tu usuario de la app)
+                        chat_id=chat_id_opt,        # <— opcional (telegram)
                         tipo="csv",
                         nombre=nombre_archivo_filtrado,
                         gcs_path=object_path,
-                        signed_url=url_publica,     # o None si no quieres guardarla
+                        signed_url=url_publica,     # o None
                         content_type="text/csv",
-                        metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
+                        metadata={
+                            "moneda_filtro": moneda_filtro,
+                            "particion": "principal",
+                            "filtrado": False
+                        },
                     )
-            
-            await enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id)
+
+            if send_to_tg:
+                    if origen == "telegram":
+                        asyncio.create_task(enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id))
+                    else:
+                        await enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id)
         else:
             logger.info(f"El DataFrame df_filtrado está vacío. No se enviará el archivo CSV: {nombre_archivo_filtrado}")
 
@@ -6808,7 +6841,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                             caption = "Oportunidades relacionadas a los activos seleccionados."
                             if len(imagenes) > 1:
                                 caption += f" Parte {i} de {len(imagenes)}"
-                            await context.bot.send_photo(chat_id=user_chat_id, photo=img, caption=caption)
+
+                            if send_to_tg:    
+                                await context.bot.send_photo(chat_id=user_chat_id, photo=img, caption=caption)
                         except Exception as e:
                             logger.info(f"Error enviando imagen de oportunidades: {e}")
             else:
@@ -6818,22 +6853,11 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
             if user_states[user_chat_id]["imagenes_oportunidades_enviadas"]:  
                 if not df_eventos.empty and divisas_oportunidades is not None and len(divisas_oportunidades) > 0:
-                    # 1) JSON de eventos filtrados
-                    if origen == "app" and exec_id:
-                        json_eventos_url = await subir_json_eventos_filtrados(
-                            df_eventos, divisas_oportunidades, exec_id, user_chat_id, moneda_filtro,
-                            timezone_country, subir_a_bucket_y_obtener_url
+                    if send_to_tg:
+                        await enviar_imagen_eventos_oportunidades(
+                            df_eventos, divisas_oportunidades, context, user_chat_id,
+                            moneda_filtro=moneda_filtro
                         )
-                        if json_eventos_url:
-                            urls_generadas.append(json_eventos_url)
-                    # 2) Imágenes de eventos (subir y enviar)
-                    urls_imgs = await enviar_imagen_eventos_oportunidades(
-                        df_eventos, divisas_oportunidades, context, user_chat_id,
-                        exec_id=exec_id, moneda_filtro=moneda_filtro,
-                        subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url
-                    )
-                    if urls_imgs:
-                        urls_generadas.extend(urls_imgs)
                 else:
                     logger.info("El DataFrame df_eventos está vacío o divisas_oportunidades no contiene elementos válidos.")
                 
@@ -6841,11 +6865,25 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 user_states[user_chat_id]["imagenes_eventos_enviadas"] = True
 
             if not es_administrador(user_chat_id):
-                success, mensaje = await descontar_transaccion(user_chat_id, user_states[user_chat_id]["numero_transacciones"])
+                num_tx = 1
+                try:
+                    num_tx = int(((user_states.get(user_chat_id) or {}).get("numero_transacciones") or 1))
+                except Exception:
+                    num_tx = 1
+
+                num_tx = int(
+                    ((user_states.get(str(user_id)) or {}).get("numero_transacciones"))
+                    or ((user_states.get(str(user_chat_id)) or {}).get("numero_transacciones"))
+                    or 1
+                )
+
+                success, mensaje = await descontar_transaccion(
+                    user_chat_id if (origen or "telegram").lower() == "telegram" else str(user_id),
+                    numero_transacciones_in=num_tx,
+                    origen=(origen or "telegram"),
+                )
                 if not success:
                     await update.message.reply_text(mensaje)
-            
-    logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
     
     urls_generadas = _solo_strings_urls(urls_generadas)
     logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
@@ -6902,7 +6940,7 @@ def limpiar_soportes_resistencias_cache(user_chat_id):
             "estado": "disponible",
             "soportes_resistencias_cache": {}
         }
-        mark_user_state(user_chat_id, "disponible")
+        mark_user_state(user_id=user_chat_id, estado="disponible")
         logger.info(f"Estado inicializado para usuario {user_chat_id}.")
 
 
@@ -6925,7 +6963,8 @@ async def manejar_fecha_eventos(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(chat_id=user_chat_id, text="No tienes opciones habilitadas para esta operación. Por favor, adquiere una suscripción.")
         return
 
-    if return_state(user_chat_id) == "en ejecución":
+    estado_actual = return_state(user_id=user_id, chat_id=user_chat_id)
+    if estado_actual == "en ejecución":
         await context.bot.send_message(
             chat_id=user_chat_id, 
             text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
@@ -6940,7 +6979,7 @@ async def manejar_fecha_eventos(update: Update, context: ContextTypes.DEFAULT_TY
         user_states[user_chat_id]["estado"] = "esperando_fechas"
         user_states[user_chat_id]["fecha_inicio"] = None
         user_states[user_chat_id]["fecha_fin"] = None
-        mark_user_state(user_chat_id, "esperando_fechas")
+        mark_user_state(user_id=user_chat_id, estado="esperando_fechas")
 
         mensaje = "Por favor, envíame las fechas de inicio y fin en formato YYYY-MM-DD separadas por un espacio."
         await context.bot.send_message(chat_id=user_chat_id, text=mensaje)
@@ -6979,7 +7018,7 @@ async def manejar_fecha_noticias_user(update: Update, context: ContextTypes.DEFA
     estado_usuario["estado"] = "esperando_fechas_noticias_user"
     estado_usuario["fecha_inicio"] = None
     estado_usuario["fecha_fin"] = None
-    mark_user_state(user_chat_id, "esperando_fechas_noticias_user")
+    mark_user_state(chat_id=user_chat_id, estado="esperando_fechas_noticias_user")
 
     mensaje = "Por favor, envíame una fecha y un simbolo(por ejemplo: AAPL, BTCUSD, etc.) en formato: YYYY-MM-DD simbolo."
     await context.bot.send_message(chat_id=user_chat_id, text=mensaje)
@@ -7015,7 +7054,7 @@ async def manejar_fecha_noticias_admin(update: Update, context: ContextTypes.DEF
     estado_usuario["estado"] = "esperando_fechas_noticias_admin"
     estado_usuario["fecha_inicio"] = None
     estado_usuario["fecha_fin"] = None
-    mark_user_state(user_chat_id, "esperando_fechas_noticias_admin")
+    mark_user_state(chat_id=user_chat_id, estado="esperando_fechas_noticias_admin")
 
     mensaje = "Por favor, envíame una fecha formato YYYY-MM-DD."
     await context.bot.send_message(chat_id=user_chat_id, text=mensaje)
@@ -7025,7 +7064,7 @@ async def manejar_ia_grafico(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_chat_id = str(update.effective_chat.id)
 
     try:
-        mark_user_state(user_chat_id, "esperando_grafico_ia")
+        mark_user_state(chat_id=user_chat_id, estado="esperando_grafico_ia")
         await update.message.reply_text("📸 Por favor, sube una imagen de un gráfico de velas para que pueda analizarla con IA.")
     except Exception as e:
         await update.message.reply_text(f"Ocurrió un error al preparar el análisis: {e}")
@@ -7058,7 +7097,7 @@ async def analizar_simbolo(update, context):
 
     # Cambiar el estado para manejar noticias
     estado_usuario["estado"] = "esperando_simbolo"
-    mark_user_state(user_chat_id, "esperando_simbolo")
+    mark_user_state(chat_id=user_chat_id, estado="esperando_simbolo")
 
     # Solicitar el símbolo al usuario
     await update.message.reply_text("Por favor, ingresa el símbolo que deseas analizar (por ejemplo: AAPL, BTCUSD, etc.)\n"\
@@ -7119,7 +7158,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             # Limpiar el estado del usuario
             if user_chat_id in user_states:
                 user_states[user_chat_id]["estado"] = "disponible"
-            mark_user_state(user_chat_id, "disponible")
+            mark_user_state(chat_id=user_chat_id, estado="disponible")
 
     elif estado_firestore == "esperando_fechas":
         try:
@@ -7160,7 +7199,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             state["fecha_inicio"] = fecha_inicio
             state["fecha_fin"] = fecha_fin
             actualizar_estado_usuario(uid, "en ejecución")
-            mark_user_state(uid, "en ejecución")
+            mark_user_state(chat_id=uid, estado="en ejecución")
 
             # Obtener eventos futuros
             df_eventos = await obtener_eventos_guardados_o_futuros(fecha_inicio, fecha_fin)
@@ -7191,7 +7230,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 user_states[uid]["fecha_inicio"] = None
                 user_states[uid]["fecha_fin"] = None
                 user_states[uid]["estado"] = "disponible"
-            mark_user_state(uid, "disponible")
+            mark_user_state(chat_id=uid, estado="disponible")
 
 
     elif estado_firestore == "esperando_fechas_noticias_user":
@@ -7216,7 +7255,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             user_states[user_chat_id]["fecha_inicio"] = fecha_inicio
             user_states[user_chat_id]["fecha_fin"] = fecha_fin
             actualizar_estado_usuario(user_chat_id, "en ejecución")
-            mark_user_state(user_chat_id, "en ejecución")
+            mark_user_state(chat_id=user_chat_id, estado="en ejecución")
 
             # Obtener noticias
             noticias = obtener_noticias_simbolo(input[1].upper(), fecha_inicio, fecha_fin, limite=15)
@@ -7275,7 +7314,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 user_states[user_chat_id]["fecha_inicio"] = None
                 user_states[user_chat_id]["fecha_fin"] = None
                 user_states[user_chat_id]["estado"] = "disponible"
-            mark_user_state(user_chat_id, "disponible")
+            mark_user_state(chat_id=user_chat_id, estado="disponible")
     
     elif estado_firestore == "esperando_fechas_noticias_admin":
         try:
@@ -7299,7 +7338,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             user_states[user_chat_id]["fecha_inicio"] = fecha_inicio
             user_states[user_chat_id]["fecha_fin"] = fecha_fin
             actualizar_estado_usuario(user_chat_id, "en ejecución")
-            mark_user_state(user_chat_id, "en ejecución")
+            mark_user_state(chat_id=user_chat_id, estado="en ejecución")
 
             # Obtener noticias
             activos_filtrados = filtrar_activos_por_moneda(activos, 'todos')
@@ -7362,7 +7401,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 user_states[user_chat_id]["fecha_inicio"] = None
                 user_states[user_chat_id]["fecha_fin"] = None
                 user_states[user_chat_id]["estado"] = "disponible"
-            mark_user_state(user_chat_id, "disponible")
+            mark_user_state(chat_id=user_chat_id, estado="disponible")
     
     elif estado_firestore == "modo_envio_mensaje":
         try:
@@ -7388,7 +7427,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 archivos_guardados.append({"tipo": "documento", "file_id": file_id})
 
             # Obtener destinatario manual si existe
-            user_ref = db.collection("user_states").document(user_chat_id)
+            user_ref = _user_state_doc(user_id=user_id, chat_id=user_chat_id)
             user_data = user_ref.get().to_dict() if user_ref.get().exists else {}
             destinatario_manual = user_data.get("destinatario_manual")
 
@@ -7409,7 +7448,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text("📩 ¿Confirmas el envío del mensaje?", reply_markup=reply_markup)
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando el envío del mensaje: {e}")
-            mark_user_state(user_chat_id, "disponible")
+            mark_user_state(chat_id=user_chat_id, estado="disponible")
 
 
     elif estado_firestore == "esperando_id_usuario":
@@ -7417,7 +7456,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             await recibir_usuario_especifico(update, context)  # Redirigir a función de ingreso de ID
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando el envío del mensaje a un usuario específico: {e}")
-            mark_user_state(user_chat_id, "disponible")
+            mark_user_state(chat_id=user_chat_id, estado="disponible")
 
     elif estado_firestore == "esperando_grafico_ia":
         try:
@@ -7453,7 +7492,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text(f"Hubo un error analizando la imagen: {e}")
 
         finally:
-            mark_user_state(user_chat_id, "disponible")
+            mark_user_state(chat_id=user_chat_id, estado="disponible")
             try:
                 if os.path.exists(ruta_local):
                     os.remove(ruta_local)
@@ -7473,11 +7512,11 @@ async def recibir_usuario_especifico(update: Update, context: ContextTypes.DEFAU
         return
     
     # Guardar ID del usuario en Firestore directamente
-    user_ref = db.collection("user_states").document(user_chat_id)
+    user_ref = _user_state_doc(user_id=user_id, chat_id=user_chat_id)
     user_ref.set({"destinatario_manual": message_text}, merge=True)  # 👈 Se guarda aquí manualmente
 
     # Guardar ID en Firestore y activar el modo de envío de mensaje
-    mark_user_state(user_chat_id, "modo_envio_mensaje", "usuario_especifico")
+    mark_user_state(chat_id=user_chat_id, estado="modo_envio_mensaje")
     await update.message.reply_text(f"✅ Usuario {message_text} seleccionado. Ahora envía el mensaje o archivo.")
 
 
@@ -7494,92 +7533,183 @@ async def enviar_mensaje_noticias(context, user_chat_id, mensaje):
         
 # Función para manejar el ciclo recurrente del análisis
 #@profile
-async def ejecutar_recurrente(context, update, moneda_filtro, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None, operatoria_cfg: dict | None = None, cfg: dict | None = None):
+async def ejecutar_recurrente(
+    context,
+    update,
+    moneda_filtro,
+    user_chat_id: str | None = None,
+    opciones_usuario: list = [],
+    user_id: str | None = None,             # UUID de la app (preferido)
+    origen: str = "telegram",
+    exec_id: str | None = None,
+    operatoria_cfg: dict | None = None,
+    cfg: dict | None = None,
+):
+    """
+    Ejecuta análisis para un conjunto de activos filtrados por moneda.
+    - Prioriza user_id (UUID). Si no hay, opera con user_chat_id (telegram).
+    - Marca estado 'en ejecución' y libera al final.
+    """
+    # --- Normalizaciones y helpers ---
+    origen_norm  = (origen or "app").lower()
+    send_results = bool(((cfg or {}).get("notifications") or {}).get("send_results_telegram"))
+    has_chat     = bool(str(user_chat_id or "").strip())
+    send_to_tg   = has_chat and (origen_norm == "telegram" or (origen_norm == "app" and send_results))
+
+    # Filtra activos (asumo que 'activos' existe en tu módulo)
     activos_filtrados = filtrar_activos_por_moneda(activos, moneda_filtro)
-    if user_chat_id not in user_states:
-            user_states[user_chat_id] = {}
-            
-    user_states[user_chat_id]["numero_transacciones"] = len(activos_filtrados)
+
+    # Estado local por chat (solo si hay chat_id)
+    if user_chat_id and user_chat_id not in user_states:
+        user_states[user_chat_id] = {}
+
+    n = len(activos_filtrados)
+    if user_id:
+        user_states.setdefault(str(user_id), {})["numero_transacciones"] = n
+    if user_chat_id:
+        user_states.setdefault(str(user_chat_id), {})["numero_transacciones"] = n
 
     if not activos_filtrados:
+        if send_to_tg:
+            await context.bot.send_message(
+                chat_id=user_chat_id,
+                text="No se encontraron activos para analizar con el filtro especificado."
+            )
+        return  # <- salimos igual aunque no haya Telegram
+
+    # --- Cuota/transacciones (lee del cache local si hay chat) ---
+    num_tx = 1
+    if user_chat_id:
+        try:
+            num_tx = int(((user_states.get(user_chat_id) or {}).get("numero_transacciones") or 1))
+        except Exception:
+            num_tx = 1
+
+    # --- Validación de suscripción (tolerante a string/dict) ---
+    estado = await estado_suscripcion(
+        user_id=user_id,                # flujo app (UUID)
+        chat_id=user_chat_id or None,   # opcional, espejo
+        numero_transacciones=num_tx,
+    )
+    # soporto ambos formatos
+    estado_code = None
+    if isinstance(estado, str):
+        estado_code = estado
+    elif isinstance(estado, dict):
+        # podría venir {"active": bool, "reason": "..."} o {"code": "..."}
+        if "code" in estado:
+            estado_code = estado["code"]
+        elif estado.get("active") is False and estado.get("reason"):
+            estado_code = estado["reason"]
+
+    if estado_code == "transacciones_insuficientes" and not es_administrador(user_id or user_chat_id):
+        if send_to_tg:
+            await context.bot.send_message(
+                chat_id=user_chat_id,
+                text="No cuenta con la cuota de transacciones requerida. Por favor, contacta con un administrador."
+            )
+        return
+
+    # --- Evitar duplicados en ejecución (por chat) ---
+    if user_chat_id and return_state(user_chat_id) == "en ejecución":
+        if send_to_tg:
+            await context.bot.send_message(
+                chat_id=user_chat_id,
+                text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
+            )
+        return
+
+    # --- Config en memoria para esta ejecución (si hay chat) ---
+    if user_chat_id:
+        user_states[user_chat_id]["operatoria_cfg"] = dict(operatoria_cfg or {})
+
+    # Saludo
+    if send_to_tg:
+        user = getattr(update, "effective_user", None)
+        first_name = getattr(user, "first_name", "") if user else ""
         await context.bot.send_message(
             chat_id=user_chat_id,
-            text="No se encontraron activos para analizar con el filtro especificado."
+            text=f"Hola {first_name}, comenzó el análisis. Por favor, espera un momento..."
         )
-        return
 
-    if await estado_suscripcion(user_chat_id, user_states[user_chat_id]["numero_transacciones"]) == 'transacciones_insuficientes' and not es_administrador(user_chat_id):
-        await context.bot.send_message(
-            chat_id=user_chat_id,
-            text="No cuenta con la cuota de transacciones requerida. Por favor, contacta con un administrador."
-        )
-        return
-    
-    if return_state(user_chat_id) == "en ejecución":
-        await context.bot.send_message(
-            chat_id=user_chat_id, 
-            text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
-        )
-        return
-    
-    # Pon la config en memoria para esta ejecución
-    if user_chat_id not in user_states:
-        user_states[user_chat_id] = {}
-    user_states[user_chat_id]["operatoria_cfg"] = operatoria_cfg or {}
-
-    user = update.effective_user.first_name
-    await context.bot.send_message(chat_id=user_chat_id, text=f"Hola {user}, comenzó el análisis. Por favor, espera un momento...")
-
+    # --- Marcar estados en Firestore y memoria ---
     actualizar_estado_usuario(user_chat_id, "en ejecución", moneda_filtro)
-    mark_user_state(user_chat_id, "en ejecución")
-    limpiar_soportes_resistencias_cache(user_chat_id)
-    estado_usuario = obtener_estado_usuario(user_chat_id)
-    estado_usuario["cache_realtime"] = {}
+    # IMPORTANTE: usa kwargs; si tienes UUID úsalo como user_id, si no, usa chat_id
+    if user_id:
+        mark_user_state(user_id=user_id, estado="en ejecución")
+    elif user_chat_id:
+        mark_user_state(chat_id=user_chat_id, estado="en ejecución")
 
-    logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Ejecutando análisis para el usuario {user_chat_id}...")
+    if user_chat_id:
+        limpiar_soportes_resistencias_cache(user_chat_id)
+        estado_usuario = obtener_estado_usuario(user_chat_id)
+        estado_usuario["cache_realtime"] = {}
 
+    logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Ejecutando análisis para el usuario chat={user_chat_id} uuid={user_id}...")
+
+    # --- Actualiza metadata de la ejecución si te pasaron exec_id ---
     if exec_id:
         try:
-            await asyncio.to_thread(fs_actualizar_ejecucion, exec_id,
-                                    activos_resueltos=activos_filtrados,
-                                    numero_transacciones=len(activos_filtrados))
+            await asyncio.to_thread(
+                fs_actualizar_ejecucion,
+                exec_id,
+                activos_resueltos=activos_filtrados,
+                numero_transacciones=len(activos_filtrados),
+            )
         except Exception as e:
             logging.warning(f"No se pudo actualizar ejecucion {exec_id}: {e}")
 
+    # --- Ejecución principal ---
     try:
         start_time = datetime.now()
+
         try:
-            df_eventos = await obtener_eventos_economicos()  # Ensure this function is async
+            df_eventos = await obtener_eventos_economicos()  # puede fallar: seguimos sin eventos
         except Exception as e:
             logging.warning(f"Error al obtener eventos económicos: {e}")
-            df_eventos = None  # continuar sin eventos
+            df_eventos = None
 
         resultados = await ejecutar_analisis_con_hilos(
-            df_eventos, activos_filtrados, user_chat_id, context,
+            df_eventos,
+            activos_filtrados,
+            user_chat_id,
+            context,
             overrides={
-                'tfs': (operatoria_cfg or {}).get('tfs'),
-                'fmpWindows':    (operatoria_cfg or {}).get('fmpWindows'),
-                'calcWindows':   (operatoria_cfg or {}).get('calcWindows'),
+                "tfs":           (operatoria_cfg or {}).get("tfs"),
+                "fmpWindows":    (operatoria_cfg or {}).get("fmpWindows"),
+                "calcWindows":   (operatoria_cfg or {}).get("calcWindows"),
             },
-            cfg=cfg
+            cfg=cfg,
         )
 
         if not resultados:
-            await context.bot.send_message(
-                chat_id=user_chat_id,
-                text="El análisis no produjo resultados. Verifique los datos y vuelva a intentarlo."
-            )
+            if send_to_tg:
+                await context.bot.send_message(
+                    chat_id=user_chat_id,
+                    text="El análisis no produjo resultados. Verifique los datos y vuelva a intentarlo."
+                )
             return
 
-        url_generadas = await procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_chat_id, opciones_usuario, origen, exec_id=exec_id, cfg=cfg)
+        url_generadas = await procesar_resultado(
+            resultados, df_eventos, context, update,
+            moneda_filtro, user_id, user_chat_id, opciones_usuario, origen,
+            exec_id=exec_id, cfg=cfg
+        )
 
         elapsed_time = (datetime.now() - start_time).total_seconds()
-        logger.info(f"[{datetime.now()}] Análisis finalizado para usuario {user_chat_id}. Tiempo: {elapsed_time:.2f} segundos.")
+        logger.info(f"[{datetime.now()}] Análisis finalizado (chat={user_chat_id}, uuid={user_id}). Tiempo: {elapsed_time:.2f}s.")
         return url_generadas
-    
+
     finally:
-        limpiar_estado_usuario(user_chat_id)
-        mark_user_state(user_chat_id, "disponible")
+        # Limpiezas locales por chat
+        if user_chat_id:
+            limpiar_estado_usuario(user_chat_id)
+
+        # Siempre liberar el estado remoto (usa el identificador disponible)
+        if user_id:
+            mark_user_state(user_id=user_id,   estado="disponible")
+        elif user_chat_id:
+            mark_user_state(chat_id=user_chat_id, estado="disponible")
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7833,24 +7963,12 @@ async def comando_reset_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await resetear_menu_usuario(context, user_chat_id)
 
 async def cargar_datos_subscription_user():
-    """Carga los datos de suscripción de usuarios desde Firestore o devuelve un diccionario vacío si no hay datos."""
     try:
-        # Obtén la referencia a la colección "suscripciones"
-        collection_ref = db.collection("suscripciones_user")
-        
-        # Consulta todos los documentos de la colección
-        docs = collection_ref.stream()
-
-        # Construir un diccionario con los datos de los usuarios
-        datos_suscripciones = {
-            doc.id: doc.to_dict()
-            for doc in docs if doc.exists
-        }
-
-        return datos_suscripciones
+        docs = db.collection("suscripciones_user").stream()
+        return {doc.id: doc.to_dict() for doc in docs if doc.exists}
     except Exception as e:
-        print(f"Error al cargar datos de suscripción de usuarios desde Firestore: {e}")
-        return {}  # Devuelve un diccionario vacío en caso de error
+        print("Error al cargar suscripciones:", e)
+        return {}
 
 
 async def cargar_datos_subscription_type():
@@ -7885,25 +8003,29 @@ async def cargar_datos_subscription_type():
         return {}
 
 
-async def guardar_datos(data):
-    """Guarda o actualiza los datos de suscripción de usuarios en Firestore."""
+async def guardar_datos(data: dict):
+    """data = {user_id: {...campos...}}"""
     try:
+        batch = db.batch()
         for user_id, detalles in data.items():
-            # Referencia al documento del usuario en la colección "suscripciones"
-            doc_ref = db.collection("suscripciones_user").document(str(user_id))
-            
-            # Guardar los datos en Firestore (merge=True para actualizar campos existentes)
-            doc_ref.set(detalles, merge=True)
-        
-        print("Datos de suscripción guardados/actualizados exitosamente.")
+            # 2.1 upsert suscripción
+            doc_ref = _subscription_doc(user_id)
+            batch.set(doc_ref, detalles, merge=True)
 
-        # 🔄 **Recargar `subscriptions` en memoria después de guardar en Firestore**
+            # 2.2 mantener índice chat_ids si viene telegram_id
+            tg = (detalles or {}).get("telegram_id")
+            if tg:
+                chat_ref = db.collection("chat_ids").document(str(tg))
+                batch.set(chat_ref, {"user_id": str(user_id)}, merge=True)
+
+        batch.commit()
+
+        # refrescar cache en memoria
         global subscriptions
         subscriptions = await cargar_datos_subscription_user()
-
+        print("Suscripciones actualizadas.")
     except Exception as e:
-        print(f"Error al guardar datos de suscripción en Firestore: {e}")
-
+        print("Error al guardar suscripciones:", e)
 
 
 # Función para verificar si un usuario es administrador
@@ -8005,45 +8127,43 @@ async def agregar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def eliminar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Elimina una suscripción de un usuario en Firestore y en memoria."""
-    user_chat_id = str(update.effective_user.id)
-
-    if not es_administrador(user_chat_id):
+    admin_chat = str(update.effective_user.id)
+    if not es_administrador(admin_chat):
         await update.message.reply_text("No tienes permisos para usar este comando.")
         return
 
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Uso: /eliminar_suscripcion <user_id>")
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /eliminar_suscripcion <user_id|telegram_id>")
         return
 
-    user_id = args[0]
+    arg = context.args[0]
 
-    # Referencia al documento en Firestore
-    doc_ref = db.collection("suscripciones_user").document(user_id)
+    # Resolver user_id (si pasaron un chat_id de TG)
+    user_id = arg
+    if not _subscription_doc(user_id).get().exists:  # no es user_id => intenta como chat_id
+        maybe = _user_id_from_chat(arg)
+        if maybe:
+            user_id = maybe
 
-    # Verificar si la suscripción existe
-    user_data = doc_ref.get()
-    if not user_data.exists:
-        await update.message.reply_text(f"No se encontró una suscripción para el ID: {user_id}.")
+    doc_ref = _subscription_doc(user_id)
+    snap = doc_ref.get()
+    if not snap.exists:
+        await update.message.reply_text(f"No se encontró suscripción para ID: {arg}.")
         return
 
-    # Obtener el nombre de usuario antes de eliminar
-    nombre_usuario = user_data.to_dict().get("nombre_usuario", "Usuario desconocido")
-
+    nombre = (snap.to_dict() or {}).get("nombre_usuario", "Usuario")
     try:
-        # Eliminar el documento de Firestore
         doc_ref.delete()
+        # opcional: limpiar índice chat_ids si existía
+        tg = (snap.to_dict() or {}).get("telegram_id")
+        if tg:
+            db.collection("chat_ids").document(str(tg)).delete()
 
-        # 🔥 Eliminar también de memoria
-        subscriptions = await cargar_datos_subscription_user()  # Recargar datos actualizados
-        if user_id in subscriptions:
-            del subscriptions[user_id]  # Ahora sí se elimina de memoria
-
-        await update.message.reply_text(f"✅ Suscripción eliminada para {nombre_usuario} (ID: {user_id}).")
-
+        global subscriptions
+        subscriptions = await cargar_datos_subscription_user()
+        await update.message.reply_text(f"✅ Suscripción eliminada para {nombre} (user_id: {user_id}).")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error al eliminar la suscripción: {e}")
+        await update.message.reply_text(f"⚠️ Error al eliminar: {e}")
 
 
 # Función para verificar el estado de suscripción de un usuario
@@ -8051,63 +8171,93 @@ async def verificar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TY
     global subscriptions
     subscriptions = await cargar_datos_subscription_user()
 
-    user_chat_id = str(update.effective_user.id)
-    suscripcion = subscriptions.get(user_chat_id)
+    chat_id = str(update.effective_user.id)          # TG
+    user_id = _user_id_from_chat(chat_id) or chat_id # si no hay mapping, intenta mismo id
 
+    suscripcion = subscriptions.get(user_id)
     if suscripcion:
         inicio = datetime.fromisoformat(suscripcion["inicio"])
-        fin = datetime.fromisoformat(suscripcion["fin"])
-        transacciones_restantes = suscripcion["transacciones_restantes"]
+        fin    = datetime.fromisoformat(suscripcion["fin"])
+        trans  = suscripcion.get("transacciones_restantes", 0)
 
-        if fin < datetime.now():
-            estado = "expirada"
-            mensaje = f"Tu suscripción está {estado}.\nInicio: {inicio}\nFin: {fin}"
-        elif transacciones_restantes <= 0:
-            estado = "inactiva"
-            mensaje = f"Tu suscripción está {estado} por falta de transacciones.\nTransacciones restantes: {transacciones_restantes}"
-        else:
-            estado = "activa"
-            mensaje = f"Tu suscripción está {estado}.\nInicio: {inicio}\nFin: {fin}\nTransacciones restantes: {transacciones_restantes}"
-            await menu_usuario_registrado(context.bot, user_chat_id)
-            
-        await update.message.reply_text(mensaje)
-
-    elif es_administrador(user_chat_id):
-        await update.message.reply_text("No necesitas suscripción, eres administrador!")
-        await menu_usuario_administrador(context, user_chat_id)
-
-    else:
-        await update.message.reply_text("No tienes una suscripción activa. Por favor, contacta con un administrador.")
-
-
-async def estado_suscripcion(user_chat_id, numero_transacciones = 1):
-    global subscriptions
-    subscriptions = await cargar_datos_subscription_user()
-
-    suscripcion = subscriptions.get(user_chat_id)
-
-    if suscripcion:
-        inicio = datetime.fromisoformat(suscripcion["inicio"])
-        fin = datetime.fromisoformat(suscripcion["fin"])
-        transacciones_restantes = suscripcion["transacciones_restantes"]
-
-        # Determinar el estado basado en las fechas y el número de transacciones restantes
         if fin < datetime.now(pytz.utc):
             estado = "expirada"
-        elif transacciones_restantes <= 0:
+            msg = f"Tu suscripción está {estado}.\nInicio: {inicio}\nFin: {fin}"
+        elif int(trans) <= 0:
             estado = "inactiva"
-        elif numero_transacciones > transacciones_restantes:
-            estado = "transacciones_insuficientes"
+            msg = f"Tu suscripción está {estado}.\nTransacciones restantes: {trans}"
         else:
             estado = "activa"
+            msg = f"Tu suscripción está {estado}.\nInicio: {inicio}\nFin: {fin}\nTransacciones restantes: {trans}"
+            await menu_usuario_registrado(context.bot, chat_id)
+        await update.message.reply_text(msg)
+
+    elif es_administrador(chat_id):
+        await update.message.reply_text("No necesitas suscripción, eres administrador!")
+        await menu_usuario_administrador(context, chat_id)
     else:
-        # Si no tiene suscripción activa, establecemos un estado "sin suscripción"
-        estado = "sin suscripción"
-
-    # Retornar el estado para posibles validaciones posteriores
-    return estado
+        await update.message.reply_text("No tienes una suscripción activa. Contacta un administrador.")
 
 
+# Devuelve: 'activa' | 'expirada' | 'inactiva' | 'transacciones_insuficientes' | 'sin suscripción'
+# user_key puede ser user_id (app) o chat_id (bot).
+async def estado_suscripcion(
+    user_key: str | None = None,                 # compat: antes venía como primer arg (chat_id)
+    numero_transacciones: int = 1,
+    *,
+    user_id: str | None = None,                  # app
+    chat_id: str | None = None,                  # bot (telegram_id)
+    origen: str | None = None,
+) -> str:
+    """
+    Devuelve: 'activa' | 'expirada' | 'inactiva' | 'transacciones_insuficientes' | 'sin suscripción'.
+    - Prefiere user_id; si no hay, usa user_key; si no, chat_id.
+    - Lee la suscripción en suscripciones_user (primero por user_id; si no existe, intenta con chat_id).
+    """
+    try:
+        key = (user_id or user_key or chat_id or "").strip()
+        if not key:
+            return "sin suscripción"
+
+        col = db.collection("suscripciones_user")
+        doc = col.document(key).get()
+
+        # compat: espejo por telegram_id
+        if not doc.exists and chat_id:
+            doc = col.document(str(chat_id)).get()
+
+        if not doc.exists:
+            return "sin suscripción"
+
+        s = doc.to_dict() or {}
+
+        # fecha fin
+        fin_str = s.get("fin")
+        if not fin_str:
+            return "sin suscripción"
+
+        # tolerante a ISO con/ sin 'Z'
+        try:
+            fin = datetime.fromisoformat(fin_str.replace("Z", "+00:00"))
+        except Exception:
+            fin = None
+        if not fin:
+            return "sin suscripción"
+
+        if fin < datetime.now(timezone.utc):
+            return "expirada"
+
+        rest = int(s.get("transacciones_restantes", s.get("limite_transacciones", 0)) or 0)
+        if rest <= 0:
+            return "inactiva"
+        if numero_transacciones > rest:
+            return "transacciones_insuficientes"
+
+        return "activa"
+
+    except Exception as e:
+        logger.warning(f"estado_suscripcion falló: {e}")
+        return "sin suscripción"
 
 # Función para listar todas las suscripciones (solo admin)
 async def listar_suscripciones(update: Update, context: CallbackContext):
@@ -8178,19 +8328,97 @@ def guardar_pagos_pendientes(data):
         print(f"Error al guardar pagos pendientes en Firestore: {e}")
 
 
-async def obtener_opciones_usuario(user_chat_id):
-    global subscriptions
-    suscripcion = subscriptions.get(user_chat_id)  # Aquí debe estar el diccionario que contiene las suscripciones.
-    
-    if not suscripcion or suscripcion.get("estado") == "inactiva":
+from datetime import datetime, timezone
+
+# Nota: asumo que ya existen:
+#   - subscriptions: dict en memoria
+#   - guardar_datos(subscriptions): persiste el dict
+#   - _user_id_from_chat(chat_id): devuelve el user_id (si usas Telegram)
+# Si no usas Telegram en ese entorno, simplemente no pases origen="telegram".
+
+async def obtener_opciones_usuario(user_key: str, origen: str | None = None):
+    """
+    Devuelve la lista de opciones del usuario.
+    - user_key puede ser user_id (APP) o chat_id (BOT).
+    - origen opcional: "app" | "telegram". Si no se pasa, se autodetecta.
+    Idempotente y tolerante a formatos ISO (con o sin 'Z').
+    """
+    try:
+        global subscriptions
+        key = str(user_key or "").strip()
+        if not key:
+            return []
+
+        # ----- Resolver user_id según el origen -----
+        user_id = None
+        if origen:
+            if origen.lower() == "telegram":
+                try:
+                    user_id = str(_user_id_from_chat(key))
+                except Exception:
+                    user_id = None
+            else:  # "app" u otro => ya es user_id
+                user_id = key
+        else:
+            # Autodetección: si la clave ya existe en subscriptions, úsala como user_id
+            if key in subscriptions:
+                user_id = key
+            else:
+                # Intentar mapear desde chat_id -> user_id
+                try:
+                    uid = _user_id_from_chat(key)
+                    uid = str(uid) if uid is not None else ""
+                    user_id = uid if uid in subscriptions else key
+                except Exception:
+                    user_id = key
+
+        suscripcion = subscriptions.get(user_id)
+        if not suscripcion:
+            return []
+
+        # ----- Chequeos de estado / expiración -----
+        estado = (suscripcion.get("estado") or "").lower()
+        fin_raw = suscripcion.get("fin")
+
+        # Si ya está marcada como inactiva, corta.
+        if estado == "inactiva":
+            return []
+
+        # Parse de fecha fin (acepta datetime o ISO string con o sin 'Z')
+        fin_dt = None
+        if isinstance(fin_raw, datetime):
+            fin_dt = fin_raw
+        elif isinstance(fin_raw, str) and fin_raw:
+            fin_str = fin_raw.replace("Z", "+00:00")
+            try:
+                fin_dt = datetime.fromisoformat(fin_str)
+            except Exception:
+                try:
+                    fin_dt = datetime.strptime(fin_raw[:19], "%Y-%m-%dT%H:%M:%S")
+                except Exception:
+                    fin_dt = None
+
+        # Comparación segura (naive/aware)
+        if fin_dt is not None:
+            now = datetime.now(fin_dt.tzinfo) if fin_dt.tzinfo else datetime.now()
+            if now > fin_dt:
+                suscripcion["estado"] = "inactiva"
+                try:
+                    await guardar_datos(subscriptions)
+                except Exception:
+                    pass
+                return []
+
+        # ----- OK: devolver opciones -----
+        opts = suscripcion.get("opciones") or []
+        # Normaliza a lista de strings
+        if isinstance(opts, (list, tuple)):
+            return [str(o) for o in opts if o is not None]
+        return []
+    except Exception:
+        # Silencioso: en caso de error, no bloquear la operación
         return []
 
-    if datetime.now().isoformat() > suscripcion["fin"]:
-        suscripcion["estado"] = "inactiva"
-        await guardar_datos(subscriptions)
-        return []
-
-    return suscripcion.get("opciones", [])
 
 async def mostrar_menu_suscripciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Despliega el menú de suscripciones para que el usuario seleccione."""
@@ -8473,40 +8701,28 @@ async def listar_pagos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(mensaje)
 
 
-async def descontar_transaccion(user_chat_id, numero_transacciones_in=1):
+async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen="telegram"):
     try:
-        # Forzar el user_chat_id como string para evitar errores de tipo
-        user_chat_id = str(user_chat_id)
+        user_id = _user_id_from_chat(user_key) if (origen or "telegram").lower()=="telegram" else user_key
+        user_id = str(user_id)
 
-        # Obtener suscripción
-        suscripcion = subscriptions.get(user_chat_id)
-        if not suscripcion:
-            return False, f"❌ No se encontró una suscripción activa para {user_chat_id}."
+        s = subscriptions.get(user_id)
+        if not s:
+            return False, f"❌ No se encontró suscripción activa para {user_id}."
 
-        # Convertir transacciones restantes a entero de forma segura
-        transacciones_restantes_raw = suscripcion.get("transacciones_restantes", 0)
-        try:
-            transacciones_restantes = int(transacciones_restantes_raw)
-        except ValueError:
-            return False, f"❌ El valor 'transacciones_restantes' no es numérico: {transacciones_restantes_raw}"
+        trans = int(s.get("transacciones_restantes", 0))
+        trans -= int(numero_transacciones_in)
+        s["transacciones_restantes"] = trans
+        if trans <= 0:
+            s["estado"] = "inactiva"
 
-        # Descontar transacción
-        transacciones_restantes -= numero_transacciones_in
-        suscripcion["transacciones_restantes"] = transacciones_restantes
-
-        # Cambiar estado si está agotado
-        if transacciones_restantes <= 0:
-            suscripcion["estado"] = "inactiva"
-
-        # Guardar cambios
         await guardar_datos(subscriptions)
 
-        # Actualizar también user_states si existe
-        if user_chat_id in user_states:
-            user_states[user_chat_id]["numero_transacciones"] = numero_transacciones_in
+        # Mantén user_states indexado por user_id (no por chat)
+        if user_id in user_states:
+            user_states[user_id]["numero_transacciones"] = numero_transacciones_in
 
-        return True, f"✅ Transacción exitosa. Te quedan {transacciones_restantes} transacciones."
-
+        return True, f"✅ Transacción exitosa. Te quedan {trans} transacciones."
     except Exception as e:
         return False, f"❌ Error inesperado al descontar transacción: {e}"
 
@@ -8684,88 +8900,83 @@ async def enviar_mensaje_segmentado(chat_id, mensaje, bot):
 
 
 async def confirmar_envio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Envía el mensaje a los destinatarios seleccionados y limpia el estado."""
+    """Envía el mensaje a los destinatarios seleccionados (por user_id) y limpia el estado."""
     query = update.callback_query
     await query.answer()
 
-    user_id = str(update.effective_user.id)
+    admin_chat_id = str(update.effective_user.id)
 
-    # Obtener los datos guardados en Firestore
-    user_ref = db.collection("user_states").document(user_id)
+    # Datos guardados en Firestore por tu flujo de admin
+    user_ref = db.collection("user_states").document(admin_chat_id)
     user_data = user_ref.get()
     datos_usuario = user_data.to_dict() if user_data.exists else {}
 
     mensaje = datos_usuario.get("mensaje_admin")
     archivos_guardados = datos_usuario.get("archivos_guardados", [])
-
-    # Determinar destinatarios
     destinatarios_tipo = datos_usuario.get("destinatarios", "todos")
-
     destinatario_manual = datos_usuario.get("destinatario_manual")
 
+    # --- 1) Construir destinatarios como **user_id** ---
+    suscripciones = await cargar_datos_subscription_user()  # {user_id: {...}}
     if destinatario_manual:
-        destinatarios = [destinatario_manual]
-    # Obtener la lista de destinatarios con la nueva lógica corregida
+        # Si en tu UI el manual es user_id, lo dejas tal cual; si a veces es chat_id, mapea a user_id aquí.
+        destinatarios = [str(destinatario_manual)]
     elif destinatarios_tipo == "todos":
-        destinatarios = await cargar_chat_ids()  # Todos los usuarios registrados
+        destinatarios = list(suscripciones.keys())
     elif destinatarios_tipo == "suscriptores_activos":
-        suscripciones = await cargar_datos_subscription_user()
         destinatarios = [
-            str(user_id) for user_id in suscripciones.keys()
-            if await estado_suscripcion(user_id) == "activa"
-        ]  # Solo suscriptores activos
+            uid for uid in suscripciones.keys()
+            if await estado_suscripcion(uid, origen="app") == "activa"
+        ]
     elif destinatarios_tipo == "suscriptores_inactivos":
-        suscripciones = await cargar_datos_subscription_user()
         destinatarios = [
-            str(user_id) for user_id in suscripciones.keys()
-            if await estado_suscripcion(user_id) in ["inactiva", "expirada", "transacciones_insuficientes"]
-        ]  # Solo suscriptores inactivos
+            uid for uid in suscripciones.keys()
+            if await estado_suscripcion(uid, origen="app") in ("inactiva", "expirada", "transacciones_insuficientes")
+        ]
     else:
         destinatarios = []
 
-    # Enviar mensaje o documento
-    mensaje = datos_usuario.get("mensaje_admin")
-
-    # 🚀 Enviar mensajes y archivos
-    for destinatario in destinatarios:
+    # --- 2) Enviar por Telegram SOLO si el doc tiene telegram_id ---
+    for user_id in destinatarios:
         try:
-            texto_enviado = False  # Controla si el texto ya fue enviado
-            
-            for archivo in archivos_guardados:
-                tipo = archivo.get("tipo")  # Extraer el tipo correctamente
-                file_id = archivo.get("file_id")  # Extraer file_id correctamente
+            s = suscripciones.get(user_id) or {}
+            chat_id = s.get("telegram_id")  # opcional: si no está, ese usuario no usa TG
+            if not chat_id:
+                continue  # no hay donde enviar por TG; lo saltamos
 
-                if not file_id:  # Si no hay file_id, saltamos este archivo
+            texto_enviado = False
+
+            for archivo in archivos_guardados:
+                tipo = archivo.get("tipo")
+                file_id = archivo.get("file_id")
+                if not file_id:
                     continue
 
-                # Enviar imagen o video con texto como caption si no se ha enviado antes
                 if tipo == "imagen":
-                    await context.bot.send_photo(chat_id=destinatario, photo=file_id, caption=mensaje if not texto_enviado else None)
-                    texto_enviado = True  # Marcar que el mensaje ya fue enviado
+                    await context.bot.send_photo(chat_id=chat_id, photo=file_id, caption=mensaje if not texto_enviado else None)
+                    texto_enviado = True
                 elif tipo == "video":
-                    await context.bot.send_video(chat_id=destinatario, video=file_id, caption=mensaje if not texto_enviado else None)
-                    texto_enviado = True  # Marcar que el mensaje ya fue enviado
+                    await context.bot.send_video(chat_id=chat_id, video=file_id, caption=mensaje if not texto_enviado else None)
+                    texto_enviado = True
                 elif tipo == "documento":
-                    await context.bot.send_document(chat_id=destinatario, document=file_id)
-            
-            # Si no había imagen ni video, enviar el mensaje de texto
+                    await context.bot.send_document(chat_id=chat_id, document=file_id)
+
             if mensaje and not texto_enviado:
-                await context.bot.send_message(chat_id=destinatario, text=mensaje)
+                await context.bot.send_message(chat_id=chat_id, text=mensaje)
 
         except Exception as e:
-            print(f"⚠️ Error al enviar mensaje a {destinatario}: {e}")
+            print(f"⚠️ Error al enviar a user_id {user_id}: {e}")
 
-    # 🧹 Limpiar datos en Firestore después del envío
+    # --- 3) Limpiar estado ---
     user_ref.set({
         "mensaje_admin": None,
         "archivos_guardados": [],
         "destinatario_manual": None,
         "destinatarios": None,
-        "estado": "disponible"  # 👈 ¡Estado cambiado a "disponible" aquí!
+        "estado": "disponible"
     }, merge=True)
 
-    await query.edit_message_text("✅ Mensaje enviado a los destinatarios seleccionados.")
-    
+    await query.edit_message_text("✅ Mensaje enviado a los destinatarios seleccionados.")    
 
 async def procesar_envio_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Guarda la opción elegida y activa el modo de envío de mensaje."""
@@ -8785,12 +8996,12 @@ async def procesar_envio_mensaje(update: Update, context: ContextTypes.DEFAULT_T
     # Si elige "usuario_especifico", pedimos que ingrese el ID manualmente
     if destinatarios == "usuario_especifico":
         # Guardar estado temporal en Firestore para esperar el ID manualmente
-        mark_user_state(user_chat_id, "esperando_id_usuario", destinatarios)
+        mark_user_state(user_id=user_chat_id, estado="esperando_id_usuario", extra={"destinatarios": destinatarios})
         await query.edit_message_text("🔢 Por favor, ingresa el ID del usuario al que deseas enviar el mensaje:")
         return  # No continuamos hasta recibir el ID
 
     # Guardar estado y destinatarios en Firestore para envío masivo
-    mark_user_state(user_chat_id, "modo_envio_mensaje", destinatarios)
+    mark_user_state(user_id=user_chat_id, estado="modo_envio_mensaje", extra={"destinatarios": destinatarios})
     await query.edit_message_text("✍️ Envía el mensaje o archivo que deseas compartir.")
 
 
@@ -8973,108 +9184,111 @@ async def ejecutar_analisis_desde_app():
     chat_id_local = None
     acquired_lock = False
     try:
-        # Si ya hay otro procesando, responde 503
+        # --- lee el payload primero ---
+        data = request.json or {}
+        user_id = str(data.get("user_id") or "").strip()
+        chat_id = str(data.get("chat_id") or "").strip()
+        chat_id_local = chat_id
+
+        if not user_id:
+            return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
+
+        activo = data.get("activo")
+        if activo is None:
+            return jsonify({"status": "error", "message": "Falta 'activo'"}), 400
+
+        origen = (data.get("origen") or "app").lower()
+        if origen == "telegram" and not chat_id:
+            return jsonify({"status": "error", "message": "Falta chat_id para origen=telegram"}), 400
+
+        # --- lock (después de validar mínimos) ---
         if ocupado_lock.locked():
             return "Estoy ocupado", 503
-
-        # A partir de aquí, tomamos el lock
         await asyncio.to_thread(ocupado_lock.acquire)
         acquired_lock = True
 
-        data = request.json or {}
-        chat_id = str(data.get("chat_id") or "")           # preferido
-        chat_id_local = chat_id  # para finally
-        user_id = str(data.get("user_id") or "")           # alternativo
-        activo  = data.get("activo")
-        origen  = (data.get("origen") or "telegram").lower()
-
-        # si no viene chat_id, intenta resolverlo con user_id
-        if not chat_id and user_id:
-            try:
-                doc = db.collection('user_ids').document(user_id).get()
-                chat_id = (doc.to_dict() or {}).get('telegram_id') or ""
-            except Exception:
-                chat_id = ""
-
-        if not chat_id or not activo:
-            return jsonify({"status": "error", "message": "Faltan parámetros obligatorios"}), 400
-
-        # Validar si está registrado
-        chat_ids = await cargar_chat_ids()
-        if chat_id not in chat_ids:
-            return jsonify({"status": "error", "message": "Usuario no registrado"}), 403
-
-        # Validar suscripción activa o admin
-        if await estado_suscripcion(chat_id) != "activa" and not es_administrador(chat_id):
+        # --- validar suscripción ---
+        estado_sub = await estado_suscripcion(user_id or chat_id, numero_transacciones=1, origen=origen)
+        if estado_sub != "activa" and not es_administrador(user_id or chat_id):
             return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
 
-        # Validar permisos
-        opciones_usuario = await obtener_opciones_usuario(chat_id)
-        if not es_administrador(chat_id) and not any(
-            opcion in opciones_usuario for opcion in ["analisis basico", "analisis premium", "analisis avanzado"]
+        # 1) Primero intenta con la clave de APP (user_id)
+        opciones_usuario = await obtener_opciones_usuario(user_id, origen="app")
+
+        # 2) Si no hay nada y existe un chat_id, intenta espejo con semántica de bot
+        if (not opciones_usuario) and chat_id:
+            try:
+                opciones_usuario = await obtener_opciones_usuario(chat_id, origen="telegram")
+            except Exception:
+                opciones_usuario = opciones_usuario or []
+
+        # 3) Admin por cualquiera de las dos claves
+        is_admin = es_administrador(user_id) or (chat_id and es_administrador(chat_id))
+
+        if (not is_admin) and not any(
+            o in (opciones_usuario or []) for o in ("analisis basico", "analisis premium", "analisis avanzado")
         ):
             return jsonify({"status": "error", "message": "No tienes permisos para esta operación"}), 403
 
-        # Validar que no haya un análisis en ejecución
-        if return_state(chat_id) == "en ejecución":
-            return jsonify({"status": "error", "message": "Ya hay un análisis en ejecución"}), 409
-
-        # -------- leer config enviada desde la app --------
-        # Tu app ahora manda 'setup'; dejamos 'operatoria' por compatibilidad.
+        # 4) config enviada por la app (setup/operatoria)
         raw_cfg = None
         if isinstance(data.get("setup"), dict):
             raw_cfg = data["setup"]
         elif isinstance(data.get("operatoria"), dict):
             op = data["operatoria"]
             raw_cfg = op.get("config", op)
-
         op_cfg = normalize_operatoria_payload(raw_cfg) if raw_cfg else None
 
-        # Crear ejecución (to_thread para no bloquear)
-        exec_id = await asyncio.to_thread(fs_crear_ejecucion, chat_id, [activo], origen, opciones_usuario)
+        # 5) crear ejecución (guarda ambos IDs; chat_id puede venir vacío)
+        exec_id = await asyncio.to_thread(
+            fs_crear_ejecucion,
+            user_id=user_id,
+            chat_id=chat_id or None,
+            activos_solicitados=[activo],
+            origen="app",
+            opciones_usuario=opciones_usuario,
+        )
 
-        # Lanzar análisis (sin Telegram)
+        # 6) dummy context/update para reusar el pipeline
         dummy_update = type("DummyUpdate", (), {
             "effective_chat": type("DummyChat", (), {"id": chat_id})(),
             "callback_query": None,
-            "effective_user": type("DummyUser", (), {
-                "first_name": "AppUser",
-                "id": chat_id
-            })()
+            "effective_user": type("DummyUser", (), {"first_name": "AppUser", "id": chat_id})()
         })()
-
         dummy_context = type("DummyContext", (), {"bot": application.bot})()
 
-        cfg = (db.collection('user_ids')
-          .document(user_id)
-          .collection('user_config')
-          .document('current')
-          .get()
-          .to_dict() or {})
+        # 7) cargar CFG + TZ desde user_ids/user_config.current
+        user_ref = db.collection('user_ids').document(user_id)
+        cfg_ref  = user_ref.collection('user_config').document('current')
+        doc_user, doc_cfg = list(db.get_all([user_ref, cfg_ref]))
 
-        task = asyncio.create_task(
+        cfg = (doc_cfg.to_dict() or {})
+        tz_name = (doc_user.to_dict() or {}).get('timezone') or 'UTC'
+
+        global timezone_country, timezone_name
+        timezone_name = tz_name
+        try:
+            timezone_country = pytz.timezone(tz_name)
+        except pytz.UnknownTimeZoneError:
+            timezone_country = pytz.UTC
+            timezone_name = 'UTC'
+
+        # 8) ejecutar
+        urls = await asyncio.shield(asyncio.create_task(
             ejecutar_recurrente(
-                dummy_context,
-                dummy_update,
-                activo,
-                chat_id,
-                opciones_usuario,
-                origen="app",
-                exec_id=exec_id,
-                operatoria_cfg=op_cfg,  # <- pasa la config hacia abajo
-                cfg=cfg
+                dummy_context, dummy_update,
+                activo, chat_id, opciones_usuario,
+                user_id=user_id, origen="app",
+                exec_id=exec_id, operatoria_cfg=op_cfg, cfg=cfg
             )
-        )
-        task = asyncio.shield(task)
+        ))
 
-        urls_generadas = await task
-        await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "completado", {"urls": urls_generadas})
-
+        await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "completado", {"urls": urls})
         return jsonify({
             "status": "ok",
             "exec_id": exec_id,
             "message": f"Análisis ejecutado para {activo}",
-            "download_urls": _solo_strings_urls(urls_generadas)
+            "download_urls": _solo_strings_urls(urls),
         }), 200
 
     except Exception as e:
@@ -9086,16 +9300,12 @@ async def ejecutar_analisis_desde_app():
         except Exception:
             pass
         return jsonify({"status": "error", "message": str(e)}), 500
-
     finally:
-        # Limpia la cfg por-request si alcanzamos a tener chat_id
         try:
             if chat_id_local:
                 clear_current_request_cfg(chat_id_local)
         except Exception:
             pass
-
-        # Libera el lock solo si lo tomamos aquí
         if acquired_lock and ocupado_lock.locked():
             try:
                 ocupado_lock.release()
@@ -9131,10 +9341,10 @@ def subir_imagen_y_analizar():
         imagen.save(ruta_local)
 
         # Establecer estado y llamar directamente a flujo IA
-        mark_user_state(chat_id, "esperando_grafico_ia")
+        mark_user_state(user_id=chat_id, estado="esperando_grafico_ia")
 
         if not es_grafico_de_velas(ruta_local):
-            mark_user_state(chat_id, "disponible")
+            mark_user_state(user_id=chat_id, estado="disponible")
             return jsonify({"status": "error", "message": "❌ No parece ser un gráfico de velas"}), 400
 
         ruta_salida, texto_resultado = analizar_con_yolo(ruta_local)
@@ -9142,7 +9352,7 @@ def subir_imagen_y_analizar():
          # Validar ruta_salida
         if not os.path.exists(ruta_salida):
             logger.warning(f"[IA] No se generó imagen procesada en: {ruta_salida}")
-            mark_user_state(chat_id, "disponible")
+            mark_user_state(user_id=chat_id, estado="disponible")
             return jsonify({"status": "error", "message": "No se generó imagen procesada"}), 500
 
         # Enviar resultado a Telegram
@@ -9158,7 +9368,7 @@ def subir_imagen_y_analizar():
             if not success:
                 application.bot.send_message(chat_id=chat_id, text=mensaje)
 
-        mark_user_state(chat_id, "disponible")
+        mark_user_state(user_id=chat_id, estado="disponible")
         
         if not os.path.exists(ruta_salida):
             return jsonify({
@@ -9186,7 +9396,7 @@ def subir_imagen_y_analizar():
     except Exception as e:
         logger.exception(f"❌ Error inesperado en subir_imagen_y_analizar: {e}")
         if chat_id:
-            mark_user_state(chat_id, "disponible")
+            mark_user_state(user_id=chat_id, estado="disponible")
         return jsonify({"status": "error", "message": str(e)}), 500
     
     finally:
