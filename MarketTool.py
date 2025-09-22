@@ -67,13 +67,16 @@ import cv2
 import socket
 import torch
 import uuid
-from typing import Any, Iterable, Mapping, Optional, Callable
-from datetime import timedelta, date, datetime, timezone, UTC
+from typing import Any, Iterable, Mapping, Optional, Callable, Dict, Tuple, List
+from datetime import timedelta, date, datetime, timezone, UTC, timezone as dt_timezone
 from textwrap import wrap
 from functools import partial
 import math
 import statistics
 from collections.abc import Sequence
+#from pathlib import Path
+#from dotenv import load_dotenv
+#load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 timezone_country = pytz.timezone('America/Santiago')
 user_states = {}
@@ -216,10 +219,12 @@ try:
 except NameError:
     calc_map = None  # idem
 
+#@profile
 def _sanitize_bars(bars):
     """Devuelve None o un entero > 0."""
     return bars if isinstance(bars, int) and bars > 0 else None
 
+#@profile
 def get_bars_for_tf(cfg: dict | None, tf: str) -> int | None:
     """
     Si cfg trae fmpWindows/fmp_windows y existe un número para 'tf', úsalo.
@@ -235,6 +240,7 @@ def get_bars_for_tf(cfg: dict | None, tf: str) -> int | None:
 
 print("🔍 GPU habilitada:", torch.cuda.is_available())
 
+#@profile
 def get_easyocr_reader(prefer_gpu: bool = True):
     """
     Inicializa EasyOCR una sola vez con cache de modelos, usa GPU si está disponible,
@@ -251,6 +257,7 @@ def get_easyocr_reader(prefer_gpu: bool = True):
         model_dir = os.environ.get('EASY_OCR_MODEL_DIR', '/app/models/easyocr')
         os.makedirs(model_dir, exist_ok=True)
 
+        #@profile
         def _try_init(gpu_flag: bool):
             return easyocr.Reader(
                 ['en'],
@@ -280,12 +287,8 @@ def get_easyocr_reader(prefer_gpu: bool = True):
 # Inicializar EasyOCR (solo una vez, fuera de la función)
 reader = get_easyocr_reader(prefer_gpu=True) 
 
-# --- claves / helpers ---------------------
-def _state_key(user_id: str | None = None, chat_id: str | None = None) -> str | None:
-    uid = (user_id or "").strip()
-    cid = (chat_id or "").strip()
-    return uid or cid or None
 
+#@profile
 def _user_state_doc(user_id: str | None, chat_id: str | None):
     """
     Devuelve la referencia al doc en user_states.
@@ -297,30 +300,7 @@ def _user_state_doc(user_id: str | None, chat_id: str | None):
     return db.collection("user_states").document(doc_id)
 
 
-# --- API de estado ------------------------
-def return_state(user_id: str | None = None, chat_id: str | None = None) -> str:
-    ref = _user_state_doc(user_id, chat_id)
-    if not ref:
-        return "disponible"
-    try:
-        snap = ref.get()
-        return (snap.to_dict() or {}).get("estado", "disponible") if snap.exists else "disponible"
-    except Exception as e:
-        logger.warning(f"return_state falló: {e}")
-        return "disponible"
-
-def set_state(estado: str, *, user_id: str | None = None, chat_id: str | None = None) -> None:
-    """
-    Marca estado del usuario ('en ejecución', 'disponible', etc).
-    """
-    ref = _user_state_doc(user_id, chat_id)
-    if not ref:
-        return
-    try:
-        ref.set({"estado": str(estado), "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
-    except Exception as e:
-        logger.warning(f"set_state falló: {e}")
-
+#@profile
 def _drop_nones(obj):
     if isinstance(obj, dict):
         return {k: _drop_nones(v) for k, v in obj.items() if v is not None}
@@ -328,6 +308,7 @@ def _drop_nones(obj):
         return [_drop_nones(v) for v in obj if v is not None]
     return obj
 
+#@profile
 def _user_id_from_chat(chat_id: str | None) -> str | None:
     """Devuelve user_id desde chat_ids. Si chat_id está vacío, devuelve None y no toca Firestore."""
     if not chat_id:
@@ -340,10 +321,12 @@ def _user_id_from_chat(chat_id: str | None) -> str | None:
         return None
 
 
+#@profile
 def _subscription_doc(user_id: str):
     return db.collection("suscripciones_user").document(str(user_id))
 
 # Mapeo de TF frontend -> backend
+#@profile
 def _tf_backend(tf: str) -> str:
     m = str(tf).strip().lower()
     mapping = {
@@ -381,9 +364,11 @@ if 'RECOMMENDED_TF_OPTIONS' not in globals():
     }
 REQUEST_OPERATORIA: dict[str, dict] = {}
 
+#@profile
 def clear_current_request_cfg(user_chat_id: str) -> None:
     REQUEST_OPERATORIA.pop(user_chat_id, None)
 
+#@profile
 def normalize_operatoria_payload(cfg: dict | None) -> dict:
     cfg = cfg or {}
     mode = (cfg.get('mode') or 'swing').strip().lower()
@@ -401,17 +386,21 @@ def normalize_operatoria_payload(cfg: dict | None) -> dict:
     }
 
 
+#@profile
 def _norm_tf(tf: str) -> str:
     tf = str(tf).lower().strip()
     return _TF_ALIAS.get(tf, tf)
 
+#@profile
 def _fmt_for_tf(tf: str) -> str:
     # FMP acepta fecha-hora para intradía; para 1d/1w basta YYYY-MM-DD
     return '%Y-%m-%d' if tf in ('1day', '1week') else '%Y-%m-%d %H:%M:%S'
 
+#@profile
 def _tf_to_backend(tf: str) -> str | None:
     return TF_MAP.get(str(tf).lower().strip())
 
+#@profile
 def _norm_windows(d: dict | None, defaults: dict[str,int]) -> dict[str,int]:
     out = dict(defaults)
     if isinstance(d, dict):
@@ -450,6 +439,7 @@ FILAS_POR_IMG_EVENTO = 40
 WRAP_HDR = 16
 WRAP_CELL = 22
 
+#@profile
 def _fmt_num(x, nd=5):
     if x is None or (isinstance(x, float) and np.isnan(x)): 
         return ""
@@ -460,6 +450,7 @@ def _fmt_num(x, nd=5):
     except Exception:
         return str(x)
 
+#@profile
 def _fmt_pct(x):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return ""
@@ -468,6 +459,7 @@ def _fmt_pct(x):
     except Exception:
         return str(x)
 
+#@profile
 def _fmt_apal(x):
     """Acepta valores 'x2243.0', 2243, '2243', etc y devuelve '2243'."""
     if x is None or (isinstance(x, float) and np.isnan(x)): 
@@ -483,12 +475,14 @@ def _fmt_apal(x):
         return s
 
 # --- helpers de texto/medidas ---
+#@profile
 def _wrap_text(s, width: int) -> str:
     s = "" if s is None else str(s)
     if not s:
         return ""
     return "\n".join(wrap(s, width=width))
 
+#@profile
 def _fmt_num(x, nd=4):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return ""
@@ -497,6 +491,7 @@ def _fmt_num(x, nd=4):
     except Exception:
         return str(x)
 
+#@profile
 def _wrap_text_multiline(s: str, width: int) -> str:
     """Envuelve texto a 'width' caracteres (sin cortar palabras), respetando saltos existentes."""
     if s is None:
@@ -519,14 +514,17 @@ def _wrap_text_multiline(s: str, width: int) -> str:
     return "\n".join(wrapped_lines)
 
 
+#@profile
 def _max_line_len(s: str) -> int:
     return max((len(x) for x in str(s).split("\n")), default=0)
 
+#@profile
 def _to_list_str_df(df: pd.DataFrame, wrap_cell=WRAP_WIDTH_CELL, wrap_head=WRAP_WIDTH_HEADER):
     headers = [_wrap_text(c, wrap_head) for c in df.columns]
     cells   = df.astype(str).applymap(lambda x: _wrap_text(x, wrap_cell))
     return headers, cells
 
+#@profile
 def _col_char_widths(headers: list[str], cells: pd.DataFrame,
                      min_chars=6, max_chars=40) -> list[int]:
     w = []
@@ -536,6 +534,7 @@ def _col_char_widths(headers: list[str], cells: pd.DataFrame,
         w.append(min(max(width_j, min_chars), max_chars))
     return w
 
+#@profile
 def _render_table(headers, cells, col_char_w,
                   font=12, dpi=180, max_w_in=18, max_h_in=14):
     # Tamaños basados en caracteres para que respete los wraps
@@ -573,23 +572,12 @@ def _render_table(headers, cells, col_char_w,
     plt.close(fig)
     return buf
 
-def _render_table_image(df: pd.DataFrame, max_rows=30, font=12, dpi=180):
-    """Devuelve un BytesIO o una lista de BytesIO si hay varias páginas."""
-    parts = []
-    for i in range(0, len(df), max_rows):
-        part = df.iloc[i:i + max_rows]
-        headers, cells = _to_list_str_df(part)
-        widths = _col_char_widths(headers, cells)
-        parts.append(_render_table(headers, cells, widths, font=font, dpi=dpi))
-    return parts[0] if len(parts) == 1 else parts
-
+#@profile
 def _wrap_header(h: str, width: int) -> str:
     return _wrap_text(h, width)
 
-def safe_name(s: str) -> str:
-    return re.sub(r'[^A-Za-z0-9._-]+', '_', str(s))
 
-
+#@profile
 def _es_serializable_basico(v: Any) -> bool:
     import numpy as np
     import pandas as pd
@@ -606,6 +594,7 @@ def _es_serializable_basico(v: Any) -> bool:
     if isinstance(v, (datetime, date, pd.Timestamp)): return True
     return False
 
+#@profile
 def _sanitize_for_firestore(obj: Any) -> Any:
     """Deja solo tipos permitidos (str, int, float, bool, None, list/dict de los mismos, datetime)."""
     if obj is None or isinstance(obj, (str, int, float, bool, datetime)):
@@ -625,25 +614,7 @@ def _sanitize_for_firestore(obj: Any) -> Any:
     return None
 
 
-def _json_default(o):
-    if isinstance(o, (np.integer,)):        return int(o)
-    if isinstance(o, (np.floating,)):       return float(o)
-    if isinstance(o, (np.bool_, bool)):     return bool(o)
-    if isinstance(o, (pd.Timestamp, datetime, date)):
-        return o.isoformat()
-
-    # 🔧 Soporte explícito para pandas
-    if isinstance(o, pd.DataFrame):
-        d = o.where(pd.notnull(o), None)
-        return d.to_dict(orient="records")
-    if isinstance(o, pd.Series):
-        s = o.where(pd.notnull(o), None)
-        return s.tolist()
-
-    if o is None: return None
-    raise TypeError(f"{type(o).__name__} no es JSON serializable")
-
-
+#@profile
 def _sanitize_records_for_json(records: list[dict]) -> list[dict]:
     """
     Elimina claves internas (_...) y valores no serializables (DataFrame, ndarray, etc).
@@ -663,6 +634,7 @@ def _sanitize_records_for_json(records: list[dict]) -> list[dict]:
     return safe
 
 
+#@profile
 def _to_epoch_ms(s: pd.Series) -> pd.Series:
     # A datetime (tz-aware en UTC)
     s = pd.to_datetime(s, errors='coerce', utc=True)
@@ -681,6 +653,7 @@ def _to_epoch_ms(s: pd.Series) -> pd.Series:
     return ms.astype('Int64')
 
 
+#@profile
 def _json_sanitize_df(d: pd.DataFrame) -> pd.DataFrame:
     d = d.where(pd.notnull(d), None)
     for c in d.columns:
@@ -689,6 +662,7 @@ def _json_sanitize_df(d: pd.DataFrame) -> pd.DataFrame:
         elif pd.api.types.is_float_dtype(d[c]):   d[c] = d[c].astype(float)
     return d
 
+#@profile
 def sanitize_for_json(x):
     """
     Convierte NaN/±Inf a None, castea tipos numpy/pandas a tipos Python
@@ -761,6 +735,7 @@ def sanitize_for_json(x):
     # strings u otros tipos serializables
     return x
     
+#@profile
 def df_to_ohlcv_records_ext(
     df: pd.DataFrame,
     *,
@@ -856,6 +831,7 @@ def df_to_ohlcv_records_ext(
     return out.to_dict('records')
 
 
+#@profile
 def construir_payload_enriquecido(
     symbol: str,
     tf: str,
@@ -988,6 +964,7 @@ def construir_payload_enriquecido(
         "entradas": entradas or {}
     }
 
+#@profile
 def _num_or_none(x):
     """Convierte números a tipos nativos y reemplaza NaN/Inf por None."""
     if x is None:
@@ -1004,6 +981,7 @@ def _num_or_none(x):
         return xf if (xf == xf and np.isfinite(xf)) else None  # (xf==xf) filtra NaN
     return x
 
+#@profile
 def json_safe(obj):
     """
     Limpia recursivamente:
@@ -1035,12 +1013,14 @@ def json_safe(obj):
     except Exception:
         return str(obj)
 
+#@profile
 def _json_safe_numeric(s: pd.Series) -> pd.Series:
     """Convierte a numérico, limpia ±inf/NaN y devuelve None (tipo object) donde falte valor."""
     s = pd.to_numeric(s, errors='coerce')
     s = s.replace([np.inf, -np.inf], np.nan)
     return s.where(s.notna(), None).astype(object)
 
+#@profile
 def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -1127,6 +1107,7 @@ def normalizar_df_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
     return d
 
+#@profile
 async def subir_ohlcv_enriquecido_y_registrar(
     *, exec_id: str, chat_id: str, user_id: str, symbol: str, temporalidad: str,
     df_velas: pd.DataFrame, df_indicadores: pd.DataFrame | None,
@@ -1153,11 +1134,13 @@ async def subir_ohlcv_enriquecido_y_registrar(
     )
 
 
+#@profile
 def build_object_path(exec_id: str, nombre: str) -> str:
     # Estructura uniforme en el bucket por ejecución
     return f"exec/{exec_id}/{nombre}"
 
 
+#@profile
 def fs_crear_ejecucion(
     *, user_id: str | None, chat_id: str | None,
     activos_solicitados: list[str], origen: str, opciones_usuario: list[str]
@@ -1178,6 +1161,7 @@ def fs_crear_ejecucion(
     db.collection("ejecuciones").document(exec_id).set(payload)
     return exec_id
 
+#@profile
 def fs_actualizar_ejecucion(exec_id: str, **campos):
     campos = _sanitize_for_firestore({k: v for k, v in campos.items() if v is not None})
     if not isinstance(campos, dict):
@@ -1185,6 +1169,7 @@ def fs_actualizar_ejecucion(exec_id: str, **campos):
     campos["updated_at"] = firestore.SERVER_TIMESTAMP
     db.collection("ejecuciones").document(exec_id).update(campos)
 
+#@profile
 def fs_finalizar_ejecucion(exec_id: str, estado: str = "completado", resumen: dict | None = None):
     db.collection("ejecuciones").document(exec_id).update({
         "estado": str(estado),
@@ -1192,6 +1177,7 @@ def fs_finalizar_ejecucion(exec_id: str, estado: str = "completado", resumen: di
         "updated_at": firestore.SERVER_TIMESTAMP
     })
 
+#@profile
 def fs_registrar_archivo_generado(
     exec_id: str,
     *, user_id: str | None, chat_id: str | None,
@@ -1217,6 +1203,7 @@ def fs_registrar_archivo_generado(
         "updated_at": firestore.SERVER_TIMESTAMP
     })
 
+#@profile
 async def guardar_json_en_storage_y_registrar(
     *, exec_id: str, chat_id: str, user_id:str, nombre_base: str,
     data, subir_a_bucket_y_obtener_url, metadata: dict | None = None,
@@ -1255,11 +1242,7 @@ async def guardar_json_en_storage_y_registrar(
     return url_publica
 
 
-def actualizar_estado_esperando_imagen(chat_id: str):
-    db = firestore.client()
-    user_ref = db.collection("user_states").document(chat_id)
-    user_ref.set({"estado": "esperando_grafico_ia"}, merge=True)
-
+#@profile
 def es_grafico_de_velas(ruta_imagen: str) -> bool:
     """
     Intenta detectar si una imagen tiene características de un gráfico de velas:
@@ -1304,6 +1287,7 @@ def es_grafico_de_velas(ruta_imagen: str) -> bool:
 
     return False
 
+#@profile
 def analizar_con_yolo(ruta_imagen: str) -> tuple[str, str]:
     nombre_archivo = os.path.basename(ruta_imagen)
     imagen_limpia_path = f"procesadas/limpia_{nombre_archivo}"
@@ -1349,6 +1333,7 @@ def analizar_con_yolo(ruta_imagen: str) -> tuple[str, str]:
     return imagen_final_path, texto_resultado
 
 
+#@profile
 async def subir_a_bucket_y_obtener_url(nombre_local, nombre_remoto=None, carpeta='analisis'):
     nombre_remoto = nombre_remoto or os.path.basename(nombre_local)
     bucket_name = "markettool_bucket"  # 🔁 Reemplazar con el nombre real de tu bucket
@@ -1361,6 +1346,7 @@ async def subir_a_bucket_y_obtener_url(nombre_local, nombre_remoto=None, carpeta
 
     return blob.public_url
 
+#@profile
 def obtener_datos_firestore():
     """
     Obtiene los datos de Firestore y los devuelve como listas de Python.
@@ -1392,6 +1378,7 @@ def obtener_datos_firestore():
 activos, forex, relacionados_usd = obtener_datos_firestore()
 
 
+#@profile
 def obtener_configuracion():
     """
     Obtiene los datos de Firestore para las categorías, temporalidades y zonas horarias.
@@ -1421,6 +1408,7 @@ def obtener_configuracion():
 # Llamar a la función al inicio de la aplicación
 categorias, temporalidades, zonas_horarias = obtener_configuracion()
 
+#@profile
 def definir_window(temporalidad: str, overrides: dict[str,int] | None = None) -> int:
 
     if overrides and temporalidad in overrides:
@@ -1453,62 +1441,143 @@ def definir_window(temporalidad: str, overrides: dict[str,int] | None = None) ->
     return window
 
 
+#@profile
 def _user_state_doc_by_uuid(uuid: str):
     return db.collection("user_states").document(uuid)
 
-def _find_uuid_by_telegram_id(tg_id: str) -> Optional[str]:
-    """
-    Busca el UUID canónico a partir de un telegram_id.
-    Intenta primero en chat_ids/{tg_id} con campos típicos,
-    y si no, consulta user_ids por igualdad.
-    """
-    # 1) chat_ids/{tg_id}
-    snap = db.collection("chat_ids").document(str(tg_id)).get()
-    if snap.exists:
-        data = snap.to_dict() or {}
-        for k in ("uuid", "user_uuid", "user_id", "uuid_user"):
-            if data.get(k):
-                return str(data[k])
 
-    # 2) user_ids where telegram_id == tg_id (si lo guardas así)
-    q = db.collection("user_ids").where("telegram_id", "==", str(tg_id)).limit(1).get()
-    if q:
-        # el doc.id de user_ids es el UUID canónico
-        return q[0].id
-
-    return None
-
+# ------------------------------------------------------------------------------------
+# UUID RESOLVER  (APP: user_id → uuid;  TELEGRAM: chat_id → tg_<chat_id> si no hay user_id)
+# ------------------------------------------------------------------------------------
+#@profile
 def resolve_user_uuid(*, user_id: Optional[str] = None, chat_id: Optional[str] = None) -> Optional[str]:
     """
-    Regresa el UUID canónico para user_states:
-    - Si viene user_id (UUID) => úsalo.
-    - Si viene chat_id (telegram_id) => mapea a UUID.
+    - Si hay user_id (APP), lo usamos como UUID.
+    - Si no hay user_id pero sí chat_id (Telegram), intentamos mapearlo a user_id.
+      Si ese mapeo falla/no existe, usamos 'tg_<chat_id>' como UUID estable.
     """
     if user_id:
         return str(user_id)
+
     if chat_id:
-        return _find_uuid_by_telegram_id(str(chat_id))
+        # Intentar mapear chat_id → user_id si tu proyecto lo soporta
+        try:
+            uid = _user_id_from_chat(str(chat_id))
+            if uid:
+                return str(uid)
+        except Exception:
+            pass
+        # Fallback: doc separado por Telegram
+        return f"tg_{chat_id}"
+
     return None
 
-def mark_user_state(*, user_id: Optional[str] = None, chat_id: Optional[str] = None,
-                    estado: str = "disponible", extra: Optional[dict] = None) -> None:
+
+# ------------------------------------------------------------------------------------
+# MARK USER STATE  (ESCRIBE SIEMPRE; sincroniza memoria y Firestore)
+# ------------------------------------------------------------------------------------
+#@profile
+def mark_user_state(
+    *, user_id: Optional[str] = None, chat_id: Optional[str] = None,
+    estado: str = "disponible", extra: Optional[Dict[str, Any]] = None
+) -> None:
     """
     Actualiza user_states/{UUID}. Soporta ambas entradas por compatibilidad.
+    - APP:  mark_user_state(user_id=..., estado="...")
+    - TG:   mark_user_state(chat_id=..., estado="...")
     """
     uuid = resolve_user_uuid(user_id=user_id, chat_id=chat_id)
     if not uuid:
-        # loguea y no revientes la ejecución
         print(f"[mark_user_state] No se pudo resolver UUID (user_id={user_id}, chat_id={chat_id})")
         return
 
-    payload = {"estado": estado}
+    payload: Dict[str, Any] = {
+        "estado": estado,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if user_id is not None:
+        payload["user_id"] = str(user_id)
+    if chat_id is not None:
+        payload["chat_id"] = str(chat_id)
     if extra:
         payload.update(extra)
 
-    _user_state_doc_by_uuid(uuid).set(payload, merge=True)
+    # Firestore
+    try:
+        _user_state_doc_by_uuid(uuid).set(payload, merge=True)
+    except Exception as e:
+        logging.warning(f"[mark_user_state] Firestore fallo (uuid={uuid}): {e}")
+
+    # Memoria (clave principal = uuid)
+    st = user_states.setdefault(uuid, {})
+    st["estado"] = estado
+    # copia campos útiles si vinieron en extra
+    for k in ("par_seleccionado", "soportes_resistencias_cache", "cache_realtime", "moneda_filtro", "exec_id"):
+        if k in (extra or {}):
+            st[k] = (extra or {})[k]
+    user_states[uuid] = st
+
+    # Espejos en memoria para compatibilidad con código existente que indexa por chat_id o user_id
+    if chat_id is not None:
+        st2 = user_states.setdefault(str(chat_id), {})
+        st2["estado"] = estado
+        user_states[str(chat_id)] = st2
+    if user_id is not None:
+        st3 = user_states.setdefault(str(user_id), {})
+        st3["estado"] = estado
+        user_states[str(user_id)] = st3
+
+
+# ------------------------------------------------------------------------------------
+# RETURN STATE  (LEE Firestore; fallback a memoria; compatible con docs antiguos)
+# ------------------------------------------------------------------------------------
+#@profile
+def return_state(
+    *, user_id: Optional[str] = None, chat_id: Optional[str] = None, default: str = "disponible"
+) -> str:
+    """
+    Lee el estado desde Firestore (user_states/{uuid}). Si falla, cae a memoria.
+    - Si vienes de Telegram y antes guardabas el doc solo con chat_id "crudo",
+      se intenta un segundo doc-id de compatibilidad (sin el prefijo tg_).
+    """
+    uuid = resolve_user_uuid(user_id=user_id, chat_id=chat_id)
+    if not uuid:
+        return default
+
+    # 1) Firestore por UUID (nuevo esquema)
+    try:
+        snap = _user_state_doc_by_uuid(uuid).get()
+        if getattr(snap, "exists", False):
+            data = snap.to_dict() or {}
+            return str(data.get("estado") or default)
+    except Exception as e:
+        logging.warning(f"[return_state] Firestore fallo (uuid={uuid}): {e}")
+
+    # 1.b) Compatibilidad: si uuid es tg_<chat_id>, intenta doc con chat_id "crudo"
+    try:
+        if (chat_id is not None) and str(uuid).startswith("tg_"):
+            snap2 = _user_state_doc_by_uuid(str(chat_id)).get()
+            if getattr(snap2, "exists", False):
+                data2 = snap2.to_dict() or {}
+                return str(data2.get("estado") or default)
+    except Exception:
+        pass
+
+    # 2) Memoria por UUID
+    if uuid in user_states and "estado" in user_states[uuid]:
+        return str(user_states[uuid]["estado"])
+
+    # 3) Memoria por claves “crudas” (compat)
+    if chat_id is not None and str(chat_id) in user_states and "estado" in user_states[str(chat_id)]:
+        return str(user_states[str(chat_id)]["estado"])
+    if user_id is not None and str(user_id) in user_states and "estado" in user_states[str(user_id)]:
+        return str(user_states[str(user_id)]["estado"])
+
+    return default
 
 
 
+#@profile
 async def actualizar_menus(application:Application):
     # Obtén la lista de usuarios (aquí debes implementar tu lógica para obtener los usuarios registrados)
     start_time = time.time()
@@ -1530,6 +1599,7 @@ async def actualizar_menus(application:Application):
 
 
 # Función para asignar la categoría en base al campo 'event'
+#@profile
 async def seleccionar_zona_horaria(update, context):
     query = update.callback_query
     zona_seleccionada = query.data.split("_", 2)[2]
@@ -1547,11 +1617,13 @@ async def seleccionar_zona_horaria(update, context):
         f"Zona horaria actualizada a {zona_seleccionada}. La hora local es {now}."
     )
 
+#@profile
 async def cargar_timezone_por_defecto(chat_id):
     """Carga la zona horaria predeterminada para un chat_id."""
     chat_ids = await cargar_chat_ids()
     return chat_ids.get(chat_id, {}).get("timezone", "America/Santiago")
 
+#@profile
 def detectar_categoria(event):
     for palabra_clave, categoria in palabras_clave_categoria.items():
         if palabra_clave.lower() in event.lower():
@@ -1559,6 +1631,7 @@ def detectar_categoria(event):
         return None  # Si no se encuentra una categoría, devuelve None
 
 # Cargar la lista de chat_ids desde el archivo
+#@profile
 async def cargar_admin_ids():
     """Carga los chat_ids desde Firestore o devuelve una lista vacía si no hay datos."""
     try:
@@ -1578,6 +1651,7 @@ async def cargar_admin_ids():
         return [] 
 
 # Cargar la lista de chat_ids desde el archivo
+#@profile
 async def cargar_chat_ids():
     """Carga los chat_ids desde Firestore o devuelve un diccionario vacío si no hay datos."""
     try:
@@ -1599,6 +1673,7 @@ async def cargar_chat_ids():
         return {}  # Devuelve un diccionario vacío en caso de error
 
 # Guardar la lista de chat_ids en el archivo
+#@profile
 async def guardar_chat_id(user_chat_id, username=None, timezone="America/Santiago"):
     """Guarda o actualiza un chat_id con información adicional en Firestore."""
     try:
@@ -1619,6 +1694,7 @@ async def guardar_chat_id(user_chat_id, username=None, timezone="America/Santiag
         print(f"Error al guardar/actualizar chat_id {user_chat_id}: {e}")
 
 
+#@profile
 async def eliminar_chat_id(chat_id):
     """Elimina un chat_id de Firestore si está registrado."""
     try:
@@ -1632,18 +1708,13 @@ async def eliminar_chat_id(chat_id):
         print(f"Error al eliminar chat_id {chat_id}: {e}")
 
 
-
-
-def obtener_timezone(user_chat_id):
-    """Devuelve la zona horaria de un chat_id si está registrada, o una por defecto."""
-    chat_ids = cargar_chat_ids()
-    return chat_ids.get(user_chat_id, {}).get("timezone", "America/Santiago")
-
+#@profile
 async def actualizar_timezone(user_chat_id, nueva_timezone):
     """Actualiza la zona horaria de un chat_id."""
     await guardar_chat_id(user_chat_id, timezone=nueva_timezone)
 
 
+#@profile
 def last_of(df, col, default=None):
     """Devuelve el último valor de df[col] de forma robusta (sin warnings),
     o default si no existe o está vacío."""
@@ -1669,12 +1740,14 @@ def last_of(df, col, default=None):
         except Exception:
             return default
 
+#@profile
 def _coerce_float_safe(v):
     try:
         return float(v)
     except Exception:
         return None
 
+#@profile
 def obtener_monedas(symbol):
     """
     Identifica si un símbolo es un par de divisas o un símbolo que no tiene divisa secundaria.
@@ -1686,6 +1759,7 @@ def obtener_monedas(symbol):
     # Si no es un par Forex, asumir que no tiene divisa secundaria
     return symbol, None
 
+#@profile
 def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=3, tiempo_espera_inicial=5):
     """
     Obtiene noticias del mercado Forex para un símbolo dado.
@@ -1781,6 +1855,7 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
                 time.sleep(tiempo_espera)
                 tiempo_espera *= 2
 
+#@profile
 def obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=3, tiempo_espera_inicial=5):
     """
     Obtiene noticias del mercado Forex para un símbolo dado.
@@ -1848,90 +1923,6 @@ def obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=50, max_rei
                 time.sleep(tiempo_espera)
                 tiempo_espera *= 2
 
-async def obtener_noticias_generales(update, context):
-    limite = 20
-    max_reintentos = 3
-    tiempo_espera_inicial = 5
-    user_chat_id = str(update.effective_chat.id)
-    noticias = []
-    actualizar_estado_usuario(user_chat_id, "en ejecución")
-    mark_user_state(chat_id=user_chat_id, estado="en ejecución")
-
-    try:
-        # Construir la URL del endpoint
-        endpoint = "https://financialmodelingprep.com/api/v4/general_news"
-        url = f"{endpoint}?limit={limite}&apikey={API_KEY}"
-
-        #logger.info(f"URL de noticias generales: {url}")
-
-        # Variables para control de reintentos
-        reintento = 0
-        tiempo_espera = tiempo_espera_inicial
-
-        while reintento < max_reintentos:
-            try:
-                # Realizar la solicitud
-                response = requests.get(url, timeout=10)
-
-                if response.status_code == 200:
-                    if not response.text.strip():
-                        logger.info("La respuesta de la API está vacía.")
-                        break
-
-                    noticias = response.json()
-                    break
-                else:
-                    logger.info(f"Error en la API: {response.status_code}")
-            except requests.exceptions.RequestException as e:
-                logger.info(f"Error al obtener noticias generales: {e}")
-                reintento += 1
-                if reintento < max_reintentos:
-                    logger.info(f"Reintentando en {tiempo_espera} segundos...")
-                    time.sleep(tiempo_espera)
-                    tiempo_espera *= 2
-
-        # Procesar las noticias recibidas
-        if isinstance(noticias, list) and len(noticias) > 0:
-            df_nuevas = pd.DataFrame(noticias)
-
-            if 'publishedDate' in df_nuevas.columns:
-                # Convertir fechas a datetime y UTC
-                df_nuevas['publishedDate'] = pd.to_datetime(df_nuevas['publishedDate'], errors='coerce')
-                df_nuevas['publishedDate'] = df_nuevas['publishedDate'].dt.tz_convert('UTC')
-
-                for index, noticia in df_nuevas.iterrows():
-                    title = noticia['title']
-                    sitio = noticia.get('site', 'Desconocido')
-                    text = noticia.get('text', 'Sin Descripción')
-                    symbol = noticia.get('symbol', 'No Aplica')
-                    fecha = noticia['publishedDate'].strftime('%Y-%m-%d %H:%M:%S')
-                    importancia = analizar_importancia(title + ' ' + text)
-                    url = noticia['url']
-                    link_traductor = f"https://translate.google.com/translate?sl=auto&tl=es&u={url}"  # Enlace a Google Translate
-
-                    mensaje = (
-                        f"Titulo: {title}\n"
-                        f"Descripción: {text}\n"
-                        f"Activo: {symbol}\n"
-                        f"Fecha: {fecha}\n"
-                        f"Sitio: {sitio}\n"
-                        f"Importancia: {importancia}\n"
-                        f"Link: {url}\n"
-                        f"Link Traducido: {link_traductor}\n"
-                    )
-
-                    await enviar_mensaje_noticias(context, user_chat_id, mensaje)
-                if not es_administrador(user_chat_id):
-                    success, mensaje = await descontar_transaccion(user_chat_id, 1)
-                    if not success:
-                        await update.message.reply_text(mensaje)
-                
-        else:
-            logger.info("No se encontraron noticias válidas en la respuesta.")
-    except Exception as e:
-        logger.info(f"Error en obtener_noticias_generales: {e}")
-    finally:
-        mark_user_state(user_id=user_chat_id, estado="disponible")
 
 #@profile
 def calcular_impacto_noticias(df_noticias):
@@ -1949,14 +1940,10 @@ def calcular_impacto_noticias(df_noticias):
     return impacto_normalizado
 
 
-# Función para obtener precios históricos por temporalidad
-#@profile
-import os, json, logging, aiofiles
-import pandas as pd
-
 # CARPETA_HISTORICOS debe estar definido en tu módulo
 # cache_historicos es global
 
+#@profile
 async def cargar_datos_historicos_inicial():
     """
     Carga inicial de los datos históricos en un diccionario global desde los archivos locales.
@@ -2044,6 +2031,7 @@ async def cargar_datos_historicos_inicial():
 
 
 
+#@profile
 def obtener_datos_historicos_fmp(
     symbol: str,
     temporalidad: str,
@@ -2395,6 +2383,7 @@ async def obtener_eventos_economicos(max_reintentos=3, tiempo_espera_inicial=5):
     return pd.DataFrame(columns=columnas_esperadas)
 
 
+#@profile
 def guardar_eventos_completos(eventos):
     """Guarda todos los eventos en Firestore."""
     try:
@@ -2412,6 +2401,7 @@ def guardar_eventos_completos(eventos):
 
 
 
+#@profile
 async def cargar_eventos_completos():
     """Carga todos los eventos desde Firestore."""
     try:
@@ -2423,6 +2413,7 @@ async def cargar_eventos_completos():
         return []
 
 
+#@profile
 async def obtener_eventos_guardados_o_futuros(fecha_inicio, fecha_fin):
     """Obtiene eventos desde la API o el archivo local si la API no está disponible."""
     try:
@@ -2800,6 +2791,7 @@ def obtener_valor_realtime_unificado(symbol: str, user_chat_id: str | None = Non
     logging.info(f"[RT] {symbol} = {valor}")
     return valor
 
+#@profile
 def _is_finite_number(x) -> bool:
     try:
         return isinstance(x, (int, float, np.floating)) and math.isfinite(float(x))
@@ -2807,6 +2799,7 @@ def _is_finite_number(x) -> bool:
         return False
 
 
+#@profile
 def _coerce_float(x):
     """Devuelve float(x) si es finito; si no, None."""
     try:
@@ -2822,6 +2815,7 @@ def _coerce_float(x):
     except Exception:
         return None
 
+#@profile
 def _lookup_rt_tick(cache_rt: dict, symbol: str):
     """Busca el último close en varias variantes de clave."""
     if symbol in cache_rt:
@@ -3048,6 +3042,7 @@ def calcular_indicadores(df, temporalidad):
     return df
 
 # Función para asegurar que la probabilidad esté entre 1 y 100
+#@profile
 def limitar_probabilidad(probabilidad_exito):
     return max(1, min(probabilidad_exito, 100))
 
@@ -3071,6 +3066,7 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
         senal_bajista_resistencia=True,
         bonus_triple_signal=True,
     )
+
     MAG_DEF = dict(
         macd_base=10,                # ±10
         macd_cruce_reciente=7,       # ±7
@@ -3192,6 +3188,7 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
     return limitar_probabilidad(probabilidad_tecnica)
 
 
+#@profile
 def limpiar_valores(val):
     """Limpia y convierte los valores que contienen 'K' y '%'."""
     if isinstance(val, str):
@@ -3225,11 +3222,6 @@ def analizar_sentimiento(texto):
     else:
         return 0  # Sentimiento neutro
 
-def _fget(cfg: Optional[dict], path: list, default):
-    cur = (cfg or {}).get("fundamental", {})
-    for k in path:
-        cur = cur.get(k, {}) if isinstance(cur, dict) else {}
-    return (cfg or {}).get("fundamental", {}).get(path[0], default) if len(path)==1 else (cur or default)
 
 #@profile
 def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, temporalidad,
@@ -3336,6 +3328,7 @@ def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, tem
         cat = detectar_categoria(ev['event'])
         adj = 0.0
 
+        #@profile
         def _cap(x):  # limitar por evento
             cap = float(fund["per_event_cap"])
             return max(min(x, cap), -cap)
@@ -3463,6 +3456,7 @@ def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, tem
     return limitar_probabilidad(probabilidad_exito)
 
 # Función para calcular la probabilidad general ponderando más la probabilidad fundamental
+#@profile
 def calcular_probabilidad_general(probabilidad_tecnica: float,
                                   probabilidad_fundamental: float,
                                   cfg: dict | None = None) -> float:
@@ -3493,6 +3487,7 @@ def calcular_probabilidad_general(probabilidad_tecnica: float,
     return float(out)
 
 # Implementación de la zona de no trading
+#@profile
 def verificar_zona_no_trading(df, window):
     # Condiciones para identificar una zona de no trading
     if df['ATR'].iloc[-1] < df['ATR'].rolling(window=window).mean().iloc[-1] * 0.8:
@@ -4116,15 +4111,19 @@ def predecir_media_movil(df, window, steps=5):
     return [prediccion] * steps  # Repetir el valor predicho para el horizonte de `steps` días
 
 # Funciones para determinar señales de compra
+#@profile
 def es_compra_arima(precio_actual, arima_prediccion, probabilidad_general, zona_no_trading):
     return precio_actual < arima_prediccion and probabilidad_general > 53 and not zona_no_trading
 
+#@profile
 def es_compra_media_movil(precio_actual, media_movil_prediccion, probabilidad_general, zona_no_trading):
     return precio_actual < media_movil_prediccion and probabilidad_general > 53 and not zona_no_trading
 
+#@profile
 def es_compra_arima_media_movil(precio_actual, arima_prediccion, media_movil_prediccion, probabilidad_general, zona_no_trading):
     return precio_actual < arima_prediccion and precio_actual < media_movil_prediccion and probabilidad_general > 53 and not zona_no_trading
 
+#@profile
 def es_compra_fuerte(probabilidad_alza, patrones_detectados, zona_sobreventa, probabilidad_general, zona_no_trading):
      return (
         (probabilidad_alza > 60 or zona_sobreventa or probabilidad_general > 53) and
@@ -4141,15 +4140,19 @@ def es_compra_fuerte(probabilidad_alza, patrones_detectados, zona_sobreventa, pr
     )
 
 # Funciones para determinar señales de venta
+#@profile
 def es_venta_arima(precio_actual, arima_prediccion, probabilidad_general, zona_no_trading):
     return precio_actual > arima_prediccion and probabilidad_general < 47 and not zona_no_trading
 
+#@profile
 def es_venta_media_movil(precio_actual, media_movil_prediccion, probabilidad_general, zona_no_trading):
     return precio_actual > media_movil_prediccion and probabilidad_general < 47 and not zona_no_trading
 
+#@profile
 def es_venta_arima_media_movil(precio_actual, arima_prediccion, media_movil_prediccion, probabilidad_general, zona_no_trading):
     return precio_actual > arima_prediccion and precio_actual > media_movil_prediccion and probabilidad_general < 47 and not zona_no_trading
 
+#@profile
 def es_venta_fuerte(probabilidad_baja, patrones_detectados, zona_sobrecompra, probabilidad_general, zona_no_trading):
     return (
         (probabilidad_baja > 60 or zona_sobrecompra or probabilidad_general < 47) and
@@ -4298,6 +4301,7 @@ def calcular_soportes_resistencias_para_window(window, df, precio_actual, min_le
     )
     return soportes, resistencias
 
+#@profile
 def _clean_levels(L):
     if not L: return []
     out=[]
@@ -4364,6 +4368,7 @@ def ajustar_window_dinamico_optimizado(
             break
 
         # Función para calcular soportes y resistencias
+        #@profile
         def calcular_soportes_resistencias():
             return calcular_soportes_resistencias_para_window(
                 window_ajustado, df, precio_actual, min_levels, symbol, temporalidad
@@ -4415,9 +4420,11 @@ def filtrar_por_distancia(niveles, atr, precio_actual, max_distancia=1.5):
 
     return niveles_filtrados
 
+#@profile
 def contar_toques(nivel, precios, umbral=0.01):
     return sum(abs(precios - nivel) / nivel <= umbral)
 
+#@profile
 def unificar_niveles(cache, symbol):
     # Verificar si el símbolo existe en el caché
     if symbol not in cache:
@@ -4443,6 +4450,7 @@ def unificar_niveles(cache, symbol):
     
     return cache
 
+#@profile
 def eliminar_niveles_redundantes(niveles, tolerancia):
 
     niveles_filtrados = []
@@ -4451,6 +4459,7 @@ def eliminar_niveles_redundantes(niveles, tolerancia):
             niveles_filtrados.append(nivel)
     return niveles_filtrados
 
+#@profile
 def seleccionar_valor_cercano(niveles, precio_actual, atr=None, tolerancia_factor=0.1):
     
     if not niveles:
@@ -4472,6 +4481,7 @@ def seleccionar_valor_cercano(niveles, precio_actual, atr=None, tolerancia_facto
     return niveles_cercanos_filtrados
 
 
+#@profile
 def detectar_rango_zigzag(
     df,
     ventana_rebotes=140,    # Número de velas recientes a analizar
@@ -4538,6 +4548,7 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soport
     if symbol not in soportes_resistencias_cache or temporalidad_actual not in soportes_resistencias_cache[symbol]:
         raise KeyError(f"El símbolo {symbol} o la temporalidad {temporalidad_actual} no se encuentran en el caché.")
 
+    #@profile
     def procesar_niveles_importantes(niveles):
         # Validar si es una tupla con un único elemento que contiene una lista
         if isinstance(niveles, tuple) and len(niveles) == 1 and isinstance(niveles[0], list):
@@ -4550,6 +4561,7 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soport
         # Si no cumple con ninguno de los formatos, lanzar un error
         raise ValueError(f"El formato de los niveles no es el esperado. Tipo recibido: {type(niveles)}, contenido: {niveles}")
 
+    #@profile
     def aplanar_niveles(niveles):
         if isinstance(niveles, (list, tuple, np.ndarray)):  # Incluye numpy.ndarray
             return [nivel for sublist in niveles for nivel in (sublist if isinstance(sublist, (list, tuple, np.ndarray)) else [sublist])]
@@ -4711,12 +4723,14 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soport
         "DataFrame Actualizado": df
     }
 
+#@profile
 def _finite(x) -> bool:
     try:
         return np.isfinite(float(x))
     except Exception:
         return False
 
+#@profile
 def _tofloat(x):
     try:
         v = float(x)
@@ -4724,6 +4738,7 @@ def _tofloat(x):
     except Exception:
         return None
     
+#@profile
 def calc_tp_sl_compra(entry, atr, mult=1.5):
     if not (_finite(entry) and _finite(atr)):
         return None, None
@@ -4733,6 +4748,7 @@ def calc_tp_sl_compra(entry, atr, mult=1.5):
         return None, None
     return tp, sl
 
+#@profile
 def calc_tp_sl_venta(entry, atr, mult=1.5):
     if not (_finite(entry) and _finite(atr)):
         return None, None
@@ -4742,6 +4758,7 @@ def calc_tp_sl_venta(entry, atr, mult=1.5):
         return None, None
     return tp, sl
 
+#@profile
 def calc_tp_sl_compra_asym(entry: float, atr: float, tp_mult: float, sl_mult: float):
     if not (_finite(entry) and _finite(atr)):
         return None, None
@@ -4751,6 +4768,7 @@ def calc_tp_sl_compra_asym(entry: float, atr: float, tp_mult: float, sl_mult: fl
         return None, None
     return tp, sl
 
+#@profile
 def calc_tp_sl_venta_asym(entry: float, atr: float, tp_mult: float, sl_mult: float):
     if not (_finite(entry) and _finite(atr)):
         return None, None
@@ -4764,12 +4782,14 @@ def calc_tp_sl_venta_asym(entry: float, atr: float, tp_mult: float, sl_mult: flo
 # Helpers para múltiples entradas con rango dinámico, niveles confirmados y RRR
 # ─────────────────────────────────────────────────────────────────────────────
 
+#@profile
 def _finite(x) -> bool:
     try:
         return x is not None and math.isfinite(float(x))
     except Exception:
         return False
 
+#@profile
 def _rrr(entry: float, tp: float, sl: float, side: str) -> Optional[float]:
     """Risk-Reward Ratio."""
     if not (_finite(entry) and _finite(tp) and _finite(sl)):
@@ -4784,6 +4804,7 @@ def _rrr(entry: float, tp: float, sl: float, side: str) -> Optional[float]:
         return None
     return reward / risk
 
+#@profile
 def _add_entry(
     entries: list[dict],
     *,
@@ -4864,6 +4885,7 @@ def _add_entry(
     logging.info(f" + AGREGADA {side.upper()} [{basado_en}] entry={entry:.6f} tp={tp:.6f} sl={sl:.6f} RRR={rrr:.3f} score={score:.3f}")
 
 
+#@profile
 def generar_entradas_multiples(
     *,
     precio_actual: float,
@@ -5232,6 +5254,7 @@ def calcular_entradas(
                 stop_loss = None
 
         # Cercanía a niveles
+        #@profile
         def esta_cerca(precio, nivel, umbral_cercania=0.01):
             return False if nivel is None else abs(precio - nivel) / precio <= umbral_cercania
 
@@ -5316,6 +5339,7 @@ def calcular_entradas(
 
 
 # Función para generar un archivo con la fecha y hora en el nombre
+#@profile
 def generar_nombre_archivo(moneda_filtro, filtro=False, tipo=None):
     fecha_hora = datetime.now().strftime("%Y%m%d_%H%M%S")
     
@@ -5375,27 +5399,6 @@ async def enviar_csv_telegram(df, context, filename="resultados.csv",  user_chat
             buffer.seek(0)  # Restablecer el buffer para el siguiente cliente
         except Exception as e:
             logger.info(f"Error al enviar CSV a {chat_id}: {e}")
-
-
-def df_a_imagen(df: pd.DataFrame, max_filas=30):
-    """
-    Genera imágenes a partir del DataFrame de oportunidades.
-    Devuelve BytesIO o lista de BytesIO.
-    """
-    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-        logger.info("El DataFrame está vacío, no se puede generar la imagen.")
-        return None
-
-    # Si por error te pasan ya un BytesIO, respétalo
-    if isinstance(df, BytesIO):
-        return df
-
-    df_prep = preparar_df_oportunidades_para_tabla(df)
-    if df_prep.empty:
-        return None
-
-    # fuente un poco mayor para legibilidad
-    return _render_table_image(df_prep, max_rows=max_filas, font=13, dpi=200)
 
 
 #@profile
@@ -5484,6 +5487,7 @@ def generar_imagen_eventos_oportunidades(
     return imgs if imgs else None
 
 
+#@profile
 def preparar_df_oportunidades_para_tabla(df_in: pd.DataFrame) -> pd.DataFrame:
     """Devuelve un DF listo para pintar: columnas seleccionadas + formato + headers multilínea."""
     if df_in is None or df_in.empty:
@@ -5544,6 +5548,7 @@ def preparar_df_oportunidades_para_tabla(df_in: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+#@profile
 def tabla_a_imagenes(
     df: pd.DataFrame,
     max_filas_por_imagen: int = 18,
@@ -5587,6 +5592,7 @@ def tabla_a_imagenes(
         col_widths_norm = [w / total_w for w in col_in]
 
         # ---- 3) Calcular alto de figura según líneas por fila (tras el wrap) ----
+        #@profile
         def _line_count_cell(txt: str) -> int:
             return max(1, len((str(txt) or "").split("\n")))
         # Para cada fila, toma el máximo de líneas entre sus celdas
@@ -5642,6 +5648,7 @@ def tabla_a_imagenes(
 
     return buffers
 
+#@profile
 def _parece_numero(s: str) -> bool:
     s = s.strip().replace(",", "")
     # permite "123", "123.45", "-0.5", "1 234.56"
@@ -5710,53 +5717,6 @@ async def enviar_imagen_eventos_oportunidades(
                     logger.info(f"Error inesperado enviando imagen de eventos a {chat_id}: {e}")
                     await asyncio.sleep(2)
 
-#@profile
-def graficar_serie_temporal(df, symbol, temporalidad):
-    """
-    Genera una gráfica de serie temporal con velas y MACD, y la retorna como un archivo en memoria (BytesIO).
-    """
-    with matplotlib_lock:  # Bloqueo para evitar conflictos entre hilos
-        df = df.tail(120)
-
-        if df.empty:
-            logger.info(f"No hay datos para {symbol} en temporalidad {temporalidad}.")
-            return None
-
-        fig, (ax_candles, ax_macd) = plt.subplots(nrows=2, ncols=1, figsize=(10, 6), sharex=True)
-
-        try:
-            # Configurar la gráfica de velas
-            ax_candles.set_title(f'{symbol} - {temporalidad}')
-            ax_candles.plot(df.index, df['close'], label='Close', alpha=0.75)
-            ax_candles.fill_between(df.index, df['low'], df['high'], color='gray', alpha=0.2, label='High-Low')
-            ax_candles.plot(df.index, df['ema_12'], label='EMA 12', color='blue', linestyle='--')
-            ax_candles.plot(df.index, df['ema_26'], label='EMA 26', color='red', linestyle='--')
-            ax_candles.legend(loc='upper left')
-            ax_candles.grid(True)
-
-            # Gráfica del MACD
-            ax_macd.plot(df.index, df['macd'], label='MACD', color='red')
-            ax_macd.plot(df.index, df['signal'], label='Signal Line', color='yellow')
-            ax_macd.bar(df.index, df['macd'] - df['signal'], label='Histogram', alpha=0.5, color='green', width=0.01)
-            ax_macd.axhline(0, color='black', linewidth=0.5)
-            ax_macd.legend(loc='upper left')
-            ax_macd.grid(True)
-
-            # Ajustar el layout
-            fig.tight_layout()
-
-            # Guardar la imagen en un archivo en memoria
-            buf = BytesIO()
-            fig.savefig(buf, format='png', bbox_inches='tight')
-            buf.seek(0)  # Posicionar el puntero al inicio del buffer
-            return buf
-
-        except Exception as e:
-            logger.info(f"Error al generar la imagen: {e}")
-            return None
-
-        finally:
-            plt.close(fig)  # Cierra la figura para liberar recursos
 
 #@profile
 def calcular_ponderacion_incremental_por_divisa(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
@@ -5785,6 +5745,7 @@ def calcular_ponderacion_incremental_por_divisa(df: pd.DataFrame, cfg: dict | No
     # mapa temporalidad -> índice
     idx = {tf.lower(): i for i, tf in enumerate(tfs)}
 
+    #@profile
     def _tf_index(tf_val: str) -> int | None:
         if not tf_val:
             return None
@@ -5844,6 +5805,7 @@ DEFAULT_PONDER_INC_CFG = {
     "temporalidades": "1w,1d,4h,1h,30m,15m,5m,1m",
 }
 
+#@profile
 def _norm_ponder_cfg(cfg: dict | None) -> dict:
     try:
         user = ((cfg or {}).get("ponderacion") or {})
@@ -5851,6 +5813,7 @@ def _norm_ponder_cfg(cfg: dict | None) -> dict:
     except Exception:
         return DEFAULT_PONDER_CFG.copy()
 
+#@profile
 def _norm_ponder_inc_cfg(cfg: dict | None) -> dict:
     try:
         user = ((cfg or {}).get("ponderacion_inc") or {})
@@ -6109,6 +6072,7 @@ def procesar_simbolo_temporalidad(
 
 
 
+#@profile
 def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
     """
     Filtra activos según la moneda o categoría especificada.
@@ -6890,6 +6854,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     return urls_generadas
 
 
+#@profile
 def _solo_strings_urls(items: list[Any]) -> list[str]:
     out: list[str] = []
     for it in items:
@@ -6910,12 +6875,15 @@ def _solo_strings_urls(items: list[Any]) -> list[str]:
     return uniq
 
 # Función para obtener el estado de un usuario
+#@profile
 def obtener_estado_usuario(user_chat_id):
     if user_chat_id not in user_states:
         user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}, "soportes_resistencias_cache": {}}
     return user_states[user_chat_id]
 
 # Función para actualizar el estado de un usuario
+# ----------------- Estado en memoria -----------------
+#@profile
 def actualizar_estado_usuario(user_chat_id, estado, par_seleccionado=None):
     estado_usuario = obtener_estado_usuario(user_chat_id)
     estado_usuario["estado"] = estado
@@ -6923,29 +6891,31 @@ def actualizar_estado_usuario(user_chat_id, estado, par_seleccionado=None):
     estado_usuario["soportes_resistencias_cache"] = {}
     user_states[user_chat_id] = estado_usuario
 
-# Función para limpiar el estado de un usuario
+#@profile
 def limpiar_estado_usuario(user_chat_id):
     if user_chat_id in user_states:
         user_states[user_chat_id]["estado"] = "disponible"
         user_states[user_chat_id]["par_seleccionado"] = None
         user_states[user_chat_id]["cache_realtime"] = {}
 
+#@profile
 def limpiar_soportes_resistencias_cache(user_chat_id):
     if user_chat_id in user_states:
         user_states[user_chat_id]["soportes_resistencias_cache"] = {}
         logger.info(f"Cache de soportes y resistencias reseteado para usuario {user_chat_id}.")
     else:
-        # Si el usuario no tiene estado, inicializar el estado
+        # Si no hay estado, inicialízalo como disponible
         user_states[user_chat_id] = {
             "estado": "disponible",
             "soportes_resistencias_cache": {}
         }
-        mark_user_state(user_id=user_chat_id, estado="disponible")
+        # ¡Ojo! Este es un chat_id, por eso usamos chat_id=... (no user_id)
+        mark_user_state(chat_id=user_chat_id, estado="disponible")
         logger.info(f"Estado inicializado para usuario {user_chat_id}.")
 
-
+# ----------------- Comandos / Flujos Telegram -----------------
+#@profile
 async def manejar_fecha_eventos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     user_chat_id = str(update.effective_chat.id)
 
     chat_ids = await cargar_chat_ids()
@@ -6953,40 +6923,48 @@ async def manejar_fecha_eventos(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("No estás registrado. Por favor, usa /start para registrarte.")
         return
     
+    # Suscripción (rama Telegram)
     if await estado_suscripcion(user_chat_id) != 'activa' and not es_administrador(user_chat_id):
-        await update.message.reply_text("No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n" \
-                                        "Por favor,  contacta con un administrador.")
-        return
-    
-    opciones_usuario = await obtener_opciones_usuario(user_chat_id)
-    if not es_administrador(user_chat_id) and (not opciones_usuario or not any(opcion in opciones_usuario for opcion in ["eventos"])):
-        await context.bot.send_message(chat_id=user_chat_id, text="No tienes opciones habilitadas para esta operación. Por favor, adquiere una suscripción.")
+        await update.message.reply_text(
+            "No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n"
+            "Por favor, contacta con un administrador."
+        )
         return
 
-    estado_actual = return_state(user_id=user_id, chat_id=user_chat_id)
+    # Permisos específicos
+    opciones_usuario = await obtener_opciones_usuario(user_chat_id, origen="telegram")
+    if not es_administrador(user_chat_id) and (not opciones_usuario or "eventos" not in opciones_usuario):
+        await context.bot.send_message(
+            chat_id=user_chat_id,
+            text="No tienes opciones habilitadas para esta operación. Por favor, adquiere una suscripción."
+        )
+        return
+
+    # Evitar ejecución concurrente
+    estado_actual = return_state(chat_id=user_chat_id)
     if estado_actual == "en ejecución":
         await context.bot.send_message(
-            chat_id=user_chat_id, 
+            chat_id=user_chat_id,
             text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
         )
         return
 
     try:
-        # Inicializar el estado del usuario
-        if user_chat_id not in user_states:
-            user_states[user_chat_id] = {}
-        
-        user_states[user_chat_id]["estado"] = "esperando_fechas"
-        user_states[user_chat_id]["fecha_inicio"] = None
-        user_states[user_chat_id]["fecha_fin"] = None
-        mark_user_state(user_id=user_chat_id, estado="esperando_fechas")
+        # Inicializa el estado
+        st = user_states.setdefault(user_chat_id, {})
+        st["estado"] = "esperando_fechas"
+        st["fecha_inicio"] = None
+        st["fecha_fin"] = None
+        mark_user_state(chat_id=user_chat_id, estado="esperando_fechas")
 
-        mensaje = "Por favor, envíame las fechas de inicio y fin en formato YYYY-MM-DD separadas por un espacio."
-        await context.bot.send_message(chat_id=user_chat_id, text=mensaje)
+        await context.bot.send_message(
+            chat_id=user_chat_id,
+            text="Por favor, envíame las fechas de inicio y fin en formato YYYY-MM-DD separadas por un espacio."
+        )
     except Exception as e:
         logger.info(f"Error al manejar el comando 'eventos_futuros': {e}")
 
-
+#@profile
 async def manejar_fecha_noticias_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_chat_id = str(update.effective_chat.id)
 
@@ -6996,179 +6974,225 @@ async def manejar_fecha_noticias_user(update: Update, context: ContextTypes.DEFA
         return
 
     if await estado_suscripcion(user_chat_id) != 'activa' and not es_administrador(user_chat_id):
-        await update.message.reply_text("No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n" \
-                                        "Por favor,  contacta con un administrador.")
+        await update.message.reply_text(
+            "No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n"
+            "Por favor, contacta con un administrador."
+        )
         return
     
-    opciones_usuario = await obtener_opciones_usuario(user_chat_id)
-    if not es_administrador(user_chat_id) and (not opciones_usuario or not any(opcion in opciones_usuario for opcion in ["noticias"])):
-        await context.bot.send_message(chat_id=user_chat_id, text="No tienes opciones habilitadas para esta operación. Por favor, adquiere una suscripción.")
+    opciones_usuario = await obtener_opciones_usuario(user_chat_id, origen="telegram")
+    if not es_administrador(user_chat_id) and (not opciones_usuario or "noticias" not in opciones_usuario):
+        await context.bot.send_message(
+            chat_id=user_chat_id,
+            text="No tienes opciones habilitadas para esta operación. Por favor, adquiere una suscripción."
+        )
         return
     
-    # Inicializar el estado del usuario para manejar noticias
-    estado_usuario = obtener_estado_usuario(user_chat_id)
-    if  return_state(user_chat_id) == "en ejecución":
+    if return_state(chat_id=user_chat_id) == "en ejecución":
         await context.bot.send_message(
             chat_id=user_chat_id,
             text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
         )
         return
   
-    # Cambiar el estado para manejar noticias
-    estado_usuario["estado"] = "esperando_fechas_noticias_user"
-    estado_usuario["fecha_inicio"] = None
-    estado_usuario["fecha_fin"] = None
+    # Cambiar el estado para capturar fecha+símbolo en el siguiente mensaje
+    st = user_states.setdefault(user_chat_id, {})
+    st["estado"] = "esperando_fechas_noticias_user"
+    st["fecha_inicio"] = None
+    st["fecha_fin"] = None
     mark_user_state(chat_id=user_chat_id, estado="esperando_fechas_noticias_user")
 
-    mensaje = "Por favor, envíame una fecha y un simbolo(por ejemplo: AAPL, BTCUSD, etc.) en formato: YYYY-MM-DD simbolo."
-    await context.bot.send_message(chat_id=user_chat_id, text=mensaje)
+    await context.bot.send_message(
+        chat_id=user_chat_id,
+        text="Envíame una fecha y un símbolo (ej: 2025-09-20 AAPL)."
+    )
 
+#@profile
 async def manejar_fecha_noticias_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_chat_id = str(update.effective_chat.id)
 
+    # 1) Verificar registro
     chat_ids = await cargar_chat_ids()
     if user_chat_id not in chat_ids:
         await update.message.reply_text("No estás registrado. Por favor, usa /start para registrarte.")
         return
 
-    if await estado_suscripcion(user_chat_id) != 'activa' and not es_administrador(user_chat_id):
-        await update.message.reply_text("No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n" \
-                                        "Por favor,  contacta con un administrador.")
-        return
-    
-    opciones_usuario = await obtener_opciones_usuario(user_chat_id)
-    if not es_administrador(user_chat_id) and (not opciones_usuario or not any(opcion in opciones_usuario for opcion in ["noticias"])):
-        await context.bot.send_message(chat_id=user_chat_id, text="No tienes opciones habilitadas para esta operación. Por favor, adquiere una suscripción.")
-        return
-    
-    # Inicializar el estado del usuario para manejar noticias
-    estado_usuario = obtener_estado_usuario(user_chat_id)
-    if return_state(user_chat_id) == "en ejecución":
-        await context.bot.send_message(
-            chat_id=user_chat_id,
-            text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
-        )
-        return
-  
-    # Cambiar el estado para manejar noticias
-    estado_usuario["estado"] = "esperando_fechas_noticias_admin"
-    estado_usuario["fecha_inicio"] = None
-    estado_usuario["fecha_fin"] = None
-    mark_user_state(chat_id=user_chat_id, estado="esperando_fechas_noticias_admin")
-
-    mensaje = "Por favor, envíame una fecha formato YYYY-MM-DD."
-    await context.bot.send_message(chat_id=user_chat_id, text=mensaje)
-
-
-async def manejar_ia_grafico(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_chat_id = str(update.effective_chat.id)
-
+    # 2) Suscripción (rama Telegram) o admin
     try:
-        mark_user_state(chat_id=user_chat_id, estado="esperando_grafico_ia")
-        await update.message.reply_text("📸 Por favor, sube una imagen de un gráfico de velas para que pueda analizarla con IA.")
-    except Exception as e:
-        await update.message.reply_text(f"Ocurrió un error al preparar el análisis: {e}")
+        estado_sub = await estado_suscripcion(user_chat_id)
+    except TypeError:
+        # Si tu estado_suscripcion usa firma nueva, descomenta la línea de abajo y comenta la anterior.
+        # estado_sub = await estado_suscripcion(user_id=None, chat_id=user_chat_id)
+        estado_sub = "activa"  # fallback blando para no romper flujo
 
-
-async def analizar_simbolo(update, context):
-    """Pide al usuario que ingrese un símbolo."""
-    user_chat_id = str(update.effective_chat.id)
-
-    # Verificar si el usuario está registrado
-    chat_ids = await cargar_chat_ids()
-    if user_chat_id not in chat_ids:
-        await update.message.reply_text("No estás registrado. Por favor, usa /start para registrarte.")
+    if estado_sub != 'activa' and not es_administrador(user_chat_id):
+        await update.message.reply_text(
+            "No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n"
+            "Por favor, contacta con un administrador."
+        )
         return
 
-    # Validar estado de la suscripción
-    if await estado_suscripcion(user_chat_id) != 'activa' and not es_administrador(user_chat_id):
-        await update.message.reply_text("No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n" \
-                                        "Por favor,  contacta con un administrador.")
+    # 3) Permisos por opciones
+    opciones_usuario = await obtener_opciones_usuario(user_chat_id, origen="telegram")
+    if not es_administrador(user_chat_id) and (not opciones_usuario or "noticias" not in opciones_usuario):
+        await context.bot.send_message(
+            chat_id=user_chat_id,
+            text="No tienes opciones habilitadas para esta operación. Por favor, adquiere una suscripción."
+        )
         return
-    
-    # Inicializar el estado del usuario para manejar noticias
-    estado_usuario = obtener_estado_usuario(user_chat_id)
-    if  return_state(user_chat_id) == "en ejecución":
+
+    # 4) Evitar ejecuciones simultáneas
+    if return_state(chat_id=user_chat_id) == "en ejecución":
         await context.bot.send_message(
             chat_id=user_chat_id,
             text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
         )
         return
 
-    # Cambiar el estado para manejar noticias
-    estado_usuario["estado"] = "esperando_simbolo"
+    # 5) Dejar el estado listo para que el próximo mensaje sea la fecha
+    st = user_states.setdefault(user_chat_id, {})
+    st["estado"] = "esperando_fechas_noticias_admin"
+    st["fecha_inicio"] = None
+    st["fecha_fin"] = None
+
+    # Si tu mark_user_state acepta 'extra', lo usamos para persistir y sincronizar memoria
+    try:
+        mark_user_state(
+            chat_id=user_chat_id,
+            estado="esperando_fechas_noticias_admin",
+            extra={"fecha_inicio": None, "fecha_fin": None}
+        )
+    except TypeError:
+        # Compatibilidad si tu versión de mark_user_state no tiene 'extra'
+        mark_user_state(chat_id=user_chat_id, estado="esperando_fechas_noticias_admin")
+
+    # 6) Pedir la fecha
+    await context.bot.send_message(
+        chat_id=user_chat_id,
+        text="Envíame una fecha en formato YYYY-MM-DD."
+    )
+
+
+#@profile
+async def analizar_simbolo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia el flujo de análisis por símbolo: deja el estado en 'esperando_simbolo'."""
+    user_chat_id = str(update.effective_chat.id)
+
+    # Verificar registro
+    chat_ids = await cargar_chat_ids()
+    if user_chat_id not in chat_ids:
+        await update.message.reply_text("No estás registrado. Por favor, usa /start para registrarte.")
+        return
+
+    # Suscripción vigente o admin
+    if await estado_suscripcion(user_chat_id) != 'activa' and not es_administrador(user_chat_id):
+        await update.message.reply_text(
+            "No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n"
+            "Por favor, contacta con un administrador."
+        )
+        return
+    
+    # Evitar ejecuciones simultáneas
+    if return_state(chat_id=user_chat_id) == "en ejecución":
+        await context.bot.send_message(
+            chat_id=user_chat_id,
+            text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
+        )
+        return
+
+    # Dejar listo para que el próximo mensaje sea el símbolo
+    st = user_states.setdefault(user_chat_id, {})
+    st["estado"] = "esperando_simbolo"
+    st["fecha_inicio"] = None
+    st["fecha_fin"] = None
     mark_user_state(chat_id=user_chat_id, estado="esperando_simbolo")
 
-    # Solicitar el símbolo al usuario
-    await update.message.reply_text("Por favor, ingresa el símbolo que deseas analizar (por ejemplo: AAPL, BTCUSD, etc.)\n"\
-                                    "En caso de no conocer puede consultar a soporte: manuelt84@gmaill.com")
-    context.user_data["esperando_simbolo"] = True  # Marcar que estamos esperando un símbolo
+    await update.message.reply_text(
+        "Por favor, ingresa el símbolo que deseas analizar (ej: AAPL, BTCUSD, EURUSD…)\n"
+        "Si tienes dudas, escribe a soporte: manuelt84@gmail.com"
+    )
+    # (context.user_data puede usarse, pero tu flujo principal mira user_states/Firestore)
 
-
+# ----------------- Utilidad existente -----------------
+#@profile
 def analizar_importancia(texto):
     if not texto or pd.isna(texto):
-        return "Sin clasificación"  # Sin ajuste si no hay texto
-
-    # Analizar el sentimiento usando TextBlob
+        return "Sin clasificación"
     sentimiento = TextBlob(texto).sentiment.polarity
-
-    # Determinar la importancia basada en el sentimiento
     if sentimiento > 0.2:
-        return "Alta"  # Alta importancia positiva
+        return "Alta"
     elif sentimiento < -0.2:
-        return "Baja"  # Alta importancia negativa
-    else:
-        return "Media"  # Importancia neutral
+        return "Baja"
+    return "Media"
     
 
+#@profile
 async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
+    """Maneja las respuestas del usuario según el estado guardado en Firestore/user_states.
+    - Usa SIEMPRE chat_id para la rama Telegram (clave en user_states).
+    - Llama a obtener_opciones_usuario(..., origen="telegram") para permisos.
+    - mark_user_state SIEMPRE con kwargs: chat_id=..., estado="..."
+    """
     user_chat_id = str(update.effective_chat.id)
 
+    # Zona horaria por defecto del usuario (telegram)
     global timezone_country
-    timezone_country = pytz.timezone(await cargar_timezone_por_defecto(user_chat_id))
+    try:
+        tz_name = await cargar_timezone_por_defecto(user_chat_id)
+        timezone_country = pytz.timezone(tz_name)
+    except Exception:
+        timezone_country = pytz.utc
 
-    if  return_state(user_chat_id) == "disponible":
+    # Si no hay un estado esperando, cortamos.
+    current_state = return_state(chat_id=user_chat_id)
+    if current_state == "disponible":
         await update.message.reply_text("Por favor, usa el comando adecuado primero.")
         return
 
-    estado_firestore=return_state(user_chat_id)
+    estado_firestore = current_state
 
-    # Manejar símbolo ingresado por el usuario
-    if  estado_firestore == "esperando_simbolo":
+    # ───────────────────────────────
+    # 1) Espera de símbolo para análisis puntual
+    # ───────────────────────────────
+    if estado_firestore == "esperando_simbolo":
         try:
-            await update.message.reply_text(f"Empezamos a obtenerla información, espere un momento por favor.")
+            await update.message.reply_text("Empezamos a obtener la información, espera un momento por favor.")
 
-            # Capturar el símbolo ingresado por el usuario
-            simbolo = update.message.text.strip()
-
-            # Validar el símbolo (puedes agregar validaciones específicas aquí)
+            simbolo = (update.message.text or "").strip()
             if not simbolo:
                 raise ValueError("El símbolo no puede estar vacío.")
 
-            opciones_usuario = await obtener_opciones_usuario(user_chat_id)
+            # Permisos del usuario (rama Telegram)
+            opciones_usuario = await obtener_opciones_usuario(user_chat_id, origen="telegram")
 
-            # Ejecutar el análisis en una tarea asíncrona
-            asyncio.create_task(ejecutar_recurrente(context, update, simbolo.upper(), user_chat_id, opciones_usuario))
-
+            # Lanza la ejecución en background
+            asyncio.create_task(
+                ejecutar_recurrente(
+                    context, update, simbolo.upper(),
+                    user_chat_id=user_chat_id,
+                    opciones_usuario=opciones_usuario,
+                    origen="telegram"
+                )
+            )
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando el símbolo: {e}")
-
         finally:
-            # Limpiar el estado del usuario
+            # Limpieza de estado local (el runner actualizará a 'en ejecución' cuando corresponda)
             if user_chat_id in user_states:
                 user_states[user_chat_id]["estado"] = "disponible"
             mark_user_state(chat_id=user_chat_id, estado="disponible")
+        return
 
-    elif estado_firestore == "esperando_fechas":
+    # ───────────────────────────────
+    # 2) Rango de fechas (eventos económicos por rango)
+    # ───────────────────────────────
+    if estado_firestore == "esperando_fechas":
+        uid_chat = user_chat_id  # clave consistente para Telegram
         try:
-            uid = str(update.effective_user.id)   # usuario de Telegram -> Firestore/user_states
-            chat_id = update.effective_chat.id    # chat para enviar mensajes
+            await update.message.reply_text("Empezamos a obtener la información, espera un momento por favor.")
 
-            await update.message.reply_text("Empezamos a obtener la información, espere un momento por favor.")
-
-            # Inicializa estructura para evitar KeyError (si no existe)
-            state = user_states.setdefault(uid, {})
+            # Estructura de estado segura
+            state = user_states.setdefault(uid_chat, {})
             state.setdefault("estado", "disponible")
             state.setdefault("links_enviados", False)
             state.setdefault("imagenes_enviadas", False)
@@ -7177,288 +7201,307 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             state["fecha_inicio"] = None
             state["fecha_fin"] = None
 
-            fechas = update.message.text.split()
-            if len(fechas) != 2:
+            partes = (update.message.text or "").split()
+            if len(partes) != 2:
                 raise ValueError("Debes ingresar dos fechas en formato YYYY-MM-DD YYYY-MM-DD.")
 
-            fecha_inicio = pd.to_datetime(fechas[0], format="%Y-%m-%d", errors='coerce')
-            fecha_fin    = pd.to_datetime(fechas[1], format="%Y-%m-%d", errors='coerce')
+            fecha_inicio = pd.to_datetime(partes[0], format="%Y-%m-%d", errors='coerce')
+            fecha_fin    = pd.to_datetime(partes[1], format="%Y-%m-%d", errors='coerce')
             if pd.isnull(fecha_inicio) or pd.isnull(fecha_fin):
                 raise ValueError("Formato de fecha inválido.")
             if fecha_inicio > fecha_fin:
                 raise ValueError("La fecha de inicio debe ser menor o igual a la fecha de fin.")
 
-            fecha_hoy = datetime.now(timezone_country).date()
+            hoy_local = datetime.now(timezone_country).date()
             if (fecha_fin.date() - fecha_inicio.date()).days > 7:
                 raise ValueError("El rango de fechas no puede exceder 7 días para eventos.")
-            if fecha_inicio.date() < (fecha_hoy - timedelta(days=14)):
+            if fecha_inicio.date() < (hoy_local - timedelta(days=14)):
                 raise ValueError("El rango de fechas no puede superar 14 días en el pasado para eventos.")
-            if fecha_fin.date() > (fecha_hoy + timedelta(days=14)):
+            if fecha_fin.date() > (hoy_local + timedelta(days=14)):
                 raise ValueError("El rango de fechas no puede superar 14 días en el futuro para eventos.")
 
             state["fecha_inicio"] = fecha_inicio
             state["fecha_fin"] = fecha_fin
-            actualizar_estado_usuario(uid, "en ejecución")
-            mark_user_state(chat_id=uid, estado="en ejecución")
+            actualizar_estado_usuario(uid_chat, "en ejecución")
+            mark_user_state(chat_id=uid_chat, estado="en ejecución")
 
-            # Obtener eventos futuros
+            # Traer/filtrar eventos
             df_eventos = await obtener_eventos_guardados_o_futuros(fecha_inicio, fecha_fin)
-            if df_eventos.empty:
+            if df_eventos is None or getattr(df_eventos, "empty", True):
                 await update.message.reply_text(
                     f"No se encontraron eventos económicos entre {fecha_inicio.strftime('%Y-%m-%d')} y {fecha_fin.strftime('%Y-%m-%d')}."
                 )
             else:
-                # Ya están inicializados en 'state', no revalides claves
                 async with state["lock"]:
                     state["lock_holder"] = asyncio.current_task()
-                    await enviar_imagenes_por_currency_a_usuario(df_eventos, context, chat_id)
+                    await enviar_imagenes_por_currency_a_usuario(df_eventos, context, uid_chat)
                     state["imagenes_enviadas"] = True
 
                     if state["imagenes_enviadas"]:
-                        asyncio.create_task(enviar_eventos_y_archivo_calendar(df_eventos, context, chat_id))
+                        asyncio.create_task(enviar_eventos_y_archivo_calendar(df_eventos, context, uid_chat))
                         state["links_enviados"] = True
 
-                    if not es_administrador(uid):
-                        success, mensaje = await descontar_transaccion(uid, 1)
+                    if not es_administrador(uid_chat):
+                        success, mensaje = await descontar_transaccion(uid_chat, 1, origen="telegram")
                         if not success:
                             await update.message.reply_text(mensaje)
-
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando las fechas: {e}")
         finally:
-            if uid in user_states:
-                user_states[uid]["fecha_inicio"] = None
-                user_states[uid]["fecha_fin"] = None
-                user_states[uid]["estado"] = "disponible"
-            mark_user_state(chat_id=uid, estado="disponible")
+            if uid_chat in user_states:
+                user_states[uid_chat]["fecha_inicio"] = None
+                user_states[uid_chat]["fecha_fin"] = None
+                user_states[uid_chat]["estado"] = "disponible"
+            mark_user_state(chat_id=uid_chat, estado="disponible")
+        return
 
-
-    elif estado_firestore == "esperando_fechas_noticias_user":
+    # ───────────────────────────────
+    # 3) Noticias por fecha + símbolo (usuario)
+    # ───────────────────────────────
+    if estado_firestore == "esperando_fechas_noticias_user":
         try:
-            await update.message.reply_text(f"Empezamos a obtenerla información, espere un momento por favor.")
+            await update.message.reply_text("Empezamos a obtener la información, espera un momento por favor.")
 
-            input = update.message.text.split()
-            if len(input) != 2:
-                raise ValueError("Debes ingresar una fecha en formato YYYY-MM-DD simbolo.")
+            partes = (update.message.text or "").split()
+            if len(partes) != 2:
+                raise ValueError("Debes ingresar una fecha y un símbolo en formato: YYYY-MM-DD SIMBOLO")
 
-            fecha_inicio = pd.to_datetime(input[0], format="%Y-%m-%d", errors='coerce').tz_localize(timezone_country)
-            fecha_fin = fecha_inicio
+            # Fecha con tz local (aware)
+            fecha_inicio = pd.to_datetime(partes[0], format="%Y-%m-%d", errors='coerce')
             if pd.isnull(fecha_inicio):
                 raise ValueError("Formato de fecha inválido.")
+            # Aware en tz del usuario
+            fecha_inicio = fecha_inicio.tz_localize(timezone_country)
+            fecha_fin = fecha_inicio
 
-            fecha_hoy = datetime.now(timezone_country).replace(tzinfo=timezone_country).date()
+            hoy_local = datetime.now(timezone_country).date()
+            if fecha_fin.date() > hoy_local:
+                raise ValueError("La fecha no puede ser mayor que hoy para noticias.")
 
-            # Validaciones para noticias
-            if fecha_fin.date() > fecha_hoy:
-                raise ValueError("La fecha final no puede ser mayor que hoy para noticias.")
-
-            user_states[user_chat_id]["fecha_inicio"] = fecha_inicio
-            user_states[user_chat_id]["fecha_fin"] = fecha_fin
+            # Inicializa en estado local
+            st = user_states.setdefault(user_chat_id, {})
+            st["fecha_inicio"] = fecha_inicio
+            st["fecha_fin"] = fecha_fin
             actualizar_estado_usuario(user_chat_id, "en ejecución")
             mark_user_state(chat_id=user_chat_id, estado="en ejecución")
 
-            # Obtener noticias
-            noticias = obtener_noticias_simbolo(input[1].upper(), fecha_inicio, fecha_fin, limite=15)
+            symbol = partes[1].upper()
+            noticias = obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=15)
 
-            if noticias.empty:  # Verificar si el DataFrame está vacío
-                await update.message.reply_text("No se encontraron noticias en el rango de fechas especificado para el símbolo ingresado.")
+            if noticias is None or getattr(noticias, "empty", True):
+                await update.message.reply_text(
+                    "No se encontraron noticias en la fecha indicada para el símbolo ingresado."
+                )
                 return
 
-            # Verificar si las columnas esperadas existen
             if not all(col in noticias.columns for col in ['symbol', 'publishedDate', 'url', 'title']):
-                logger.info(f"Las columnas esperadas no están presentes en el DataFrame para el símbolo {input[1]}: {noticias.columns.tolist()}")
-                return  
+                logger.info(f"Columnas inesperadas para {symbol}: {list(noticias.columns)}")
+                return
 
-            # Filtrar noticias del día
+            # Filtrar por el día exacto (en tz local)
             noticias_del_dia = noticias[noticias['publishedDate'].dt.date == fecha_inicio.date()]
             if noticias_del_dia.empty:
                 await update.message.reply_text("No se encontraron noticias publicadas en la fecha ingresada.")
                 return
 
-            # Enviar mensajes de cada noticia
-            for index, noticia in noticias_del_dia.iterrows():
-                title = noticia['title']
+            for _, noticia in noticias_del_dia.iterrows():
+                title = noticia.get('title', '')
                 sitio = noticia.get('site', 'No especificado')
-                text = noticia.get('text', 'Sin Descripción')
-                symbol = noticia['symbol']
-                fecha = noticia['publishedDate'].strftime('%Y-%m-%d %H:%M:%S')
-                importancia = analizar_importancia(title + ' ' + text)
-                url = noticia['url']
-                link_traductor = f"https://translate.google.com/translate?sl=auto&tl=es&u={url}"  # Enlace a Google Translate
+                text = noticia.get('text', 'Sin Descripción') or 'Sin Descripción'
+                symbol = noticia.get('symbol', symbol)
+                fecha = noticia['publishedDate']
+                try:
+                    fecha_str = fecha.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    fecha_str = str(fecha)
+                importancia = analizar_importancia(f"{title} {text}")
+                url = noticia.get('url', '')
+                link_traductor = f"https://translate.google.com/translate?sl=auto&tl=es&u={url}"
 
                 mensaje = (
                     f"Titulo: {title}\n"
                     f"Descripción: {text}\n"
                     f"Activo: {symbol}\n"
-                    f"Fecha: {fecha}\n"
+                    f"Fecha: {fecha_str}\n"
                     f"Sitio: {sitio}\n"
                     f"Importancia: {importancia}\n"
                     f"Link: {url}\n"
                     f"Link Traducido: {link_traductor}\n"
                 )
-
                 await enviar_mensaje_noticias(context, user_chat_id, mensaje)
 
             if not es_administrador(user_chat_id):
-                success, mensaje = await descontar_transaccion(user_chat_id, 1)
+                success, mensaje = await descontar_transaccion(user_chat_id, 1, origen="telegram")
                 if not success:
                     await update.message.reply_text(mensaje)
         except ValueError as e:
-            await update.message.reply_text(f"Error: {str(e)}")
+            await update.message.reply_text(f"Error: {e}")
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando las fechas para noticias: {e}")
-
         finally:
-            # Limpiar el estado del usuario
             if user_chat_id in user_states:
                 user_states[user_chat_id]["fecha_inicio"] = None
                 user_states[user_chat_id]["fecha_fin"] = None
                 user_states[user_chat_id]["estado"] = "disponible"
             mark_user_state(chat_id=user_chat_id, estado="disponible")
-    
-    elif estado_firestore == "esperando_fechas_noticias_admin":
-        try:
-            await update.message.reply_text(f"Empezamos a obtenerla información, espere un momento por favor.")
+        return
 
-            fechas = update.message.text.split()
-            if len(fechas) != 1:
+    # ───────────────────────────────
+    # 4) Noticias por fecha (admin, recorre varios símbolos)
+    # ───────────────────────────────
+    if estado_firestore == "esperando_fechas_noticias_admin":
+        try:
+            await update.message.reply_text("Empezamos a obtener la información, espera un momento por favor.")
+
+            partes = (update.message.text or "").split()
+            if len(partes) != 1:
                 raise ValueError("Debes ingresar una fecha en formato YYYY-MM-DD.")
 
-            fecha_inicio = pd.to_datetime(fechas[0], format="%Y-%m-%d", errors='coerce').tz_localize(timezone_country)
-            fecha_fin = fecha_inicio
+            fecha_inicio = pd.to_datetime(partes[0], format="%Y-%m-%d", errors='coerce')
             if pd.isnull(fecha_inicio):
                 raise ValueError("Formato de fecha inválido.")
+            fecha_inicio = fecha_inicio.tz_localize(timezone_country)
+            fecha_fin = fecha_inicio
 
-            fecha_hoy = datetime.now(timezone_country).replace(tzinfo=timezone_country).date()
+            hoy_local = datetime.now(timezone_country).date()
+            if fecha_fin.date() > hoy_local:
+                raise ValueError("La fecha no puede ser mayor que hoy para noticias.")
 
-            # Validaciones para noticias
-            if fecha_fin.date() > fecha_hoy:
-                raise ValueError("La fecha final no puede ser mayor que hoy para noticias.")
-
-            user_states[user_chat_id]["fecha_inicio"] = fecha_inicio
-            user_states[user_chat_id]["fecha_fin"] = fecha_fin
+            st = user_states.setdefault(user_chat_id, {})
+            st["fecha_inicio"] = fecha_inicio
+            st["fecha_fin"] = fecha_fin
             actualizar_estado_usuario(user_chat_id, "en ejecución")
             mark_user_state(chat_id=user_chat_id, estado="en ejecución")
 
-            # Obtener noticias
             activos_filtrados = filtrar_activos_por_moneda(activos, 'todos')
-            todas_las_noticias = []  # Lista para acumular todas las noticias
+            hubo_algo = False
 
             for symbol in activos_filtrados:
-                noticias = obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=2) #symbol, fecha_inicio=None, fecha_fin=None, limite=50, max_reintentos=3, tiempo_espera_inicial=5
-                
-                if noticias.empty:
-                    continue  # No hay noticias, continuar con el siguiente símbolo
-
-                # Verificar si las columnas esperadas existen
+                noticias = obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=2)
+                if noticias is None or getattr(noticias, "empty", True):
+                    continue
                 if not all(col in noticias.columns for col in ['symbol', 'publishedDate', 'url', 'title']):
-                    logger.info(f"Las columnas esperadas no están presentes en el DataFrame para el símbolo {symbol}: {noticias.columns.tolist()}")
-                    continue  # O manejar de otra forma según tus necesidades
-                
-                todas_las_noticias.append(noticias)
+                    logger.info(f"Columnas inesperadas para {symbol}: {list(noticias.columns)}")
+                    continue
 
-            if not todas_las_noticias:
-                await update.message.reply_text("No se encontraron noticias en el rango de fechas especificado.")
-                return
-
-            # Enviar mensajes de cada noticia
-            for noticias in todas_las_noticias:
                 noticias_del_dia = noticias[noticias['publishedDate'].dt.date == fecha_inicio.date()]
-                for index, noticia in noticias_del_dia.iterrows():
-                    title = noticia['title']
-                    sitio = noticia['site']
-                    text = noticia['text'] if 'text' in noticia else 'Sin Descripción'
-                    symbol = noticia['symbol']
-                    fecha = noticia['publishedDate'].strftime('%Y-%m-%d %H:%M:%S')
-                    importancia = analizar_importancia(title + ' ' + text) 
-                    url = noticia['url']
-                    link_traductor = f"https://translate.google.com/translate?sl=auto&tl=es&u={url}"  # Enlace a Google Translate
+                if noticias_del_dia.empty:
+                    continue
+
+                hubo_algo = True
+                for _, noticia in noticias_del_dia.iterrows():
+                    title = noticia.get('title', '')
+                    sitio = noticia.get('site', 'No especificado')
+                    text = noticia.get('text', 'Sin Descripción') or 'Sin Descripción'
+                    sym  = noticia.get('symbol', symbol)
+                    fecha = noticia['publishedDate']
+                    try:
+                        fecha_str = fecha.strftime('%Y-%m-%d %H:%M:%S')
+                    except Exception:
+                        fecha_str = str(fecha)
+                    importancia = analizar_importancia(f"{title} {text}")
+                    url = noticia.get('url', '')
+                    link_traductor = f"https://translate.google.com/translate?sl=auto&tl=es&u={url}"
 
                     mensaje = (
                         f"Titulo: {title}\n"
                         f"Descripción: {text}\n"
-                        f"Activo: {symbol}\n"
-                        f"Fecha: {fecha}\n"
+                        f"Activo: {sym}\n"
+                        f"Fecha: {fecha_str}\n"
                         f"Sitio: {sitio}\n"
                         f"Importancia: {importancia}\n"
                         f"Link: {url}\n"
                         f"Link Traducido: {link_traductor}\n"
                     )
+                    await enviar_mensaje_noticias(context, user_chat_id, mensaje)
 
-                    await enviar_mensaje_noticias(context, user_chat_id, mensaje)                
+            if not hubo_algo:
+                await update.message.reply_text("No se encontraron noticias en la fecha indicada.")
+                return
 
             if not es_administrador(user_chat_id):
-                success, mensaje = await descontar_transaccion(user_chat_id, 1)
+                success, mensaje = await descontar_transaccion(user_chat_id, 1, origen="telegram")
                 if not success:
-                    await update.message.reply_text(mensaje)        
-        
+                    await update.message.reply_text(mensaje)
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando las fechas para noticias: {e}")
-
         finally:
-            # Limpiar el estado del usuario
             if user_chat_id in user_states:
                 user_states[user_chat_id]["fecha_inicio"] = None
                 user_states[user_chat_id]["fecha_fin"] = None
                 user_states[user_chat_id]["estado"] = "disponible"
             mark_user_state(chat_id=user_chat_id, estado="disponible")
-    
-    elif estado_firestore == "modo_envio_mensaje":
+        return
+
+    # ───────────────────────────────
+    # 5) Modo envío de mensaje (admin)
+    # ───────────────────────────────
+    if estado_firestore == "modo_envio_mensaje":
         try:
-            mensaje_usuario = update.message.text if update.message.text else update.message.caption  # Capturar mensaje en texto o caption
-            archivos_guardados = []  # Lista para almacenar rutas de archivos
+            mensaje_usuario = update.message.text if update.message.text else update.message.caption
+            archivos_guardados = []
 
-            # 📸 Capturar imágenes
             if update.message.photo:
-                imagen_usuario = update.message.photo[-1]  # Toma la mejor calidad
-                file_id = imagen_usuario.file_id
-                archivos_guardados.append({"tipo": "imagen", "file_id": file_id})
+                imagen = update.message.photo[-1]
+                archivos_guardados.append({"tipo": "imagen", "file_id": imagen.file_id})
 
-            # 🎥 Capturar videos
             if update.message.video:
-                video_usuario = update.message.video
-                file_id = video_usuario.file_id
-                archivos_guardados.append({"tipo": "video", "file_id": file_id})
+                video = update.message.video
+                archivos_guardados.append({"tipo": "video", "file_id": video.file_id})
 
-            # 📂 Capturar documentos
             if update.message.document:
-                documento_usuario = update.message.document
-                file_id = documento_usuario.file_id
-                archivos_guardados.append({"tipo": "documento", "file_id": file_id})
+                doc = update.message.document
+                archivos_guardados.append({"tipo": "documento", "file_id": doc.file_id})
 
-            # Obtener destinatario manual si existe
-            user_ref = _user_state_doc(user_id=user_id, chat_id=user_chat_id)
-            user_data = user_ref.get().to_dict() if user_ref.get().exists else {}
+            # Resolver user_id (si tienes mapeo chat->user)
+            user_id_val = None
+            try:
+                user_id_val = str(_user_id_from_chat(user_chat_id))
+            except Exception:
+                user_id_val = None
+
+            # Guardar mensaje y adjuntos en Firestore (estado del admin)
+            ref = _user_state_doc(user_id=user_id_val, chat_id=user_chat_id)
+            snap = ref.get()
+            user_data = snap.to_dict() if getattr(snap, "exists", False) else {}
             destinatario_manual = user_data.get("destinatario_manual")
 
-            # Guardar mensaje en Firestore
-            user_ref.set({
+            ref.set({
                 "mensaje_admin": mensaje_usuario,
                 "archivos_guardados": archivos_guardados,
-                "destinatario_manual": destinatario_manual  # Mantener para `confirmar_envio`
+                "destinatario_manual": destinatario_manual
             }, merge=True)
 
-            # Botones para confirmar o cancelar el envío
             keyboard = [
                 [InlineKeyboardButton("✅ Confirmar Envío", callback_data="confirmar_envio")],
                 [InlineKeyboardButton("❌ Cancelar", callback_data="cancelar_envio_mensaje")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-
             await update.message.reply_text("📩 ¿Confirmas el envío del mensaje?", reply_markup=reply_markup)
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando el envío del mensaje: {e}")
+        finally:
             mark_user_state(chat_id=user_chat_id, estado="disponible")
+        return
 
-
-    elif estado_firestore == "esperando_id_usuario":
+    # ───────────────────────────────
+    # 6) Esperando id de usuario para envío
+    # ───────────────────────────────
+    if estado_firestore == "esperando_id_usuario":
         try:
-            await recibir_usuario_especifico(update, context)  # Redirigir a función de ingreso de ID
+            await recibir_usuario_especifico(update, context)
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando el envío del mensaje a un usuario específico: {e}")
+        finally:
             mark_user_state(chat_id=user_chat_id, estado="disponible")
+        return
 
-    elif estado_firestore == "esperando_grafico_ia":
+    # ───────────────────────────────
+    # 7) Análisis de gráfico con IA a partir de imagen
+    # ───────────────────────────────
+    if estado_firestore == "esperando_grafico_ia":
+        ruta_local = None
+        ruta_salida = None
         try:
             if not update.message.photo:
                 await update.message.reply_text("⚠️ Por favor, sube una imagen válida.")
@@ -7474,7 +7517,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             if not es_grafico_de_velas(ruta_local):
                 await update.message.reply_text("❌ No parece ser un gráfico de velas. Intenta con otra imagen.")
                 return
-            
+
             await update.message.reply_text("Empezó el análisis...")
 
             ruta_salida, texto_resultado = analizar_con_yolo(ruta_local)
@@ -7484,24 +7527,25 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 await update.message.reply_text(texto_resultado)
 
             if not es_administrador(user_chat_id):
-                success, mensaje = await descontar_transaccion(user_chat_id, 1)
+                success, mensaje = await descontar_transaccion(user_chat_id, 1, origen="telegram")
                 if not success:
-                    await update.message.reply_text(mensaje)    
-
+                    await update.message.reply_text(mensaje)
         except Exception as e:
             await update.message.reply_text(f"Hubo un error analizando la imagen: {e}")
-
         finally:
             mark_user_state(chat_id=user_chat_id, estado="disponible")
             try:
-                if os.path.exists(ruta_local):
+                if ruta_local and os.path.exists(ruta_local):
                     os.remove(ruta_local)
-                if 'ruta_salida' in locals() and os.path.exists(ruta_salida):
+                if ruta_salida and os.path.exists(ruta_salida):
                     os.remove(ruta_salida)
             except Exception as cleanup_error:
                 print(f"⚠️ Error al eliminar archivos temporales: {cleanup_error}")
+        return
 
 
+
+#@profile
 async def recibir_usuario_especifico(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Guarda el ID del usuario específico y activa el modo de envío de mensaje."""
     user_chat_id = str(update.effective_chat.id)
@@ -7520,6 +7564,7 @@ async def recibir_usuario_especifico(update: Update, context: ContextTypes.DEFAU
     await update.message.reply_text(f"✅ Usuario {message_text} seleccionado. Ahora envía el mensaje o archivo.")
 
 
+#@profile
 async def enviar_mensaje_noticias(context, user_chat_id, mensaje):
     try:
         await context.bot.send_message(chat_id=user_chat_id, text=mensaje)
@@ -7611,7 +7656,7 @@ async def ejecutar_recurrente(
         return
 
     # --- Evitar duplicados en ejecución (por chat) ---
-    if user_chat_id and return_state(user_chat_id) == "en ejecución":
+    if user_chat_id and return_state(chat_id=user_chat_id) == "en ejecución":
         if send_to_tg:
             await context.bot.send_message(
                 chat_id=user_chat_id,
@@ -7712,6 +7757,7 @@ async def ejecutar_recurrente(
             mark_user_state(chat_id=user_chat_id, estado="disponible")
 
 
+#@profile
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Maneja el comando /stop para eliminar el chat_id del registro."""
     user_chat_id = str(update.effective_chat.id)
@@ -7722,6 +7768,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Has sido eliminado del registro. Si deseas volver a usar el bot, usa el comando /start.")
 
+#@profile
 async def start(update: Update, context):
     """Función que maneja el comando /start y guarda el chat_id del usuario."""
     user_chat_id = str(update.effective_chat.id)
@@ -7745,6 +7792,7 @@ async def start(update: Update, context):
 
 
 # Función para mostrar el menú principal
+#@profile
 async def trader_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_chat_id = str(update.effective_chat.id)
@@ -7762,6 +7810,7 @@ async def trader_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await menu(update, context)
 
 
+#@profile
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     global categorias
@@ -7836,6 +7885,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text="Opción no válida. Por favor, selecciona nuevamente.")
 
 
+#@profile
 async def seleccionar_par(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_chat_id = str(update.callback_query.message.chat_id)
 
@@ -7862,7 +7912,7 @@ async def seleccionar_par(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Obtener o inicializar el estado del usuario
     estado_usuario = obtener_estado_usuario(user_chat_id)
 
-    if  return_state(user_chat_id) == "en ejecución":
+    if  return_state(chat_id=user_chat_id) == "en ejecución":
         await context.bot.send_message(
             chat_id=user_chat_id, 
             text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
@@ -7881,6 +7931,7 @@ async def seleccionar_par(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # Menú principal
+#@profile
 async def menu_usuario_administrador(context: ContextTypes.DEFAULT_TYPE, user_chat_id):
     """El menú del usuario registrado."""
     try:
@@ -7910,6 +7961,7 @@ async def menu_usuario_administrador(context: ContextTypes.DEFAULT_TYPE, user_ch
 
 
 
+#@profile
 async def menu_usuario_registrado(bot, user_chat_id):
     """El menú del usuario registrado según su estado de suscripción."""
     try:
@@ -7942,6 +7994,7 @@ async def menu_usuario_registrado(bot, user_chat_id):
         logger.info(f"Error al resetear el menú para el usuario {user_chat_id}: {e}")
 
 
+#@profile
 async def resetear_menu_usuario(context: ContextTypes.DEFAULT_TYPE, user_chat_id: int):
     """Resetea el menú del usuario a la configuración principal."""
     global timezone_country
@@ -7956,12 +8009,14 @@ async def resetear_menu_usuario(context: ContextTypes.DEFAULT_TYPE, user_chat_id
     except Exception as e:
         logger.info(f"Error al resetear el menú para el usuario {user_chat_id}: {e}")
 
+#@profile
 async def comando_reset_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando para que un usuario pueda resetear su menú."""
     global timezone_country
     user_chat_id = update.effective_chat.id
     await resetear_menu_usuario(context, user_chat_id)
 
+#@profile
 async def cargar_datos_subscription_user():
     try:
         docs = db.collection("suscripciones_user").stream()
@@ -7971,6 +8026,7 @@ async def cargar_datos_subscription_user():
         return {}
 
 
+#@profile
 async def cargar_datos_subscription_type():
     """Carga los datos de tipos de suscripción desde Firestore y los ordena según el tipo (solo para bot o ambos)."""
     try:
@@ -8003,6 +8059,7 @@ async def cargar_datos_subscription_type():
         return {}
 
 
+#@profile
 async def guardar_datos(data: dict):
     """data = {user_id: {...campos...}}"""
     try:
@@ -8029,268 +8086,60 @@ async def guardar_datos(data: dict):
 
 
 # Función para verificar si un usuario es administrador
+#@profile
 def es_administrador(user_id):
     return user_id in admin_ids
 
-# Función para agregar un usuario a la lista de suscritos
-async def agregar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    subscriptions = await cargar_datos_subscription_user()
-    user_chat_id = str(update.effective_user.id)
-    if not es_administrador(user_chat_id):
-        await update.message.reply_text("No tienes permisos para usar este comando.")
-        return
 
-    args = context.args
-    if len(args) < 3 or len(args) > 4:
-        await update.message.reply_text("Uso: /agregar_suscripcion <user_id> <tipo_suscripcion> <nombre_usuario> [hash_transaccion]")
-        return
-
-    user_id, tipo_suscripcion, nombre_usuario = args[:3]
-    user_id = int(user_id)
-    
-    # Obtener el hash_transaccion si se proporciona
-    hash_transaccion = args[3] if len(args) == 4 else None
-
-    # Validar el tipo de suscripción
-    if tipo_suscripcion not in subscriptions_type:
-        await update.message.reply_text("Tipo de suscripción no válido.")
-        return
-
-    # Obtener los detalles de la suscripción
-    detalles_suscripcion = subscriptions_type[tipo_suscripcion]
-    duracion = detalles_suscripcion["duracion"]
-
-    if duracion == "1 mes":
-        dias =30
-    elif duracion == "6 meses":
-        dias = 30 * 6
-    elif duracion == "1 año":
-        dias = 365
-    else:
-        await update.message.reply_text("Duración de la suscripción no reconocida.")
-        return
-
-
-    inicio = datetime.now()
-    fin = inicio + timedelta(days=dias)
-
-    # Generar el ID de pago
-    id_pago = generar_hash(str(user_id), tipo_suscripcion)
-
-    # Actualizar las suscripciones
-    subscriptions[user_id] = {
-        "nombre_usuario": nombre_usuario,
-        "id_pago": id_pago,  # Agregar el id_pago a la suscripción
-        "inicio": inicio.isoformat(),
-        "fin": fin.isoformat(),
-        "limite_transacciones": detalles_suscripcion["transacciones_maximas"],  # Límite de transacciones
-        "transacciones_restantes": detalles_suscripcion["transacciones_maximas"],
-        "opciones": detalles_suscripcion["opciones"]  # Opciones de la suscripción
-    }
-    await guardar_datos(subscriptions)
-
-    # Agregar pago pendiente
-    pagos_pendientes = await cargar_pagos_pendientes()
-
-    pago_info = {
-        "user_id": str(user_id),
-        "monto": detalles_suscripcion["precio"],
-        "id_pago": id_pago,
-        "estado": "verificado",  # O "pendiente" si así lo deseas
-        "suscripcion": tipo_suscripcion,
-        "fecha": datetime.now().isoformat()
-    }
-    
-    # Incluir el hash_transaccion si se proporcionó
-    if hash_transaccion:
-        pago_info["hash_transaccion"] = hash_transaccion
-
-    index_existente = next(
-        (index for index, pago in enumerate(pagos_pendientes["pendientes"]) if pago["user_id"] == str(user_id) and pago["estado"] == "pendiente"), 
-        None
-    )
-
-    if index_existente is not None:
-        # Reemplazar el pago existente con el nuevo
-        pagos_pendientes["pendientes"][index_existente] = pago_info
-        logger.info(f"Pago pendiente actualizado para el usuario {user_id}.")
-    else:
-        # Agregar un nuevo pago pendiente
-        pagos_pendientes["pendientes"].append(pago_info)
-        logger.info(f"Nuevo pago pendiente agregado para el usuario {user_id}.")
-
-    guardar_pagos_pendientes(pagos_pendientes)
-
-    await update.message.reply_text(
-        f"Suscripción agregada para {nombre_usuario}. Tu ID de pago es {id_pago}."
-        + (f"\nHash de transacción: {hash_transaccion}" if hash_transaccion else "")
-    )
-
-async def eliminar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_chat = str(update.effective_user.id)
-    if not es_administrador(admin_chat):
-        await update.message.reply_text("No tienes permisos para usar este comando.")
-        return
-
-    if len(context.args) != 1:
-        await update.message.reply_text("Uso: /eliminar_suscripcion <user_id|telegram_id>")
-        return
-
-    arg = context.args[0]
-
-    # Resolver user_id (si pasaron un chat_id de TG)
-    user_id = arg
-    if not _subscription_doc(user_id).get().exists:  # no es user_id => intenta como chat_id
-        maybe = _user_id_from_chat(arg)
-        if maybe:
-            user_id = maybe
-
-    doc_ref = _subscription_doc(user_id)
-    snap = doc_ref.get()
-    if not snap.exists:
-        await update.message.reply_text(f"No se encontró suscripción para ID: {arg}.")
-        return
-
-    nombre = (snap.to_dict() or {}).get("nombre_usuario", "Usuario")
+def parse_iso_aware(s: str):
+    # Acepta ISO con o sin tz. Devuelve AWARE (UTC) o None.
     try:
-        doc_ref.delete()
-        # opcional: limpiar índice chat_ids si existía
-        tg = (snap.to_dict() or {}).get("telegram_id")
-        if tg:
-            db.collection("chat_ids").document(str(tg)).delete()
-
-        global subscriptions
-        subscriptions = await cargar_datos_subscription_user()
-        await update.message.reply_text(f"✅ Suscripción eliminada para {nombre} (user_id: {user_id}).")
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Error al eliminar: {e}")
-
-
-# Función para verificar el estado de suscripción de un usuario
-async def verificar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global subscriptions
-    subscriptions = await cargar_datos_subscription_user()
-
-    chat_id = str(update.effective_user.id)          # TG
-    user_id = _user_id_from_chat(chat_id) or chat_id # si no hay mapping, intenta mismo id
-
-    suscripcion = subscriptions.get(user_id)
-    if suscripcion:
-        inicio = datetime.fromisoformat(suscripcion["inicio"])
-        fin    = datetime.fromisoformat(suscripcion["fin"])
-        trans  = suscripcion.get("transacciones_restantes", 0)
-
-        if fin < datetime.now(pytz.utc):
-            estado = "expirada"
-            msg = f"Tu suscripción está {estado}.\nInicio: {inicio}\nFin: {fin}"
-        elif int(trans) <= 0:
-            estado = "inactiva"
-            msg = f"Tu suscripción está {estado}.\nTransacciones restantes: {trans}"
-        else:
-            estado = "activa"
-            msg = f"Tu suscripción está {estado}.\nInicio: {inicio}\nFin: {fin}\nTransacciones restantes: {trans}"
-            await menu_usuario_registrado(context.bot, chat_id)
-        await update.message.reply_text(msg)
-
-    elif es_administrador(chat_id):
-        await update.message.reply_text("No necesitas suscripción, eres administrador!")
-        await menu_usuario_administrador(context, chat_id)
-    else:
-        await update.message.reply_text("No tienes una suscripción activa. Contacta un administrador.")
-
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except Exception:
+        return None
 
 # Devuelve: 'activa' | 'expirada' | 'inactiva' | 'transacciones_insuficientes' | 'sin suscripción'
 # user_key puede ser user_id (app) o chat_id (bot).
-async def estado_suscripcion(
-    user_key: str | None = None,                 # compat: antes venía como primer arg (chat_id)
-    numero_transacciones: int = 1,
-    *,
-    user_id: str | None = None,                  # app
-    chat_id: str | None = None,                  # bot (telegram_id)
-    origen: str | None = None,
-) -> str:
+#@profile
+async def estado_suscripcion(*, user_id: str | None = None, chat_id: str | None = None) -> str:
     """
-    Devuelve: 'activa' | 'expirada' | 'inactiva' | 'transacciones_insuficientes' | 'sin suscripción'.
-    - Prefiere user_id; si no hay, usa user_key; si no, chat_id.
-    - Lee la suscripción en suscripciones_user (primero por user_id; si no existe, intenta con chat_id).
+    Devuelve 'activa' | 'inactiva' basado en Firestore suscripciones_user.
+    Actualiza a 'inactiva' si expiró o sin transacciones.
     """
     try:
-        key = (user_id or user_key or chat_id or "").strip()
-        if not key:
-            return "sin suscripción"
+        cand_ids = []
+        if user_id: cand_ids.append(str(user_id))
+        if chat_id: cand_ids.append(str(chat_id))
 
-        col = db.collection("suscripciones_user")
-        doc = col.document(key).get()
+        # 1) Busca por user_id primero
+        for key in cand_ids:
+            doc_ref = db.collection("suscripciones_user").document(key)
+            snap = doc_ref.get()
+            if snap.exists:
+                sus = snap.to_dict() or {}
+                fin  = parse_iso_aware(sus.get("fin") or "")
+                rest = int(sus.get("transacciones_restantes", 0))
+                ahora = now_utc()
 
-        # compat: espejo por telegram_id
-        if not doc.exists and chat_id:
-            doc = col.document(str(chat_id)).get()
+                estado = "activa" if (fin and fin >= ahora and rest > 0) else "inactiva"
+                if (sus.get("estado") or "").lower() != estado:
+                    try:
+                        doc_ref.set({"estado": estado, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+                    except Exception as e:
+                        logger.info(f"estado_suscripcion: no se pudo guardar estado: {e}")
+                return estado
 
-        if not doc.exists:
-            return "sin suscripción"
-
-        s = doc.to_dict() or {}
-
-        # fecha fin
-        fin_str = s.get("fin")
-        if not fin_str:
-            return "sin suscripción"
-
-        # tolerante a ISO con/ sin 'Z'
-        try:
-            fin = datetime.fromisoformat(fin_str.replace("Z", "+00:00"))
-        except Exception:
-            fin = None
-        if not fin:
-            return "sin suscripción"
-
-        if fin < datetime.now(timezone.utc):
-            return "expirada"
-
-        rest = int(s.get("transacciones_restantes", s.get("limite_transacciones", 0)) or 0)
-        if rest <= 0:
-            return "inactiva"
-        if numero_transacciones > rest:
-            return "transacciones_insuficientes"
-
-        return "activa"
-
+        return "inactiva"
     except Exception as e:
-        logger.warning(f"estado_suscripcion falló: {e}")
-        return "sin suscripción"
-
-# Función para listar todas las suscripciones (solo admin)
-async def listar_suscripciones(update: Update, context: CallbackContext):
-    subscriptions = await cargar_datos_subscription_user()
-    user_chat_id = str(update.effective_user.id)
-    if not es_administrador(user_chat_id):
-        await update.message.reply_text("No tienes permisos para usar este comando.")
-        return
-
-    if not subscriptions:
-        await update.message.reply_text("No hay usuarios suscritos.")
-        return
-
-    mensaje = "Suscripciones actuales:\n"
-    for user_id, data in subscriptions.items():
-        inicio = datetime.fromisoformat(data["inicio"])
-        fin = datetime.fromisoformat(data["fin"])
-        estado = "activa" if fin >= datetime.now() else "expirada"
-        transacciones_restantes = data.get("transacciones_restantes", 0)  # Obtener las transacciones restantes
-        
-        mensaje += (
-            f"- {data['nombre_usuario']} (ID: {user_id})\n"
-            f"  Id Pago: {data['id_pago']}\n"  # Se corrigió las comillas para acceder a 'id_pago'
-            f"  Inicio: {inicio}\n"
-            f"  Fin: {fin}\n"
-            f"  Estado: {estado}\n"
-            f"  Transacciones Restantes: {transacciones_restantes}\n\n"  # Añadir el número de transacciones restantes
-        )
-
-    await update.message.reply_text(mensaje)
+        logger.info(f"estado_suscripcion error: {e}")
+        return "inactiva"
 
 
 # Función para cargar pagos pendientes
+#@profile
 async def cargar_pagos_pendientes():
     """Carga los pagos pendientes desde Firestore o devuelve una estructura vacía si no hay datos."""
     try:
@@ -8313,6 +8162,7 @@ async def cargar_pagos_pendientes():
 
 
 # Función para guardar pagos pendies
+#@profile
 def guardar_pagos_pendientes(data):
     """Guarda o actualiza un pago pendiente en Firestore."""
     try:
@@ -8336,90 +8186,67 @@ from datetime import datetime, timezone
 #   - _user_id_from_chat(chat_id): devuelve el user_id (si usas Telegram)
 # Si no usas Telegram en ese entorno, simplemente no pases origen="telegram".
 
-async def obtener_opciones_usuario(user_key: str, origen: str | None = None):
+#@profile
+async def obtener_opciones_usuario(user_or_chat_id: str, *, origen: str = "telegram") -> list[str]:
     """
-    Devuelve la lista de opciones del usuario.
-    - user_key puede ser user_id (APP) o chat_id (BOT).
-    - origen opcional: "app" | "telegram". Si no se pasa, se autodetecta.
-    Idempotente y tolerante a formatos ISO (con o sin 'Z').
+    Lee opciones desde Firestore (suscripciones_user) priorizando user_id; si no, telegram_id.
+    Si fin expiró => marca 'inactiva' y guarda. Devuelve [] si no activa o sin doc.
     """
     try:
-        global subscriptions
-        key = str(user_key or "").strip()
-        if not key:
-            return []
-
-        # ----- Resolver user_id según el origen -----
-        user_id = None
-        if origen:
+        # 1) Resolver ids
+        uid = _user_id_from_chat(user_or_chat_id) if (origen or "telegram").lower() == "telegram" else user_or_chat_id
+        uid = str(uid or user_or_chat_id).strip()
+        tg  = None
+        try:
+            # Si no encontramos por user_id, intentamos por chat_id
             if origen.lower() == "telegram":
-                try:
-                    user_id = str(_user_id_from_chat(key))
-                except Exception:
-                    user_id = None
-            else:  # "app" u otro => ya es user_id
-                user_id = key
+                tg = str(user_or_chat_id).strip()
+        except:
+            tg = None
+
+        # 2) Intento 1: user_id
+        doc_ref = db.collection("suscripciones_user").document(uid)
+        snap = doc_ref.get()
+        sus = snap.to_dict() if snap.exists else None
+
+        # 3) Intento 2: telegram_id
+        if not sus and tg:
+            doc_ref_tg = db.collection("suscripciones_user").document(tg)
+            snap_tg = doc_ref_tg.get()
+            if snap_tg.exists:
+                sus = snap_tg.to_dict()
+                doc_ref = doc_ref_tg  # trabajar sobre este
+
+        if not sus:
+            return []
+
+        fin  = parse_iso_aware(sus.get("fin") or "")
+        rest = int(sus.get("transacciones_restantes", 0))
+        estado = (sus.get("estado") or "").lower().strip() or "inactiva"
+
+        # 4) Normalizar estado por fechas y transacciones
+        ahora = now_utc()
+        if not fin or fin < ahora:
+            estado_nuevo = "inactiva"
+        elif rest <= 0:
+            estado_nuevo = "inactiva"
         else:
-            # Autodetección: si la clave ya existe en subscriptions, úsala como user_id
-            if key in subscriptions:
-                user_id = key
-            else:
-                # Intentar mapear desde chat_id -> user_id
-                try:
-                    uid = _user_id_from_chat(key)
-                    uid = str(uid) if uid is not None else ""
-                    user_id = uid if uid in subscriptions else key
-                except Exception:
-                    user_id = key
+            estado_nuevo = "activa"
 
-        suscripcion = subscriptions.get(user_id)
-        if not suscripcion:
-            return []
-
-        # ----- Chequeos de estado / expiración -----
-        estado = (suscripcion.get("estado") or "").lower()
-        fin_raw = suscripcion.get("fin")
-
-        # Si ya está marcada como inactiva, corta.
-        if estado == "inactiva":
-            return []
-
-        # Parse de fecha fin (acepta datetime o ISO string con o sin 'Z')
-        fin_dt = None
-        if isinstance(fin_raw, datetime):
-            fin_dt = fin_raw
-        elif isinstance(fin_raw, str) and fin_raw:
-            fin_str = fin_raw.replace("Z", "+00:00")
+        if estado != estado_nuevo:
+            sus["estado"] = estado_nuevo
             try:
-                fin_dt = datetime.fromisoformat(fin_str)
-            except Exception:
-                try:
-                    fin_dt = datetime.strptime(fin_raw[:19], "%Y-%m-%dT%H:%M:%S")
-                except Exception:
-                    fin_dt = None
+                doc_ref.set({"estado": estado_nuevo, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+            except Exception as e:
+                logger.info(f"No se pudo normalizar estado suscripción: {e}")
 
-        # Comparación segura (naive/aware)
-        if fin_dt is not None:
-            now = datetime.now(fin_dt.tzinfo) if fin_dt.tzinfo else datetime.now()
-            if now > fin_dt:
-                suscripcion["estado"] = "inactiva"
-                try:
-                    await guardar_datos(subscriptions)
-                except Exception:
-                    pass
-                return []
-
-        # ----- OK: devolver opciones -----
-        opts = suscripcion.get("opciones") or []
-        # Normaliza a lista de strings
-        if isinstance(opts, (list, tuple)):
-            return [str(o) for o in opts if o is not None]
-        return []
-    except Exception:
-        # Silencioso: en caso de error, no bloquear la operación
+        return sus.get("opciones", []) if estado_nuevo == "activa" else []
+    except Exception as e:
+        logger.info(f"obtener_opciones_usuario error: {e}")
         return []
 
 
+#@profile
 async def mostrar_menu_suscripciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Despliega el menú de suscripciones para que el usuario seleccione."""
     user_id = update.effective_chat.id
@@ -8439,12 +8266,14 @@ async def mostrar_menu_suscripciones(update: Update, context: ContextTypes.DEFAU
 
 
 
+#@profile
 async def cancelar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Maneja la cancelación de la selección de suscripción."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("Has cancelado la selección de la suscripción... ")
 
+#@profile
 async def cancelar_zonas_horarias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Maneja la cancelación de la selección del timezone."""
     query = update.callback_query
@@ -8452,11 +8281,906 @@ async def cancelar_zonas_horarias(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text("Has cancelado la selección del timezone... ")
 
 
+#@profile
 async def volver_al_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Volver al menú principal"""
     await mostrar_menu_suscripciones(update, context)
 
+#@profile
+def _suscripciones_col():
+    return db.collection("suscripciones_user")
 
+#@profile
+def _user_ids_col():
+    return db.collection("user_ids")  # mapea user_id <-> telegram_id
+
+#@profile
+def _resolve_user_uuid(user_id: Optional[str], chat_id: Optional[str]) -> Optional[str]:
+    """
+    - Si viene user_id (APP), úsalo.
+    - Si no hay user_id pero hay chat_id, intenta mapear; si no, usa chat_id tal cual como uid.
+    """
+    if user_id:
+        return str(user_id)
+    if chat_id:
+        try:
+            mapped = _user_id_from_chat(str(chat_id))
+            if mapped:
+                return str(mapped)
+        except Exception:
+            pass
+        return str(chat_id)
+    return None
+
+#@profile
+def _now_utc():
+    return datetime.now(dt_timezone.utc)
+
+#@profile
+def _parse_dt_mixed(v) -> Optional[datetime]:
+    """
+    Acepta Timestamp de Firestore, ISO string o None.
+    Devuelve datetime UTC aware.
+    """
+    if v is None:
+        return None
+    try:
+        # Firestore Timestamp
+        if hasattr(v, "timestamp"):
+            return datetime.fromtimestamp(v.timestamp(), tz=dt_timezone.utc)
+        # pandas Timestamp
+        if hasattr(v, "to_pydatetime"):
+            d = v.to_pydatetime()
+            return d if d.tzinfo else d.replace(tzinfo=dt_timezone.utc)
+        # ISO string
+        d = pd.to_datetime(v, utc=True, errors="coerce")
+        if pd.isna(d):
+            return None
+        return d.to_pydatetime()
+    except Exception:
+        return None
+
+#@profile
+def _build_sub_doc_id(user_uuid: str, origen: str) -> str:
+    """
+    Creamos un doc-id estable por origen, pero SIEMPRE consultamos por campo user_id en queries.
+    """
+    origen_norm = (origen or "telegram").lower()
+    return f"{user_uuid}__{origen_norm}"
+
+#@profile
+def _options_from_catalog(tipo_suscripcion: str) -> Tuple[List[str], int, str]:
+    """
+    Lee desde tu diccionario subscriptions_type.
+    Retorna (opciones, transacciones_maximas, duracion_texto)
+    """
+    st = subscriptions_type.get(tipo_suscripcion, {})
+    opts = list(st.get("opciones", []))
+    txs = int(st.get("transacciones_maximas", 0))
+    dur = str(st.get("duracion", "1 mes"))
+    return (opts, txs, dur)
+
+#@profile
+def _calc_fin_from_text(duracion_texto: str, inicio: datetime) -> datetime:
+    dur = (duracion_texto or "").lower()
+    if "año" in dur or "ano" in dur:
+        n = int(pd.to_numeric(dur.split()[0], errors="coerce")) if dur.split() else 1
+        return inicio + timedelta(days=365*n)
+    if "mes" in dur:
+        n = int(pd.to_numeric(dur.split()[0], errors="coerce")) if dur.split() else 1
+        return inicio + timedelta(days=30*n)
+    if "semana" in dur:
+        n = int(pd.to_numeric(dur.split()[0], errors="coerce")) if dur.split() else 1
+        return inicio + timedelta(days=7*n)
+    return inicio + timedelta(days=30)
+
+#@profile
+def _get_all_subs_for_user(user_uuid: str) -> List[Any]:
+    try:
+        qs = _suscripciones_col().where("user_id", "==", user_uuid).stream()
+        return list(qs)
+    except Exception as e:
+        logging.warning(f"[subs] No se pudieron obtener suscripciones para {user_uuid}: {e}")
+        return []
+
+#@profile
+def _pick_active_or_latest(sub_snaps: List[Any]) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+    """
+    De una lista de docs de suscripciones, elige la activa (fin>=now y estado!='inactiva' y tx>0).
+    Si no hay activa, elige la más reciente por 'fin'.
+    """
+    now = _now_utc()
+    best = None
+    best_data = None
+    latest = None
+    latest_data = None
+
+    for s in sub_snaps:
+        data = s.to_dict() or {}
+        fin = _parse_dt_mixed(data.get("fin"))
+        tx = int(data.get("transacciones_restantes", 0))
+        estado = str(data.get("estado") or "").lower()
+        if fin and fin >= now and estado != "inactiva" and tx > 0:
+            # candidata activa
+            if (best is None) or (_parse_dt_mixed(best_data.get("fin")) or now) < fin:
+                best = s
+                best_data = data
+        # track más reciente
+        if fin and ((latest is None) or (_parse_dt_mixed(latest_data.get("fin")) or now) < fin):
+            latest = s
+            latest_data = data
+
+    return (best or latest, best_data or latest_data)
+
+#@profile
+def get_active_subscription(*, user_id: Optional[str] = None, chat_id: Optional[str] = None) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+    """
+    Devuelve (doc_ref | None, data | None) de la suscripción activa (o la más reciente si no hay activa).
+    Busca por user_id (resuelto desde chat_id si hace falta).
+    """
+    user_uuid = _resolve_user_uuid(user_id, chat_id)
+    if not user_uuid:
+        return (None, None)
+    snaps = _get_all_subs_for_user(user_uuid)
+    return _pick_active_or_latest(snaps)
+
+#@profile
+def upsert_subscription_firestore(
+    *,
+    user_id: str,
+    nombre_usuario: str,
+    tipo_suscripcion: str,
+    origen: str,
+    id_pago: Optional[str] = None,
+    hash_transaccion: Optional[str] = None,
+    telegram_id: Optional[str] = None,
+    inicio: Optional[datetime] = None,
+    fin: Optional[datetime] = None
+) -> Tuple[Any, Dict[str, Any]]:
+    """
+    Crea o actualiza una suscripción en suscripciones_user para (user_id, origen).
+    - Si inicio/fin no vienen, se calculan desde el catálogo.
+    - Mantiene estado 'activa' y resetea transacciones al máximo del plan si no existen.
+    """
+    user_uuid = str(user_id)
+    origen_norm = (origen or "telegram").lower()
+
+    opts, tx_max, dur = _options_from_catalog(tipo_suscripcion)
+    start = inicio or _now_utc()
+    end = fin or _calc_fin_from_text(dur, start)
+
+    doc_id = _build_sub_doc_id(user_uuid, origen_norm)
+    ref = _suscripciones_col().document(doc_id)
+
+    snap = ref.get()
+    prev = snap.to_dict() if snap.exists else {}
+
+    tx_rest = prev.get("transacciones_restantes")
+    if tx_rest is None:
+        tx_rest = tx_max
+
+    payload = {
+        "user_id": user_uuid,
+        "telegram_id": str(telegram_id) if telegram_id else prev.get("telegram_id"),
+        "nombre_usuario": nombre_usuario,
+        "tipo": tipo_suscripcion,
+        "origen": origen_norm,
+        "id_pago": id_pago or prev.get("id_pago"),
+        "hash_transaccion": hash_transaccion or prev.get("hash_transaccion"),
+        "inicio": start.isoformat(),
+        "fin": end.isoformat(),
+        "estado": "activa",
+        "opciones": opts,
+        "limite_transacciones": tx_max,
+        "transacciones_restantes": int(tx_rest),
+        "updated_at": _now_utc().isoformat(),
+    }
+
+    ref.set(payload, merge=True)
+    return (ref, payload)
+
+#@profile
+def update_sub_transacciones(
+    *, user_id: Optional[str] = None, chat_id: Optional[str] = None, delta: int = -1
+) -> Tuple[bool, str]:
+    """
+    Incrementa/decrementa `transacciones_restantes` en la suscripción activa más reciente.
+    Si llega a 0, marca estado = 'inactiva'.
+    """
+    ref, data = get_active_subscription(user_id=user_id, chat_id=chat_id)
+    if not ref or not data:
+        return (False, "No se encontró suscripción en Firestore.")
+
+    try:
+        curr = int(data.get("transacciones_restantes", 0)) + int(delta)
+        estado = "activa"
+        if curr <= 0:
+            curr = 0
+            estado = "inactiva"
+
+        ref.set({
+            "transacciones_restantes": curr,
+            "estado": estado,
+            "updated_at": _now_utc().isoformat(),
+        }, merge=True)
+        return (True, f"Transacciones restantes: {curr}")
+    except Exception as e:
+        return (False, f"No se pudo actualizar transacciones: {e}")
+
+# ✅ Mejora tu función existente para preferir Firestore:
+#@profile
+async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen="telegram"):
+    try:
+        uid = _user_id_from_chat(user_key) if (origen or "telegram").lower()=="telegram" else user_key
+        uid = str(uid)
+
+        # Firestore
+        doc_ref = db.collection("suscripciones_user").document(uid)
+        snap = doc_ref.get()
+        if not snap.exists:
+            return False, f"❌ No se encontró suscripción activa para {uid}."
+
+        sus = snap.to_dict() or {}
+        trans = int(sus.get("transacciones_restantes", 0))
+        trans -= int(numero_transacciones_in)
+        updates = {
+            "transacciones_restantes": max(trans, 0),
+            "estado": "activa" if trans > 0 else "inactiva",
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        doc_ref.set(updates, merge=True)
+
+        # Reflejar en user_states (por user_id y, si se deduce, por chat_id)
+        user_states.setdefault(uid, {})["numero_transacciones"] = int(numero_transacciones_in)
+        maybe_chat = _chat_from_user_id(uid)
+        if maybe_chat:
+            user_states.setdefault(str(maybe_chat), {})["numero_transacciones"] = int(numero_transacciones_in)
+
+        if trans <= 0:
+            return True, "✅ Transacción aplicada. Te quedan 0; tu suscripción quedó inactiva."
+        return True, f"✅ Transacción aplicada. Te quedan {trans}."
+
+    except Exception as e:
+        return False, f"❌ Error inesperado al descontar transacción: {e}"
+
+
+# =========================
+# ✉️ Noticias generales (Firestore + descuento)
+# =========================
+#@profile
+async def obtener_noticias_generales(update, context):
+    limite = 20
+    max_reintentos = 3
+    tiempo_espera_inicial = 5
+    user_chat_id = str(update.effective_chat.id)
+
+    # Estado UI
+    try:
+        mark_user_state(chat_id=user_chat_id, estado="en ejecución")
+    except Exception:
+        pass
+
+    try:
+        # Validar suscripción activa en Firestore (o admin)
+        ref, sub = get_active_subscription(chat_id=user_chat_id)
+        if not sub and not es_administrador(user_chat_id):
+            await update.message.reply_text(
+                "No tienes una suscripción activa o sin transacciones. Contacta con un administrador."
+            )
+            return
+
+        endpoint = "https://financialmodelingprep.com/api/v4/general_news"
+        url = f"{endpoint}?limit={limite}&apikey={API_KEY}"
+
+        reintento = 0
+        tiempo_espera = tiempo_espera_inicial
+        noticias = []
+
+        while reintento < max_reintentos:
+            try:
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    if not response.text.strip():
+                        logging.info("La respuesta de la API está vacía.")
+                        break
+                    noticias = response.json()
+                    break
+                else:
+                    logging.info(f"Error en la API: {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                logging.info(f"Error al obtener noticias generales: {e}")
+                reintento += 1
+                if reintento < max_reintentos:
+                    logging.info(f"Reintentando en {tiempo_espera} segundos...")
+                    time.sleep(tiempo_espera)
+                    tiempo_espera *= 2
+
+        # Procesar
+        if isinstance(noticias, list) and len(noticias) > 0:
+            df = pd.DataFrame(noticias)
+
+            if "publishedDate" in df.columns:
+                # Parse seguro → UTC aware
+                df["publishedDate"] = pd.to_datetime(df["publishedDate"], utc=True, errors="coerce")
+                df = df.dropna(subset=["publishedDate"])
+
+                for _, n in df.iterrows():
+                    title = n.get("title", "")
+                    sitio = n.get("site", "Desconocido")
+                    text = n.get("text", "Sin Descripción")
+                    symbol = n.get("symbol", "No Aplica")
+                    fecha = n["publishedDate"].strftime("%Y-%m-%d %H:%M:%S")
+                    importancia = analizar_importancia(f"{title} {text}")
+                    url = n.get("url", "")
+                    link_traductor = f"https://translate.google.com/translate?sl=auto&tl=es&u={url}"
+
+                    mensaje = (
+                        f"Titulo: {title}\n"
+                        f"Descripción: {text}\n"
+                        f"Activo: {symbol}\n"
+                        f"Fecha: {fecha}\n"
+                        f"Sitio: {sitio}\n"
+                        f"Importancia: {importancia}\n"
+                        f"Link: {url}\n"
+                        f"Link Traducido: {link_traductor}\n"
+                    )
+                    await enviar_mensaje_noticias(context, user_chat_id, mensaje)
+
+                # Descontar 1 transacción si no es admin
+                if not es_administrador(user_chat_id):
+                    success, mensaje_tx = await descontar_transaccion(user_chat_id, 1, origen="telegram")
+                    if not success:
+                        await update.message.reply_text(mensaje_tx)
+        else:
+            logging.info("No se encontraron noticias válidas en la respuesta.")
+
+    except Exception as e:
+        logging.info(f"Error en obtener_noticias_generales: {e}")
+    finally:
+        # ⚠️ corregido: era user_id=user_chat_id
+        try:
+            mark_user_state(chat_id=user_chat_id, estado="disponible")
+        except Exception:
+            pass
+
+
+# =========================
+# 🖼️ IA gráfico (sin cambios de subs)
+# =========================
+#@profile
+async def manejar_ia_grafico(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_chat_id = str(update.effective_chat.id)
+    try:
+        mark_user_state(chat_id=user_chat_id, estado="esperando_grafico_ia")
+        await update.message.reply_text("📸 Sube una imagen de un gráfico de velas para analizarla con IA.")
+    except Exception as e:
+        await update.message.reply_text(f"Ocurrió un error al preparar el análisis: {e}")
+
+
+# =========================
+# 🛠️ Admin: agregar / eliminar / listar / verificar
+# =========================
+#@profile
+async def agregar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_chat = str(update.effective_user.id)
+    if not es_administrador(admin_chat):
+        await update.message.reply_text("No tienes permisos para usar este comando.")
+        return
+
+    args = context.args
+    if len(args) < 3 or len(args) > 4:
+        await update.message.reply_text("Uso: /agregar_suscripcion <user_id|telegram_id> <tipo_suscripcion> <nombre_usuario> [hash_transaccion]")
+        return
+
+    raw_user_id, tipo_suscripcion, nombre_usuario = args[:3]
+    hash_transaccion = args[3] if len(args) == 4 else None
+
+    # Resolver user_id real (acepta chat_id)
+    user_uuid = _resolve_user_uuid(user_id=raw_user_id if raw_user_id.isdigit() else raw_user_id, chat_id=raw_user_id)
+    if not user_uuid:
+        await update.message.reply_text("No se pudo resolver el usuario.")
+        return
+
+    if tipo_suscripcion not in subscriptions_type:
+        await update.message.reply_text("Tipo de suscripción no válido.")
+        return
+
+    # Intenta leer telegram_id mapeado (si existe)
+    telegram_id = None
+    try:
+        # Si raw es chat_id y existe mapping inverso, úsalo
+        if raw_user_id and raw_user_id.isdigit():
+            telegram_id = raw_user_id
+        else:
+            # Busca en user_ids si tiene telegram_id
+            q = _user_ids_col().document(user_uuid).get()
+            if q.exists:
+                telegram_id = str((q.to_dict() or {}).get("telegram_id") or "") or None
+    except Exception:
+        pass
+
+    try:
+        ref, payload = upsert_subscription_firestore(
+            user_id=user_uuid,
+            nombre_usuario=nombre_usuario,
+            tipo_suscripcion=tipo_suscripcion,
+            origen="telegram",
+            id_pago=f"admin_{_now_utc().timestamp():.0f}",
+            hash_transaccion=hash_transaccion,
+            telegram_id=telegram_id,
+        )
+        await update.message.reply_text(
+            f"✅ Suscripción {tipo_suscripcion} activada para {nombre_usuario} (uid: {user_uuid})."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error al registrar suscripción: {e}")
+
+
+#@profile
+async def eliminar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_chat = str(update.effective_user.id)
+    if not es_administrador(admin_chat):
+        await update.message.reply_text("No tienes permisos para usar este comando.")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Uso: /eliminar_suscripcion <user_id|telegram_id>")
+        return
+
+    arg = context.args[0]
+    user_uuid = _resolve_user_uuid(user_id=arg if arg.isdigit() else arg, chat_id=arg)
+    if not user_uuid:
+        await update.message.reply_text("No se pudo resolver el usuario.")
+        return
+
+    snaps = _get_all_subs_for_user(user_uuid)
+    if not snaps:
+        await update.message.reply_text(f"No se encontraron suscripciones para {arg}.")
+        return
+
+    try:
+        for s in snaps:
+            s.reference.delete()
+        await update.message.reply_text(f"✅ Eliminadas {len(snaps)} suscripciones para {user_uuid}.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error al eliminar: {e}")
+
+
+#Filtros opcionales:
+#/listar_suscripciones → todas
+#/listar_suscripciones activas|inactivas|expiradas → filtra por estado calculado
+#/listar_suscripciones detalle o /listar_suscripciones activas detalle → salida expandida
+#@profile
+async def listar_suscripciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lista suscripciones de la colección 'suscripciones_user'.
+    Uso:
+      /listar_suscripciones
+      /listar_suscripciones activas|inactivas|expiradas
+      /listar_suscripciones detalle
+      /listar_suscripciones activas detalle
+    """
+
+    # ---- helpers locales para evitar conflictos de nombres ----
+    #@profile
+    def _parse_iso_z_local(s: str | None):
+        if not s:
+            return None
+        try:
+            ss = str(s)
+            if ss.endswith("Z"):
+                ss = ss.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ss)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    #@profile
+    def _fmt_dt_local_local(dt: datetime, tz_str: str | None) -> str:
+        try:
+            tz = pytz.timezone(tz_str) if tz_str else pytz.utc
+        except Exception:
+            tz = pytz.utc
+        return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    #@profile
+    def _estado_calc_local(data: dict, now_utc: datetime):
+        fin = _parse_iso_z_local(data.get("fin"))
+        rest = int((data.get("transacciones_restantes") or 0) or 0)
+        if fin and fin < now_utc:
+            return "expirada", rest, fin
+        if rest <= 0:
+            return "inactiva", rest, fin
+        return "activa", rest, fin
+
+    admin_id = str(update.effective_user.id)
+    if not es_administrador(admin_id):
+        await update.message.reply_text("🚫 No tienes permisos para usar este comando.")
+        return
+
+    # filtros
+    args = [a.lower() for a in (context.args or [])]
+    valid_filters = {"activas", "inactivas", "expiradas", "todas"}
+    filtro = next((a for a in args if a in valid_filters), "todas")
+    modo_detalle = ("detalle" in args) or ("det" in args)
+
+    try:
+        tz_admin = await cargar_timezone_por_defecto(admin_id)
+    except Exception:
+        tz_admin = "UTC"
+
+    # ---- LECTURA DE FIRESTORE ----
+    try:
+        # 'db' debe ser tu cliente Firestore ya inicializado
+        snaps = list(db.collection("suscripciones_user").stream())
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error leyendo suscripciones: {e}")
+        return
+
+    if not snaps:
+        await update.message.reply_text("No hay suscripciones registradas.")
+        return
+
+    now = datetime.now(timezone.utc)
+
+    counters = {"activa": 0, "inactiva": 0, "expirada": 0}
+    filas = []  # [(estado, fin_dt, linea_formateada)]
+
+    for s in snaps:
+        d = s.to_dict() or {}
+        uid = d.get("user_id") or s.id
+        tg  = d.get("telegram_id")
+        base_plan = d.get("basePlanId") or d.get("base_plan_id") or "-"
+        product   = d.get("productId") or "-"
+        inicio_dt = _parse_iso_z_local(d.get("inicio"))
+        estado, rest, fin_dt = _estado_calc_local(d, now)
+        limit = int((d.get("limite_transacciones") or 0) or 0)
+        opciones = d.get("opciones") or []
+        trans_id = d.get("transactionId") or d.get("transaction_id")
+        tokens   = d.get("tokens") or []
+
+        updated = d.get("updated_at")
+        if hasattr(updated, "to_datetime"):
+            updated = updated.to_datetime().astimezone(timezone.utc)
+        elif isinstance(updated, str):
+            updated = _parse_iso_z_local(updated)
+        else:
+            updated = None
+
+        # filtro por estado
+        if filtro != "todas" and filtro.rstrip("s") != estado:
+            # permite "activas" o "activa", etc.
+            continue
+
+        dias = (fin_dt - now).days if fin_dt else None
+        badge = "✅" if estado == "activa" else ("⚠️" if estado == "inactiva" else "⛔")
+
+        if modo_detalle:
+            lineas = [
+                f"{badge} *{estado.capitalize()}*",
+                f"• Usuario: `{uid}`" + (f"  · TG: `{tg}`" if tg else ""),
+                f"• Plan/basePlanId: `{base_plan}`  · Producto: `{product}`",
+                f"• Transacciones: {rest}" + (f" / {limit}" if limit else ""),
+            ]
+            if inicio_dt:
+                lineas.append(f"• Inicio: {_fmt_dt_local_local(inicio_dt, tz_admin)}")
+            if fin_dt:
+                extra = f"  · Quedan {dias} días" if dias is not None and dias >= 0 else ""
+                lineas.append(f"• Fin: {_fmt_dt_local_local(fin_dt, tz_admin)}{extra}")
+            if opciones:
+                lineas.append("• Opciones: " + ", ".join(opciones))
+            if trans_id:
+                lineas.append(f"• Última transacción: `{trans_id}`")
+            if tokens:
+                lineas.append(f"• Tokens Play guardados: {len(tokens)}")
+            if updated:
+                lineas.append(f"• Actualizado: {_fmt_dt_local_local(updated, tz_admin)}")
+
+            texto = "\n".join(lineas)
+        else:
+            vence_txt = _fmt_dt_local_local(fin_dt, tz_admin) if fin_dt else "—"
+            extra = f" · queda {dias}d" if fin_dt and dias is not None and dias >= 0 else ""
+            texto = (
+                f"{badge} `{uid}` · {estado} · {rest}"
+                + (f"/{limit}" if limit else "")
+                + f" · vence: {vence_txt}{extra} · {base_plan}"
+                + (f" · tg:{tg}" if tg else "")
+            )
+
+        filas.append((estado, fin_dt or now, texto))
+
+    if not filas:
+        await update.message.reply_text("No hay suscripciones que coincidan con el filtro.")
+        return
+
+    # ordenar: activa → inactiva → expirada, y por fecha de fin
+    orden_estado = {"activa": 0, "inactiva": 1, "expirada": 2}
+    filas.sort(key=lambda r: (orden_estado.get(r[0], 9), r[1] or now))
+
+    # contadores
+    for est, _, _ in filas:
+        counters[est] += 1
+
+    total = len(snaps)
+    header = (
+        f"*Suscripciones* (total docs: {total})\n"
+        f"• Activas: {counters['activa']}  ·  Inactivas: {counters['inactiva']}  ·  Expiradas: {counters['expirada']}\n"
+    )
+    if filtro != "todas":
+        header += f"_Filtro aplicado_: *{filtro}*\n"
+    header += "_Vista_: " + ("detalle\n" if modo_detalle else "compacta  (usa `detalle` para ampliar)\n")
+
+    # Telegram 4096 chars → partimos en trozos
+    CHUNK = 3500
+    buffer = header + "\n"
+    for _, __, linea in filas:
+        if len(buffer) + len(linea) + 1 > CHUNK:
+            await update.message.reply_text(buffer, parse_mode="Markdown", disable_web_page_preview=True)
+            buffer = ""
+        buffer += linea + "\n"
+
+    if buffer.strip():
+        await update.message.reply_text(buffer, parse_mode="Markdown", disable_web_page_preview=True)
+
+#@profile
+def _parse_iso_z(s: str | None) -> datetime | None:
+    """Acepta '2025-09-20T18:35:47.867Z' o ISO sin tz; siempre devuelve UTC aware."""
+    if not s:
+        return None
+    try:
+        s = str(s)
+        # Firestore puede guardar con "Z"
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+#@profile
+def _fmt_dt_local(dt: datetime, tz_str: str | None) -> str:
+    """Formatea un datetime UTC a la zona del usuario."""
+    try:
+        tz = pytz.timezone(tz_str) if tz_str else pytz.utc
+    except Exception:
+        tz = pytz.utc
+    return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+#@profile
+async def verificar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra en Telegram el detalle enriquecido de la(s) suscripción(es) del usuario."""
+    chat_id = str(update.effective_user.id)
+
+    # Intenta resolver el UUID canónico si tienes mapping; si no, usa el chat_id
+    try:
+        user_id = _user_id_from_chat(chat_id) or chat_id
+    except Exception:
+        user_id = chat_id
+
+    # Zona horaria preferida del usuario (si tienes esa función)
+    try:
+        tz_str = await cargar_timezone_por_defecto(user_id)  # p.ej. "America/Santiago"
+    except Exception:
+        tz_str = "UTC"
+
+    # --- Recolecta documentos candidatos (puede haber varios por "origen") ---
+    docs: list[tuple[str, dict]] = []
+
+    # 1) doc con id = user_id (alias canónico)
+    try:
+        snap = _subscription_doc(user_id).get()  # -> db.collection("suscripciones_user").document(user_id)
+        if snap.exists:
+            docs.append((snap.id, snap.to_dict() or {}))
+    except Exception:
+        pass
+
+    # 2) docs con campo user_id == user_id
+    try:
+        for s in db.collection("suscripciones_user").where("user_id", "==", user_id).stream():
+            docs.append((s.id, s.to_dict() or {}))
+    except Exception:
+        pass
+
+    # 3) docs con campo telegram_id == chat_id
+    try:
+        for s in db.collection("suscripciones_user").where("telegram_id", "==", chat_id).stream():
+            docs.append((s.id, s.to_dict() or {}))
+    except Exception:
+        pass
+
+    # Dedup por id de documento
+    uniq = {}
+    for doc_id, data in docs:
+        if doc_id not in uniq and isinstance(data, dict):
+            uniq[doc_id] = data
+    docs = list(uniq.items())
+
+    if not docs:
+        # Sin suscripción registrada
+        if es_administrador(chat_id):
+            await update.message.reply_text(
+                "No se encontraron suscripciones asociadas a tu cuenta.\n"
+                "Puedes activarla desde el panel de administración o con /agregar_suscripcion."
+            )
+            await menu_usuario_administrador(context, chat_id)
+        else:
+            await update.message.reply_text(
+                "No tienes una suscripción activa. Ve a *Suscripción y Paquetes* en la app para contratar o renueva con /suscripcion.",
+                parse_mode="Markdown"
+            )
+        return
+
+    # --- Arma los mensajes enriquecidos ---
+    now = datetime.now(timezone.utc)
+    tarjetas: list[str] = []
+    hay_activa = False
+
+    for doc_id, data in docs:
+        inicio = _parse_iso_z(data.get("inicio"))
+        fin    = _parse_iso_z(data.get("fin"))
+        trans_rest = int((data.get("transacciones_restantes") or 0) or 0)
+        limite     = int((data.get("limite_transacciones") or 0) or 0)
+        estado_raw = str(data.get("estado") or "").lower()
+
+        # Estado calculado (toma prioridad sobre el guardado)
+        if fin and fin < now:
+            estado = "expirada"
+        elif trans_rest <= 0:
+            estado = "inactiva"
+        else:
+            estado = "activa"
+
+        hay_activa = hay_activa or (estado == "activa")
+
+        base_plan   = data.get("basePlanId") or data.get("base_plan_id") or "-"
+        product_id  = data.get("productId") or "-"
+        opciones    = data.get("opciones") or []
+        transaction = data.get("transactionId") or data.get("transaction_id") or "-"
+        tokens      = data.get("tokens") or []
+        updated_at  = data.get("updated_at")
+
+        # Firestore timestamp → datetime
+        if hasattr(updated_at, "to_datetime"):
+            updated_at = updated_at.to_datetime().astimezone(timezone.utc)
+        elif isinstance(updated_at, str):
+            updated_at = _parse_iso_z(updated_at)
+        else:
+            updated_at = None
+
+        # Días restantes si corresponde
+        dias_rest = (fin - now).days if fin else None
+
+        badge = "✅" if estado == "activa" else ("⚠️" if estado == "inactiva" else "⛔")
+        lineas = [
+            f"{badge} *Estado*: {estado}  _(registrado: {estado_raw or '—'})_",
+        ]
+        if inicio:
+            lineas.append(f"• Inicio: {_fmt_dt_local(inicio, tz_str)}")
+        if fin:
+            lineas.append(f"• Fin: {_fmt_dt_local(fin, tz_str)}")
+        if dias_rest is not None and dias_rest >= 0:
+            lineas.append(f"• Quedan: *{dias_rest}* días")
+        if limite:
+            lineas.append(f"• Transacciones: {trans_rest} / {limite}")
+        else:
+            lineas.append(f"• Transacciones restantes: {trans_rest}")
+
+        lineas += [
+            f"• Plan/basePlanId: `{base_plan}`",
+            f"• Producto: `{product_id}`",
+        ]
+
+        if opciones:
+            lineas.append("• Opciones: " + ", ".join(opciones))
+        if transaction and transaction != "-":
+            lineas.append(f"• Última transacción: `{transaction}`")
+        if isinstance(tokens, list) and tokens:
+            lineas.append(f"• Tokens Play guardados: {len(tokens)}")
+
+        if updated_at:
+            lineas.append(f"• Actualizado: {_fmt_dt_local(updated_at, tz_str)}")
+
+        # Identificador por si hay varias
+        lineas.append(f"• DocID: `{doc_id}`")
+
+        tarjetas.append("\n".join(lineas))
+
+    # Mensaje final
+    if len(tarjetas) == 1:
+        texto = "*Tu suscripción:*\n\n" + tarjetas[0]
+    else:
+        texto = "*Suscripciones encontradas:*\n\n" + "\n\n— — — — —\n\n".join(tarjetas)
+
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
+    # Navegación contextual
+    if hay_activa:
+        if es_administrador(chat_id):
+            await menu_usuario_administrador(context, chat_id)
+        else:
+            # tu firma de menú de usuario parece ser (bot, chat_id)
+            await menu_usuario_registrado(context.bot, chat_id)
+
+# ==============
+# 💳 Flujos TRC20 (se mantienen, pero al verificar escribimos Firestore)
+# ==============
+#@profile
+async def verificar_pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_chat_id = str(update.effective_user.id)
+    args = context.args
+
+    if len(args) != 2:
+        await update.message.reply_text("Uso: /verificar_pago <id_pago> <hash_transaccion>")
+        return
+
+    id_pago_proporcionado, hash_proporcionado = args
+    pagos_pendientes = await cargar_pagos_pendientes()
+
+    # Evitar duplicados
+    for pago in pagos_pendientes["pendientes"] + pagos_pendientes.get("verificados", []):
+        if pago.get("hash_transaccion") == hash_proporcionado:
+            await update.message.reply_text("El hash de transacción ya está asociado con otro pago.")
+            return
+
+    for pago in pagos_pendientes["pendientes"]:
+        if pago["user_id"] == user_chat_id and pago["id_pago"] == id_pago_proporcionado:
+            if pago["estado"] == "verificado":
+                await update.message.reply_text("Este pago ya ha sido verificado.")
+                return
+
+            monto_esperado = pago["monto"]
+            pago_verificado = await validar_pago_blockchain(hash_proporcionado, monto_esperado)
+            if not pago_verificado:
+                await update.message.reply_text("La transacción no fue verificada en la blockchain o el monto no coincide.")
+                return
+
+            # Activar suscripción en Firestore
+            pago["estado"] = "verificado"
+            pago["hash_transaccion"] = hash_proporcionado
+            guardar_pagos_pendientes(pagos_pendientes)
+
+            seleccion = pago["suscripcion"]
+            inicio = _now_utc()
+            dur = subscriptions_type[seleccion]["duracion"]
+            fin   = _calc_fin_from_text(dur, inicio)
+
+            user_uuid = _resolve_user_uuid(user_id=None, chat_id=user_chat_id)
+            nombre = update.effective_user.full_name
+
+            try:
+                upsert_subscription_firestore(
+                    user_id=user_uuid,
+                    nombre_usuario=nombre,
+                    tipo_suscripcion=seleccion,
+                    origen="telegram",
+                    id_pago=pago["id_pago"],
+                    hash_transaccion=hash_proporcionado,
+                    telegram_id=user_chat_id,
+                    inicio=inicio,
+                    fin=fin,
+                )
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Pago verificado pero fallo guardando suscripción: {e}")
+                return
+
+            await update.message.reply_text(
+                f"Pago verificado. Tu suscripción {seleccion} está activa hasta {fin}."
+            )
+
+            if not es_administrador(user_chat_id):
+                await menu_usuario_registrado(context.bot, user_chat_id)
+            else:
+                await menu_usuario_administrador(context, user_chat_id)
+            return
+
+    await update.message.reply_text("No se encontró un pago pendiente con ese hash.")
+
+
+#@profile
 async def seleccionar_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Procesa la selección de suscripción y muestra detalles."""
     user_id = str(update.callback_query.message.chat_id)
@@ -8482,6 +9206,7 @@ async def seleccionar_suscripcion(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("Suscripción no encontrada.")
 
 
+#@profile
 def generar_hash(user_id, suscripcion):
     datos = f"{user_id}-{suscripcion}-{time.time()}"
     hash_valor = hashlib.sha256(datos.encode()).hexdigest()
@@ -8489,6 +9214,7 @@ def generar_hash(user_id, suscripcion):
     return id_pago
 
 # Procesar selección de suscripción
+#@profile
 async def procesar_seleccion_suscripcion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -8535,6 +9261,7 @@ async def procesar_seleccion_suscripcion(update: Update, context: ContextTypes.D
     )
 
 
+#@profile
 async def validar_pago_blockchain(hash_transaccion, monto_esperado, max_reintentos=3, tiempo_espera_inicial=5):
     # URL de la API de Tronscan para verificar transacciones
     url = f"https://apilist.tronscanapi.com/api/transaction-info?hash={hash_transaccion}"
@@ -8590,84 +9317,7 @@ async def validar_pago_blockchain(hash_transaccion, monto_esperado, max_reintent
                     time.sleep(tiempo_espera)
                     tiempo_espera *= 2    
 
-# Verificar pago
-async def verificar_pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_chat_id = str(update.effective_user.id)
-    args = context.args
-
-    if len(args) != 2:
-        await update.message.reply_text("Uso: /verificar_pago <id_pago> <hash_transaccion>")
-        return
-
-    id_pago_proporcionado = args[0]
-    hash_proporcionado = args[1]
-    pagos_pendientes = await cargar_pagos_pendientes()
-
-    # Verificar si el hash ya está registrado
-    for pago in pagos_pendientes["pendientes"] + pagos_pendientes.get("verificados", []):
-        if pago.get("hash_transaccion") == hash_proporcionado:
-            await update.message.reply_text("El hash de transacción ya está asociado con otro pago.")
-            return
-
-    for pago in pagos_pendientes["pendientes"]:
-        if pago["user_id"] == user_chat_id and pago["id_pago"] == id_pago_proporcionado:
-            if pago["estado"] == "verificado":
-                await update.message.reply_text("Este pago ya ha sido verificado.")
-                return
-
-            # Obtener el monto esperado de la suscripción
-            monto_esperado = pago["monto"]
-
-            # Validar transacción en la blockchain
-            pago_verificado = await validar_pago_blockchain(hash_proporcionado, monto_esperado )
-            if not pago_verificado:
-                await update.message.reply_text("La transacción no fue verificada en la blockchain o el monto no coincide. Por favor verifica el hash y el monto.")
-                return
-
-            # Activar suscripción
-            pago["estado"] = "verificado"
-            pago["hash_transaccion"] = hash_proporcionado
-            guardar_pagos_pendientes(pagos_pendientes)
-            duracion = subscriptions_type[pago["suscripcion"]]["duracion"]
-            inicio = datetime.now()
-            if duracion == "1 mes":
-                fin = inicio + timedelta(days=30)
-            elif duracion == "6 meses":
-                fin = inicio + timedelta(days=30 * 6)
-            elif duracion == "1 año":
-                fin = inicio + timedelta(days=365)
-            else:
-                await update.message.reply_text("Duración de la suscripción no reconocida.")
-                return
-
-
-            # Registrar suscripción activa
-            subscriptions[user_chat_id] = {
-                "nombre_usuario": update.effective_user.full_name,
-                "id_pago": pago["id_pago"],
-                "inicio": inicio.isoformat(),
-                "fin": fin.isoformat(),
-                "limite_transacciones": subscriptions_type[pago["suscripcion"]]["transacciones_maximas"],
-                "transacciones_restantes": subscriptions_type[pago["suscripcion"]]["transacciones_maximas"],
-                "opciones": subscriptions_type[pago["suscripcion"]]["opciones"]
-            }
-            await guardar_datos(subscriptions)
-
-            await update.message.reply_text(
-                f"Pago verificado. Tu suscripción {pago['suscripcion']} está activa hasta {fin}."
-            )
-
-            if not es_administrador(user_chat_id):
-                logger.info("Es usuario registrado se procede a actualizar el menú")
-                await menu_usuario_registrado(context.bot, user_chat_id)
-            elif es_administrador(user_chat_id):
-                logger.info("Es administrador se procede a actualizar el menú")
-                await menu_usuario_administrador(context, user_chat_id)
-
-            return
-
-    await update.message.reply_text("No se encontró un pago pendiente con ese hash.")
-
+#@profile
 async def listar_pagos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_chat_id = str(update.effective_user.id)
     pagos_pendientes = await cargar_pagos_pendientes()  # Esto debería devolver el JSON de los pagos
@@ -8701,37 +9351,14 @@ async def listar_pagos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(mensaje)
 
 
-async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen="telegram"):
-    try:
-        user_id = _user_id_from_chat(user_key) if (origen or "telegram").lower()=="telegram" else user_key
-        user_id = str(user_id)
-
-        s = subscriptions.get(user_id)
-        if not s:
-            return False, f"❌ No se encontró suscripción activa para {user_id}."
-
-        trans = int(s.get("transacciones_restantes", 0))
-        trans -= int(numero_transacciones_in)
-        s["transacciones_restantes"] = trans
-        if trans <= 0:
-            s["estado"] = "inactiva"
-
-        await guardar_datos(subscriptions)
-
-        # Mantén user_states indexado por user_id (no por chat)
-        if user_id in user_states:
-            user_states[user_id]["numero_transacciones"] = numero_transacciones_in
-
-        return True, f"✅ Transacción exitosa. Te quedan {trans} transacciones."
-    except Exception as e:
-        return False, f"❌ Error inesperado al descontar transacción: {e}"
-
 
 # Programa la tarea para que se ejecute todos los días a las 00:00
 scheduler = BackgroundScheduler()
+#@profile
 def programar_actualizacion_menus(application: Application):
     loop = asyncio.get_running_loop()
 
+    #@profile
     def actualizar():
         asyncio.run_coroutine_threadsafe(actualizar_menus(application), loop)
 
@@ -8742,6 +9369,7 @@ def programar_actualizacion_menus(application: Application):
 
     scheduler.start()
 
+#@profile
 async def menu_zonas_horarias(update, context):
     # Crear los botones para cada zona horaria
     user_id = update.effective_chat.id
@@ -8758,6 +9386,7 @@ async def menu_zonas_horarias(update, context):
         reply_markup=teclado
     )
 
+#@profile
 async def cargar_noticias_en_memoria():
     global cache_noticias
     for archivo in os.listdir(CARPETA_FOREX_NEWS):
@@ -8798,6 +9427,7 @@ async def cargar_noticias_en_memoria():
     logger.info("Noticias cargadas en memoria.")
 
 
+#@profile
 async def guardar_noticias_forex():
     """
     Guarda las noticias Forex almacenadas en `cache_noticias` en archivos locales.
@@ -8813,6 +9443,7 @@ async def guardar_noticias_forex():
     except Exception as e:
         logger.info(f"Error al guardar noticias Forex: {e}")
 
+#@profile
 async def guardar_datos_historicos(): 
     """
     Guarda los datos del diccionario global `cache_historicos` en archivos locales.
@@ -8842,6 +9473,7 @@ async def guardar_datos_historicos():
         except Exception as e:
             logger.info(f"Error al guardar datos históricos: {e}")
 
+#@profile
 async def descargar_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Envía el manual PDF al usuario."""
     user_chat_id = update.effective_chat.id
@@ -8863,6 +9495,7 @@ async def descargar_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+#@profile
 async def cancelar_envio_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancela el envío de mensaje y resetea el estado en Firestore."""
     query = update.callback_query
@@ -8887,6 +9520,7 @@ async def cancelar_envio_mensaje(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text("🚫 Envío de mensaje cancelado.")
 
 
+#@profile
 async def enviar_mensaje_segmentado(chat_id, mensaje, bot):
     """Envía un mensaje en partes si excede el límite de 4096 caracteres."""
     max_length = 4096  # Límite de Telegram
@@ -8899,6 +9533,7 @@ async def enviar_mensaje_segmentado(chat_id, mensaje, bot):
             print(f"Error al enviar mensaje a {chat_id}: {e}")
 
 
+#@profile
 async def confirmar_envio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Envía el mensaje a los destinatarios seleccionados (por user_id) y limpia el estado."""
     query = update.callback_query
@@ -8978,13 +9613,14 @@ async def confirmar_envio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text("✅ Mensaje enviado a los destinatarios seleccionados.")    
 
+#@profile
 async def procesar_envio_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Guarda la opción elegida y activa el modo de envío de mensaje."""
     user_chat_id = str(update.effective_chat.id)
     query = update.callback_query
     await query.answer()
 
-    if return_state(user_chat_id) == "en ejecución":
+    if return_state(chat_id=user_chat_id) == "en ejecución":
         await context.bot.send_message(
             chat_id=user_chat_id,
             text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
@@ -9005,6 +9641,7 @@ async def procesar_envio_mensaje(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text("✍️ Envía el mensaje o archivo que deseas compartir.")
 
 
+#@profile
 async def enviar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra opciones para seleccionar destinatarios del mensaje."""
     user_id = str(update.effective_user.id)
@@ -9069,6 +9706,7 @@ webhook_app = Flask(__name__)
 # Convierte la aplicación Flask a ASGI
 asgi_app = WsgiToAsgi(webhook_app)
 
+#@profile
 async def guardar_noticias_forex_diarias():
     """
     Ejecuta `guardar_noticias_forex` una vez al día, a medianoche.
@@ -9084,6 +9722,7 @@ async def guardar_noticias_forex_diarias():
         await guardar_noticias_forex()
 
 
+#@profile
 async def guardar_datos_historicos_diarios():
     """
     Ejecuta `guardar_datos_historicos` una vez al día, a medianoche.
@@ -9100,6 +9739,7 @@ async def guardar_datos_historicos_diarios():
 
 
 # Cargar datos iniciales
+#@profile
 async def initialize_bot():
     try:
         global subscriptions, subscriptions_type, clientes_chat_ids, admin_ids
@@ -9180,6 +9820,7 @@ async def initialize_bot():
         
 
 @webhook_app.route('/analisis/ejecutar', methods=['POST'])
+#@profile
 async def ejecutar_analisis_desde_app():
     chat_id_local = None
     acquired_lock = False
@@ -9314,6 +9955,7 @@ async def ejecutar_analisis_desde_app():
     
    
 @webhook_app.route('/analisis/imagen', methods=['POST'])
+#@profile
 def subir_imagen_y_analizar():
     try:
         if ocupado_lock.locked():
@@ -9414,6 +10056,7 @@ def subir_imagen_y_analizar():
 
 # Ruta para el webhook
 @webhook_app.route('/webhook', methods=['POST'])
+#@profile
 async def webhook():
     try:
         payload = request.get_json()
@@ -9426,14 +10069,17 @@ async def webhook():
         return jsonify({"status": "error", "message": str(e)}), 500
     
 @webhook_app.route('/health', methods=['GET'])
+#@profile
 def health():
     return {"status": "ok", "instance": socket.gethostname()}
     
 @webhook_app.route('/healthz', methods=['GET'])
+#@profile
 def health_check():
     return jsonify({"status": "ok"}), 200
 
 @webhook_app.route('/', methods=['GET'])
+#@profile
 def index():
     return "El bot está funcionando", 200
 
