@@ -78,6 +78,13 @@ from collections.abc import Sequence
 #from dotenv import load_dotenv
 #load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
+try:
+    # Si usas firebase_admin con google-cloud-firestore detrás:
+    from google.cloud import firestore as gcf
+    SERVER_TS = gcf.SERVER_TIMESTAMP
+except Exception:
+    SERVER_TS = None  # fallback si no está disponible
+
 timezone_country = pytz.timezone('America/Santiago')
 user_states = {}
 timeout_request_global = 2 # Tiempo máximo de espera en segundos
@@ -199,6 +206,21 @@ TF_MAP = {
     '1h':'1hour','4h':'4hour','1d':'1day','1w':'1week',
 }
 
+MY_ID   = os.getenv("WORKER_ID") or socket.gethostname()
+MY_ADDR = (os.getenv("WORKER_ADDR") or "").strip()  # p. ej. "10.8.0.2:8103"
+# (Opcional) valida formato/IP:puerto que expones
+_ALLOW_TARGET = re.compile(r"^10\.8\.0\.(\d{1,3}):8(1|2|3)\d{2}$")  # rangos 81xx/82xx/83xx
+
+# Registro de ejecuciones en curso: exec_id -> asyncio.Task
+RUNNING: Dict[str, asyncio.Task] = {}
+
+STOP_EVENTS: dict[str, threading.Event] = {}
+STOP_EVENTS_LOCK = threading.Lock()
+
+USER_STATE_STALE_SECONDS = int(os.getenv("USER_STATE_STALE_SECONDS", "180"))   # 3 min
+USER_STATE_SWEEP_EVERY   = int(os.getenv("USER_STATE_SWEEP_EVERY", "60"))       # cada 60s
+USER_STATE_BUSY_VALUES   = {"ocupado", "en_ejecucion", "esperando_grafico_ia", "running"}
+
 modelo_patrones = YOLO("patrones.pt")
 modelo_ruido = YOLO("ruido.pt")
 
@@ -218,6 +240,158 @@ try:
     calc_map  # type: ignore[name-defined]
 except NameError:
     calc_map = None  # idem
+
+
+
+def _as_unix(d):
+    """
+    Convierte distintos formatos posibles de updated_at a unix.
+    Acepta: int/float, datetime, string ISO. Devuelve None si no se puede.
+    """
+    if d is None:
+        return None
+    if isinstance(d, (int, float)):
+        return int(d)
+    if hasattr(d, "timestamp"):  # Firestore Timestamp o datetime
+        try:
+            return int(d.timestamp())
+        except Exception:
+            pass
+    if isinstance(d, str):
+        try:
+            # admite "2025-09-22T05:29:51.313045+00:00" o con 'Z'
+            s = d.replace("Z", "+00:00")
+            return int(datetime.fromisoformat(s).timestamp())
+        except Exception:
+            return None
+    return None
+
+def _sweep_stuck_user_states_once():
+    now = int(time.time())
+    cutoff = now - USER_STATE_STALE_SECONDS
+
+    try:
+        # No filtramos por campo de tiempo porque puede variar el tipo; filtramos en cliente.
+        docs = db.collection("user_states").stream()
+        batch = db.batch()
+        pending = 0
+
+        for doc in docs:
+            data = doc.to_dict() or {}
+
+            estado = str(data.get("estado") or "").lower()
+            if estado not in USER_STATE_BUSY_VALUES:
+                continue
+
+            # preferimos updated_at_unix, si no, intentamos con otros
+            ts = (
+                _as_unix(data.get("updated_at_unix"))
+                or _as_unix(data.get("updated_at"))
+                or _as_unix(data.get("fecha_inicio"))
+            )
+
+            # si nunca tuvo timestamp o está vencido, liberamos
+            if (ts is None) or (ts < cutoff):
+                batch.set(
+                    doc.reference,
+                    {
+                        "estado": "disponible",
+                        "updated_at_unix": now,
+                        "fecha_fin": datetime.now(timezone.utc).isoformat(),
+                    },
+                    merge=True,
+                )
+                pending += 1
+                # evita batches gigantes
+                if pending % 400 == 0:
+                    batch.commit()
+                    batch = db.batch()
+
+        if pending:
+            batch.commit()
+
+    except Exception as e:
+        logger.warning(f"[watchdog] error barriendo user_states: {e}")
+
+def _user_states_watchdog_loop():
+    # pequeño delay para no pelearse con el arranque
+    time.sleep(5)
+    while True:
+        _sweep_stuck_user_states_once()
+        time.sleep(USER_STATE_SWEEP_EVERY)
+
+if os.getenv("ENABLE_USER_STATE_WATCHDOG", "1") == "1":
+    threading.Thread(target=_user_states_watchdog_loop, daemon=True).start()
+# ====== /Watchdog user_states ======
+
+def _now_unix() -> int:
+    return int(time.time())
+
+def fs_marcar_worker(
+    exec_id: str,
+    *,
+    estado: str = "running",
+    worker_addr: str | None = None,
+    detalles_worker: dict | None = None,
+):
+    """
+    Actualiza ejecuciones/{exec_id} con la metadata del worker para que el front pueda
+    rutar /analisis/stop directo al contenedor correcto.
+
+    - estado: "running" | "stop_requested" | "completed" | "stopped" | "fallido"
+    - worker_addr: "IP:PUERTO" del contenedor (si no se pasa, usa WORKER_ADDR)
+    - detalles_worker: (opcional) info adicional (pid, versión, etc.)
+    """
+    addr = (worker_addr or MY_ADDR or "").strip()
+
+    # Validación suave del target (no rompe si falla, solo evita guardar basura).
+    if addr and not _ALLOW_TARGET.match(addr):
+        # Si no pasa el patrón, lo descartamos para no quebrar el stop.
+        addr = ""
+
+    ts_unix = _now_unix()
+
+    payload = {
+        "worker_id": MY_ID,
+        "task_key": exec_id,
+        "estado": estado,
+        "updated_at": ts_unix,
+        "last_heartbeat": ts_unix,
+    }
+
+    if addr:
+        payload["worker_addr"] = addr
+        # Útil para debug/observabilidad desde la app o consola
+        payload["stop_url"] = f"http://{addr}/analisis/stop"
+
+    if detalles_worker and isinstance(detalles_worker, dict):
+        payload["detalles_worker"] = detalles_worker
+
+    # Si dispones de SERVER_TIMESTAMP, puedes añadirlo sin romper el resto
+    if SERVER_TS is not None:
+        payload["updated_at_server"] = SERVER_TS
+
+    # merge=True para no pisar otros campos (resumen, urls, etc.)
+    db.collection("ejecuciones").document(exec_id).set(payload, merge=True)
+
+
+def fs_heartbeat(exec_id: str):
+    ts = int(time.time())
+    db.collection("ejecuciones").document(exec_id).set(
+        {"last_heartbeat": ts, "updated_at": ts}, merge=True
+    )
+    # ⬇️ Mantén vivo el user_state (sirve para que el watchdog no lo resetee por error)
+    try:
+        snap = db.collection("ejecuciones").document(exec_id).get()
+        d = snap.to_dict() or {}
+        # la ejecución guarda ambos; usa el que haya
+        key = d.get("user_id") or (f"tg_{d.get('chat_id')}" if d.get("chat_id") else None)
+        if key:
+            db.collection("user_states").document(key).set(
+                {"updated_at_unix": ts}, merge=True
+            )
+    except Exception:
+        pass
 
 #@profile
 def _sanitize_bars(bars):
@@ -4898,7 +5072,7 @@ def generar_entradas_multiples(
     bollinger_lower: float | None = None,
     señales_compra: set[str],
     señales_venta: set[str],
-    # --- parámetros tunables (ahora asimétricos por defecto) ---
+    # --- parámetros tunables (asimétricos por defecto) ---
     mult_mid=(1.8, 1.2),
     mult_pullback_s1=(2.0, 1.2),
     mult_pullback_s2=(2.2, 1.2),
@@ -4910,10 +5084,21 @@ def generar_entradas_multiples(
     breakout_offset_atr=0.2,
     scale_offset_atr=0.5,
     boll_offset_atr=0.1,
-    min_rrr=1.2
+    min_rrr=1.2,
+    # --- nuevos parámetros opcionales ---
+    enable_breakout_retest=True,
+    retest_offset_atr=0.2,          # distancia típica del pullback tras la ruptura
+    enable_ladder=True,
+    ladder_steps=2,                 # cuántas escalas a cada lado del nivel
+    ladder_step_atr=0.25,           # separación entre escalas
+    enable_range_mean_revert=True,  # mean-reversion adicional usando rango_dinamico
+    range_pad_atr=0.15,             # al acercarse al borde del rango
+    max_candidates=40,              # límite de propuestas (antes de ordenar)
+    dedupe_tol_atr=0.05,            # entradas a <0.05*ATR se consideran duplicadas
 ):
     """
-    Crea múltiples candidatos (long/short) usando niveles, rango, Bollinger y ATR.
+    Crea múltiples candidatos (long/short) usando niveles, rango, Bollinger y ATR,
+    con ajustes adaptativos según prob_general, tendencia y ancho de Bollinger.
     Filtra por coherencia y RRR >= min_rrr. Ordena por score (menor=mejor).
     """
     entries: list[dict] = []
@@ -4921,18 +5106,18 @@ def generar_entradas_multiples(
     logging.info("===== INPUT =====")
     logging.info(f"precio_actual={precio_actual:.6f}, ATR={ATR if ATR is not None else None}")
     logging.info(f"niveles: S1={niveles.get('soporte_nivel_1')}, S2={niveles.get('soporte_nivel_2')}, "
-                f"R1={niveles.get('resistencia_nivel_1')}, R2={niveles.get('resistencia_nivel_2')}")
+                 f"R1={niveles.get('resistencia_nivel_1')}, R2={niveles.get('resistencia_nivel_2')}")
     logging.info(f"tipo_operacion={tipo_operacion}, estructura={(en_rango or {}).get('estructura_tendencia')}, "
-                f"es_rango={bool((en_rango or {}).get('es_rango_repetitivo'))}")
-    logging.info(f"rango_dinamico={(en_rango or {}).get('rango_dinamico')}")
+                 f"es_rango={bool((en_rango or {}).get('es_rango_repetitivo'))}")
+    logging.info(f"rango_dinamico={(en_rango or {}).get('rango_dinamico')} prob_general={prob_general}")
     logging.info("=================")
 
-    if precio_actual is None or not _finite(precio_actual):
-        return entries
-    if ATR is None or not _finite(ATR) or ATR <= 0:
-        logging.info("ATR inválido: no se generan entradas")
+    # Validaciones básicas
+    if not (_finite(precio_actual) and ATR is not None and _finite(ATR) and ATR > 0):
+        logging.info("Input inválido: sin precio o ATR.")
         return entries
 
+    # --- desestructurar entradas base ---
     s1 = niveles.get("soporte_nivel_1")
     s2 = niveles.get("soporte_nivel_2")
     r1 = niveles.get("resistencia_nivel_1")
@@ -4941,6 +5126,7 @@ def generar_entradas_multiples(
     estructura = (en_rango or {}).get("estructura_tendencia", "indefinida")
     es_rango = bool((en_rango or {}).get("es_rango_repetitivo"))
     rango_dinamico = (en_rango or {}).get("rango_dinamico") or (None, None)
+    rango_low, rango_high = rango_dinamico
 
     sesgo_long = (tipo_operacion in señales_compra) or (tipo_operacion == "Neutral" and estructura in ("alcista", "indefinida"))
     sesgo_short = (tipo_operacion in señales_venta)  or (tipo_operacion == "Neutral" and estructura == "bajista")
@@ -4949,109 +5135,182 @@ def generar_entradas_multiples(
 
     midpoint = ((r1 + s1) / 2.0) if _finite(r1) and _finite(s1) else precio_actual
 
-    # LONG
+    # ====== ADAPTADORES DE CONTEXTO ======
+    # 1) Factor por prob_general (0..100). 50 = neutro.
+    def _prob_factor(p: float | None) -> float:
+        if p is None or not _finite(p): return 1.0
+        # mapear [20..80] -> [0.9..1.1], saturando fuera
+        p = max(0.0, min(100.0, p))
+        if p < 50:
+            return max(0.9, 0.9 + (p - 50) * 0.004)  # 50->0.9, 0->≈0.7 (cap 0.9)
+        else:
+            return min(1.1, 0.9 + (p - 50) * 0.004)  # 50->0.9+0 =0.9? ajustemos:
+    # corrección: neutro=1.0
+    def _prob_factor(p: float | None) -> float:
+        if p is None or not _finite(p): return 1.0
+        p = max(0.0, min(100.0, p))
+        # 50->1.0; 80->1.1; 20->0.9 (lineal)
+        return 0.9 + (p - 20.0) * (0.2 / 60.0)
+
+    # 2) Factor por estructura
+    def _trend_factor(estr: str, side: str) -> float:
+        estr = (estr or "indefinida").lower()
+        if estr == "alcista":
+            return 1.08 if side == "long" else 0.96
+        if estr == "bajista":
+            return 1.08 if side == "short" else 0.96
+        return 1.0  # indefinida
+
+    # 3) Factor por régimen de volatilidad usando ancho de Bollinger
+    def _vol_factor(bu: float | None, bl: float | None, atr: float) -> float:
+        if _finite(bu) and _finite(bl) and atr > 0:
+            width_atr = max(0.1, (bu - bl) / atr)
+            # ancho ~1.0-2.5 ATR: 1.0->0.95 (aprieta), 2.5->1.10 (afloja)
+            width_atr = max(0.5, min(3.0, width_atr))
+            return 0.85 + (width_atr - 0.5) * (0.35 / 2.5)  # ~0.85..1.20
+        return 1.0
+
+    def _adapt_mult(base: tuple[float, float], side: str) -> tuple[float, float]:
+        """Ajusta (tp_mult, sl_mult) con contexto."""
+        tp, sl = base
+        f_prob = _prob_factor(prob_general)
+        f_trend = _trend_factor(estructura, side)
+        f_vol = _vol_factor(bollinger_upper, bollinger_lower, ATR)
+        # Heurística: TP escala con prob y tendencia, SL inverso (protege en baja convicción).
+        tp_adj = tp * f_prob * f_trend * f_vol
+        sl_adj = sl * (2.0 - f_prob) * (2.0 - min(1.15, f_trend))  # cap para no disparar SL
+        # Limites razonables
+        tp_adj = max(0.8, min(3.5, tp_adj))
+        sl_adj = max(0.8, min(2.0, sl_adj))
+        return (tp_adj, sl_adj)
+
+    # ====== ÚTILES ======
+    def _near(a: float, b: float, tol: float) -> bool:
+        return abs(a - b) <= tol
+
+    def _try_add(side: str, entry: float, mult_base: tuple[float, float], basado_en: str):
+        """Aplica adaptadores, crea y filtra por RRR, dedup y límites."""
+        if not _finite(entry): 
+            return
+        # dedupe
+        for e in entries:
+            if e.get("side") == side and _near(e.get("precio_entrada", 0.0), entry, dedupe_tol_atr * ATR):
+                return  # muy cercano a otro ya agregado
+
+        mult_adj = _adapt_mult(mult_base, side)
+        make = calc_tp_sl_compra if side == "long" else calc_tp_sl_venta
+        _add_entry(entries, side=side, entry=entry, atr=ATR, mult_tp_sl=mult_adj,
+                   make_tp_sl=make, basado_en=basado_en,
+                   precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
+                   min_rrr=min_rrr)
+
+    # ====== ESTRATEGIAS BASE (tus originales) ======
     if sesgo_long:
         if _finite(s1):
-            logging.info(f"INTENTO LONG [pullback_S1] entry={s1}")
-            _add_entry(entries, side="long", entry=s1, atr=ATR, mult_tp_sl=mult_pullback_s1,
-                       make_tp_sl=calc_tp_sl_compra, basado_en="pullback_S1",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
+            _try_add("long", s1, mult_pullback_s1, "pullback_S1")
         if _finite(s2):
-            logging.info(f"INTENTO LONG [pullback_S2] entry={s2}")
-            _add_entry(entries, side="long", entry=s2, atr=ATR, mult_tp_sl=mult_pullback_s2,
-                       make_tp_sl=calc_tp_sl_compra, basado_en="pullback_S2",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
+            _try_add("long", s2, mult_pullback_s2, "pullback_S2")
         if _finite(r1):
-            br = r1 + breakout_offset_atr * ATR
-            logging.info(f"INTENTO LONG [breakout_R1] entry={br}")
-            _add_entry(entries, side="long", entry=br, atr=ATR, mult_tp_sl=mult_breakout,
-                       make_tp_sl=calc_tp_sl_compra, basado_en="breakout_R1",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
+            _try_add("long", r1 + breakout_offset_atr * ATR, mult_breakout, "breakout_R1")
         if _finite(midpoint):
-            logging.info(f"INTENTO LONG [midpoint] entry={midpoint}")
-            _add_entry(entries, side="long", entry=midpoint, atr=ATR, mult_tp_sl=mult_mid,
-                       make_tp_sl=calc_tp_sl_compra, basado_en="midpoint",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
-            e1 = midpoint - scale_offset_atr * ATR
-            e2 = midpoint + scale_offset_atr * ATR
-            logging.info(f"INTENTO LONG [scale_in_midpoint_-0.5ATR] entry={e1}")
-            _add_entry(entries, side="long", entry=e1, atr=ATR, mult_tp_sl=mult_scale_lo,
-                       make_tp_sl=calc_tp_sl_compra, basado_en="scale_in_midpoint_-0.5ATR",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
-            logging.info(f"INTENTO LONG [scale_in_midpoint_+0.5ATR] entry={e2}")
-            _add_entry(entries, side="long", entry=e2, atr=ATR, mult_tp_sl=mult_scale_hi,
-                       make_tp_sl=calc_tp_sl_compra, basado_en="scale_in_midpoint_+0.5ATR",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
+            _try_add("long", midpoint, mult_mid, "midpoint")
+            _try_add("long", midpoint - scale_offset_atr * ATR, mult_scale_lo, "scale_in_midpoint_-0.5ATR")
+            _try_add("long", midpoint + scale_offset_atr * ATR, mult_scale_hi, "scale_in_midpoint_+0.5ATR")
         if es_rango and _finite(bollinger_lower):
-            e = bollinger_lower + boll_offset_atr * ATR
-            logging.info(f"INTENTO LONG [bollinger_lower_reversion] entry={e}")
-            _add_entry(entries, side="long", entry=e, atr=ATR, mult_tp_sl=mult_mid,
-                       make_tp_sl=calc_tp_sl_compra, basado_en="bollinger_lower_reversion",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
+            _try_add("long", bollinger_lower + boll_offset_atr * ATR, mult_mid, "bollinger_lower_reversion")
 
-    # SHORT
     if sesgo_short:
         if _finite(r1):
-            logging.info(f"INTENTO SHORT [pullback_R1] entry={r1}")
-            _add_entry(entries, side="short", entry=r1, atr=ATR, mult_tp_sl=mult_pullback_r1,
-                       make_tp_sl=calc_tp_sl_venta, basado_en="pullback_R1",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
+            _try_add("short", r1, mult_pullback_r1, "pullback_R1")
         if _finite(r2):
-            logging.info(f"INTENTO SHORT [pullback_R2] entry={r2}")
-            _add_entry(entries, side="short", entry=r2, atr=ATR, mult_tp_sl=mult_pullback_r2,
-                       make_tp_sl=calc_tp_sl_venta, basado_en="pullback_R2",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
+            _try_add("short", r2, mult_pullback_r2, "pullback_R2")
         if _finite(s1):
-            brk = s1 - breakout_offset_atr * ATR
-            logging.info(f"INTENTO SHORT [breakdown_S1] entry={brk}")
-            _add_entry(entries, side="short", entry=brk, atr=ATR, mult_tp_sl=mult_breakout,
-                       make_tp_sl=calc_tp_sl_venta, basado_en="breakdown_S1",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
+            _try_add("short", s1 - breakout_offset_atr * ATR, mult_breakout, "breakdown_S1")
         if _finite(midpoint):
-            logging.info(f"INTENTO SHORT [midpoint] entry={midpoint}")
-            _add_entry(entries, side="short", entry=midpoint, atr=ATR, mult_tp_sl=mult_mid,
-                       make_tp_sl=calc_tp_sl_venta, basado_en="midpoint",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
-            e1 = midpoint + scale_offset_atr * ATR
-            e2 = midpoint - scale_offset_atr * ATR
-            logging.info(f"INTENTO SHORT [scale_in_midpoint_+0.5ATR] entry={e1}")
-            _add_entry(entries, side="short", entry=e1, atr=ATR, mult_tp_sl=mult_scale_lo,
-                       make_tp_sl=calc_tp_sl_venta, basado_en="scale_in_midpoint_+0.5ATR",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
-            logging.info(f"INTENTO SHORT [scale_in_midpoint_-0.5ATR] entry={e2}")
-            _add_entry(entries, side="short", entry=e2, atr=ATR, mult_tp_sl=mult_scale_hi,
-                       make_tp_sl=calc_tp_sl_venta, basado_en="scale_in_midpoint_-0.5ATR",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
+            _try_add("short", midpoint, mult_mid, "midpoint")
+            _try_add("short", midpoint + scale_offset_atr * ATR, mult_scale_lo, "scale_in_midpoint_+0.5ATR")
+            _try_add("short", midpoint - scale_offset_atr * ATR, mult_scale_hi, "scale_in_midpoint_-0.5ATR")
         if es_rango and _finite(bollinger_upper):
-            e = bollinger_upper - boll_offset_atr * ATR
-            logging.info(f"INTENTO SHORT [bollinger_upper_reversion] entry={e}")
-            _add_entry(entries, side="short", entry=e, atr=ATR, mult_tp_sl=mult_mid,
-                       make_tp_sl=calc_tp_sl_venta, basado_en="bollinger_upper_reversion",
-                       precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                       min_rrr=min_rrr)
+            _try_add("short", bollinger_upper - boll_offset_atr * ATR, mult_mid, "bollinger_upper_reversion")
 
-    
+    # ====== NUEVA ESTRATEGIA 1: Breakout-Retest ======
+    # Long: rompe R1, esperar pullback a (~R1 + retest_offset) para entrar mejor.
+    # Short: rompe S1, esperar pullback a (~S1 - retest_offset).
+    if enable_breakout_retest:
+        if sesgo_long and _finite(r1):
+            retest_long = r1 + retest_offset_atr * ATR
+            _try_add("long", retest_long, mult_breakout, "breakout_R1_retest")
+        if sesgo_short and _finite(s1):
+            retest_short = s1 - retest_offset_atr * ATR
+            _try_add("short", retest_short, mult_breakout, "breakdown_S1_retest")
+
+    # ====== NUEVA ESTRATEGIA 2: Laddered Pullback alrededor de niveles ======
+    # Genera pequeñas escalas ±k*ATR del nivel base para mejorar el precio promedio.
+    if enable_ladder:
+        def _ladder(side: str, level: float, base_mult: tuple[float, float], tag: str, dir_sign: int):
+            # dir_sign: +1 para long (comprar más abajo), -1 para short (vender más arriba)
+            if not _finite(level): 
+                return
+            for step in range(1, ladder_steps + 1):
+                off = dir_sign * step * ladder_step_atr * ATR
+                _try_add(side, level - off, base_mult, f"{tag}_ladder_{step}")
+
+        if sesgo_long:
+            if _finite(s1): _ladder("long", s1, mult_pullback_s1, "pullback_S1", +1)
+            if _finite(s2): _ladder("long", s2, mult_pullback_s2, "pullback_S2", +1)
+        if sesgo_short:
+            if _finite(r1): _ladder("short", r1, mult_pullback_r1, "pullback_R1", -1)
+            if _finite(r2): _ladder("short", r2, mult_pullback_r2, "pullback_R2", -1)
+
+    # ====== NUEVA ESTRATEGIA 3: Mean-Reversion con rango_dinamico ======
+    # Si hay rango, buscar reversión cerca de sus bordes (además de Bollinger).
+    if enable_range_mean_revert and es_rango and _finite(rango_low) and _finite(rango_high):
+        # Long cerca del borde inferior del rango
+        if sesgo_long:
+            e_low = rango_low + range_pad_atr * ATR
+            _try_add("long", e_low, mult_mid, "range_lower_reversion")
+        # Short cerca del borde superior del rango
+        if sesgo_short:
+            e_high = rango_high - range_pad_atr * ATR
+            _try_add("short", e_high, mult_mid, "range_upper_reversion")
+
+    # ====== LIMITE DE CANDIDATOS (por performance/ruido) ======
+    if len(entries) > max_candidates:
+        entries = entries[:max_candidates]
+
+    # ====== ORDENACIÓN Y LOG ======
     logging.info("===== RESUMEN =====")
     logging.info(f"Intentos totales: {len(entries)} (antes de ordenar)")
+
+    # Mejora de score: pondera RRR alto, cercanía a precio, y confluencia (señales/estructura)
+    def _confluence_boost(e: dict) -> float:
+        base = 0.0
+        # bonus si basado en pullback a nivel fuerte
+        if "pullback" in e.get("basado_en", ""): base -= 0.05
+        if "retest"  in e.get("basado_en", ""): base -= 0.04
+        if "range_"  in e.get("basado_en", ""): base -= 0.03
+        if "bollinger" in e.get("basado_en", ""): base -= 0.02
+        # cercanía al precio (prefiere no demasiado lejos)
+        dist = abs(e.get("precio_entrada", 0.0) - precio_actual) / max(1e-9, ATR)
+        base += min(0.3, 0.03 * dist)  # penaliza muy lejos
+        # RRR alto mejor
+        rrr = e.get("rrr", 1.0)
+        base -= min(0.4, 0.06 * (rrr - min_rrr))  # recompensa RRR por encima del mínimo
+        # ligero sesgo con estructura
+        if estructura == "alcista" and e.get("side") == "long": base -= 0.02
+        if estructura == "bajista" and e.get("side") == "short": base -= 0.02
+        return base
+
+    # Si ya tenías un "score" propio dentro de _add_entry, esto lo re-combina sin romper.
+    for e in entries:
+        e["score"] = float(e.get("score", 0.0)) + _confluence_boost(e)
+
     entries.sort(key=lambda e: e.get("score", 1e9))
 
     for i, e in enumerate(entries[:10], 1):
         logging.info(f"{i:02d}) {e['side'].upper()} {e['basado_en']} "
-                    f"entry={e['precio_entrada']:.6f} tp={e['take_profit']:.6f} "
-                    f"sl={e['stop_loss']:.6f} RRR={e['rrr']:.3f} score={e['score']:.3f}")
+                     f"entry={e['precio_entrada']:.6f} tp={e['take_profit']:.6f} "
+                     f"sl={e['stop_loss']:.6f} RRR={e['rrr']:.3f} score={e['score']:.3f}")
 
     return entries
 
@@ -6847,7 +7106,8 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                     origen=(origen or "telegram"),
                 )
                 if not success:
-                    await update.message.reply_text(mensaje)
+                    if send_to_tg and context:
+                        await update.message.reply_text(mensaje)
     
     urls_generadas = _solo_strings_urls(urls_generadas)
     logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
@@ -6924,7 +7184,7 @@ async def manejar_fecha_eventos(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     # Suscripción (rama Telegram)
-    if await estado_suscripcion(user_chat_id) != 'activa' and not es_administrador(user_chat_id):
+    if await estado_suscripcion(chat_id=user_chat_id) != 'activa' and not es_administrador(user_chat_id):
         await update.message.reply_text(
             "No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n"
             "Por favor, contacta con un administrador."
@@ -6973,7 +7233,7 @@ async def manejar_fecha_noticias_user(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text("No estás registrado. Por favor, usa /start para registrarte.")
         return
 
-    if await estado_suscripcion(user_chat_id) != 'activa' and not es_administrador(user_chat_id):
+    if await estado_suscripcion(chat_id=user_chat_id) != 'activa' and not es_administrador(user_chat_id):
         await update.message.reply_text(
             "No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n"
             "Por favor, contacta con un administrador."
@@ -7019,7 +7279,7 @@ async def manejar_fecha_noticias_admin(update: Update, context: ContextTypes.DEF
 
     # 2) Suscripción (rama Telegram) o admin
     try:
-        estado_sub = await estado_suscripcion(user_chat_id)
+        estado_sub = await estado_suscripcion(chat_id=user_chat_id)
     except TypeError:
         # Si tu estado_suscripcion usa firma nueva, descomenta la línea de abajo y comenta la anterior.
         # estado_sub = await estado_suscripcion(user_id=None, chat_id=user_chat_id)
@@ -7085,7 +7345,7 @@ async def analizar_simbolo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Suscripción vigente o admin
-    if await estado_suscripcion(user_chat_id) != 'activa' and not es_administrador(user_chat_id):
+    if await estado_suscripcion(chat_id=user_chat_id) != 'activa' and not es_administrador(user_chat_id):
         await update.message.reply_text(
             "No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n"
             "Por favor, contacta con un administrador."
@@ -7802,7 +8062,7 @@ async def trader_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No estás registrado. Por favor, usa /start para registrarte.")
         return
     
-    if await estado_suscripcion(user_chat_id) != 'activa' and not es_administrador(user_chat_id):
+    if await estado_suscripcion(chat_id=user_chat_id) != 'activa' and not es_administrador(user_chat_id):
         await update.message.reply_text("No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n" \
                                         "Por favor,  contacta con un administrador.")
         return
@@ -7897,7 +8157,7 @@ async def seleccionar_par(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No estás registrado. Por favor, usa /start para registrarte.")
         return
 
-    if await estado_suscripcion(user_chat_id) != 'activa' and not es_administrador(user_chat_id):
+    if await estado_suscripcion(chat_id=user_chat_id) != 'activa' and not es_administrador(user_chat_id):
         await update.message.reply_text("No tiene una suscripción activa o no cuenta con la cuota de transacciones requerida.\n" \
                                         "Por favor,  contacta con un administrador.")
         return
@@ -7962,11 +8222,11 @@ async def menu_usuario_administrador(context: ContextTypes.DEFAULT_TYPE, user_ch
 
 
 #@profile
-async def menu_usuario_registrado(bot, user_chat_id):
+async def menu_usuario_registrado(bot, user_chat_id: str):
     """El menú del usuario registrado según su estado de suscripción."""
     try:
-        if  await estado_suscripcion(user_chat_id) == 'activa' :
-            # Menú para usuarios con suscripción activa
+        # ⬇️ usa keyword para que respete la firma de estado_suscripcion
+        if await estado_suscripcion(chat_id=user_chat_id) == "activa":
             comandos_principales = [
                 BotCommand("trader_menu", "Menú Operador"),
                 BotCommand("ia_grafico", "Analisis IA por imagen"),
@@ -7979,7 +8239,6 @@ async def menu_usuario_registrado(bot, user_chat_id):
                 BotCommand("stop", "Detener el bot"),
             ]
         else:
-            # Menú para usuarios sin suscripción activa
             comandos_principales = [
                 BotCommand("menu_suscripciones", "Menu suscripción"),
                 BotCommand("verificar_pago", "Verificar pago"),
@@ -7988,10 +8247,10 @@ async def menu_usuario_registrado(bot, user_chat_id):
                 BotCommand("stop", "Detener el bot"),
             ]
 
-        # Configurar comandos para el usuario
         await bot.set_my_commands(comandos_principales, scope=BotCommandScopeChat(user_chat_id))
     except Exception as e:
         logger.info(f"Error al resetear el menú para el usuario {user_chat_id}: {e}")
+
 
 
 #@profile
@@ -8104,33 +8363,53 @@ def parse_iso_aware(s: str):
 # Devuelve: 'activa' | 'expirada' | 'inactiva' | 'transacciones_insuficientes' | 'sin suscripción'
 # user_key puede ser user_id (app) o chat_id (bot).
 #@profile
-async def estado_suscripcion(*, user_id: str | None = None, chat_id: str | None = None) -> str:
+async def estado_suscripcion(
+    *, 
+    user_id: str | None = None, 
+    chat_id: str | None = None,
+    numero_transacciones: int | None = None,   # ← nuevo (opcional)
+    **_kwargs                                       # ← ignora futuros kwargs
+) -> str:
     """
-    Devuelve 'activa' | 'inactiva' basado en Firestore suscripciones_user.
-    Actualiza a 'inactiva' si expiró o sin transacciones.
+    Devuelve:
+      - 'activa' si hay suscripción vigente y saldo suficiente (o no se pidió validar cantidad)
+      - 'transacciones_insuficientes' si hay suscripción activa pero el saldo < numero_transacciones
+      - 'inactiva' si no hay suscripción o está expirada/sin saldo
+    Además normaliza en Firestore el campo 'estado' a 'activa'/'inactiva' (no guarda 'transacciones_insuficientes').
     """
     try:
-        cand_ids = []
+        cand_ids: list[str] = []
         if user_id: cand_ids.append(str(user_id))
         if chat_id: cand_ids.append(str(chat_id))
 
-        # 1) Busca por user_id primero
         for key in cand_ids:
             doc_ref = db.collection("suscripciones_user").document(key)
             snap = doc_ref.get()
-            if snap.exists:
-                sus = snap.to_dict() or {}
-                fin  = parse_iso_aware(sus.get("fin") or "")
-                rest = int(sus.get("transacciones_restantes", 0))
-                ahora = now_utc()
+            if not snap.exists:
+                continue
 
-                estado = "activa" if (fin and fin >= ahora and rest > 0) else "inactiva"
-                if (sus.get("estado") or "").lower() != estado:
-                    try:
-                        doc_ref.set({"estado": estado, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
-                    except Exception as e:
-                        logger.info(f"estado_suscripcion: no se pudo guardar estado: {e}")
-                return estado
+            sus = snap.to_dict() or {}
+            fin  = parse_iso_aware(sus.get("fin") or "")
+            rest = int(sus.get("transacciones_restantes", 0))
+            ahora = _now_utc()
+
+            # Estado base que se persiste en Firestore
+            base_estado = "activa" if (fin and fin >= ahora and rest > 0) else "inactiva"
+            if (sus.get("estado") or "").lower() != base_estado:
+                try:
+                    doc_ref.set({"estado": base_estado, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+                except Exception as e:
+                    logger.info(f"estado_suscripcion: no se pudo guardar estado: {e}")
+
+            # Si no está activa, devolvemos 'inactiva'
+            if base_estado != "activa":
+                return "inactiva"
+
+            # Validación opcional por cantidad pedida
+            if isinstance(numero_transacciones, int) and numero_transacciones > 0 and rest < numero_transacciones:
+                return "transacciones_insuficientes"
+
+            return "activa"
 
         return "inactiva"
     except Exception as e:
@@ -8225,7 +8504,7 @@ async def obtener_opciones_usuario(user_or_chat_id: str, *, origen: str = "teleg
         estado = (sus.get("estado") or "").lower().strip() or "inactiva"
 
         # 4) Normalizar estado por fechas y transacciones
-        ahora = now_utc()
+        ahora = _now_utc()
         if not fin or fin < ahora:
             estado_nuevo = "inactiva"
         elif rest <= 0:
@@ -9561,12 +9840,12 @@ async def confirmar_envio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif destinatarios_tipo == "suscriptores_activos":
         destinatarios = [
             uid for uid in suscripciones.keys()
-            if await estado_suscripcion(uid, origen="app") == "activa"
+            if await estado_suscripcion(user_id=uid, origen="app") == "activa"
         ]
     elif destinatarios_tipo == "suscriptores_inactivos":
         destinatarios = [
             uid for uid in suscripciones.keys()
-            if await estado_suscripcion(uid, origen="app") in ("inactiva", "expirada", "transacciones_insuficientes")
+            if await estado_suscripcion(user_id=uid, origen="app") in ("inactiva", "expirada", "transacciones_insuficientes")
         ]
     else:
         destinatarios = []
@@ -9845,13 +10124,21 @@ async def ejecutar_analisis_desde_app():
         # --- lock (después de validar mínimos) ---
         if ocupado_lock.locked():
             return "Estoy ocupado", 503
+            
         await asyncio.to_thread(ocupado_lock.acquire)
         acquired_lock = True
 
         # --- validar suscripción ---
-        estado_sub = await estado_suscripcion(user_id or chat_id, numero_transacciones=1, origen=origen)
+        kwargs = {"user_id": user_id} if user_id else {"chat_id": chat_id}
+        estado_sub = await estado_suscripcion(
+            **kwargs,
+            numero_transacciones=1,
+            origen=origen,
+        )
         if estado_sub != "activa" and not es_administrador(user_id or chat_id):
             return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
+
+        await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id, estado="ocupado")
 
         # 1) Primero intenta con la clave de APP (user_id)
         opciones_usuario = await obtener_opciones_usuario(user_id, origen="app")
@@ -9890,6 +10177,19 @@ async def ejecutar_analisis_desde_app():
             opciones_usuario=opciones_usuario,
         )
 
+        my_worker_addr = os.getenv("WORKER_ADDR") 
+        await asyncio.to_thread(
+            fs_marcar_worker,
+            exec_id,
+            estado="running",
+            worker_addr=os.getenv("WORKER_ADDR"),  # ej. "10.8.0.2:8103"
+            detalles_worker={
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "image": os.getenv("DOCKER_IMAGE", "markettool:latest"),
+            },
+        )
+
         # 6) dummy context/update para reusar el pipeline
         dummy_update = type("DummyUpdate", (), {
             "effective_chat": type("DummyChat", (), {"id": chat_id})(),
@@ -9915,22 +10215,53 @@ async def ejecutar_analisis_desde_app():
             timezone_name = 'UTC'
 
         # 8) ejecutar
-        urls = await asyncio.shield(asyncio.create_task(
-            ejecutar_recurrente(
-                dummy_context, dummy_update,
-                activo, chat_id, opciones_usuario,
-                user_id=user_id, origen="app",
-                exec_id=exec_id, operatoria_cfg=op_cfg, cfg=cfg
-            )
-        ))
 
-        await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "completado", {"urls": urls})
-        return jsonify({
-            "status": "ok",
-            "exec_id": exec_id,
-            "message": f"Análisis ejecutado para {activo}",
-            "download_urls": _solo_strings_urls(urls),
-        }), 200
+        async def _runner():
+            try:
+                urls_local = await ejecutar_recurrente(
+                    dummy_context, dummy_update,
+                    activo, chat_id, opciones_usuario,
+                    user_id=user_id, origen="app",
+                    exec_id=exec_id, operatoria_cfg=op_cfg, cfg=cfg
+                )
+                # fin normal
+                await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "completado", {"urls": urls_local})
+                return urls_local
+            except asyncio.CancelledError:
+                # cancelación solicitada
+                await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "stopped", {"detalle": "detenido_por_usuario"})
+                raise
+            except Exception as e:
+                # error real
+                await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "fallido", {"error": str(e)})
+                raise
+            finally:
+                RUNNING.pop(exec_id, None)
+
+        task = asyncio.create_task(_runner())
+        RUNNING[exec_id] = task
+
+        # Heartbeat en background (opcional, útil para detectar zombies)
+        async def _hb():
+            try:
+                while not task.done():
+                    await asyncio.sleep(8)
+                    await asyncio.to_thread(fs_heartbeat, exec_id)
+            except Exception:
+                pass
+        asyncio.create_task(_hb())
+
+        resp = jsonify({"status": "accepted", "exec_id": exec_id})
+        status_code = 202
+        return resp, status_code
+        
+        #urls = await task
+        #return jsonify({
+        #    "status": "ok",
+        #    "exec_id": exec_id,
+        #    "message": f"Análisis ejecutado para {activo}",
+        #    "download_urls": _solo_strings_urls(urls),
+        #}), 200
 
     except Exception as e:
         logger.error(f"Error en /analisis/ejecutar: {e}")
@@ -9943,6 +10274,7 @@ async def ejecutar_analisis_desde_app():
         return jsonify({"status": "error", "message": str(e)}), 500
     finally:
         try:
+            await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id_local, estado="disponible")
             if chat_id_local:
                 clear_current_request_cfg(chat_id_local)
         except Exception:
@@ -9953,106 +10285,239 @@ async def ejecutar_analisis_desde_app():
             except Exception:
                 pass
     
-   
-@webhook_app.route('/analisis/imagen', methods=['POST'])
-#@profile
-def subir_imagen_y_analizar():
+
+@webhook_app.route('/analisis/stop', methods=['POST'])
+async def detener_analisis_desde_app():
     try:
+        body = request.get_json(force=True) or {}
+        exec_id = str(body.get("exec_id") or "").strip()
+        if not exec_id:
+            return jsonify({"status":"error","message":"exec_id es obligatorio"}), 400
+
+        # Debe llegar enroutado al nodo correcto por NGINX (?target=IP:PUERTO)
+        task = RUNNING.get(exec_id)
+        if not task:
+            # idempotencia: si ya no existe, mira en DB el estado
+            doc = db.collection("ejecuciones").document(exec_id).get()
+            estado = (doc.to_dict() or {}).get("estado")
+            if estado in {"stopped","completed","fallido"}:
+                return jsonify({"status":"ok","exec_id":exec_id,"already":estado}), 200
+            return jsonify({"status":"error","message":"exec_id no encontrado en este worker"}), 404
+
+        # 1) marca intención de stop (NO toques worker_addr aquí)
+        await asyncio.to_thread(
+            fs_marcar_worker,
+            exec_id,
+            estado="stop_requested",
+            detalles_worker={
+                "stop_requested_at": int(time.time()),
+                "stop_origin": "user/app",  # o "system/timeout", etc.
+            },
+        )
+
+        # cancelar
+        task.cancel()
+        try:
+            await task     # esperar cleanup del runner
+        except asyncio.CancelledError:
+            pass
+
+        # 3) marca estado final
+        await asyncio.to_thread(
+            fs_marcar_worker,
+            exec_id,
+            estado="stopped",
+            detalles_worker={
+                "stopped_at": int(time.time()),
+                "stopped_by": "user/app",
+            },
+        )
+
+        return jsonify({"status":"ok","exec_id":exec_id,"stopped":True}), 200
+
+    except Exception as e:
+        logging.exception("Error en /analisis/stop")
+        return jsonify({"status":"error","message":str(e)}), 500
+
+
+def _get_stop_evt(exec_id: str) -> threading.Event:
+    with STOP_EVENTS_LOCK:
+        return STOP_EVENTS.setdefault(exec_id, threading.Event())
+
+def _release_stop_evt(exec_id: str):
+    with STOP_EVENTS_LOCK:
+        STOP_EVENTS.pop(exec_id, None)
+
+class StopRequested(Exception):
+    pass
+
+@webhook_app.route('/analisis/imagen', methods=['POST'])
+async def subir_imagen_y_analizar():
+    """
+    Bloqueante (devuelve 200 con imagen_base64) y cancelable con /analisis/stop.
+    Acepta exec_id opcional en el form/json para poder cancelarlo desde la app.
+    """
+    ruta_local = None
+    ruta_salida = None
+    acquired_lock = False
+    exec_id = None
+    user_id = None
+
+    try:
+        # ---- payload ----
+        form = request.form or {}
+        j = request.get_json(silent=True) or {}
+        user_id = str(form.get("user_id") or j.get("user_id") or "").strip()
+        chat_id = str(form.get("chat_id") or j.get("chat_id") or "").strip()  # opcional/legacy
+        if not user_id:
+            return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
+        if "imagen" not in request.files:
+            return jsonify({"status": "error", "message": "Falta archivo 'imagen'"}), 400
+
+        # ---- lock global (si aplica) ----
         if ocupado_lock.locked():
             return "Estoy ocupado", 503
-        
-        data = request.form
-        chat_id = str(data.get("chat_id"))
+        await asyncio.to_thread(ocupado_lock.acquire)
+        acquired_lock = True
 
-        if not chat_id or "imagen" not in request.files:
-            return jsonify({"status": "error", "message": "Faltan parámetros o archivo"}), 400
+        # ---- suscripción/permisos ----
+        estado_sub = await estado_suscripcion(user_id=user_id, numero_transacciones=1, origen="app")
+        if estado_sub != "activa" and not es_administrador(user_id or chat_id):
+            return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
 
-        # Verificar permisos
-        if chat_id not in cargar_chat_ids():
-            return jsonify({"status": "error", "message": "Usuario no registrado"}), 403
+        await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id, estado="ocupado")
 
-        if estado_suscripcion(chat_id) != "activa" and not es_administrador(chat_id):
-            return jsonify({"status": "error", "message": "Suscripción inactiva"}), 403
-
-        # Guardar la imagen
+        # ---- exec_id y guardado del archivo ----
+        exec_id = (form.get("exec_id") or j.get("exec_id") or uuid.uuid4().hex)
         os.makedirs("imagenes", exist_ok=True)
         os.makedirs("procesadas", exist_ok=True)
 
         imagen = request.files["imagen"]
-        ruta_local = f"imagenes/{chat_id}.jpg"
-        imagen.save(ruta_local)
+        ruta_local = os.path.join("imagenes", f"{exec_id}.jpg")
+        await asyncio.to_thread(imagen.save, ruta_local)
 
-        # Establecer estado y llamar directamente a flujo IA
-        mark_user_state(user_id=chat_id, estado="esperando_grafico_ia")
+        ts = int(time.time())
+        db.collection("ejecuciones").document(exec_id).set({
+            "estado": "running",
+            "tipo": "analisis_imagen",
+            "user_id": user_id,
+            "created_at": ts,
+            "updated_at": ts
+        }, merge=True)
 
-        if not es_grafico_de_velas(ruta_local):
-            mark_user_state(user_id=chat_id, estado="disponible")
+        # Publica dónde corre para que /analisis/stop pueda enrutar
+        await asyncio.to_thread(
+            fs_marcar_worker,
+            exec_id,
+            estado="running",
+            worker_addr=os.getenv("WORKER_ADDR"),
+            detalles_worker={"pid": os.getpid(), "tipo": "imagen", "origen": "app"},
+        )
+
+        stop_evt = _get_stop_evt(exec_id)
+        RUNNING[exec_id] = asyncio.current_task()  # <- permite cancelación desde /analisis/stop
+
+        try:
+            mark_user_state(user_id=user_id, estado="esperando_grafico_ia")
+        except Exception:
+            pass
+
+        # ---- validación rápida ----
+        es_chart = await asyncio.to_thread(es_grafico_de_velas, ruta_local)
+        if not es_chart:
+            await asyncio.to_thread(fs_marcar_worker, exec_id, estado="fallido")
+            db.collection("ejecuciones").document(exec_id).set({
+                "estado": "fallido",
+                "resumen": {"message": "❌ No parece ser un gráfico de velas"},
+                "updated_at": int(time.time())
+            }, merge=True)
             return jsonify({"status": "error", "message": "❌ No parece ser un gráfico de velas"}), 400
 
-        ruta_salida, texto_resultado = analizar_con_yolo(ruta_local)
+        # ---- análisis (en hilo) con soporte de stop_cb si existe) ----
+        try:
+            ruta_salida, texto_resultado = await asyncio.to_thread(
+                analizar_con_yolo, ruta_local, stop_cb=stop_evt.is_set
+            )
+        except TypeError:
+            ruta_salida, texto_resultado = await asyncio.to_thread(analizar_con_yolo, ruta_local)
 
-         # Validar ruta_salida
-        if not os.path.exists(ruta_salida):
-            logger.warning(f"[IA] No se generó imagen procesada en: {ruta_salida}")
-            mark_user_state(user_id=chat_id, estado="disponible")
+        if stop_evt.is_set():
+            raise asyncio.CancelledError()
+
+        if not ruta_salida or not os.path.exists(ruta_salida):
+            await asyncio.to_thread(fs_marcar_worker, exec_id, estado="fallido")
+            db.collection("ejecuciones").document(exec_id).set({
+                "estado": "fallido",
+                "resumen": {"message": "No se generó imagen procesada"},
+                "updated_at": int(time.time())
+            }, merge=True)
             return jsonify({"status": "error", "message": "No se generó imagen procesada"}), 500
 
-        # Enviar resultado a Telegram
-        with open(ruta_salida, 'rb') as f:
-            application.bot.send_photo(
-                chat_id=chat_id,
-                photo=InputFile(f),
-            )
-            application.bot.send_message(chat_id=chat_id, text=texto_resultado)
+        # ---- base64 para la app ----
+        with open(ruta_salida, "rb") as f:
+            img_base64 = base64.b64encode(f.read()).decode("utf-8")
 
-        if not es_administrador(chat_id):
-            success, mensaje = descontar_transaccion(chat_id, 1)
-            if not success:
-                application.bot.send_message(chat_id=chat_id, text=mensaje)
-
-        mark_user_state(user_id=chat_id, estado="disponible")
-        
-        if not os.path.exists(ruta_salida):
-            return jsonify({
-                "status": "error",
-                "message": "No se generó la imagen procesada"
-            }), 500
-
-        # Codificar la imagen procesada para devolverla a la app
+        # ---- cobro (si corresponde) ----
         try:
-            with open(ruta_salida, "rb") as f:
-                img_base64 = base64.b64encode(f.read()).decode("utf-8")
-        except Exception as e:
-            logger.error(f"Error al codificar imagen procesada: {e}")
-            return jsonify({
-                "status": "error",
-                "message": "Error al codificar la imagen procesada"
-            }), 500
+            if not es_administrador(user_id or chat_id):
+                success, mensaje = await descontar_transaccion(user_id, 1)
+                if not success:
+                    db.collection("ejecuciones").document(exec_id).set({"billing_warn": mensaje}, merge=True)
+        except Exception as cobro_e:
+            logger.warning(f"[IA] Error en cobro: {cobro_e}")
+
+        # ---- final OK ----
+        await asyncio.to_thread(fs_marcar_worker, exec_id, estado="completed")
+        db.collection("ejecuciones").document(exec_id).set({
+            "estado": "completed",
+            "resumen": {"message": texto_resultado, "imagen_base64": img_base64},
+            "updated_at": int(time.time())
+        }, merge=True)
 
         return jsonify({
             "status": "ok",
+            "exec_id": exec_id,
             "message": texto_resultado,
-            "imagen_base64": img_base64 or None
+            "imagen_base64": img_base64
         }), 200
 
-    except Exception as e:
-        logger.exception(f"❌ Error inesperado en subir_imagen_y_analizar: {e}")
-        if chat_id:
-            mark_user_state(user_id=chat_id, estado="disponible")
-        return jsonify({"status": "error", "message": str(e)}), 500
-    
-    finally:
-        # Limpiar archivos temporales
-        try:
-            if os.path.exists(ruta_local):
-                os.remove(ruta_local)
-            if os.path.exists(ruta_salida):
-                os.remove(ruta_salida)
-        except Exception as cleanup_error:
-            logger.warning(f"No se pudieron eliminar archivos temporales: {cleanup_error}")
+    except asyncio.CancelledError:
+        # Cancelado mediante /analisis/stop
+        await asyncio.to_thread(fs_marcar_worker, exec_id, estado="stopped")
+        db.collection("ejecuciones").document(exec_id).set({
+            "estado": "stopped", "updated_at": int(time.time())
+        }, merge=True)
+        return jsonify({"status": "stopped", "exec_id": exec_id}), 200
 
-        if ocupado_lock.locked():
-            ocupado_lock.release()
+    except Exception as e:
+        logger.exception("❌ Error en /analisis/imagen")
+        if exec_id:
+            try:
+                await asyncio.to_thread(fs_marcar_worker, exec_id, estado="fallido", detalles_worker={"error": str(e)})
+                db.collection("ejecuciones").document(exec_id).set({
+                    "estado": "fallido", "error": str(e), "updated_at": int(time.time())
+                }, merge=True)
+            except Exception:
+                pass
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    finally:
+        RUNNING.pop(exec_id, None)
+        _release_stop_evt(exec_id)
+        try:
+            await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id_local, estado="disponible")
+        except Exception:
+            pass
+        try:
+            if ruta_local and os.path.exists(ruta_local): os.remove(ruta_local)
+            if ruta_salida and os.path.exists(ruta_salida): os.remove(ruta_salida)
+        except Exception:
+            pass
+        if acquired_lock and ocupado_lock.locked():
+            try: ocupado_lock.release()
+            except Exception:
+                pass
+
 
 # Ruta para el webhook
 @webhook_app.route('/webhook', methods=['POST'])
