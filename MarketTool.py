@@ -6719,7 +6719,6 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             _load_cfg_and_tz_sync, db, user_id=user_id, chat_id=user_chat_id
         )
 
-    logging.info(f'MTORO100 - el cfg notification: {cfg.get("notifications")}')
 
     # --- normalizaciones básicas
     origen_norm  = (origen or "app").lower()
@@ -6729,7 +6728,6 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
     # --- resolver chat_id (telegram_id) usando la prioridad definida
     chat_id = _resolve_chat_id(user_id, user_chat_id)
-    logging.info(f'MTORO200 - chat_id: {chat_id}')
     has_chat = bool(chat_id)
 
     # --- política de envío:
@@ -6745,8 +6743,6 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     #   Si hay exec_id -> archivamos (GCS + Firestore).
     #   Si no hay exec_id -> no se archiva.
     can_archive = bool(exec_id)
-
-    logging.info(f'MTORO300 - can_archive: {can_archive}')
 
     urls_generadas = []
 
@@ -8349,13 +8345,6 @@ async def ejecutar_recurrente(
             text=f"Hola {first_name}, comenzó el análisis. Por favor, espera un momento..."
         )
 
-    logging.info(f'MTORO400 - cfg:{cfg}')
-
-    is_upload = _is_uploads_enabled(cfg)
-
-    logging.info(f"MTORO500 - is_upload: {is_upload}")
-
-    
 
     if origen_norm == "telegram" and exec_id is None and _is_uploads_enabled(cfg):
         try:
