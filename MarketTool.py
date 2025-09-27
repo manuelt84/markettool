@@ -9,12 +9,11 @@ import requests
 import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
 import numpy as np
-from datetime import datetime, timedelta
 import datetime as _dt
 from statsmodels.tsa.arima.model import ARIMA
 import concurrent.futures
 import telegram
-from io import BytesIO
+from io import StringIO, BytesIO
 import os
 import json
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand, BotCommandScopeChat
@@ -74,6 +73,7 @@ from functools import partial
 import math
 import statistics
 from collections.abc import Sequence
+import csv as _csv
 #from pathlib import Path
 #from dotenv import load_dotenv
 #load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
@@ -753,9 +753,6 @@ def _wrap_header(h: str, width: int) -> str:
 
 #@profile
 def _es_serializable_basico(v: Any) -> bool:
-    import numpy as np
-    import pandas as pd
-    from datetime import datetime, date
     if v is None: return True
     if isinstance(v, (str, int, float, bool)): return True
     if isinstance(v, (list, tuple)):  # listas anidadas OK si sus elementos lo son
@@ -1289,7 +1286,6 @@ async def subir_ohlcv_enriquecido_y_registrar(
     niveles: dict | None = None, entradas: dict | None = None,
     extra_metadata: dict | None = None,
 ) -> str | None:
-    from datetime import datetime, UTC
 
     d_norm = normalizar_df_ohlcv(df_velas)
     payload = construir_payload_enriquecido(
@@ -5619,43 +5615,99 @@ def generar_nombre_archivo(moneda_filtro, filtro=False, tipo=None):
     # Construir el nombre en el orden deseado
     return f"{moneda_filtro}_{tipo_parte}_{base}_{fecha_hora}.csv"
 
+
+def df_to_csv_buffer(df: pd.DataFrame, cfg: dict) -> BytesIO:
+    """Devuelve un BytesIO con el CSV formateado según cfg.csv y cfg.locale."""
+    if df is None or df.empty:
+        return BytesIO()
+
+    # ---- Lee config ----
+    csv_cfg = (cfg.get("csv") or {})
+    sep = csv_cfg.get("delimiter", ",")
+    if sep == "\\t":
+        sep = "\t"
+    quotechar = csv_cfg.get("quote", '"')
+    header = bool(csv_cfg.get("header", True))
+    encoding = (csv_cfg.get("encoding", "utf-8") or "utf-8").lower()
+    newline = (csv_cfg.get("newline", "LF") or "LF").upper()
+    lineterminator = "\r\n" if newline == "CRLF" else "\n"
+
+    # ---- Aplica formateos regionales al DF (fecha/hora, decimales, miles) ----
+    df_out = _prepare_df_for_csv(df, cfg)
+
+    # ---- Escribe a StringIO (texto), con lineterminator correcto ----
+    s_buf = StringIO()
+    df_out.to_csv(
+        s_buf,
+        sep=sep,
+        index=False,
+        header=header,
+        lineterminator=lineterminator,
+        quoting=_csv.QUOTE_MINIMAL,
+        quotechar=quotechar,
+    )
+
+    # ---- Codifica al encoding pedido en BytesIO ----
+    bin_buf = BytesIO(
+        s_buf.getvalue().encode(
+            "ISO-8859-1" if encoding in ("iso-8859-1", "latin-1") else "utf-8"
+        )
+    )
+    bin_buf.seek(0)
+    return bin_buf
+
 # Función para enviar el archivo CSV a todos los clientes
 #@profile
-async def enviar_csv_telegram(df, context, filename="resultados.csv",  user_chat_id=None, intentos=3):
-    """Función para enviar un archivo CSV a todos los clientes."""
-
+async def enviar_csv_telegram(
+    df,
+    context,
+    filename: str = "resultados.csv",
+    user_chat_id=None,
+    intentos: int = 3,
+    cfg: dict | None = None,   # <— NUEVO (opcional)
+):
+    """Envía CSV formateado según cfg a 1+ chats."""
     chat_ids = [user_chat_id] if user_chat_id else clientes_chat_ids
 
-    # Verificar si el DataFrame está vacío antes de generar el archivo
     if df.empty:
         for chat_id in chat_ids:
             for intento in range(intentos):
                 try:
-                    await context.bot.send_message(chat_id=chat_id, text="No se pudo generar el CSV. El DataFrame está vacío.")
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="No se pudo generar el CSV. El DataFrame está vacío."
+                    )
                     break
                 except TimedOut:
-                    logger.info(f"Intento {intento + 1} fallido. Reintentando...")
-                    await asyncio.sleep(2)  # Espera antes de reintentar
+                    await asyncio.sleep(2)
         return
-    
-    # Crear un buffer en memoria para guardar el archivo CSV
+
+    # Parametrización regional
+    sep, quotechar, header, encoding, lineterminator = _csv_params_from_cfg(cfg)
+
+    # Usa el mismo preformateo que el archivo en disco
+    df_out = _prepare_df_for_csv(df, cfg)
+
+    # Crear buffer binario y escribir CSV respetando encoding / saltos de línea
     buffer = BytesIO()
-    
-    # Guardar el DataFrame como CSV en el buffer en memoria
-    df.to_csv(buffer, sep=';', index=False, float_format='%.6f')
-    buffer.seek(0)  # Volver al inicio del buffer para poder leerlo
-    
-    # Verificar si el buffer no está vacío
-    if buffer.getbuffer().nbytes == 0:
-        for chat_id in chat_ids:
-            await context.bot.send_message(chat_id=chat_id, text="No se pudo generar el CSV. El archivo está vacío.")
-        return
-    
-    # Enviar el CSV a todos los clientes
+    df_out.to_csv(
+        buffer,
+        sep=sep,
+        index=False,
+        header=header,
+        encoding=encoding,
+        lineterminator=lineterminator,
+        quoting=_csv.QUOTE_MINIMAL,
+        quotechar=quotechar,
+    )
+    buffer.seek(0)
+
     for chat_id in chat_ids:
         try:
-            await context.bot.send_document(chat_id=chat_id, document=buffer, filename=f'{filename}')
-            buffer.seek(0)  # Restablecer el buffer para el siguiente cliente
+            await context.bot.send_document(
+                chat_id=chat_id, document=buffer, filename=f"{filename}"
+            )
+            buffer.seek(0)
         except Exception as e:
             logger.info(f"Error al enviar CSV a {chat_id}: {e}")
 
@@ -6443,18 +6495,258 @@ async def ejecutar_analisis_con_hilos(
     return resultados
 
 
+
+def _datetime_strf_pattern(cfg: dict) -> str:
+    """Construye el patrón strftime según la config regional."""
+    date_fmt = (cfg.get("locale") or {}).get("date_format", "YYYY-MM-DD")
+    # mapear tokens comunes a strftime
+    date_map = {
+        "DD/MM/YYYY": "%d/%m/%Y",
+        "MM/DD/YYYY": "%m/%d/%Y",
+        "YYYY-MM-DD": "%Y-%m-%d",
+    }
+    date_strf = date_map.get(date_fmt, "%Y-%m-%d")
+
+    time_fmt = (cfg.get("locale") or {}).get("time_format", "24h")
+    time_strf = "%H:%M" if time_fmt == "24h" else "%I:%M %p"
+
+    # Combinar fecha + hora. Si una col es solo fecha o solo hora no pasa nada,
+    # strftime aplica lo que corresponda.
+    return f"{date_strf} {time_strf}"
+
+def _format_numeric(x, dec_sep: str, thou_sep: str, decimals: int = 5):
+    if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
+        return ""
+    if isinstance(x, (int, np.integer)):
+        # miles en enteros
+        s = f"{x:,}"
+        # estandariza a , / . y luego reemplaza al separador pedido
+        s = s.replace(",", "_COMA_").replace(".", "_PUNTO_")
+        if thou_sep == ",":
+            s = s.replace("_COMA_", ",").replace("_PUNTO_", "")
+        elif thou_sep == ".":
+            s = s.replace("_COMA_", "").replace("_PUNTO_", ".")
+        elif thou_sep == " ":
+            s = s.replace("_COMA_", " ").replace("_PUNTO_", "")
+        else:  # ''
+            s = s.replace("_COMA_", "").replace("_PUNTO_", "")
+        return s
+    try:
+        # flotantes con N decimales
+        s = f"{float(x):,.{decimals}f}"  # usa coma como miles y punto decimal (estándar en US)
+    except Exception:
+        return str(x)
+
+    # normaliza a marcadores, luego aplica los separadores elegidos
+    s = s.replace(",", "_COMA_").replace(".", "_PUNTO_")
+    # primero miles:
+    if thou_sep == ",":
+        s = s.replace("_COMA_", ",")
+    elif thou_sep == ".":
+        s = s.replace("_COMA_", ".")
+    elif thou_sep == " ":
+        s = s.replace("_COMA_", " ")
+    else:  # ''
+        s = s.replace("_COMA_", "")
+    # luego decimal:
+    s = s.replace("_PUNTO_", dec_sep)
+    return s
+
+def _csv_params_from_cfg(cfg: dict):
+    csv_cfg = (cfg or {}).get("csv") or {}
+    sep = csv_cfg.get("delimiter", ";")
+    quotechar = csv_cfg.get("quote", '"')
+    header = bool(csv_cfg.get("header", True))
+    enc = (csv_cfg.get("encoding") or "utf-8").lower()
+    newline = (csv_cfg.get("newline") or "LF").upper()
+    lineterminator = "\r\n" if newline == "CRLF" else "\n"
+    # normaliza encoding
+    encoding = "ISO-8859-1" if enc in ("iso-8859-1", "latin-1") else "utf-8"
+    return sep, quotechar, header, encoding, lineterminator
+
+
+def _use_dayfirst(cfg: dict | None) -> bool:
+    fmt = ((cfg or {}).get("locale") or {}).get("date_format")
+    return fmt == "DD/MM/YYYY"
+
+# si quieres formatear el texto de salida también:
+def _strftime_from_cfg(cfg: dict | None) -> tuple[str, str, str]:
+    loc = (cfg or {}).get("locale") or {}
+    date_map = {
+        "DD/MM/YYYY": "%d/%m/%Y",
+        "MM/DD/YYYY": "%m/%d/%Y",
+        "YYYY-MM-DD": "%Y-%m-%d",
+    }
+    time_map = {"24h": "%H:%M", "12h": "%I:%M %p"}
+    date_fmt = date_map.get(loc.get("date_format"), "%Y-%m-%d")
+    time_fmt = time_map.get(loc.get("time_format"), "%H:%M")
+    return date_fmt, time_fmt, f"{date_fmt} {time_fmt}"
+
+def _prepare_df_for_csv(df_in: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """Copia el DF y aplica formatos de fecha/hora, decimal y miles según cfg."""
+    if df_in is None or df_in.empty:
+        return df_in
+
+    df = df_in.copy()
+
+    # 1) Formato fecha/hora
+    dt_fmt = _datetime_strf_pattern(cfg)
+    for col in df.columns:
+        # intenta convertir si es de tipo datetime o string ISO
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].dt.strftime(dt_fmt).fillna("")
+        else:
+            # si hay strings con fecha ISO, intenta parsear (suave)
+            sample = df[col].iloc[0] if len(df[col]) else None
+            if isinstance(sample, str):
+                try:
+                    use_dayfirst = _use_dayfirst(cfg)
+
+                    # Si es columna de fecha/hora, parsea así:
+                    parsed = pd.to_datetime(
+                        df[col],
+                        errors="coerce",
+                        utc=False,
+                        dayfirst=use_dayfirst,
+                        format="mixed",          # <- clave: evita el warning en pandas >= 2.0
+                    )
+                    df[col] = parsed
+                except Exception:
+                    pass
+
+    # 2) Formato numérico (decimal + miles)
+    loc = cfg.get("locale") or {}
+    dec_sep = loc.get("decimal_sep", ".")
+    thou_sep = loc.get("thousands_sep", "")
+
+    num_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    if num_cols:
+        for c in num_cols:
+            df[c] = df[c].apply(lambda v: _format_numeric(v, dec_sep, thou_sep, decimals=5))
+
+    return df
+
+def save_df_as_csv(df: pd.DataFrame, path: str, cfg: dict):
+    """Exporta df a CSV aplicando toda la config regional/csv."""
+    if df is None:
+        return
+ 
+    sep, quotechar, header, encoding, lineterminator = _csv_params_from_cfg(cfg)
+
+    # Sugerencia (LOG) si delimitador y decimal chocan
+    try:
+        dec_sep = (cfg.get("locale") or {}).get("decimal_sep", ".")
+        if dec_sep == sep:
+            # no cambiamos la elección del usuario; solo dejamos aviso en logs
+                logging.info(
+                f"[CSV] El separador decimal '{dec_sep}' coincide con el delimitador '{sep}'. "
+                "Considera usar ';' como delimitador para evitar ambigüedad."
+            )
+    except Exception:
+        pass
+
+    # Prepara copia con formatos aplicados
+    df_out = _prepare_df_for_csv(df, cfg)
+
+    # Guardado
+    df_out.to_csv(
+        path,
+        sep=sep,
+        index=False,
+        header=header,
+        encoding="ISO-8859-1" if encoding in ("iso-8859-1", "latin-1") else "utf-8",
+        lineterminator=lineterminator,
+        quoting=_csv.QUOTE_MINIMAL,
+        quotechar=quotechar,
+    )
+
+
+def _read_telegram_id_prefer_subscription(user_id: str) -> Optional[str]:
+    """Lee telegram_id priorizando suscripciones_user, luego user_ids."""
+    try:
+        sub_doc = db.collection('suscripciones_user').document(user_id).get()
+        if sub_doc.exists:
+            tg = (sub_doc.to_dict() or {}).get('telegram_id')
+            if tg:
+                return str(tg)
+    except Exception:
+        pass
+
+    try:
+        uid_doc = db.collection('user_ids').document(user_id).get()
+        if uid_doc.exists:
+            tg = (uid_doc.to_dict() or {}).get('telegram_id')
+            if tg:
+                return str(tg)
+    except Exception:
+        pass
+
+    return None
+
+
+def _resolve_chat_id(user_id: Optional[str], user_chat_id: Optional[str]) -> Optional[str]:
+    """
+    Resuelve el chat_id (telegram_id) con prioridad:
+      1) user_chat_id explícito (cuando viene del bot TG).
+      2) suscripciones_user/{userId}.telegram_id
+      3) user_ids/{userId}.telegram_id
+    """
+    # 1) parámetro explícito
+    if user_chat_id and str(user_chat_id).strip():
+        return str(user_chat_id).strip()
+
+    # 2) buscar por user_id en Firestore
+    if user_id and str(user_id).strip():
+        return _read_telegram_id_prefer_subscription(str(user_id).strip())
+
+    return None
+
+def _is_uploads_enabled(cfg: Optional[dict]) -> bool:
+    cfg = cfg or {}
+    # acepta dos formas: plana o anidada en "features"
+    if "enable_file_uploads" in cfg:
+        return bool(cfg.get("enable_file_uploads"))
+    return bool((cfg.get("features") or {}).get("enable_file_uploads"))
+
+
 # Función para procesar el resultado de cada análisis
 #@profile
 async def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_id, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None, cfg: dict | None = None):
 
-    origen_norm  = (origen or "app").lower()
-    send_results = bool(((cfg or {}).get("notifications") or {}).get("send_results_telegram"))
-    has_chat     = bool(str(user_chat_id or "").strip())
+    # --- CARGA CFG
+    if cfg is None:
+        cfg, _ = await asyncio.to_thread(
+            _load_cfg_and_tz_sync, db, user_id=user_id, chat_id=user_chat_id
+        )
 
+    logging.info(f'MTORO100 - el cfg notification: {cfg.get("notifications")}')
+
+    # --- normalizaciones básicas
+    origen_norm  = (origen or "app").lower()
+    cfg          = cfg or {}
+    notifications = cfg.get("notifications") or {}
+    send_results = bool(notifications.get("send_results_telegram"))
+
+    # --- resolver chat_id (telegram_id) usando la prioridad definida
+    chat_id = _resolve_chat_id(user_id, user_chat_id)
+    logging.info(f'MTORO200 - chat_id: {chat_id}')
+    has_chat = bool(chat_id)
+
+    # --- política de envío:
+    # - si el origen es telegram -> enviar (estamos en el hilo del bot)
+    # - si el origen es app     -> enviar solo si el usuario lo activó en cfg
     send_to_tg = has_chat and (
         (origen_norm == "telegram") or
         (origen_norm == "app" and send_results)
     )
+
+
+    # Con esto, a partir de aquí mantenemos la política clara:
+    #   Si hay exec_id -> archivamos (GCS + Firestore).
+    #   Si no hay exec_id -> no se archiva.
+    can_archive = bool(exec_id)
+
+    logging.info(f'MTORO300 - can_archive: {can_archive}')
 
     urls_generadas = []
 
@@ -6505,8 +6797,8 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
     df_resultados_ordenado = df_resultados.sort_values(by='Ponderacion', ascending=False)  
 
-    # 7) (Solo app) Subir enriquecidos por símbolo/TF — se mantiene
-    if origen == "app" and exec_id:
+    # 7)Subir enriquecidos por símbolo/TF — se mantiene
+    if can_archive:
         urls_enriched = []
         for res in resultados:
             if not isinstance(res, dict):
@@ -6566,7 +6858,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             urls_generadas.extend(urls_enriched)
 
     # 8) (Solo app) Subir **ordenado** saneado (reemplaza al “resultados_completos”)
-    if origen == "app" and exec_id:
+    if can_archive:
         # Limpieza escalar (NaN/±Inf -> None) y anidados
         df_ord = (
             df_resultados_ordenado
@@ -6601,7 +6893,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     ]
 
     # --- JSON oportunidades ---
-    if origen == "app" and exec_id:
+    if can_archive:
         opp_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
         url_opp = await guardar_json_en_storage_y_registrar(
             exec_id=exec_id,
@@ -6784,7 +7076,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             if not df_principal.empty:
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_principal)
-                    df_principal.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
+                    save_df_as_csv(df_principal, ruta_local, cfg)
 
                     if exec_id:
                         object_path = build_object_path(exec_id, nombre_archivo_principal)
@@ -6794,7 +7086,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                     url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                     urls_generadas.append(url_publica)
 
-                    if exec_id:
+                    if can_archive:
                         await asyncio.to_thread(
                             fs_registrar_archivo_generado,
                             exec_id=exec_id, 
@@ -6810,9 +7102,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
                 if send_to_tg:
                     if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id))
+                        asyncio.create_task(enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id, cfg=cfg))
                     else:
-                        await enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id)
+                        await enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id, cfg=cfg)
 
             else:
                 logger.info(f"El DataFrame principal está vacío. No se enviará el archivo: {nombre_archivo_principal}")
@@ -6820,9 +7112,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             if not df_secundaria.empty:
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_secundaria)
-                    df_secundaria.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
+                    save_df_as_csv(df_secundaria, ruta_local, cfg)
 
-                    if exec_id:
+                    if can_archive:
                         object_path = build_object_path(exec_id, nombre_archivo_secundaria)
                     else:
                         object_path = nombre_archivo_secundaria  # fallback sin exec_id si fuera necesario
@@ -6830,7 +7122,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                     url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                     urls_generadas.append(url_publica)
 
-                    if exec_id:
+                    if can_archive:
                         await asyncio.to_thread(
                             fs_registrar_archivo_generado,
                             exec_id=exec_id, 
@@ -6846,9 +7138,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
                 if send_to_tg:
                     if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id))
+                        asyncio.create_task(enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id, cfg=cfg))
                     else:
-                        await enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id)
+                        await enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id, cfg=cfg)
 
             else:
                 logger.info(f"El DataFrame secundario está vacío. No se enviará el archivo: {nombre_archivo_secundaria}")
@@ -6868,9 +7160,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             if not df_filtrado_principal.empty:
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_principal)
-                    df_filtrado_principal.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
+                    save_df_as_csv(df_filtrado_principal, ruta_local, cfg)
 
-                    if exec_id:
+                    if can_archive:
                         object_path = build_object_path(exec_id, nombre_archivo_filtrado_principal)
                     else:
                         object_path = nombre_archivo_filtrado_principal  # fallback sin exec_id si fuera necesario
@@ -6878,7 +7170,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                     url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                     urls_generadas.append(url_publica)
 
-                    if exec_id:
+                    if can_archive:
                         await asyncio.to_thread(
                             fs_registrar_archivo_generado,
                             exec_id=exec_id, 
@@ -6894,18 +7186,18 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
                 if send_to_tg:
                     if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id))
+                        asyncio.create_task(enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id, cfg=cfg))
                     else:
-                        await enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id)
+                        await enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id, cfg=cfg)
             else:
                 logger.info(f"El DataFrame filtrado principal está vacío. No se enviará el archivo: {nombre_archivo_filtrado_principal}")
 
             if not df_filtrado_secundaria.empty:
                 if origen == "app":
                     ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_secundaria)
-                    df_filtrado_secundaria.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
+                    save_df_as_csv(df_filtrado_secundaria, ruta_local, cfg)
 
-                    if exec_id:
+                    if can_archive:
                         object_path = build_object_path(exec_id, nombre_archivo_filtrado_secundaria)
                     else:
                         object_path = nombre_archivo_filtrado_secundaria  # fallback sin exec_id si fuera necesario
@@ -6913,7 +7205,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                     url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                     urls_generadas.append(url_publica)
 
-                    if exec_id:
+                    if can_archive:
                         await asyncio.to_thread(
                             fs_registrar_archivo_generado,
                             exec_id=exec_id, 
@@ -6929,9 +7221,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
                 if send_to_tg:
                     if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id))
+                        asyncio.create_task(enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id, cfg=cfg))
                     else:
-                        await enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id)
+                        await enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id, cfg=cfg)
 
             else:
                 logger.info(f"El DataFrame filtrado secundario está vacío. No se enviará el archivo: {nombre_archivo_filtrado_secundaria}")
@@ -6967,9 +7259,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
         if not df_resultados.empty:
             if origen == "app":
                 ruta_local = os.path.join("/tmp", nombre_archivo)
-                df_resultados.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
+                save_df_as_csv(df_resultados, ruta_local, cfg)
 
-                if exec_id:
+                if can_archive:
                     object_path = build_object_path(exec_id, nombre_archivo)
                 else:
                     object_path = nombre_archivo  # fallback sin exec_id si fuera necesario
@@ -6977,7 +7269,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                 urls_generadas.append(url_publica)
 
-                if exec_id:
+                if can_archive:
                     await asyncio.to_thread(
                         fs_registrar_archivo_generado,
                         exec_id=exec_id, 
@@ -6993,9 +7285,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
             if send_to_tg:
                     if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id))
+                        asyncio.create_task(enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id, cfg=cfg))
                     else:
-                        await enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id)
+                        await enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id, cfg=cfg)
         else:
             logger.info(f"El DataFrame df_resultados está vacío. No se enviará el archivo CSV: {nombre_archivo}")
 
@@ -7003,9 +7295,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
         if not df_filtrado.empty:
             if origen == "app":
                 ruta_local = os.path.join("/tmp", nombre_archivo_filtrado)
-                df_filtrado.to_csv(ruta_local, sep=';', index=False, float_format='%.5f')
+                save_df_as_csv(df_filtrado, ruta_local, cfg)
 
-                if exec_id:
+                if can_archive:
                     object_path = build_object_path(exec_id, nombre_archivo_filtrado)
                 else:
                     object_path = nombre_archivo_filtrado  # fallback sin exec_id si fuera necesario
@@ -7013,7 +7305,7 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
                 url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                 urls_generadas.append(url_publica)
 
-                if exec_id:
+                if can_archive:
                     # usa chat_id solo si existe (origen telegram o lo tengas disponible)
                     chat_id_opt = user_chat_id or None
 
@@ -7036,9 +7328,9 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
             if send_to_tg:
                     if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id))
+                        asyncio.create_task(enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id, cfg=cfg))
                     else:
-                        await enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id)
+                        await enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id, cfg=cfg)
         else:
             logger.info(f"El DataFrame df_filtrado está vacío. No se enviará el archivo CSV: {nombre_archivo_filtrado}")
 
@@ -7835,7 +8127,106 @@ async def enviar_mensaje_noticias(context, user_chat_id, mensaje):
             # Implementar un tiempo de espera más largo y reintentar
             await asyncio.sleep(10)  # Esperar 10 segundos antes de volver a intentar
             await enviar_mensaje_noticias(context, user_chat_id, mensaje)
-        
+
+
+def _find_user_id_for_chat_sync(db, chat_id: str) -> str | None:
+    """Resuelve user_id desde un chat_id de Telegram."""
+    chat_id = (chat_id or "").strip()
+    if not chat_id:
+        return None
+
+    # A) mapping directo: chat_ids/{chat_id} => { user_id }
+    try:
+        doc = db.collection("chat_ids").document(chat_id).get()
+        if doc.exists:
+            uid = (doc.to_dict() or {}).get("user_id")
+            if uid:
+                return str(uid)
+    except Exception:
+        pass
+
+    # B) buscar en suscripciones_user por telegram_id == chat_id
+    try:
+        q = db.collection("suscripciones_user") \
+              .where("telegram_id", "==", chat_id).limit(1).get()
+        if q:
+            # id del doc = user_id en tu diseño
+            return q[0].id
+    except Exception:
+        pass
+
+    # C) fallback: buscar en user_ids por telegram_id == chat_id
+    try:
+        q = db.collection("user_ids") \
+              .where("telegram_id", "==", chat_id).limit(1).get()
+        if q:
+            return q[0].id
+    except Exception:
+        pass
+
+    return None
+
+
+def _load_cfg_and_tz_sync(db, *, user_id: str | None, chat_id: str | None):
+    """
+    Lee cfg + timezone desde Firestore.
+    Retorna: (cfg_dict, tz_name_str)  -- cfg puede ser {}
+    """
+    uid = (user_id or "").strip()
+    if not uid and chat_id:
+        uid = _find_user_id_for_chat_sync(db, chat_id)
+
+    if not uid:
+        return {}, "UTC"
+
+    user_ref = db.collection("user_ids").document(uid)
+    cfg_ref  = user_ref.collection("user_config").document("current")
+
+    doc_user, doc_cfg = list(db.get_all([user_ref, cfg_ref]))
+
+    cfg = (doc_cfg.to_dict() or {})  # puede incluir notifications, features.enable_file_uploads, etc.
+    tz_name = (doc_user.to_dict() or {}).get("timezone") or "UTC"
+
+    return cfg, tz_name
+
+
+def _find_chat_id_for_user_sync(db, user_id: str | None) -> str | None:
+    """Resuelve chat_id (telegram_id) a partir de un user_id (UUID de app)."""
+    uid = (user_id or "").strip()
+    if not uid:
+        return None
+
+    # A) mapping directo: chat_ids/* con campo user_id == uid
+    try:
+        q = db.collection("chat_ids").where("user_id", "==", uid).limit(1).get()
+        if q:
+            # id del doc es el chat_id
+            return str(q[0].id)
+    except Exception:
+        pass
+
+    # B) user_ids/{uid}.telegram_id
+    try:
+        d = db.collection("user_ids").document(uid).get()
+        if d.exists:
+            tg = (d.to_dict() or {}).get("telegram_id")
+            if tg:
+                return str(tg)
+    except Exception:
+        pass
+
+    # C) suscripciones_user/{uid}.telegram_id
+    try:
+        d = db.collection("suscripciones_user").document(uid).get()
+        if d.exists:
+            tg = (d.to_dict() or {}).get("telegram_id")
+            if tg:
+                return str(tg)
+    except Exception:
+        pass
+
+    return None
+
 # Función para manejar el ciclo recurrente del análisis
 #@profile
 async def ejecutar_recurrente(
@@ -7855,14 +8246,35 @@ async def ejecutar_recurrente(
     - Prioriza user_id (UUID). Si no hay, opera con user_chat_id (telegram).
     - Marca estado 'en ejecución' y libera al final.
     """
-    # --- Normalizaciones y helpers ---
-    origen_norm  = (origen or "app").lower()
-    send_results = bool(((cfg or {}).get("notifications") or {}).get("send_results_telegram"))
-    has_chat     = bool(str(user_chat_id or "").strip())
-    send_to_tg   = has_chat and (origen_norm == "telegram" or (origen_norm == "app" and send_results))
 
+    # --- CARGA CFG
+    if cfg is None:
+        cfg, _ = await asyncio.to_thread(
+            _load_cfg_and_tz_sync, db, user_id=user_id, chat_id=user_chat_id
+        )
+
+    # --- Resolver chat_id (prioriza el que viene; si no, buscar por user_id)
+    if not user_chat_id and user_id:
+        user_chat_id = await asyncio.to_thread(_find_chat_id_for_user_sync, db, user_id)
+
+    global activos
     # Filtra activos (asumo que 'activos' existe en tu módulo)
     activos_filtrados = filtrar_activos_por_moneda(activos, moneda_filtro)
+
+    # --- normalizaciones básicas
+    origen_norm  = (origen or "app").lower()
+    cfg          = cfg or {}
+    notifications = cfg.get("notifications") or {}
+    send_results = bool(notifications.get("send_results_telegram"))
+    has_chat = bool(user_chat_id)
+
+    # --- política de envío:
+    # - si el origen es telegram -> enviar (estamos en el hilo del bot)
+    # - si el origen es app     -> enviar solo si el usuario lo activó en cfg
+    send_to_tg = has_chat and (
+        (origen_norm == "telegram") or
+        (origen_norm == "app" and send_results)
+    )
 
     # Estado local por chat (solo si hay chat_id)
     if user_chat_id and user_chat_id not in user_states:
@@ -7937,6 +8349,53 @@ async def ejecutar_recurrente(
             text=f"Hola {first_name}, comenzó el análisis. Por favor, espera un momento..."
         )
 
+    logging.info(f'MTORO400 - cfg:{cfg}')
+
+    is_upload = _is_uploads_enabled(cfg)
+
+    logging.info(f"MTORO500 - is_upload: {is_upload}")
+
+    
+
+    if origen_norm == "telegram" and exec_id is None and _is_uploads_enabled(cfg):
+        try:
+            activos = [moneda_filtro] if moneda_filtro else []
+            exec_id = await asyncio.to_thread(
+                fs_crear_ejecucion,
+                user_id=user_id,
+                chat_id=user_chat_id or None,
+                activos_solicitados=activos,
+                origen="telegram",
+                opciones_usuario=opciones_usuario or [],
+            )
+        except Exception as e:
+            # si falla la creación, logueamos y seguimos SIN exec_id (sin archivar)
+            logger.warning(f"No se pudo crear exec_id auto (telegram): {e}", exc_info=True)
+            exec_id = None
+
+
+    can_archive = bool(exec_id)
+
+    # =======================
+    # ARCHIVADO (si hay exec)
+    # =======================
+    if can_archive:
+        # 1) Documento base en ejecuciones/{exec_id} (si fs_crear_ejecucion no lo dejó completo)
+        try:
+            db.collection("ejecuciones").document(exec_id).set({
+                "exec_id": exec_id,
+                "user_id": user_id,
+                "chat_id": user_chat_id or None,
+                "origen": origen_norm,
+                "moneda_filtro": moneda_filtro,
+                "cfg_snapshot": cfg,
+                "estado": "running",  # o "completado" si prefieres cerrar directo aquí
+                "created_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+                "updated_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            }, merge=True)
+        except Exception:
+            pass
+
     # --- Marcar estados en Firestore y memoria ---
     actualizar_estado_usuario(user_chat_id, "en ejecución", moneda_filtro)
     # IMPORTANTE: usa kwargs; si tienes UUID úsalo como user_id, si no, usa chat_id
@@ -8005,7 +8464,30 @@ async def ejecutar_recurrente(
         logger.info(f"[{datetime.now()}] Análisis finalizado (chat={user_chat_id}, uuid={user_id}). Tiempo: {elapsed_time:.2f}s.")
         return url_generadas
 
+    except Exception as e:
+        if can_archive:
+            logger.error(f"Error archivando exec_id={exec_id}: {e}", exc_info=True)
+            # marca como fallido si alcanzó a crear exec
+            try:
+                await asyncio.to_thread(
+                    fs_finalizar_ejecucion,
+                    exec_id,
+                    "fallido",
+                    {"error": str(e)}
+                )
+            except Exception:
+                pass
+
     finally:
+
+        if can_archive:
+            await asyncio.to_thread(
+                    fs_finalizar_ejecucion,
+                    exec_id,
+                    "completado",
+                    {"origen": origen_norm, "urls": []}  # si tienes URLs públicas, colócalas aquí
+                )
+                
         # Limpiezas locales por chat
         if user_chat_id:
             limpiar_estado_usuario(user_chat_id)
@@ -8456,8 +8938,6 @@ def guardar_pagos_pendientes(data):
     except Exception as e:
         print(f"Error al guardar pagos pendientes en Firestore: {e}")
 
-
-from datetime import datetime, timezone
 
 # Nota: asumo que ya existen:
 #   - subscriptions: dict en memoria
@@ -10118,8 +10598,6 @@ async def ejecutar_analisis_desde_app():
             return jsonify({"status": "error", "message": "Falta 'activo'"}), 400
 
         origen = (data.get("origen") or "app").lower()
-        if origen == "telegram" and not chat_id:
-            return jsonify({"status": "error", "message": "Falta chat_id para origen=telegram"}), 400
 
         # --- lock (después de validar mínimos) ---
         if ocupado_lock.locked():
