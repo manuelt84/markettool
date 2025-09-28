@@ -5616,46 +5616,6 @@ def generar_nombre_archivo(moneda_filtro, filtro=False, tipo=None):
     return f"{moneda_filtro}_{tipo_parte}_{base}_{fecha_hora}.csv"
 
 
-def df_to_csv_buffer(df: pd.DataFrame, cfg: dict) -> BytesIO:
-    """Devuelve un BytesIO con el CSV formateado según cfg.csv y cfg.locale."""
-    if df is None or df.empty:
-        return BytesIO()
-
-    # ---- Lee config ----
-    csv_cfg = (cfg.get("csv") or {})
-    sep = csv_cfg.get("delimiter", ",")
-    if sep == "\\t":
-        sep = "\t"
-    quotechar = csv_cfg.get("quote", '"')
-    header = bool(csv_cfg.get("header", True))
-    encoding = (csv_cfg.get("encoding", "utf-8") or "utf-8").lower()
-    newline = (csv_cfg.get("newline", "LF") or "LF").upper()
-    lineterminator = "\r\n" if newline == "CRLF" else "\n"
-
-    # ---- Aplica formateos regionales al DF (fecha/hora, decimales, miles) ----
-    df_out = _prepare_df_for_csv(df, cfg)
-
-    # ---- Escribe a StringIO (texto), con lineterminator correcto ----
-    s_buf = StringIO()
-    df_out.to_csv(
-        s_buf,
-        sep=sep,
-        index=False,
-        header=header,
-        lineterminator=lineterminator,
-        quoting=_csv.QUOTE_MINIMAL,
-        quotechar=quotechar,
-    )
-
-    # ---- Codifica al encoding pedido en BytesIO ----
-    bin_buf = BytesIO(
-        s_buf.getvalue().encode(
-            "ISO-8859-1" if encoding in ("iso-8859-1", "latin-1") else "utf-8"
-        )
-    )
-    bin_buf.seek(0)
-    return bin_buf
-
 # Función para enviar el archivo CSV a todos los clientes
 #@profile
 async def enviar_csv_telegram(
@@ -5722,31 +5682,31 @@ def generar_imagen_eventos_oportunidades(
     dpi: int = 170,
     font_size: int = 9
 ):
+    import numpy as np
+    import re
+
+    # 1) Validaciones y filtro por divisas
     try:
         divisas = (
             pd.Series(list(divisas_oportunidades) if divisas_oportunidades is not None else [])
-            .dropna()
-            .astype(str)
-            .unique()
-            .tolist()
+            .dropna().astype(str).unique().tolist()
         )
     except Exception:
         divisas = []
 
-    # Corta temprano si no hay nada que mostrar
     if df_eventos is None or getattr(df_eventos, "empty", True) or len(divisas) == 0:
-        return None  # o [] según tu contrato de retorno
+        return None
 
     df = df_eventos.copy()
 
     if divisas_oportunidades:
-        divs = set([str(x).upper() for x in divisas_oportunidades if x])
+        divs = set(str(x).upper() for x in divisas_oportunidades if x)
         if "currency" in df.columns:
             df = df[df["currency"].astype(str).str.upper().isin(divs)]
     if df.empty:
         return None
 
-    # ordenar por tiempo si existe
+    # 2) Orden por tiempo si existe y columna "Fecha/Hora"
     for cand in ["t", "time", "timestamp", "fecha", "date", "datetime"]:
         if cand in df.columns:
             try:
@@ -5763,40 +5723,96 @@ def generar_imagen_eventos_oportunidades(
                 pass
             break
 
-    # renombrar
-    rename_map = {
-        "title": "Evento",
-        "event": "Evento",
-        "currency": "Moneda",
-        "impact": "Impacto",
-        "actual": "Actual",
-        "forecast": "Estimado",
-        "previous": "Anterior",
-    }
-    for k, v in rename_map.items():
-        if k in df.columns and v not in df.columns:
-            df[v] = df[k]
+    # 3) Búsqueda robusta de columnas (case-insensitive con coalesce por fila)
+    cols_lower = [str(c).strip().lower() for c in df.columns]
 
-    cols_pref = ["Fecha/Hora", "Moneda", "Impacto", "Evento", "Actual", "Estimado", "Anterior"]
-    cols = [c for c in cols_pref if c in df.columns]
-    if not cols:
-        cols = list(df.columns)[:7]
+    def _find_cols(candidates: list[str], *, forbid_substrings: list[str] | None = None) -> list[str]:
+        """Devuelve columnas reales que matchean aliases (exacto primero, luego por token/substring seguro).
+           forbid_substrings: evita columnas que contengan estas cadenas (p.ej. para no confundir 'value' prev/forecast)."""
+        found = []
+        seen = set()
+        forb = [s.lower() for s in (forbid_substrings or [])]
 
-    df = df[cols].fillna("—")
+        def _allowed(name_lower: str) -> bool:
+            return not any(f in name_lower for f in forb)
 
-    for c in ["Actual", "Estimado", "Anterior"]:
+        # exact matches
+        for a in candidates:
+            for i, lc in enumerate(cols_lower):
+                if lc == a and _allowed(lc) and df.columns[i] not in seen:
+                    found.append(df.columns[i]); seen.add(df.columns[i])
+        # token-aware / substring segura: límite por separadores comunes
+        for a in candidates:
+            pat = re.compile(rf'(^|[ _\-\.:/]){re.escape(a)}($|[ _\-\.:/])')
+            for i, lc in enumerate(cols_lower):
+                if df.columns[i] in seen:
+                    continue
+                if _allowed(lc) and (pat.search(lc) or a in lc):
+                    found.append(df.columns[i]); seen.add(df.columns[i])
+        return found
+
+    def _coalesce_into(dst: str, aliases: list[str], *, forbid_substrings: list[str] | None = None):
+        """Crea df[dst] como el primer no-nulo por fila entre las columnas candidatas."""
+        if dst in df.columns:
+            return
+        srcs = _find_cols([a.lower() for a in aliases], forbid_substrings=forbid_substrings)
+        if srcs:
+            tmp = df[srcs].copy()
+            for c in tmp.columns:
+                tmp[c] = tmp[c].replace("", np.nan)
+            df[dst] = tmp.bfill(axis=1).iloc[:, 0]
+        else:
+            df[dst] = np.nan
+
+    # Aliases: quitamos 'act' y 'value' para evitar confundir con 'impact' y valores genéricos
+    _coalesce_into("Evento",   ["title", "event", "name", "evento"])
+    _coalesce_into("Moneda",   ["currency", "cur", "moneda", "fx"])
+    _coalesce_into("Impacto",  ["impact", "importance", "volatility", "impacto"])
+    _coalesce_into("Actual",   ["actual", "actual_value", "last", "real", "resultado"], forbid_substrings=["impact", "forecast", "previous", "prior"])
+    _coalesce_into("Estimado", ["forecast", "estimate", "consensus", "expected", "predicted", "projection"])
+    _coalesce_into("Anterior", ["previous", "prior", "prev", "previous_value", "anterior", "revised_previous", "revised_prior"])
+
+    # 4) Orden de columnas solicitado
+    desired_order = ["Fecha/Hora", "Moneda", "Evento", "Impacto", "Anterior", "Estimado", "Actual"]
+    cols = [c for c in desired_order if c in df.columns]
+
+    # Asegurar existencia (se rellenan luego)
+    for name in desired_order:
+        if name not in df.columns:
+            df[name] = np.nan
+        if name not in cols:
+            cols.append(name)
+
+    # Evitar duplicados manteniendo orden
+    seen = set(); cols = [c for c in cols if not (c in seen or seen.add(c))]
+    df = df[cols]
+
+    # 5) Normalización/numérico y relleno
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    # Intentar convertir a numérico Actual/Estimado/Anterior; si falla, quedará NaN -> "—"
+    for c in ("Actual", "Estimado", "Anterior"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.fillna("—")
+
+    for c in ("Actual", "Estimado", "Anterior"):
         if c in df.columns:
             df[c] = df[c].apply(_fmt_num)
+
+    # 6) Ajustes de legibilidad/ancho
+    fs = min(font_size, 8)    # un punto menos para ganar ancho
+    wrap = {"Evento": 18}     # más wrap en Evento (columna larga)
 
     imgs = tabla_a_imagenes(
         df,
         max_filas_por_imagen=max_filas_por_imagen,
         dpi=dpi,
-        font_size=font_size,
-        wrap_map={"Evento": 15}
+        font_size=fs,
+        wrap_map=wrap
     )
     return imgs if imgs else None
-
 
 #@profile
 def preparar_df_oportunidades_para_tabla(df_in: pd.DataFrame) -> pd.DataFrame:
@@ -6349,8 +6365,7 @@ def procesar_simbolo_temporalidad(
         "Soportes Importantes Alcanzados": entradas.get("soportes_importantes_alcanzados"),
         "Resistencias Importantes Alcanzadas": entradas.get("resistencias_importantes_alcanzadas"),
         **({"Niveles Confirmados (Toques)": entradas.get('niveles_confirmados_orden_toques_all')} if es_administrador(user_chat_id) else {}),
-        **({"Niveles Confirmados (Nivel)": entradas.get('niveles_confirmados_orden_nivel_all')} if es_administrador(user_chat_id) else {}),
-        **({"Niveles Confirmados (Nivel)": entradas.get('niveles_confirmados_orden_nivel_reduced')} if not es_administrador(user_chat_id) else {}),
+        "Niveles Confirmados (Nivel)":  entradas.get("niveles_confirmados_orden_nivel_all") if es_administrador(user_chat_id) else entradas.get("niveles_confirmados_orden_nivel_reduced"),
         "Bollinger Signal": entradas.get('bollinger_signal'),
         "bollinger_upper": entradas.get('bollinger_upper'),
         "bollinger_lower": entradas.get('bollinger_lower'),
@@ -6583,82 +6598,128 @@ def _strftime_from_cfg(cfg: dict | None) -> tuple[str, str, str]:
     return date_fmt, time_fmt, f"{date_fmt} {time_fmt}"
 
 def _prepare_df_for_csv(df_in: pd.DataFrame, cfg: dict) -> pd.DataFrame:
-    """Copia el DF y aplica formatos de fecha/hora, decimal y miles según cfg."""
+    """Copia el DF y aplica formatos de fecha/hora y numéricos según cfg, sin destruir columnas no-fecha."""
     if df_in is None or df_in.empty:
         return df_in
 
     df = df_in.copy()
 
-    # 1) Formato fecha/hora
-    dt_fmt = _datetime_strf_pattern(cfg)
+    # --- Config ---
+    dt_fmt    = _datetime_strf_pattern(cfg)
+    dayfirst  = _use_dayfirst(cfg)
+    loc       = (cfg.get("locale") or {})
+    dec_sep   = loc.get("decimal_sep", ".")
+    thou_sep  = loc.get("thousands_sep", "")
+
+    # --- Heurística: solo considerar como fechas las columnas con nombre relacionado a fecha/hora ---
+    def _looks_datetime_col(name: str) -> bool:
+        n = str(name).strip().lower()
+        # añade o quita claves si te conviene
+        keys = ("fecha", "hora", "date", "time", "timestamp", "datetime", "created_at", "updated_at")
+        return any(k in n for k in keys)
+
+    # 1) Formatear columnas que YA son datetime
     for col in df.columns:
-        # intenta convertir si es de tipo datetime o string ISO
         if pd.api.types.is_datetime64_any_dtype(df[col]):
             df[col] = df[col].dt.strftime(dt_fmt).fillna("")
-        else:
-            # si hay strings con fecha ISO, intenta parsear (suave)
-            sample = df[col].iloc[0] if len(df[col]) else None
-            if isinstance(sample, str):
-                try:
-                    use_dayfirst = _use_dayfirst(cfg)
 
-                    # Si es columna de fecha/hora, parsea así:
-                    parsed = pd.to_datetime(
-                        df[col],
-                        errors="coerce",
-                        utc=False,
-                        dayfirst=use_dayfirst,
-                        format="mixed",          # <- clave: evita el warning en pandas >= 2.0
-                    )
-                    df[col] = parsed
-                except Exception:
-                    pass
+    # 2) Intentar parsear SOLO columnas string que "parecen" de fecha/hora y con tasa de éxito suficiente
+    for col in df.columns:
+        ser = df[col]
+        if pd.api.types.is_datetime64_any_dtype(ser):
+            continue
+        if not pd.api.types.is_string_dtype(ser):
+            continue
+        if not _looks_datetime_col(col):
+            continue
 
-    # 2) Formato numérico (decimal + miles)
-    loc = cfg.get("locale") or {}
-    dec_sep = loc.get("decimal_sep", ".")
-    thou_sep = loc.get("thousands_sep", "")
+        try:
+            parsed = pd.to_datetime(
+                ser, errors="coerce", utc=False, dayfirst=dayfirst, format="mixed"
+            )
+            success_ratio = float(parsed.notna().mean()) if len(parsed) else 0.0
+            # Solo aceptar si parseó una proporción razonable de filas
+            if success_ratio >= 0.6:
+                df[col] = parsed.dt.strftime(dt_fmt).fillna("")
+            # si no, dejamos la columna tal cual para NO romper texto numérico o categórico
+        except Exception:
+            # ante cualquier falla, no tocar la columna
+            pass
 
+    # 3) Formato numérico (solo columnas numéricas reales)
     num_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    if num_cols:
-        for c in num_cols:
-            df[c] = df[c].apply(lambda v: _format_numeric(v, dec_sep, thou_sep, decimals=5))
+    for c in num_cols:
+        df[c] = df[c].apply(lambda v: _format_numeric(v, dec_sep, thou_sep, decimals=5))
 
     return df
 
+
 def save_df_as_csv(df: pd.DataFrame, path: str, cfg: dict):
-    """Exporta df a CSV aplicando toda la config regional/csv."""
+    """Exporta df a CSV aplicando config regional/csv, evitando romper columnas no-fecha."""
     if df is None:
         return
- 
+
     sep, quotechar, header, encoding, lineterminator = _csv_params_from_cfg(cfg)
 
-    # Sugerencia (LOG) si delimitador y decimal chocan
+    # Aviso si decimal == delimitador (solo log)
     try:
         dec_sep = (cfg.get("locale") or {}).get("decimal_sep", ".")
         if dec_sep == sep:
-            # no cambiamos la elección del usuario; solo dejamos aviso en logs
-                logging.info(
+            logging.info(
                 f"[CSV] El separador decimal '{dec_sep}' coincide con el delimitador '{sep}'. "
                 "Considera usar ';' como delimitador para evitar ambigüedad."
             )
     except Exception:
         pass
 
-    # Prepara copia con formatos aplicados
     df_out = _prepare_df_for_csv(df, cfg)
 
-    # Guardado
     df_out.to_csv(
         path,
         sep=sep,
         index=False,
         header=header,
-        encoding="ISO-8859-1" if encoding in ("iso-8859-1", "latin-1") else "utf-8",
+        encoding="ISO-8859-1" if (encoding or "").lower() in ("iso-8859-1", "latin-1") else "utf-8",
         lineterminator=lineterminator,
         quoting=_csv.QUOTE_MINIMAL,
         quotechar=quotechar,
     )
+
+
+def df_to_csv_buffer(df: pd.DataFrame, cfg: dict) -> BytesIO:
+    """Devuelve BytesIO con CSV formateado; respeta cfg.csv y cfg.locale."""
+    if df is None or df.empty:
+        return BytesIO()
+
+    csv_cfg        = (cfg.get("csv") or {})
+    sep            = csv_cfg.get("delimiter", ",")
+    if sep == "\\t": sep = "\t"
+    quotechar      = csv_cfg.get("quote", '"')
+    header         = bool(csv_cfg.get("header", True))
+    encoding       = (csv_cfg.get("encoding", "utf-8") or "utf-8").lower()
+    newline        = (csv_cfg.get("newline", "LF") or "LF").upper()
+    lineterminator = "\r\n" if newline == "CRLF" else "\n"
+
+    df_out = _prepare_df_for_csv(df, cfg)
+
+    s_buf = StringIO()
+    df_out.to_csv(
+        s_buf,
+        sep=sep,
+        index=False,
+        header=header,
+        lineterminator=lineterminator,
+        quoting=_csv.QUOTE_MINIMAL,
+        quotechar=quotechar,
+    )
+
+    bin_buf = BytesIO(
+        s_buf.getvalue().encode("ISO-8859-1" if encoding in ("iso-8859-1", "latin-1") else "utf-8")
+    )
+    bin_buf.seek(0)
+    return bin_buf
+
+
 
 
 def _read_telegram_id_prefer_subscription(user_id: str) -> Optional[str]:
@@ -6709,41 +6770,47 @@ def _is_uploads_enabled(cfg: Optional[dict]) -> bool:
     return bool((cfg.get("features") or {}).get("enable_file_uploads"))
 
 
-# Función para procesar el resultado de cada análisis
 #@profile
-async def procesar_resultado(resultados, df_eventos, context, update, moneda_filtro, user_id, user_chat_id=None, opciones_usuario=[], origen="telegram", exec_id: str | None = None, cfg: dict | None = None):
-
+# ==============================
+# procesar_resultado (optimizado)
+# ==============================
+async def procesar_resultado(
+    resultados,
+    df_eventos,
+    context,
+    update,
+    moneda_filtro,
+    user_id,
+    user_chat_id=None,
+    opciones_usuario=[],
+    origen="telegram",
+    exec_id: str | None = None,
+    cfg: dict | None = None
+):
     # --- CARGA CFG
     if cfg is None:
         cfg, _ = await asyncio.to_thread(
             _load_cfg_and_tz_sync, db, user_id=user_id, chat_id=user_chat_id
         )
 
-
     # --- normalizaciones básicas
-    origen_norm  = (origen or "app").lower()
-    cfg          = cfg or {}
+    origen_norm   = (origen or "app").lower()
+    cfg           = cfg or {}
     notifications = cfg.get("notifications") or {}
-    send_results = bool(notifications.get("send_results_telegram"))
+    send_results  = bool(notifications.get("send_results_telegram"))
 
     # --- resolver chat_id (telegram_id) usando la prioridad definida
-    chat_id = _resolve_chat_id(user_id, user_chat_id)
+    chat_id  = _resolve_chat_id(user_id, user_chat_id)
     has_chat = bool(chat_id)
 
     # --- política de envío:
-    # - si el origen es telegram -> enviar (estamos en el hilo del bot)
-    # - si el origen es app     -> enviar solo si el usuario lo activó en cfg
     send_to_tg = has_chat and (
         (origen_norm == "telegram") or
         (origen_norm == "app" and send_results)
     )
 
-
-    # Con esto, a partir de aquí mantenemos la política clara:
-    #   Si hay exec_id -> archivamos (GCS + Firestore).
-    #   Si no hay exec_id -> no se archiva.
+    # --- ¿podemos archivar?
     can_archive = bool(exec_id)
-
     urls_generadas = []
 
     # >>> registros sin DataFrames ni claves privadas
@@ -6754,58 +6821,93 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     # --- JSON completo (antes de filtrar) ---
     df_resultados = pd.DataFrame(registros_limpios)
 
-    # Aplicar la función de ponderación incremental al DataFrame `df_filtrado` en memoria
+        # Serializadores locales (no crean funciones globales)
+    def _fmt_toques_cell(v):
+        try:
+            import pandas as pd
+            if isinstance(v, (list, tuple, set, pd.Series)):
+                parts = []
+                for item in v:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        nivel, cnt = item[0], item[1]
+                        try: cnt = int(cnt)
+                        except: pass
+                        parts.append(f"{_fmt_num(nivel)}×{cnt}")
+                    else:
+                        parts.append(str(item))
+                return " | ".join(parts) if parts else "—"
+            if isinstance(v, str):
+                return v if v.strip() else "—"
+            return "—" if v is None else str(v)
+        except Exception:
+            return "—" if v is None else str(v)
+
+    def _fmt_niveles_cell(v):
+        # admite lista de niveles, lista de tuplas, dicts, etc.
+        try:
+            import pandas as pd
+            if isinstance(v, (list, tuple, set, pd.Series)):
+                parts = []
+                for item in v:
+                    if isinstance(item, (list, tuple)) and item:
+                        parts.append(_fmt_num(item[0]))       # solo el nivel
+                    elif isinstance(item, dict) and "nivel" in item:
+                        parts.append(_fmt_num(item.get("nivel")))
+                    else:
+                        parts.append(str(item))
+                return " | ".join(parts) if parts else "—"
+            if isinstance(v, str):
+                return v if v.strip() else "—"
+            return "—" if v is None else str(v)
+        except Exception:
+            return "—" if v is None else str(v)
+
+    if "Niveles Confirmados (Toques)" in df_resultados.columns:
+        df_resultados["Niveles Confirmados (Toques)"] = df_resultados["Niveles Confirmados (Toques)"].apply(_fmt_toques_cell)
+
+    if "Niveles Confirmados (Nivel)" in df_resultados.columns:
+        df_resultados["Niveles Confirmados (Nivel)"] = df_resultados["Niveles Confirmados (Nivel)"].apply(_fmt_niveles_cell)
+
+    if "Niveles Confirmados Reduced (Nivel)" in df_resultados.columns:
+        df_resultados["Niveles Confirmados Reduced (Nivel)"] = df_resultados["Niveles Confirmados Reduced (Nivel)"].apply(_fmt_niveles_cell)
+
+
+    # Ponderaciones
     df_resultados = df_resultados.copy()
     df_resultados = calcular_ponderacion_incremental_por_divisa(df_resultados, cfg)
-    
-    # Aplicar la función de ponderación al DataFrame `df_filtrado` en memoria
+
     df_resultados = df_resultados.copy()
-    df_resultados['Ponderacion'] = df_resultados.apply(lambda row: calcular_ponderacion(row, cfg), axis=1).astype(float)
+    df_resultados["Ponderacion"] = (
+        df_resultados.apply(lambda row: calcular_ponderacion(row, cfg), axis=1)
+        .astype(float)
+    )
 
-    df_resultados.pop('bollinger_lower')
-    df_resultados.pop('bollinger_upper')
-    # Ordenar el DataFrame por la columna de ponderación
-    df_resultados = df_resultados.copy()
+    # Limpia columnas internas si existen
+    if not df_resultados.empty:
+        df_resultados = df_resultados.drop(
+            columns=["bollinger_lower", "bollinger_upper"],
+            errors="ignore"
+        )
+
     
-    # Verificar si el usuario tiene acceso a "análisis avanzado"
-    if "analisis avanzado" in opciones_usuario and not es_administrador(user_chat_id):
-        logger.info("El usuario tiene acceso a análisis avanzado.")
-    elif "analisis premium" in opciones_usuario and not es_administrador(user_chat_id):
-        df_resultados.pop("Soportes Importantes Alcanzados")
-        df_resultados.pop("Resistencias Importantes Alcanzadas")
-        df_resultados.pop("Niveles Confirmados (Nivel)")
-        logger.info("El usuario tiene acceso a análisis premium.")
-    elif "analisis basico" in opciones_usuario and not es_administrador(user_chat_id):
-        df_resultados.pop("Patrones Detectados")
-        df_resultados.pop("Soportes Alcanzados")
-        df_resultados.pop("Resistencias Alcanzadas")
-        df_resultados.pop("Cerca de Soporte Resistencia")
-        df_resultados.pop("Es Rango Repetitivo")
-        df_resultados.pop("Estructura Tendencia")
-        df_resultados.pop("Rebotes")
-        df_resultados.pop("Rango Dinamico")
-        df_resultados.pop("Soportes Importantes Alcanzados")
-        df_resultados.pop("Resistencias Importantes Alcanzadas")
-        df_resultados.pop("Niveles Confirmados (Nivel)")
-        df_resultados.pop("Probabilidad Alza (Montecarlo)")
-        df_resultados.pop("Probabilidad Baja (Montecarlo)")
-        logger.info("El usuario tiene acceso a análisis basico.")  
+    # Ordenado por ponderación
+    df_resultados_ordenado = df_resultados.sort_values(
+        by="Ponderacion", ascending=False
+    )
 
-    df_resultados_ordenado = df_resultados.sort_values(by='Ponderacion', ascending=False)  
-
-    # 7)Subir enriquecidos por símbolo/TF — se mantiene
+    # 7) Subir enriquecidos por símbolo/TF
     if can_archive:
         urls_enriched = []
         for res in resultados:
             if not isinstance(res, dict):
                 continue
 
-            sym = res.get("Activo")
-            tf = res.get("Temporalidad")
-            df_velas = res.get("_ohlcv_df")
-            df_inds = res.get("_indicadores_df")
-            niveles = res.get("_niveles") or {}
-            entradas = res.get("_entradas") or {}
+            sym       = res.get("Activo")
+            tf        = res.get("Temporalidad")
+            df_velas  = res.get("_ohlcv_df")
+            df_inds   = res.get("_indicadores_df")
+            niveles   = res.get("_niveles") or {}
+            entradas  = res.get("_entradas") or {}
 
             tiene_datos = (
                 isinstance(df_velas, pd.DataFrame) and not df_velas.empty
@@ -6813,26 +6915,6 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
 
             if sym and tf and tiene_datos:
                 try:
-                    #if isinstance(df_resultados, dict):
-                    #    entradas = dict(df_resultados)  # copy
-                    #    if df_resultados['Ponderacion'] is not None:
-                    #        entradas["ponderacion"] = df_resultados['Ponderacion']
-                    #    if df_resultados['Ponderacion Incremental'] is not None:
-                    #        entradas["ponderacion_incremental"] = int(round(float(df_resultados["Ponderacion Incremental"])))
-                    #elif isinstance(df_resultados, list):
-                    #    # Si 'entradas' es una lista, la envolvemos para poder agregar campos
-                    #    entradas = {"entradas": df_resultados}
-                    #    if df_resultados['Ponderacion'] is not None:
-                    #        entradas["ponderacion"] = df_resultados['Ponderacion']
-                    #    if df_resultados['Ponderacion Incremental'] is not None:
-                    #        entradas["ponderacion_incremental"] = int(round(float(df_resultados["Ponderacion Incremental"])))
-                    #else:
-                    #    entradas = {}
-                    #    if df_resultados['Ponderacion'] is not None:
-                    #        entradas["ponderacion"] = df_resultados['Ponderacion']
-                    #    if df_resultados['Ponderacion Incremental'] is not None:
-                    #        entradas["ponderacion_incremental"] = int(round(float(df_resultados["Ponderacion Incremental"])))
-
                     url = await subir_ohlcv_enriquecido_y_registrar(
                         exec_id=exec_id,
                         chat_id=user_chat_id,
@@ -6853,21 +6935,19 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
         if urls_enriched:
             urls_generadas.extend(urls_enriched)
 
-    # 8) (Solo app) Subir **ordenado** saneado (reemplaza al “resultados_completos”)
+    # 8) (Solo app) Subir **ordenado** saneado
     if can_archive:
-        # Limpieza escalar (NaN/±Inf -> None) y anidados
         df_ord = (
             df_resultados_ordenado
             .replace([np.inf, -np.inf], np.nan)
             .where(pd.notnull(df_resultados_ordenado), None)
             .copy()
         )
-        # Sanea celdas anidadas si las hubiera
+        # sanea celdas anidadas si las hubiera
         for col in df_ord.columns:
             if df_ord[col].apply(lambda v: isinstance(v, (dict, list, tuple, set, pd.Series))).any():
                 df_ord[col] = df_ord[col].apply(sanitize_for_json)
 
-        # Convierte a records y (ligeramente redundante) sanea por si acaso
         ordered_records = sanitize_for_json(df_ord.to_dict("records"))
 
         url_ordenado = await guardar_json_en_storage_y_registrar(
@@ -6875,18 +6955,18 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             chat_id=user_chat_id,
             user_id=user_id,
             nombre_base=f"{moneda_filtro.upper()}_resultados_ordenados",
-            data=ordered_records,  # DataFrame ya serializable
+            data=ordered_records,
             subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
             metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado"},
         )
         if url_ordenado:
-            urls_generadas.append(url_ordenado)        
-    
-    # Filtrar solo las oportunidades donde flag_oportunidad es True, Zona No Trading es False y el tipo de operación no es "Neutral"
+            urls_generadas.append(url_ordenado)
+
+    # Oportunidades base (solo zona válida)
     df_filtrado = df_resultados_ordenado[
-        (df_resultados_ordenado['Oportunidad'] == True) &
-        (df_resultados_ordenado['Zona No Trading'] == False) 
-    ]
+        (df_resultados_ordenado.get('Oportunidad') == True) &
+        (df_resultados_ordenado.get('Zona No Trading') == False)
+    ].copy()
 
     # --- JSON oportunidades ---
     if can_archive:
@@ -6896,11 +6976,12 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
             chat_id=user_chat_id,
             user_id=user_id,
             nombre_base=f"{moneda_filtro.upper()}_oportunidades",
-            data=opp_records,  # <- IMPORTANTE
+            data=opp_records,
             subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
             metadata={"moneda_filtro": moneda_filtro, "scope": "oportunidades"},
         )
-        if url_opp: urls_generadas.append(url_opp)
+        if url_opp:
+            urls_generadas.append(url_opp)
 
     df_resultadosToImage = pd.DataFrame(df_filtrado)
 
@@ -6908,495 +6989,287 @@ async def procesar_resultado(resultados, df_eventos, context, update, moneda_fil
     if 'Activo' in df_filtrado.columns and not df_filtrado.empty:
         divisas_oportunidades = (
             df_filtrado['Activo']
-            .astype(str)              # por si viene algún tipo no-string
+            .astype(str)
             .str.slice(0, 3)
             .dropna()
             .unique()
-            .tolist()                 # <- clave: pásalo a list para que el truth value no sea ambiguo
+            .tolist()
         )
     else:
         divisas_oportunidades = []
 
+    # Filtro para imágenes (compras)
     df_filtradoToImage = df_resultadosToImage[
-        (df_resultadosToImage['Oportunidad'] == True) &
-        (df_resultadosToImage['Zona No Trading'] == False) &
-        ((df_resultadosToImage['Tipo de Operacion'] == "Compra") | 
-        (df_resultadosToImage['Tipo de Operacion'] == "Compra Fuerte") |
-        (df_resultadosToImage['Tipo de Operacion'] == "Compra Predicha con ARIMA y Media Movil") |
-        (df_resultadosToImage['Tipo de Operacion'] == "Compra Predicha con Media Movil") |
-        (df_resultadosToImage['Tipo de Operacion'] == "Compra Predicha con ARIMA"))
-    ]
+        (df_resultadosToImage.get('Oportunidad') == True) &
+        (df_resultadosToImage.get('Zona No Trading') == False) &
+        (df_resultadosToImage.get('Tipo de Operacion').isin([
+            "Compra", "Compra Fuerte",
+            "Compra Predicha con ARIMA y Media Movil",
+            "Compra Predicha con Media Movil",
+            "Compra Predicha con ARIMA"
+        ]))
+    ].copy()
 
-    if es_administrador(user_chat_id): 
-        df_filtradoToImage.pop("Niveles Confirmados (Toques)")
-        df_filtradoToImage.pop("Niveles Confirmados (Nivel)")
-        df_filtradoToImage.pop("Soportes Importantes Alcanzados")
-        df_filtradoToImage.pop("Resistencias Importantes Alcanzadas")
-        df_filtradoToImage.pop("Patrones Detectados")
-        df_filtradoToImage.pop("Soportes Alcanzados")
-        df_filtradoToImage.pop("Resistencias Alcanzadas")
-        df_filtradoToImage.pop("Cerca de Soporte Resistencia")
-        df_filtradoToImage.pop("Es Rango Repetitivo")
-        df_filtradoToImage.pop("Estructura Tendencia")
-        df_filtradoToImage.pop("Rebotes")
-        df_filtradoToImage.pop("Rango Dinamico")
-        df_filtradoToImage.pop("Probabilidad Alza (Montecarlo)")
-        df_filtradoToImage.pop("Probabilidad Baja (Montecarlo)")
-        df_filtradoToImage.pop('Oportunidad')  # Eliminar 'Oportunidad'
-        df_filtradoToImage.pop('Zona No Trading')  # Eliminar 'Zona No Trading'
-        df_filtradoToImage.pop('Cruce MACD')
-        df_filtradoToImage.pop('MACD Cerca')
-        df_filtradoToImage.pop('Bollinger Signal')
-        df_filtradoToImage.pop('MACD Tendencia Predicha')
-        df_filtradoToImage.pop('Probabilidad Tecnica (%)')
-        df_filtradoToImage.pop('Probabilidad Fundamental (%)')
-        df_filtradoToImage.pop('Zona Sobreventa RSI-Stochastic')
-        df_filtradoToImage.pop('Zona Sobrecompra RSI-Stochastic')
-        df_filtradoToImage.pop('Ponderacion')
-        df_filtradoToImage.pop('Ponderacion Incremental')
-        df_filtradoToImage.pop('Soporte Nivel 2')
-        df_filtradoToImage.pop('Soporte Nivel 1')
-        df_filtradoToImage.pop('Resistencia Nivel 1')
-        df_filtradoToImage.pop('Resistencia Nivel 2')
-        df_filtradoToImage.pop('Precio de Entrada')
-        df_filtradoToImage.pop('Take Profit')
-        df_filtradoToImage.pop('Stop Loss')
-    elif "analisis avanzado" in opciones_usuario:
-        df_filtradoToImage.pop("Soportes Importantes Alcanzados")
-        df_filtradoToImage.pop("Resistencias Importantes Alcanzadas")
-        df_filtradoToImage.pop("Niveles Confirmados (Nivel)")
-        df_filtradoToImage.pop("Patrones Detectados")
-        df_filtradoToImage.pop("Soportes Alcanzados")
-        df_filtradoToImage.pop("Resistencias Alcanzadas")
-        df_filtradoToImage.pop("Cerca de Soporte Resistencia")
-        df_filtradoToImage.pop("Es Rango Repetitivo")
-        df_filtradoToImage.pop("Estructura Tendencia")
-        df_filtradoToImage.pop("Rebotes")
-        df_filtradoToImage.pop("Rango Dinamico")
-        df_filtradoToImage.pop("Probabilidad Alza (Montecarlo)")
-        df_filtradoToImage.pop("Probabilidad Baja (Montecarlo)")
-        df_filtradoToImage.pop('Oportunidad')  # Eliminar 'Oportunidad'
-        df_filtradoToImage.pop('Zona No Trading')  # Eliminar 'Zona No Trading'
-        df_filtradoToImage.pop('Cruce MACD')
-        df_filtradoToImage.pop('MACD Cerca')
-        df_filtradoToImage.pop('Bollinger Signal')
-        df_filtradoToImage.pop('MACD Tendencia Predicha')
-        df_filtradoToImage.pop('Probabilidad Tecnica (%)')
-        df_filtradoToImage.pop('Probabilidad Fundamental (%)')
-        df_filtradoToImage.pop('Zona Sobreventa RSI-Stochastic')
-        df_filtradoToImage.pop('Zona Sobrecompra RSI-Stochastic')
-        df_filtradoToImage.pop('Ponderacion')
-        df_filtradoToImage.pop('Ponderacion Incremental')
-        df_filtradoToImage.pop('Soporte Nivel 2')
-        df_filtradoToImage.pop('Soporte Nivel 1')
-        df_filtradoToImage.pop('Resistencia Nivel 1')
-        df_filtradoToImage.pop('Resistencia Nivel 2')
-        df_filtradoToImage.pop('Precio de Entrada')
-        df_filtradoToImage.pop('Take Profit')
-        df_filtradoToImage.pop('Stop Loss')
-        logger.info("El usuario tiene acceso a análisis avanzado.")
-    elif "analisis premium" in opciones_usuario:
-        df_filtradoToImage.pop("Patrones Detectados")
-        df_filtradoToImage.pop("Soportes Alcanzados")
-        df_filtradoToImage.pop("Resistencias Alcanzadas")
-        df_filtradoToImage.pop("Cerca de Soporte Resistencia")
-        df_filtradoToImage.pop("Es Rango Repetitivo")
-        df_filtradoToImage.pop("Estructura Tendencia")
-        df_filtradoToImage.pop("Rebotes")
-        df_filtradoToImage.pop("Rango Dinamico")
-        df_filtradoToImage.pop("Probabilidad Alza (Montecarlo)")
-        df_filtradoToImage.pop("Probabilidad Baja (Montecarlo)")
-        df_filtradoToImage.pop('Oportunidad')  # Eliminar 'Oportunidad'
-        df_filtradoToImage.pop('Zona No Trading')  # Eliminar 'Zona No Trading'
-        df_filtradoToImage.pop('Cruce MACD')
-        df_filtradoToImage.pop('MACD Cerca')
-        df_filtradoToImage.pop('Bollinger Signal')
-        df_filtradoToImage.pop('MACD Tendencia Predicha')
-        df_filtradoToImage.pop('Probabilidad Tecnica (%)')
-        df_filtradoToImage.pop('Probabilidad Fundamental (%)')
-        df_filtradoToImage.pop('Zona Sobreventa RSI-Stochastic')
-        df_filtradoToImage.pop('Zona Sobrecompra RSI-Stochastic')
-        df_filtradoToImage.pop('Ponderacion')
-        df_filtradoToImage.pop('Ponderacion Incremental')
-        df_filtradoToImage.pop('Soporte Nivel 2')
-        df_filtradoToImage.pop('Soporte Nivel 1')
-        df_filtradoToImage.pop('Resistencia Nivel 1')
-        df_filtradoToImage.pop('Resistencia Nivel 2')
-        df_filtradoToImage.pop('Precio de Entrada')
-        df_filtradoToImage.pop('Take Profit')
-        df_filtradoToImage.pop('Stop Loss')
-        logger.info("El usuario tiene acceso a análisis premium.")
-    elif "analisis basico" in opciones_usuario:
-        df_filtradoToImage.pop('Oportunidad')  # Eliminar 'Oportunidad'
-        df_filtradoToImage.pop('Zona No Trading')  # Eliminar 'Zona No Trading'
-        df_filtradoToImage.pop('Cruce MACD')
-        df_filtradoToImage.pop('MACD Cerca')
-        df_filtradoToImage.pop('Bollinger Signal')
-        df_filtradoToImage.pop('MACD Tendencia Predicha')
-        df_filtradoToImage.pop('Probabilidad Tecnica (%)')
-        df_filtradoToImage.pop('Probabilidad Fundamental (%)')
-        df_filtradoToImage.pop('Zona Sobreventa RSI-Stochastic')
-        df_filtradoToImage.pop('Zona Sobrecompra RSI-Stochastic')
-        df_filtradoToImage.pop('Ponderacion')
-        df_filtradoToImage.pop('Ponderacion Incremental')
-        df_filtradoToImage.pop('Soporte Nivel 2')
-        df_filtradoToImage.pop('Soporte Nivel 1')
-        df_filtradoToImage.pop('Resistencia Nivel 1')
-        df_filtradoToImage.pop('Resistencia Nivel 2')
-        df_filtradoToImage.pop('Precio de Entrada')
-        df_filtradoToImage.pop('Take Profit')
-        df_filtradoToImage.pop('Stop Loss')
-        logger.info("El usuario tiene acceso a análisis basico.")    
+    # Quitar columnas según plan, sin romper si faltan
+    def _drop_cols(df, cols):
+        return df.drop(columns=cols, errors="ignore")
 
-    if "analisis premium" in opciones_usuario or "analisis avanzado" in opciones_usuario or es_administrador(user_chat_id):
-        # Dividir los datos según si la divisa consultada es principal o secundaria
-        if moneda_filtro.upper() in categorias["Principales"]:
-            # Filtrar pares donde la moneda es principal
-            df_principal = df_resultados_ordenado[df_resultados_ordenado['Activo'].str.startswith(moneda_filtro.upper())]
-            # Filtrar pares donde la moneda es secundaria
-            df_secundaria = df_resultados_ordenado[df_resultados_ordenado['Activo'].str.endswith(moneda_filtro.upper())]
-
-            # Guardar los archivos separados para principales y secundarios
-            nombre_archivo_principal = generar_nombre_archivo(moneda_filtro, tipo="principal")
-            #df_principal.to_csv(nombre_archivo_principal, sep=';', index=False, float_format='%.5f')
-
-            nombre_archivo_secundaria = generar_nombre_archivo(moneda_filtro, tipo="secundaria")
-            #df_secundaria.to_csv(nombre_archivo_secundaria, sep=';', index=False, float_format='%.5f')
-
-            logger.info(f"Archivo principal generado: {nombre_archivo_principal}" )
-            logger.info(f"Archivo secundaria generado: {nombre_archivo_secundaria}")
-
-            # Enviar los archivos por Telegram
-
-            # Verificar si los DataFrame no están vacíos antes de enviarlos
-            if not df_principal.empty:
-                if origen == "app":
-                    ruta_local = os.path.join("/tmp", nombre_archivo_principal)
-                    save_df_as_csv(df_principal, ruta_local, cfg)
-
-                    if exec_id:
-                        object_path = build_object_path(exec_id, nombre_archivo_principal)
-                    else:
-                        object_path = nombre_archivo_principal  # fallback sin exec_id si fuera necesario
-
-                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
-                    urls_generadas.append(url_publica)
-
-                    if can_archive:
-                        await asyncio.to_thread(
-                            fs_registrar_archivo_generado,
-                            exec_id=exec_id, 
-                            user_id=user_id, 
-                            chat_id=user_chat_id,
-                            tipo="csv",
-                            nombre=nombre_archivo_principal,
-                            gcs_path=object_path,
-                            signed_url=url_publica,     # o None si no quieres guardarla
-                            content_type="text/csv",
-                            metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
-                        )
-
-                if send_to_tg:
-                    if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id, cfg=cfg))
-                    else:
-                        await enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id, cfg=cfg)
-
-            else:
-                logger.info(f"El DataFrame principal está vacío. No se enviará el archivo: {nombre_archivo_principal}")
-
-            if not df_secundaria.empty:
-                if origen == "app":
-                    ruta_local = os.path.join("/tmp", nombre_archivo_secundaria)
-                    save_df_as_csv(df_secundaria, ruta_local, cfg)
-
-                    if can_archive:
-                        object_path = build_object_path(exec_id, nombre_archivo_secundaria)
-                    else:
-                        object_path = nombre_archivo_secundaria  # fallback sin exec_id si fuera necesario
-
-                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
-                    urls_generadas.append(url_publica)
-
-                    if can_archive:
-                        await asyncio.to_thread(
-                            fs_registrar_archivo_generado,
-                            exec_id=exec_id, 
-                            user_id=user_id, 
-                            chat_id=user_chat_id,
-                            tipo="csv",
-                            nombre=nombre_archivo_secundaria,
-                            gcs_path=object_path,
-                            signed_url=url_publica,     # o None si no quieres guardarla
-                            content_type="text/csv",
-                            metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
-                        )
-
-                if send_to_tg:
-                    if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id, cfg=cfg))
-                    else:
-                        await enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id, cfg=cfg)
-
-            else:
-                logger.info(f"El DataFrame secundario está vacío. No se enviará el archivo: {nombre_archivo_secundaria}")
-
-            # Filtrar también el archivo de oportunidades
-            df_filtrado_principal = df_filtrado[df_filtrado['Activo'].str.startswith(moneda_filtro.upper())]
-            df_filtrado_secundaria = df_filtrado[df_filtrado['Activo'].str.endswith(moneda_filtro.upper())]
-
-            # Guardar los archivos filtrados separados para principales y secundarios
-            nombre_archivo_filtrado_principal = generar_nombre_archivo(moneda_filtro, filtro=True, tipo="principal")
-            #df_filtrado_principal.to_csv(nombre_archivo_filtrado_principal, sep=';', index=False, float_format='%.5f')
-
-            nombre_archivo_filtrado_secundaria = generar_nombre_archivo(moneda_filtro, filtro=True, tipo="secundaria")
-            #df_filtrado_secundaria.to_csv(nombre_archivo_filtrado_secundaria, sep=';', index=False, float_format='%.5f')
-
-            # Verificar si los DataFrame no están vacíos antes de enviarlos por telegram
-            if not df_filtrado_principal.empty:
-                if origen == "app":
-                    ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_principal)
-                    save_df_as_csv(df_filtrado_principal, ruta_local, cfg)
-
-                    if can_archive:
-                        object_path = build_object_path(exec_id, nombre_archivo_filtrado_principal)
-                    else:
-                        object_path = nombre_archivo_filtrado_principal  # fallback sin exec_id si fuera necesario
-
-                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
-                    urls_generadas.append(url_publica)
-
-                    if can_archive:
-                        await asyncio.to_thread(
-                            fs_registrar_archivo_generado,
-                            exec_id=exec_id, 
-                            user_id=user_id, 
-                            chat_id=user_chat_id, 
-                            tipo="csv",
-                            nombre=nombre_archivo_filtrado_principal,
-                            gcs_path=object_path,
-                            signed_url=url_publica,     # o None si no quieres guardarla
-                            content_type="text/csv",
-                            metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
-                        )
-
-                if send_to_tg:
-                    if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id, cfg=cfg))
-                    else:
-                        await enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id, cfg=cfg)
-            else:
-                logger.info(f"El DataFrame filtrado principal está vacío. No se enviará el archivo: {nombre_archivo_filtrado_principal}")
-
-            if not df_filtrado_secundaria.empty:
-                if origen == "app":
-                    ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_secundaria)
-                    save_df_as_csv(df_filtrado_secundaria, ruta_local, cfg)
-
-                    if can_archive:
-                        object_path = build_object_path(exec_id, nombre_archivo_filtrado_secundaria)
-                    else:
-                        object_path = nombre_archivo_filtrado_secundaria  # fallback sin exec_id si fuera necesario
-
-                    url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
-                    urls_generadas.append(url_publica)
-
-                    if can_archive:
-                        await asyncio.to_thread(
-                            fs_registrar_archivo_generado,
-                            exec_id=exec_id, 
-                            user_id=user_id, 
-                            chat_id=user_chat_id, 
-                            tipo="csv",
-                            nombre=nombre_archivo_filtrado_secundaria,
-                            gcs_path=object_path,
-                            signed_url=url_publica,     # o None si no quieres guardarla
-                            content_type="text/csv",
-                            metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
-                        )
-
-                if send_to_tg:
-                    if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id, cfg=cfg))
-                    else:
-                        await enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id, cfg=cfg)
-
-            else:
-                logger.info(f"El DataFrame filtrado secundario está vacío. No se enviará el archivo: {nombre_archivo_filtrado_secundaria}")
-        
-
-    # Guardar el archivo principal
-    nombre_archivo = generar_nombre_archivo(moneda_filtro)
-    #df_resultados_ordenado.to_csv(nombre_archivo, sep=';', index=False, float_format='%.5f')
+    df_filtradoToImage = _drop_cols(df_filtradoToImage, [
+        "Niveles Confirmados (Toques)","Niveles Confirmados (Nivel)",
+        "Soportes Importantes Alcanzados","Resistencias Importantes Alcanzadas",
+        "Patrones Detectados","Soportes Alcanzados","Resistencias Alcanzadas",
+        "Cerca de Soporte Resistencia","Es Rango Repetitivo","Estructura Tendencia",
+        "Rebotes","Rango Dinamico","Probabilidad Alza (Montecarlo)","Probabilidad Baja (Montecarlo)",
+        "Oportunidad","Zona No Trading","Cruce MACD","MACD Cerca","Bollinger Signal",
+        "MACD Tendencia Predicha","Probabilidad Tecnica (%)","Probabilidad Fundamental (%)",
+        "Zona Sobreventa RSI-Stochastic","Zona Sobrecompra RSI-Stochastic",
+        "Ponderacion","Ponderacion Incremental","Soporte Nivel 2","Soporte Nivel 1",
+        "Resistencia Nivel 1","Resistencia Nivel 2","Precio de Entrada","Take Profit","Stop Loss"
+    ])
     
-    # Guardar el archivo filtrado
+
+    # ---------- ⬇️ LÓGICA “DIVISA PRINCIPAL” RESTAURADA ⬇️ ----------
+    # Origen: solo generar artefactos extra (principal/secundaria) si la divisa consultada es "principal"
+    # Fuente de categorías: usar 'categorias["Principales"]' si existe; si no, fallback estándar FX
+    _cat = (globals().get("categorias") or {})
+    _principales = set(map(str.upper, _cat.get("Principales") or
+                           ["USD","EUR","JPY","GBP","AUD","CAD","CHF","NZD"]))
+    is_principal_moneda = str(moneda_filtro or "").upper() in _principales
+
+    if is_principal_moneda:
+        # Dividir por posición de la divisa (prefijo/sufijo)
+        df_principal  = df_resultados_ordenado[df_resultados_ordenado["Activo"].astype(str).str.startswith(moneda_filtro.upper())].copy()
+        df_secundaria = df_resultados_ordenado[df_resultados_ordenado["Activo"].astype(str).str.endswith(moneda_filtro.upper())].copy()
+
+        nombre_archivo_principal  = generar_nombre_archivo(moneda_filtro, tipo="principal")
+        nombre_archivo_secundaria = generar_nombre_archivo(moneda_filtro, tipo="secundaria")
+
+        if not df_principal.empty:
+            if origen == "app":
+                ruta_local = os.path.join("/tmp", nombre_archivo_principal)
+                save_df_as_csv(df_principal, ruta_local, cfg)
+                object_path = build_object_path(exec_id, nombre_archivo_principal) if can_archive else nombre_archivo_principal
+                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
+                urls_generadas.append(url_publica)
+                if can_archive:
+                    await asyncio.to_thread(
+                        fs_registrar_archivo_generado,
+                        exec_id=exec_id,
+                        user_id=user_id,
+                        chat_id=user_chat_id,
+                        tipo="csv",
+                        nombre=nombre_archivo_principal,
+                        gcs_path=object_path,
+                        signed_url=url_publica,
+                        content_type="text/csv",
+                        metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
+                    )
+            if send_to_tg:
+                if origen == "telegram":
+                    asyncio.create_task(enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id, cfg=cfg))
+                else:
+                    await enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id, cfg=cfg)
+        else:
+            logger.info(f"DF principal vacío; no se envía {nombre_archivo_principal}")
+
+        if not df_secundaria.empty:
+            if origen == "app":
+                ruta_local = os.path.join("/tmp", nombre_archivo_secundaria)
+                save_df_as_csv(df_secundaria, ruta_local, cfg)
+                object_path = build_object_path(exec_id, nombre_archivo_secundaria) if can_archive else nombre_archivo_secundaria
+                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
+                urls_generadas.append(url_publica)
+                if can_archive:
+                    await asyncio.to_thread(
+                        fs_registrar_archivo_generado,
+                        exec_id=exec_id,
+                        user_id=user_id,
+                        chat_id=user_chat_id,
+                        tipo="csv",
+                        nombre=nombre_archivo_secundaria,
+                        gcs_path=object_path,
+                        signed_url=url_publica,
+                        content_type="text/csv",
+                        metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
+                    )
+            if send_to_tg:
+                if origen == "telegram":
+                    asyncio.create_task(enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id, cfg=cfg))
+                else:
+                    await enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id, cfg=cfg)
+        else:
+            logger.info(f"DF secundaria vacío; no se envía {nombre_archivo_secundaria}")
+
+        # Filtrados por oportunidades (principal/secundaria)
+        df_filtrado_principal  = df_filtrado[df_filtrado["Activo"].astype(str).str.startswith(moneda_filtro.upper())].copy()
+        df_filtrado_secundaria = df_filtrado[df_filtrado["Activo"].astype(str).str.endswith(moneda_filtro.upper())].copy()
+
+        nombre_archivo_filtrado_principal  = generar_nombre_archivo(moneda_filtro, filtro=True, tipo="principal")
+        nombre_archivo_filtrado_secundaria = generar_nombre_archivo(moneda_filtro, filtro=True, tipo="secundaria")
+
+        if not df_filtrado_principal.empty:
+            if origen == "app":
+                ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_principal)
+                save_df_as_csv(df_filtrado_principal, ruta_local, cfg)
+                object_path = build_object_path(exec_id, nombre_archivo_filtrado_principal) if can_archive else nombre_archivo_filtrado_principal
+                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
+                urls_generadas.append(url_publica)
+                if can_archive:
+                    await asyncio.to_thread(
+                        fs_registrar_archivo_generado,
+                        exec_id=exec_id,
+                        user_id=user_id,
+                        chat_id=user_chat_id,
+                        tipo="csv",
+                        nombre=nombre_archivo_filtrado_principal,
+                        gcs_path=object_path,
+                        signed_url=url_publica,
+                        content_type="text/csv",
+                        metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": True},
+                    )
+            if send_to_tg:
+                if origen == "telegram":
+                    asyncio.create_task(enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id, cfg=cfg))
+                else:
+                    await enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id, cfg=cfg)
+        else:
+            logger.info(f"DF filtrado principal vacío; no se envía {nombre_archivo_filtrado_principal}")
+
+        if not df_filtrado_secundaria.empty:
+            if origen == "app":
+                ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_secundaria)
+                save_df_as_csv(df_filtrado_secundaria, ruta_local, cfg)
+                object_path = build_object_path(exec_id, nombre_archivo_filtrado_secundaria) if can_archive else nombre_archivo_filtrado_secundaria
+                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
+                urls_generadas.append(url_publica)
+                if can_archive:
+                    await asyncio.to_thread(
+                        fs_registrar_archivo_generado,
+                        exec_id=exec_id,
+                        user_id=user_id,
+                        chat_id=user_chat_id,
+                        tipo="csv",
+                        nombre=nombre_archivo_filtrado_secundaria,
+                        gcs_path=object_path,
+                        signed_url=url_publica,
+                        content_type="text/csv",
+                        metadata={"moneda_filtro": moneda_filtro, "particion": "secundaria", "filtrado": True},
+                    )
+            if send_to_tg:
+                if origen == "telegram":
+                    asyncio.create_task(enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id, cfg=cfg))
+                else:
+                    await enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id, cfg=cfg)
+        else:
+            logger.info(f"DF filtrado secundaria vacío; no se envía {nombre_archivo_filtrado_secundaria}")
+    else:
+        logger.info(f"La divisa '{moneda_filtro}' NO es principal: se omiten artefactos principal/secundaria.")
+    # ---------- ⬆️ FIN LÓGICA PRINCIPAL / SECUNDARIA ⬆️ ----------
+
+    # Guardar CSVs “globales”
+    nombre_archivo          = generar_nombre_archivo(moneda_filtro)
     nombre_archivo_filtrado = generar_nombre_archivo(moneda_filtro, filtro=True)
-    #df_filtrado.to_csv(nombre_archivo_filtrado, sep=';', index=False, float_format='%.5f')
 
-    # Mostrar los resultados en formato de tabla
-    #logger.info(f"Archivo completo generado: {nombre_archivo}")
-    #logger.info(f"Archivo filtrado generado: {nombre_archivo_filtrado}")
-
-    # Asegurar que el usuario tiene las claves necesarias en user_states
+    # Asegurar llaves en user_states
+    user_states.setdefault(user_chat_id, {})
     if "lock" not in user_states[user_chat_id]:
-        user_states[user_chat_id]["lock"] = asyncio.Lock()  # Agregar Lock si no existe
-        user_states[user_chat_id]["lock_holder"] = None  # Inicializar con None
-    if "archivos_enviados" not in user_states[user_chat_id]:
-        user_states[user_chat_id]["archivos_enviados"] = False  # Estado inicial
-    if "imagenes_oportunidades_enviadas" not in user_states[user_chat_id]:
-        user_states[user_chat_id]["imagenes_oportunidades_enviadas"] = False  # Estado inicial
-    if "imagenes_eventos_enviadas" not in user_states[user_chat_id]:
-        user_states[user_chat_id]["imagenes_eventos_enviadas"] = False  # Estado inicial
-    
+        user_states[user_chat_id]["lock"] = asyncio.Lock()
+        user_states[user_chat_id]["lock_holder"] = None
+    for k in ("archivos_enviados","imagenes_oportunidades_enviadas","imagenes_eventos_enviadas"):
+        user_states[user_chat_id].setdefault(k, False)
 
     async with user_states[user_chat_id]["lock"]:
         user_states[user_chat_id]["lock_holder"] = asyncio.current_task()
-        # Validar si df_resultados no está vacío antes de enviarlo como CSV
+
+        # CSV “completo”
         if not df_resultados.empty:
             if origen == "app":
                 ruta_local = os.path.join("/tmp", nombre_archivo)
                 save_df_as_csv(df_resultados, ruta_local, cfg)
-
-                if can_archive:
-                    object_path = build_object_path(exec_id, nombre_archivo)
-                else:
-                    object_path = nombre_archivo  # fallback sin exec_id si fuera necesario
-
+                object_path = build_object_path(exec_id, nombre_archivo) if can_archive else nombre_archivo
                 url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                 urls_generadas.append(url_publica)
-
                 if can_archive:
                     await asyncio.to_thread(
                         fs_registrar_archivo_generado,
-                        exec_id=exec_id, 
-                        user_id=user_id, 
-                        chat_id=user_chat_id, 
-                        tipo="csv",
-                        nombre=nombre_archivo,
-                        gcs_path=object_path,
-                        signed_url=url_publica,     # o None si no quieres guardarla
-                        content_type="text/csv",
+                        exec_id=exec_id, user_id=user_id, chat_id=user_chat_id,
+                        tipo="csv", nombre=nombre_archivo, gcs_path=object_path,
+                        signed_url=url_publica, content_type="text/csv",
                         metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
                     )
-
             if send_to_tg:
-                    if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id, cfg=cfg))
-                    else:
-                        await enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id, cfg=cfg)
+                if origen == "telegram":
+                    asyncio.create_task(enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id, cfg=cfg))
+                else:
+                    await enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id, cfg=cfg)
         else:
-            logger.info(f"El DataFrame df_resultados está vacío. No se enviará el archivo CSV: {nombre_archivo}")
+            logger.info(f"DF df_resultados vacío; no se envía {nombre_archivo}")
 
-        # Validar si df_filtrado no está vacío antes de enviarlo como CSV
+        # CSV “filtrado”
         if not df_filtrado.empty:
             if origen == "app":
                 ruta_local = os.path.join("/tmp", nombre_archivo_filtrado)
                 save_df_as_csv(df_filtrado, ruta_local, cfg)
-
-                if can_archive:
-                    object_path = build_object_path(exec_id, nombre_archivo_filtrado)
-                else:
-                    object_path = nombre_archivo_filtrado  # fallback sin exec_id si fuera necesario
-
+                object_path = build_object_path(exec_id, nombre_archivo_filtrado) if can_archive else nombre_archivo_filtrado
                 url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
                 urls_generadas.append(url_publica)
-
                 if can_archive:
-                    # usa chat_id solo si existe (origen telegram o lo tengas disponible)
-                    chat_id_opt = user_chat_id or None
-
                     await asyncio.to_thread(
                         fs_registrar_archivo_generado,
-                        exec_id=exec_id,
-                        user_id=user_id,            # <— obligatorio (tu usuario de la app)
-                        chat_id=chat_id_opt,        # <— opcional (telegram)
-                        tipo="csv",
-                        nombre=nombre_archivo_filtrado,
-                        gcs_path=object_path,
-                        signed_url=url_publica,     # o None
-                        content_type="text/csv",
-                        metadata={
-                            "moneda_filtro": moneda_filtro,
-                            "particion": "principal",
-                            "filtrado": False
-                        },
+                        exec_id=exec_id, user_id=user_id, chat_id=(user_chat_id or None),
+                        tipo="csv", nombre=nombre_archivo_filtrado, gcs_path=object_path,
+                        signed_url=url_publica, content_type="text/csv",
+                        metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": True},
                     )
-
             if send_to_tg:
-                    if origen == "telegram":
-                        asyncio.create_task(enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id, cfg=cfg))
-                    else:
-                        await enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id, cfg=cfg)
+                if origen == "telegram":
+                    asyncio.create_task(enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id, cfg=cfg))
+                else:
+                    await enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id, cfg=cfg)
         else:
-            logger.info(f"El DataFrame df_filtrado está vacío. No se enviará el archivo CSV: {nombre_archivo_filtrado}")
+            logger.info(f"DF df_filtrado vacío; no se envía {nombre_archivo_filtrado}")
 
         user_states[user_chat_id]["archivos_enviados"] = True
 
-        # Enviar imágenes solo después de que los archivos hayan sido enviados
-        if user_states[user_chat_id]["archivos_enviados"]:    
-            # Verificar si df_filtradoToImage no está vacío antes de enviar la imagen
+        # Imágenes de oportunidades
+        if user_states[user_chat_id]["archivos_enviados"]:
             if not df_filtradoToImage.empty:
                 df_para_imagen = preparar_df_oportunidades_para_tabla(df_filtradoToImage)
-
                 imagenes = tabla_a_imagenes(
                     df_para_imagen,
-                    max_filas_por_imagen=18,   # ajusta a gusto
+                    max_filas_por_imagen=18,
                     dpi=170,
                     font_size=9,
                     wrap_map={"Tipo de Operación": 22}
                 )
-
-                if imagenes:
+                if imagenes and send_to_tg:
                     for i, img in enumerate(imagenes, 1):
                         try:
                             caption = "Oportunidades relacionadas a los activos seleccionados."
                             if len(imagenes) > 1:
                                 caption += f" Parte {i} de {len(imagenes)}"
-
-                            if send_to_tg:    
-                                await context.bot.send_photo(chat_id=user_chat_id, photo=img, caption=caption)
+                            await context.bot.send_photo(chat_id=user_chat_id, photo=img, caption=caption)
                         except Exception as e:
                             logger.info(f"Error enviando imagen de oportunidades: {e}")
             else:
-                logger.info(f"El DataFrame df_filtradoToImage está vacío. No se enviará la imagen.")
-
+                logger.info("DF df_filtradoToImage vacío; no se envían imágenes.")
             user_states[user_chat_id]["imagenes_oportunidades_enviadas"] = True
 
-            if user_states[user_chat_id]["imagenes_oportunidades_enviadas"]:  
-                if not df_eventos.empty and divisas_oportunidades is not None and len(divisas_oportunidades) > 0:
+            # Imágenes de eventos si aplica
+            if user_states[user_chat_id]["imagenes_oportunidades_enviadas"]:
+                if not df_eventos.empty and divisas_oportunidades:
                     if send_to_tg:
                         await enviar_imagen_eventos_oportunidades(
                             df_eventos, divisas_oportunidades, context, user_chat_id,
                             moneda_filtro=moneda_filtro
                         )
                 else:
-                    logger.info("El DataFrame df_eventos está vacío o divisas_oportunidades no contiene elementos válidos.")
-                
-                # Marcar imágenes como enviadas
+                    logger.info("df_eventos vacío o sin divisas_oportunidades válidas.")
                 user_states[user_chat_id]["imagenes_eventos_enviadas"] = True
 
-            if not es_administrador(user_chat_id):
-                num_tx = 1
-                try:
-                    num_tx = int(((user_states.get(user_chat_id) or {}).get("numero_transacciones") or 1))
-                except Exception:
-                    num_tx = 1
+            # ⚠️ Nota: el descuento de transacciones lo moviste a *antes* de ejecutar_analisis_con_hilos.
+            # Aquí NO descontamos nada para evitar doble cargo.
 
-                num_tx = int(
-                    ((user_states.get(str(user_id)) or {}).get("numero_transacciones"))
-                    or ((user_states.get(str(user_chat_id)) or {}).get("numero_transacciones"))
-                    or 1
-                )
-
-                success, mensaje = await descontar_transaccion(
-                    user_chat_id if (origen or "telegram").lower() == "telegram" else str(user_id),
-                    numero_transacciones_in=num_tx,
-                    origen=(origen or "telegram"),
-                )
-                if not success:
-                    if send_to_tg and context:
-                        await update.message.reply_text(mensaje)
-    
     urls_generadas = _solo_strings_urls(urls_generadas)
     logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
     return urls_generadas
@@ -8223,9 +8096,11 @@ def _find_chat_id_for_user_sync(db, user_id: str | None) -> str | None:
 
     return None
 
-# Función para manejar el ciclo recurrente del análisis
 #@profile
-async def ejecutar_recurrente(
+# ==============================
+# ejecutar_recurrente (optimizado)
+# ==============================
+async def ejecutar_recurrente( 
     context,
     update,
     moneda_filtro,
@@ -8241,75 +8116,80 @@ async def ejecutar_recurrente(
     Ejecuta análisis para un conjunto de activos filtrados por moneda.
     - Prioriza user_id (UUID). Si no hay, opera con user_chat_id (telegram).
     - Marca estado 'en ejecución' y libera al final.
+    - AHORA: descuenta transacciones justo antes de ejecutar_analisis_con_hilos.
     """
 
-    # --- CARGA CFG
+    logger = logging.getLogger(__name__)
+    error_occurred = False
+    url_generadas = None
+
+    # --- CFG base (carga perezosa)
     if cfg is None:
         cfg, _ = await asyncio.to_thread(
             _load_cfg_and_tz_sync, db, user_id=user_id, chat_id=user_chat_id
         )
 
-    # --- Resolver chat_id (prioriza el que viene; si no, buscar por user_id)
+    # --- Resolver chat_id si falta y hay user_id
     if not user_chat_id and user_id:
         user_chat_id = await asyncio.to_thread(_find_chat_id_for_user_sync, db, user_id)
 
+    # --- Filtrado de activos por moneda
     global activos
-    # Filtra activos (asumo que 'activos' existe en tu módulo)
-    activos_filtrados = filtrar_activos_por_moneda(activos, moneda_filtro)
+    try:
+        activos_filtrados = filtrar_activos_por_moneda(activos, moneda_filtro)
+    except Exception as e:
+        logger.error(f"Error filtrando activos por moneda '{moneda_filtro}': {e}", exc_info=True)
+        activos_filtrados = []
 
-    # --- normalizaciones básicas
-    origen_norm  = (origen or "app").lower()
-    cfg          = cfg or {}
+    # --- Normalizaciones
+    origen_norm   = (origen or "app").lower()
+    cfg           = cfg or {}
+    opciones_usuario = list(opciones_usuario or [])
     notifications = cfg.get("notifications") or {}
-    send_results = bool(notifications.get("send_results_telegram"))
-    has_chat = bool(user_chat_id)
+    send_results  = bool(notifications.get("send_results_telegram"))
+    has_chat      = bool(user_chat_id)
 
-    # --- política de envío:
-    # - si el origen es telegram -> enviar (estamos en el hilo del bot)
-    # - si el origen es app     -> enviar solo si el usuario lo activó en cfg
+    # Política de envío a Telegram
     send_to_tg = has_chat and (
-        (origen_norm == "telegram") or
-        (origen_norm == "app" and send_results)
+        origen_norm == "telegram" or (origen_norm == "app" and send_results)
     )
 
-    # Estado local por chat (solo si hay chat_id)
+    # Estado local por chat
     if user_chat_id and user_chat_id not in user_states:
         user_states[user_chat_id] = {}
 
-    n = len(activos_filtrados)
+    cfg_overrides = operatoria_cfg or {}
+    temps = cfg_overrides.get("tfs") or temporalidades
+
+    # Contabilizar transacciones (activo x tf)
+    n = len(activos_filtrados) * len(temps)
     if user_id:
         user_states.setdefault(str(user_id), {})["numero_transacciones"] = n
     if user_chat_id:
         user_states.setdefault(str(user_chat_id), {})["numero_transacciones"] = n
 
+    # Sin activos
     if not activos_filtrados:
         if send_to_tg:
-            await context.bot.send_message(
-                chat_id=user_chat_id,
-                text="No se encontraron activos para analizar con el filtro especificado."
-            )
-        return  # <- salimos igual aunque no haya Telegram
+            try:
+                await context.bot.send_message(
+                    chat_id=user_chat_id,
+                    text="No se encontraron activos para analizar con el filtro especificado."
+                )
+            except Exception as e:
+                logger.warning(f"No se pudo enviar mensaje Telegram (sin activos): {e}")
+        return
 
-    # --- Cuota/transacciones (lee del cache local si hay chat) ---
-    num_tx = 1
-    if user_chat_id:
-        try:
-            num_tx = int(((user_states.get(user_chat_id) or {}).get("numero_transacciones") or 1))
-        except Exception:
-            num_tx = 1
-
-    # --- Validación de suscripción (tolerante a string/dict) ---
+    # --- Validación de suscripción previa (no descuenta aún)
     estado = await estado_suscripcion(
-        user_id=user_id,                # flujo app (UUID)
-        chat_id=user_chat_id or None,   # opcional, espejo
-        numero_transacciones=num_tx,
+        user_id=user_id,
+        chat_id=user_chat_id or None,
+        numero_transacciones=n if n > 0 else 1,
     )
-    # soporto ambos formatos
     estado_code = None
     if isinstance(estado, str):
         estado_code = estado
     elif isinstance(estado, dict):
-        # podría venir {"active": bool, "reason": "..."} o {"code": "..."}
         if "code" in estado:
             estado_code = estado["code"]
         elif estado.get("active") is False and estado.get("reason"):
@@ -8317,59 +8197,66 @@ async def ejecutar_recurrente(
 
     if estado_code == "transacciones_insuficientes" and not es_administrador(user_id or user_chat_id):
         if send_to_tg:
-            await context.bot.send_message(
-                chat_id=user_chat_id,
-                text="No cuenta con la cuota de transacciones requerida. Por favor, contacta con un administrador."
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=user_chat_id,
+                    text="No cuenta con la cuota de transacciones requerida. Por favor, contacta con un administrador."
+                )
+            except Exception as e:
+                logger.warning(f"No se pudo enviar mensaje Telegram (cuota): {e}")
         return
 
-    # --- Evitar duplicados en ejecución (por chat) ---
+    # --- Evitar ejecuciones duplicadas por chat
     if user_chat_id and return_state(chat_id=user_chat_id) == "en ejecución":
         if send_to_tg:
-            await context.bot.send_message(
-                chat_id=user_chat_id,
-                text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=user_chat_id,
+                    text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
+                )
+            except Exception as e:
+                logger.warning(f"No se pudo enviar mensaje Telegram (duplicado): {e}")
         return
 
-    # --- Config en memoria para esta ejecución (si hay chat) ---
+    # --- Guardar operatoria_cfg en memoria (si hay chat)
     if user_chat_id:
         user_states[user_chat_id]["operatoria_cfg"] = dict(operatoria_cfg or {})
 
-    # Saludo
+    # --- Saludo
     if send_to_tg:
-        user = getattr(update, "effective_user", None)
-        first_name = getattr(user, "first_name", "") if user else ""
-        await context.bot.send_message(
-            chat_id=user_chat_id,
-            text=f"Hola {first_name}, comenzó el análisis. Por favor, espera un momento..."
-        )
+        try:
+            user = getattr(update, "effective_user", None)
+            first_name = getattr(user, "first_name", "") if user else ""
+            await context.bot.send_message(
+                chat_id=user_chat_id,
+                text=f"Hola {first_name}, comenzó el análisis. Por favor, espera un momento..."
+            )
+        except Exception as e:
+            logger.warning(f"No se pudo enviar mensaje de saludo: {e}")
 
-
+    # --- Crear exec en FS si corresponde (solo auto en origen telegram y con uploads habilitados)
+    can_archive = False
     if origen_norm == "telegram" and exec_id is None and _is_uploads_enabled(cfg):
         try:
-            activos = [moneda_filtro] if moneda_filtro else []
+            activos_solicitados = [moneda_filtro] if moneda_filtro else []
             exec_id = await asyncio.to_thread(
                 fs_crear_ejecucion,
                 user_id=user_id,
                 chat_id=user_chat_id or None,
-                activos_solicitados=activos,
+                activos_solicitados=activos_solicitados,
                 origen="telegram",
-                opciones_usuario=opciones_usuario or [],
+                opciones_usuario=opciones_usuario,
             )
         except Exception as e:
-            # si falla la creación, logueamos y seguimos SIN exec_id (sin archivar)
             logger.warning(f"No se pudo crear exec_id auto (telegram): {e}", exc_info=True)
             exec_id = None
-
 
     can_archive = bool(exec_id)
 
     # =======================
-    # ARCHIVADO (si hay exec)
+    # ARCHIVADO inicial (si hay exec)
     # =======================
     if can_archive:
-        # 1) Documento base en ejecuciones/{exec_id} (si fs_crear_ejecucion no lo dejó completo)
         try:
             db.collection("ejecuciones").document(exec_id).set({
                 "exec_id": exec_id,
@@ -8378,48 +8265,104 @@ async def ejecutar_recurrente(
                 "origen": origen_norm,
                 "moneda_filtro": moneda_filtro,
                 "cfg_snapshot": cfg,
-                "estado": "running",  # o "completado" si prefieres cerrar directo aquí
-                "created_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
-                "updated_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+                "estado": "running",
+                "created_at": _now_utc().isoformat().replace("+00:00", "Z"),
+                "updated_at": _now_utc().isoformat().replace("+00:00", "Z")
             }, merge=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"No se pudo setear documento base de ejecución {exec_id}: {e}")
 
-    # --- Marcar estados en Firestore y memoria ---
+    # --- Marcar estados en memoria y remoto
     actualizar_estado_usuario(user_chat_id, "en ejecución", moneda_filtro)
-    # IMPORTANTE: usa kwargs; si tienes UUID úsalo como user_id, si no, usa chat_id
-    if user_id:
-        mark_user_state(user_id=user_id, estado="en ejecución")
-    elif user_chat_id:
-        mark_user_state(chat_id=user_chat_id, estado="en ejecución")
+    try:
+        if user_id:
+            mark_user_state(user_id=user_id, estado="en ejecución")
+        elif user_chat_id:
+            mark_user_state(chat_id=user_chat_id, estado="en ejecución")
+    except Exception as e:
+        logger.warning(f"No se pudo marcar estado remoto 'en ejecución': {e}")
 
     if user_chat_id:
-        limpiar_soportes_resistencias_cache(user_chat_id)
-        estado_usuario = obtener_estado_usuario(user_chat_id)
-        estado_usuario["cache_realtime"] = {}
+        try:
+            limpiar_soportes_resistencias_cache(user_chat_id)
+            estado_usuario = obtener_estado_usuario(user_chat_id)
+            estado_usuario["cache_realtime"] = {}
+        except Exception as e:
+            logger.warning(f"No se pudo limpiar/sincronizar cache_realtime: {e}")
 
-    logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Ejecutando análisis para el usuario chat={user_chat_id} uuid={user_id}...")
+    logger.info(
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Ejecutando análisis "
+        f"chat={user_chat_id} uuid={user_id} activos={len(activos_filtrados)} temps={len(temps)}"
+    )
 
-    # --- Actualiza metadata de la ejecución si te pasaron exec_id ---
+    # --- Actualizar metadata si vino exec_id externo
     if exec_id:
         try:
             await asyncio.to_thread(
                 fs_actualizar_ejecucion,
                 exec_id,
                 activos_resueltos=activos_filtrados,
-                numero_transacciones=len(activos_filtrados),
+                numero_transacciones=n,
             )
         except Exception as e:
-            logging.warning(f"No se pudo actualizar ejecucion {exec_id}: {e}")
+            logger.warning(f"No se pudo actualizar ejecución {exec_id}: {e}")
+
+    # === Descontar transacciones JUSTO ANTES del análisis ===
+    try:
+        # ✅ Preferimos cobrar por user_id (doc id en suscripciones_user). Si no hay, usamos chat_id.
+        identificador_cobro = (str(user_id) if user_id else None) or (str(user_chat_id) if user_chat_id else None)
+
+        if not es_administrador(user_id or user_chat_id) and identificador_cobro:
+            success, mensaje = await descontar_transaccion(
+                identificador_cobro,
+                numero_transacciones_in=n,
+                origen=origen_norm,  # para logs/telemetría
+            )
+            if not success:
+                error_occurred = True
+                if send_to_tg and context:
+                    try:
+                        await context.bot.send_message(chat_id=user_chat_id, text=mensaje or "No fue posible descontar transacciones.")
+                    except Exception:
+                        pass
+                if can_archive:
+                    try:
+                        await asyncio.to_thread(
+                            fs_finalizar_ejecucion,
+                            exec_id,
+                            "fallido",
+                            {"error": "saldo_insuficiente"}
+                        )
+                    except Exception:
+                        pass
+                return
+    except Exception as e:
+        error_occurred = True
+        logger.error(f"Error al descontar transacciones: {e}", exc_info=True)
+        if can_archive:
+            try:
+                await asyncio.to_thread(
+                    fs_finalizar_ejecucion,
+                    exec_id,
+                    "fallido",
+                    {"error": f"descuento_fallido: {e}"}
+                )
+            except Exception:
+                pass
+        # liberar estados al final del finally
 
     # --- Ejecución principal ---
     try:
+        if error_occurred:
+            return  # ya se manejó y se liberará estado en finally
+
         start_time = datetime.now()
 
+        # Eventos económicos (tolerante a error)
         try:
-            df_eventos = await obtener_eventos_economicos()  # puede fallar: seguimos sin eventos
+            df_eventos = await obtener_eventos_economicos()
         except Exception as e:
-            logging.warning(f"Error al obtener eventos económicos: {e}")
+            logger.warning(f"Error al obtener eventos económicos: {e}")
             df_eventos = None
 
         resultados = await ejecutar_analisis_con_hilos(
@@ -8428,19 +8371,22 @@ async def ejecutar_recurrente(
             user_chat_id,
             context,
             overrides={
-                "tfs":           (operatoria_cfg or {}).get("tfs"),
-                "fmpWindows":    (operatoria_cfg or {}).get("fmpWindows"),
-                "calcWindows":   (operatoria_cfg or {}).get("calcWindows"),
+                "tfs":         (operatoria_cfg or {}).get("tfs"),
+                "fmpWindows":  (operatoria_cfg or {}).get("fmpWindows"),
+                "calcWindows": (operatoria_cfg or {}).get("calcWindows"),
             },
             cfg=cfg,
         )
 
         if not resultados:
             if send_to_tg:
-                await context.bot.send_message(
-                    chat_id=user_chat_id,
-                    text="El análisis no produjo resultados. Verifique los datos y vuelva a intentarlo."
-                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_chat_id,
+                        text="El análisis no produjo resultados. Verifique los datos y vuelva a intentarlo."
+                    )
+                except Exception as e:
+                    logger.warning(f"No se pudo enviar mensaje Telegram (sin resultados): {e}")
             return
 
         url_generadas = await procesar_resultado(
@@ -8450,13 +8396,16 @@ async def ejecutar_recurrente(
         )
 
         elapsed_time = (datetime.now() - start_time).total_seconds()
-        logger.info(f"[{datetime.now()}] Análisis finalizado (chat={user_chat_id}, uuid={user_id}). Tiempo: {elapsed_time:.2f}s.")
+        logger.info(
+            f"[{datetime.now()}] Análisis finalizado (chat={user_chat_id}, uuid={user_id}). "
+            f"Tiempo: {elapsed_time:.2f}s."
+        )
         return url_generadas
 
     except Exception as e:
+        error_occurred = True
+        logger.error(f"Error durante la ejecución principal: {e}", exc_info=True)
         if can_archive:
-            logger.error(f"Error archivando exec_id={exec_id}: {e}", exc_info=True)
-            # marca como fallido si alcanzó a crear exec
             try:
                 await asyncio.to_thread(
                     fs_finalizar_ejecucion,
@@ -8464,28 +8413,37 @@ async def ejecutar_recurrente(
                     "fallido",
                     {"error": str(e)}
                 )
-            except Exception:
-                pass
+            except Exception as e2:
+                logger.warning(f"No se pudo marcar fallido exec_id={exec_id}: {e2}")
 
     finally:
-
-        if can_archive:
-            await asyncio.to_thread(
+        # Cierre de ejecución (solo si no se marcó como fallido/abortado arriba)
+        if can_archive and not error_occurred:
+            try:
+                await asyncio.to_thread(
                     fs_finalizar_ejecucion,
                     exec_id,
                     "completado",
-                    {"origen": origen_norm, "urls": []}  # si tienes URLs públicas, colócalas aquí
+                    {"origen": origen_norm, "urls": url_generadas or []}
                 )
-                
-        # Limpiezas locales por chat
-        if user_chat_id:
-            limpiar_estado_usuario(user_chat_id)
+            except Exception as e:
+                logger.warning(f"No se pudo marcar completado exec_id={exec_id}: {e}")
 
-        # Siempre liberar el estado remoto (usa el identificador disponible)
-        if user_id:
-            mark_user_state(user_id=user_id,   estado="disponible")
-        elif user_chat_id:
-            mark_user_state(chat_id=user_chat_id, estado="disponible")
+        # Limpieza estado local por chat
+        if user_chat_id:
+            try:
+                limpiar_estado_usuario(user_chat_id)
+            except Exception as e:
+                logger.warning(f"Error limpiando estado local del usuario {user_chat_id}: {e}")
+
+        # Liberar estado remoto
+        try:
+            if user_id:
+                mark_user_state(user_id=user_id, estado="disponible")
+            elif user_chat_id:
+                mark_user_state(chat_id=user_chat_id, estado="disponible")
+        except Exception as e:
+            logger.warning(f"No se pudo marcar usuario disponible: {e}")
 
 
 #@profile
@@ -9258,35 +9216,85 @@ def update_sub_transacciones(
 # ✅ Mejora tu función existente para preferir Firestore:
 #@profile
 async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen="telegram"):
-    try:
-        uid = _user_id_from_chat(user_key) if (origen or "telegram").lower()=="telegram" else user_key
-        uid = str(uid)
 
-        # Firestore
-        doc_ref = db.collection("suscripciones_user").document(uid)
+    try:
+        origen_norm = (origen or "telegram").lower()
+        key = str(user_key or "").strip()
+        if not key:
+            return False, "❌ Identificador de usuario inválido."
+
+        col = db.collection("suscripciones_user")
+
+        # --- Paso 1: probar directamente como document id (user_id esperado)
+        doc_ref = col.document(key)
         snap = doc_ref.get()
+
+        # Heurísticas
+        looks_chat = key.isdigit()
+        looks_uuid = (not looks_chat) and (len(key) >= 16)  # heurística laxa
+
+        # --- Paso 2: si no existe y parece chat_id, buscar por telegram_id == key
+        if not snap.exists and looks_chat:
+            try:
+                q = col.where("telegram_id", "==", key).limit(1)
+                qs = q.get()
+                if qs:
+                    snap = qs[0]
+                    doc_ref = col.document(snap.id)
+            except Exception as e:
+                # seguimos sin snap válido
+                pass
+
+        # --- Paso 3: si aún no existe y parece UUID, buscar por user_id == key (por si el doc_id no coincide)
+        if (not snap.exists) and looks_uuid:
+            try:
+                q = col.where("user_id", "==", key).limit(1)
+                qs = q.get()
+                if qs:
+                    snap = qs[0]
+                    doc_ref = col.document(snap.id)
+            except Exception:
+                pass
+
         if not snap.exists:
-            return False, f"❌ No se encontró suscripción activa para {uid}."
+            return False, f"❌ No se encontró suscripción activa para {key}."
 
         sus = snap.to_dict() or {}
-        trans = int(sus.get("transacciones_restantes", 0))
-        trans -= int(numero_transacciones_in)
+
+        # Normalizar números
+        try:
+            trans = int(sus.get("transacciones_restantes", 0))
+        except Exception:
+            trans = 0
+
+        try:
+            dec = int(numero_transacciones_in)
+        except Exception:
+            dec = 1
+
+        nuevo = trans - dec
         updates = {
-            "transacciones_restantes": max(trans, 0),
-            "estado": "activa" if trans > 0 else "inactiva",
+            "transacciones_restantes": max(nuevo, 0),
+            "estado": "activa" if nuevo > 0 else "inactiva",
             "updated_at": firestore.SERVER_TIMESTAMP,
         }
         doc_ref.set(updates, merge=True)
 
-        # Reflejar en user_states (por user_id y, si se deduce, por chat_id)
-        user_states.setdefault(uid, {})["numero_transacciones"] = int(numero_transacciones_in)
-        maybe_chat = _chat_from_user_id(uid)
-        if maybe_chat:
-            user_states.setdefault(str(maybe_chat), {})["numero_transacciones"] = int(numero_transacciones_in)
+        # --- Reflect en user_states (por ambos identificadores cuando se puedan inferir)
+        # doc principal
+        user_states.setdefault(snap.id, {})["numero_transacciones"] = int(numero_transacciones_in)
 
-        if trans <= 0:
+        # si el doc trae telegram_id, reflejar también allí
+        try:
+            tg_field = str(sus.get("telegram_id") or "").strip()
+            if tg_field:
+                user_states.setdefault(tg_field, {})["numero_transacciones"] = int(numero_transacciones_in)
+        except Exception:
+            pass
+
+        if nuevo <= 0:
             return True, "✅ Transacción aplicada. Te quedan 0; tu suscripción quedó inactiva."
-        return True, f"✅ Transacción aplicada. Te quedan {trans}."
+        return True, f"✅ Transacción aplicada. Te quedan {nuevo}."
 
     except Exception as e:
         return False, f"❌ Error inesperado al descontar transacción: {e}"
