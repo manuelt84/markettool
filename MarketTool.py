@@ -7999,10 +7999,20 @@ async def enviar_mensaje_noticias(context, user_chat_id, mensaje):
 
 
 def _find_user_id_for_chat_sync(db, chat_id: str) -> str | None:
-    """Resuelve user_id desde un chat_id de Telegram."""
     chat_id = (chat_id or "").strip()
     if not chat_id:
         return None
+
+    # A0) alias directo: suscripciones_user/{chat_id}
+    try:
+        alias_snap = db.collection("suscripciones_user").document(chat_id).get()
+        if alias_snap.exists:
+            d = alias_snap.to_dict() or {}
+            uid = d.get("doc_alias_of") or d.get("user_id")
+            if uid:
+                return str(uid)
+    except Exception:
+        pass
 
     # A) mapping directo: chat_ids/{chat_id} => { user_id }
     try:
@@ -8014,27 +8024,23 @@ def _find_user_id_for_chat_sync(db, chat_id: str) -> str | None:
     except Exception:
         pass
 
-    # B) buscar en suscripciones_user por telegram_id == chat_id
+    # B) buscar canónico por telegram_id == chat_id
     try:
-        q = db.collection("suscripciones_user") \
-              .where("telegram_id", "==", chat_id).limit(1).get()
+        q = db.collection("suscripciones_user").where("telegram_id", "==", chat_id).limit(1).get()
         if q:
-            # id del doc = user_id en tu diseño
-            return q[0].id
+            return str(q[0].id)   # id del canónico = user_id
     except Exception:
         pass
 
-    # C) fallback: buscar en user_ids por telegram_id == chat_id
+    # C) fallback: user_ids por telegram_id
     try:
-        q = db.collection("user_ids") \
-              .where("telegram_id", "==", chat_id).limit(1).get()
+        q = db.collection("user_ids").where("telegram_id", "==", chat_id).limit(1).get()
         if q:
-            return q[0].id
+            return str(q[0].id)
     except Exception:
         pass
 
     return None
-
 
 def _load_cfg_and_tz_sync(db, *, user_id: str | None, chat_id: str | None):
     """
@@ -8708,7 +8714,17 @@ async def comando_reset_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def cargar_datos_subscription_user():
     try:
         docs = db.collection("suscripciones_user").stream()
-        return {doc.id: doc.to_dict() for doc in docs if doc.exists}
+        out = {}
+        for doc in docs:
+            if not doc.exists:
+                continue
+            d = doc.to_dict() or {}
+            # Alias = tiene doc_alias_of, o el id es numérico y no coincide con user_id
+            is_alias = bool(d.get("doc_alias_of")) or (str(doc.id).isdigit() and str(d.get("user_id") or "") != str(doc.id))
+            if is_alias:
+                continue
+            out[doc.id] = d
+        return out
     except Exception as e:
         print("Error al cargar suscripciones:", e)
         return {}
@@ -8796,51 +8812,50 @@ async def estado_suscripcion(
     *, 
     user_id: str | None = None, 
     chat_id: str | None = None,
-    numero_transacciones: int | None = None,   # ← nuevo (opcional)
-    **_kwargs                                       # ← ignora futuros kwargs
+    numero_transacciones: int | None = None,
+    **_kwargs
 ) -> str:
-    """
-    Devuelve:
-      - 'activa' si hay suscripción vigente y saldo suficiente (o no se pidió validar cantidad)
-      - 'transacciones_insuficientes' si hay suscripción activa pero el saldo < numero_transacciones
-      - 'inactiva' si no hay suscripción o está expirada/sin saldo
-    Además normaliza en Firestore el campo 'estado' a 'activa'/'inactiva' (no guarda 'transacciones_insuficientes').
-    """
     try:
-        cand_ids: list[str] = []
-        if user_id: cand_ids.append(str(user_id))
-        if chat_id: cand_ids.append(str(chat_id))
+        key = (user_id or chat_id or "").strip()
+        if not key:
+            return "inactiva"
 
-        for key in cand_ids:
-            doc_ref = db.collection("suscripciones_user").document(key)
-            snap = doc_ref.get()
+        canon_ref, alias_ref, data_canon = _resolve_refs_from_key(key)
+        if not canon_ref:
+            return "inactiva"
+
+        # lee canónico
+        doc = data_canon
+        if not doc:
+            snap = canon_ref.get()
             if not snap.exists:
-                continue
-
-            sus = snap.to_dict() or {}
-            fin  = parse_iso_aware(sus.get("fin") or "")
-            rest = int(sus.get("transacciones_restantes", 0))
-            ahora = _now_utc()
-
-            # Estado base que se persiste en Firestore
-            base_estado = "activa" if (fin and fin >= ahora and rest > 0) else "inactiva"
-            if (sus.get("estado") or "").lower() != base_estado:
-                try:
-                    doc_ref.set({"estado": base_estado, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
-                except Exception as e:
-                    logger.info(f"estado_suscripcion: no se pudo guardar estado: {e}")
-
-            # Si no está activa, devolvemos 'inactiva'
-            if base_estado != "activa":
                 return "inactiva"
+            doc = snap.to_dict() or {}
 
-            # Validación opcional por cantidad pedida
-            if isinstance(numero_transacciones, int) and numero_transacciones > 0 and rest < numero_transacciones:
-                return "transacciones_insuficientes"
+        fin  = parse_iso_aware(doc.get("fin") or "")
+        rest = int(doc.get("transacciones_restantes", 0))
+        ahora = _now_utc()
 
-            return "activa"
+        base_estado = "activa" if (fin and fin >= ahora and rest > 0) else "inactiva"
 
-        return "inactiva"
+        # Si cambió, normaliza en canónico (+ alias si existe)
+        try:
+            batch = db.batch()
+            batch.set(canon_ref, {"estado": base_estado, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+            if alias_ref is not None:
+                batch.set(alias_ref, {"estado": base_estado, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+            batch.commit()
+        except Exception:
+            pass
+
+        if base_estado != "activa":
+            return "inactiva"
+
+        if isinstance(numero_transacciones, int) and numero_transacciones > 0 and rest < numero_transacciones:
+            return "transacciones_insuficientes"
+
+        return "activa"
+
     except Exception as e:
         logger.info(f"estado_suscripcion error: {e}")
         return "inactiva"
@@ -8894,59 +8909,39 @@ def guardar_pagos_pendientes(data):
 
 #@profile
 async def obtener_opciones_usuario(user_or_chat_id: str, *, origen: str = "telegram") -> list[str]:
-    """
-    Lee opciones desde Firestore (suscripciones_user) priorizando user_id; si no, telegram_id.
-    Si fin expiró => marca 'inactiva' y guarda. Devuelve [] si no activa o sin doc.
-    """
     try:
-        # 1) Resolver ids
-        uid = _user_id_from_chat(user_or_chat_id) if (origen or "telegram").lower() == "telegram" else user_or_chat_id
-        uid = str(uid or user_or_chat_id).strip()
-        tg  = None
-        try:
-            # Si no encontramos por user_id, intentamos por chat_id
-            if origen.lower() == "telegram":
-                tg = str(user_or_chat_id).strip()
-        except:
-            tg = None
-
-        # 2) Intento 1: user_id
-        doc_ref = db.collection("suscripciones_user").document(uid)
-        snap = doc_ref.get()
-        sus = snap.to_dict() if snap.exists else None
-
-        # 3) Intento 2: telegram_id
-        if not sus and tg:
-            doc_ref_tg = db.collection("suscripciones_user").document(tg)
-            snap_tg = doc_ref_tg.get()
-            if snap_tg.exists:
-                sus = snap_tg.to_dict()
-                doc_ref = doc_ref_tg  # trabajar sobre este
-
-        if not sus:
+        key = (user_or_chat_id or "").strip()
+        if not key:
             return []
 
-        fin  = parse_iso_aware(sus.get("fin") or "")
-        rest = int(sus.get("transacciones_restantes", 0))
-        estado = (sus.get("estado") or "").lower().strip() or "inactiva"
+        canon_ref, alias_ref, data_canon = _resolve_refs_from_key(key)
+        if not canon_ref:
+            return []
 
-        # 4) Normalizar estado por fechas y transacciones
+        doc = data_canon
+        if not doc:
+            snap = canon_ref.get()
+            if not snap.exists:
+                return []
+            doc = snap.to_dict() or {}
+
+        fin  = parse_iso_aware(doc.get("fin") or "")
+        rest = int(doc.get("transacciones_restantes", 0))
         ahora = _now_utc()
-        if not fin or fin < ahora:
-            estado_nuevo = "inactiva"
-        elif rest <= 0:
-            estado_nuevo = "inactiva"
-        else:
-            estado_nuevo = "activa"
+        estado_nuevo = "activa" if (fin and fin >= ahora and rest > 0) else "inactiva"
 
-        if estado != estado_nuevo:
-            sus["estado"] = estado_nuevo
-            try:
-                doc_ref.set({"estado": estado_nuevo, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
-            except Exception as e:
-                logger.info(f"No se pudo normalizar estado suscripción: {e}")
+        # Normalizar estado en ambos
+        try:
+            batch = db.batch()
+            batch.set(canon_ref, {"estado": estado_nuevo, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+            if alias_ref is not None:
+                batch.set(alias_ref, {"estado": estado_nuevo, "updated_at": firestore.SERVER_TIMESTAMP}, merge=True)
+            batch.commit()
+        except Exception:
+            pass
 
-        return sus.get("opciones", []) if estado_nuevo == "activa" else []
+        return doc.get("opciones", []) if estado_nuevo == "activa" else []
+
     except Exception as e:
         logger.info(f"obtener_opciones_usuario error: {e}")
         return []
@@ -9144,158 +9139,288 @@ def upsert_subscription_firestore(
     fin: Optional[datetime] = None
 ) -> Tuple[Any, Dict[str, Any]]:
     """
-    Crea o actualiza una suscripción en suscripciones_user para (user_id, origen).
-    - Si inicio/fin no vienen, se calculan desde el catálogo.
-    - Mantiene estado 'activa' y resetea transacciones al máximo del plan si no existen.
+    Crea/actualiza la suscripción del usuario en el doc canónico:
+      /suscripciones_user/{user_id}
+    y refleja (espejo mínimo) en el alias:
+      /suscripciones_user/{telegram_id}  (si existe)
+    
+    Reglas:
+    - SSOT = canónico por user_id.
+    - Alias es solo espejo (campos mínimos que el bot necesita).
+    - Si no existía saldo previo, arranca en tx_max.
+    - Si cambió el plan (tipo/limite), se capa el saldo al nuevo límite.
+    - Timestamps con SERVER_TIMESTAMP.
     """
-    user_uuid = str(user_id)
+
+    user_uuid = str(user_id).strip()
+    if not user_uuid:
+        raise ValueError("user_id vacío")
+
     origen_norm = (origen or "telegram").lower()
 
+    # 1) Obtener parámetros desde catálogo
+    # Debe devolver: opciones (lista), limite transacciones (int), duración en texto (p.ej. "1 mes")
     opts, tx_max, dur = _options_from_catalog(tipo_suscripcion)
+
+    # 2) Calcular inicio/fin
     start = inicio or _now_utc()
     end = fin or _calc_fin_from_text(dur, start)
 
-    doc_id = _build_sub_doc_id(user_uuid, origen_norm)
-    ref = _suscripciones_col().document(doc_id)
+    # 3) Referencias canónico + alias
+    col = db.collection("suscripciones_user")
+    canon_ref = col.document(user_uuid)
+    alias_ref = col.document(str(telegram_id)) if telegram_id else None
 
-    snap = ref.get()
-    prev = snap.to_dict() if snap.exists else {}
+    # 4) Leer estado previo del canónico (si existe)
+    prev = canon_ref.get()
+    prev_data = prev.to_dict() if prev.exists else {}
+    saldo_actual = int(prev_data.get("transacciones_restantes") or 0)
 
-    tx_rest = prev.get("transacciones_restantes")
-    if tx_rest is None:
-        tx_rest = tx_max
+    # 5) Determinar saldo
+    #    - Si no existía, arranca en tx_max
+    #    - Si existía y cambió límite o tipo, cap al nuevo tx_max (no sube automáticamente)
+    prev_rest = prev.get("transacciones_restantes")
+    if prev_rest is None:
+        tx_rest = int(tx_max)
+    else:
+        try:
+            tx_rest = int(prev_rest)
+        except Exception:
+            tx_rest = int(tx_max)
+        # Cap si bajó el tope o cambiaste de plan
+        try:
+            prev_lim = int(prev.get("limite_transacciones", tx_max))
+        except Exception:
+            prev_lim = int(tx_max)
+        prev_tipo = str(prev.get("tipo") or "")
+        if prev_tipo != tipo_suscripcion or prev_lim != tx_max:
+            tx_rest = min(tx_rest, int(tx_max))
 
+    # 6) Payload canónico (SSOT)
     payload = {
         "user_id": user_uuid,
-        "telegram_id": str(telegram_id) if telegram_id else prev.get("telegram_id"),
+        "telegram_id": str(telegram_id) if telegram_id else (prev.get("telegram_id") or None),
         "nombre_usuario": nombre_usuario,
         "tipo": tipo_suscripcion,
-        "origen": origen_norm,
+        "origen": origen_norm,  # info, no forma parte del doc id
         "id_pago": id_pago or prev.get("id_pago"),
         "hash_transaccion": hash_transaccion or prev.get("hash_transaccion"),
         "inicio": start.isoformat(),
         "fin": end.isoformat(),
         "estado": "activa",
         "opciones": opts,
-        "limite_transacciones": tx_max,
-        "transacciones_restantes": int(tx_rest),
-        "updated_at": _now_utc().isoformat(),
+        "limite_transacciones": int(tx_max),   # solo visual
+        "transacciones_restantes": saldo_actual,  # ❗️preserva
+        "updated_at": firestore.SERVER_TIMESTAMP,
     }
 
-    ref.set(payload, merge=True)
-    return (ref, payload)
+    # 7) Alias mínimo para el bot (solo si hay telegram_id)
+    alias_payload = None
+    if alias_ref is not None:
+        alias_payload = {
+            "user_id": user_uuid,
+            "doc_alias_of": user_uuid,
+            "telegram_id": str(telegram_id),
+            "estado": payload["estado"],
+            "fin": payload["fin"],
+            "transacciones_restantes": payload["transacciones_restantes"],
+            "updated_at": firestore.SERVER_TIMESTAMP,
+            # Puedes añadir más campos si tu bot los usa,
+            # pero evita arrays como "tokens" aquí para no duplicar.
+        }
+
+    # 8) Commit atómico en ambos (batch)
+    batch = db.batch()
+    batch.set(canon_ref, payload, merge=True)
+    if alias_payload is not None:
+        batch.set(alias_ref, alias_payload, merge=True)
+    batch.commit()
+
+    return (canon_ref, payload)
+
 
 #@profile
-def update_sub_transacciones(
-    *, user_id: Optional[str] = None, chat_id: Optional[str] = None, delta: int = -1
-) -> Tuple[bool, str]:
+def _resolve_refs_from_key(user_key: str):
     """
-    Incrementa/decrementa `transacciones_restantes` en la suscripción activa más reciente.
-    Si llega a 0, marca estado = 'inactiva'.
+    Resuelve referencias para el modelo:
+      - Canónico:  /suscripciones_user/{user_id}
+      - Alias TG:  /suscripciones_user/{telegram_id}  (espejo mínimo)
+
+    Devuelve: (canon_ref, alias_ref, data_canon)
+      - canon_ref: DocumentReference del doc canónico (SSOT)
+      - alias_ref: DocumentReference del alias (o None si no aplica)
+      - data_canon: dict del canónico si ya lo leímos en este flujo, si no -> None
+
+    Estrategia de resolución (en orden):
+      1) Si existe /suscripciones_user/{user_key}:
+         - Si parece alias (tiene doc_alias_of o es id numérico y user_id != id) => usa ese como alias y resuelve canónico por doc_alias_of/user_id.
+         - Si no, trátalo como canónico; alias_ref a partir de su telegram_id (si existe).
+      2) Buscar canónico por where("telegram_id" == user_key) => alias_ref es el doc {user_key}.
+      3) Buscar canónico por where("user_id" == user_key).
+      4) Mapping auxiliar chat_ids/{chat_id} => { user_id }, y de ahí el canónico.
+
+    Notas:
+      - No escribe nada; solo resuelve referencias.
+      - Considera id numérico como indicio fuerte de alias (chat_id), pero confirma con campos.
     """
-    ref, data = get_active_subscription(user_id=user_id, chat_id=chat_id)
-    if not ref or not data:
-        return (False, "No se encontró suscripción en Firestore.")
+    key = (user_key or "").strip()
+    if not key:
+        return None, None, None
 
+    col = db.collection("suscripciones_user")
+
+    # ---------- 1) Intento directo: existe un doc con id == key ----------
     try:
-        curr = int(data.get("transacciones_restantes", 0)) + int(delta)
-        estado = "activa"
-        if curr <= 0:
-            curr = 0
-            estado = "inactiva"
-
-        ref.set({
-            "transacciones_restantes": curr,
-            "estado": estado,
-            "updated_at": _now_utc().isoformat(),
-        }, merge=True)
-        return (True, f"Transacciones restantes: {curr}")
-    except Exception as e:
-        return (False, f"No se pudo actualizar transacciones: {e}")
-
-# ✅ Mejora tu función existente para preferir Firestore:
-#@profile
-async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen="telegram"):
-
-    try:
-        origen_norm = (origen or "telegram").lower()
-        key = str(user_key or "").strip()
-        if not key:
-            return False, "❌ Identificador de usuario inválido."
-
-        col = db.collection("suscripciones_user")
-
-        # --- Paso 1: probar directamente como document id (user_id esperado)
         doc_ref = col.document(key)
         snap = doc_ref.get()
+    except Exception:
+        snap = None
 
-        # Heurísticas
-        looks_chat = key.isdigit()
-        looks_uuid = (not looks_chat) and (len(key) >= 16)  # heurística laxa
+    if snap and snap.exists:
+        d = snap.to_dict() or {}
+        is_numeric_id = key.isdigit()
 
-        # --- Paso 2: si no existe y parece chat_id, buscar por telegram_id == key
-        if not snap.exists and looks_chat:
-            try:
-                q = col.where("telegram_id", "==", key).limit(1)
-                qs = q.get()
-                if qs:
-                    snap = qs[0]
-                    doc_ref = col.document(snap.id)
-            except Exception as e:
-                # seguimos sin snap válido
-                pass
+        # Candidatos provistos por el documento leído
+        cand_user_id = d.get("doc_alias_of") or d.get("user_id")
+        cand_telegram_id = d.get("telegram_id")
 
-        # --- Paso 3: si aún no existe y parece UUID, buscar por user_id == key (por si el doc_id no coincide)
-        if (not snap.exists) and looks_uuid:
-            try:
-                q = col.where("user_id", "==", key).limit(1)
-                qs = q.get()
-                if qs:
-                    snap = qs[0]
-                    doc_ref = col.document(snap.id)
-            except Exception:
-                pass
+        # Heurística de "parece alias":
+        #   - Si trae doc_alias_of => alias.
+        #   - O si el id es numérico y trae un user_id distinto a ese id => alias.
+        looks_alias = bool(d.get("doc_alias_of")) or (is_numeric_id and cand_user_id and str(cand_user_id) != key)
 
-        if not snap.exists:
-            return False, f"❌ No se encontró suscripción activa para {key}."
+        if looks_alias:
+            # Este doc es el alias; resolver canónico por doc_alias_of/user_id
+            user_id = str(cand_user_id) if cand_user_id else None
+            if user_id:
+                canon_ref = col.document(user_id)
+                alias_ref = col.document(key)  # el propio doc leído
+                # No tenemos garantía de haber leído el canónico aún → data_canon = None
+                return canon_ref, alias_ref, None
+            # Si no pudimos sacar user_id, seguimos a los demás pasos
+        else:
+            # Tratar el doc directo como canónico
+            user_id = str(d.get("user_id") or key)
+            canon_ref = col.document(user_id)
+            alias_ref = col.document(str(cand_telegram_id)) if cand_telegram_id else None
+            # Si el id del doc coincide con el canónico, devolvemos data_canon para evitar otra lectura
+            data_canon = d if snap.id == user_id else None
+            return canon_ref, alias_ref, data_canon
 
-        sus = snap.to_dict() or {}
+    # ---------- 2) Buscar canónico por telegram_id == key ----------
+    try:
+        qs = col.where("telegram_id", "==", key).limit(1).get()
+        if qs:
+            canon_snap = qs[0]
+            d = canon_snap.to_dict() or {}
+            user_id = str(canon_snap.id)  # en tu diseño, el id del canónico es el user_id
+            canon_ref = col.document(user_id)
+            alias_ref = col.document(key)  # el alias debería ser {telegram_id}
+            return canon_ref, alias_ref, d
+    except Exception:
+        pass
 
-        # Normalizar números
-        try:
-            trans = int(sus.get("transacciones_restantes", 0))
-        except Exception:
-            trans = 0
+    # ---------- 3) Buscar canónico por user_id == key ----------
+    try:
+        qs = col.where("user_id", "==", key).limit(1).get()
+        if qs:
+            canon_snap = qs[0]
+            d = canon_snap.to_dict() or {}
+            user_id = str(d.get("user_id") or canon_snap.id)
+            canon_ref = col.document(user_id)
+            tg = d.get("telegram_id")
+            alias_ref = col.document(str(tg)) if tg else None
+            return canon_ref, alias_ref, d
+    except Exception:
+        pass
 
-        try:
-            dec = int(numero_transacciones_in)
-        except Exception:
-            dec = 1
+    # ---------- 4) Mapping auxiliar: chat_ids/{chat_id} => { user_id } ----------
+    # Útil cuando existe un mapping separado y no hay telegram_id en canónico.
+    try:
+        map_snap = db.collection("chat_ids").document(key).get()
+        if map_snap.exists:
+            uid = (map_snap.to_dict() or {}).get("user_id")
+            if uid:
+                canon_ref = col.document(str(uid))
+                # Intentar armar alias_ref con el propio chat_id (key) o con el telegram_id del canónico si existe
+                try:
+                    canon_doc = canon_ref.get()
+                    if canon_doc.exists:
+                        d = canon_doc.to_dict() or {}
+                        tg = d.get("telegram_id") or key
+                        alias_ref = col.document(str(tg)) if tg else None
+                        return canon_ref, alias_ref, d
+                    else:
+                        return canon_ref, None, None
+                except Exception:
+                    return canon_ref, None, None
+    except Exception:
+        pass
 
-        nuevo = trans - dec
-        updates = {
-            "transacciones_restantes": max(nuevo, 0),
-            "estado": "activa" if nuevo > 0 else "inactiva",
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        }
-        doc_ref.set(updates, merge=True)
+    # ---------- No se pudo resolver ----------
+    return None, None, None
 
-        # --- Reflect en user_states (por ambos identificadores cuando se puedan inferir)
-        # doc principal
-        user_states.setdefault(snap.id, {})["numero_transacciones"] = int(numero_transacciones_in)
 
-        # si el doc trae telegram_id, reflejar también allí
-        try:
-            tg_field = str(sus.get("telegram_id") or "").strip()
-            if tg_field:
-                user_states.setdefault(tg_field, {})["numero_transacciones"] = int(numero_transacciones_in)
-        except Exception:
-            pass
+async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen="telegram") -> Tuple[bool, str]:
+    """
+    Descuenta 'numero_transacciones_in' de transacciones_restantes:
+      - Lee SIEMPRE del doc canónico (/suscripciones_user/{user_id})
+      - Escribe en canónico y refleja en alias (si existe) ATÓMICAMENTE (transacción)
+      - Actualiza 'estado' => 'inactiva' si llega a 0
+    """
+    try:
+        dec = int(numero_transacciones_in) if int(numero_transacciones_in) > 0 else 1
+    except Exception:
+        dec = 1
 
+    canon_ref, alias_ref, _ = _resolve_refs_from_key(user_key)
+    if not canon_ref:
+        return False, f"❌ No se encontró suscripción para {user_key}."
+
+    @firestore.transactional
+    def _tx(transaction: firestore.Transaction):
+        canon_snap = canon_ref.get(transaction=transaction)
+        if not canon_snap.exists:
+            raise ValueError("No existe el documento canónico.")
+
+        sus = canon_snap.to_dict() or {}
+        curr = int(sus.get("transacciones_restantes") or 0)
+        nuevo = max(curr - dec, 0)
+        estado = "activa" if nuevo > 0 else "inactiva"
+
+        # Canónico (SSOT)
+        transaction.set(
+            canon_ref,
+            {
+                "transacciones_restantes": nuevo,
+                "estado": estado,
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
+
+        # Alias (si existe): espejo mínimo
+        if alias_ref is not None:
+            transaction.set(
+                alias_ref,
+                {
+                    "user_id": sus.get("user_id") or canon_ref.id,
+                    "doc_alias_of": sus.get("user_id") or canon_ref.id,
+                    "transacciones_restantes": nuevo,
+                    "estado": estado,
+                    "updated_at": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+
+        return nuevo
+
+    try:
+        tx = db.transaction()
+        nuevo = _tx(tx)
         if nuevo <= 0:
             return True, "✅ Transacción aplicada. Te quedan 0; tu suscripción quedó inactiva."
         return True, f"✅ Transacción aplicada. Te quedan {nuevo}."
-
     except Exception as e:
         return False, f"❌ Error inesperado al descontar transacción: {e}"
 
