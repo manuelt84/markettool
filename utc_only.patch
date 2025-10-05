@@ -1,0 +1,251 @@
+*** a/MarketTool.py
+--- b/MarketTool.py
+@@
+-from datetime import datetime, timedelta, timezone
++from datetime import datetime, timedelta, timezone
+@@
+-import pytz # Para manejar las zonas horarias
++import pytz # Para manejar las zonas horarias
+@@
+ @dataclass
+ class AppConfig:
+-    timezone_country: str = field(default_factory=lambda: os.environ.get("TIMEZONE_COUNTRY", "America/Santiago"))
++    # ⚠️ Ya no se usa para convertir nada en el back. Dejamos el env por compat.
++    timezone_country: str = field(default_factory=lambda: os.environ.get("TIMEZONE_COUNTRY", "America/Santiago"))
+@@
+-# ======================================================================
+-# Timezone/Datetime utilities — UTC-first
+-# ======================================================================
++# ======================================================================
++# Timezone/Datetime utilities — **UTC-only** en el backend
++# ======================================================================
+@@
+ def utc_now() -> datetime:
+     return datetime.now(timezone.utc)
+ 
+ def ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
+@@
+-    return out
+-
+-def get_local_tz() -> pytz.BaseTzInfo:
+-    try:
+-        return pytz.timezone(APP_CONFIG.timezone_country)
+-    except Exception:
+-        return pytz.timezone("America/Santiago")
++    return out
++
++# 💡 Back en UTC. Nada se “convierte” a la zona del usuario aquí.
++def get_local_tz() -> pytz.BaseTzInfo:
++    return pytz.UTC
++
++# Helper de formateo SOLO para CSV (cuando corresponda)
++def format_dt_for_csv(dt_like) -> str:
++    """
++    Formatea timestamps a string para CSV. Mantiene UTC y marca con 'Z'.
++    (Si luego quieres exportar con otra tz, cambia aquí solamente.)
++    """
++    ts = pd.to_datetime(dt_like, errors="coerce", utc=True)
++    if pd.isna(ts):
++        return ""
++    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+@@
+-# ======================================================================
+-# FMP historicals — UTC-first with cache & resampling
+-# ======================================================================
++# ======================================================================
++# FMP historicals — UTC-first (sin conversiones a tz de usuario)
++# ======================================================================
+@@
+-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(timezone.utc)
++        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+@@
+ # Cache CSV
+@@
+ def save_cached_history(symbol: str, tf: str, out: pd.DataFrame, *, storage_dir: str | None = None) -> None:
+@@
+-        out["time"] = idx_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
++        # CSV/JSON: mantenemos UTC explícito en Z
++        out["time"] = idx_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+@@
+-timezone_country = pytz.timezone('America/Santiago')
++# ⚠️ Se mantiene la variable por compatibilidad, pero NO se usa ya para convertir tiempos.
++timezone_country = pytz.timezone('America/Santiago')
+@@
+-# ======================================================================
+-# Economic Events — FMP + (optional) investpy, UTC-first + local presentation
+-# ======================================================================
++# ======================================================================
++# Economic Events — FMP + (opcional) investpy, **todo en UTC** en el backend
++# ======================================================================
+@@
+-def _local_tz():
+-    # Reuse application's configured local tz
+-    return get_local_tz()
++def _local_tz():
++    # Back en UTC.
++    return pytz.UTC
+@@
+-def _local_day_key(dt_like) -> str:
+-    ts = pd.to_datetime(dt_like, errors="coerce")
+-    if ts.tzinfo is None:
+-        ts = ts.tz_localize(_local_tz())
+-    else:
+-        ts = ts.tz_convert(_local_tz())
+-    return ts.strftime("%Y-%m-%d")
++def _local_day_key(dt_like) -> str:
++    # Agrupaciones de cache por día: usar **UTC** (sin tz de usuario).
++    ts = pd.to_datetime(dt_like, errors="coerce", utc=True)
++    return ts.strftime("%Y-%m-%d")
+@@
+-def _investing_econ_fetch() -> pd.DataFrame:
+-    """Optional investpy calendar (GMT base)."""
++def _investing_econ_fetch() -> pd.DataFrame:
++    """Optional investpy calendar (GMT base). Se acopla a FMP (UTC)."""
+@@
+-        cal = investpy.economic_calendar(time_zone="GMT")
++        cal = investpy.economic_calendar(time_zone="GMT")  # GMT≈UTC
+@@
+-        cal["date"] = pd.to_datetime(cal["date"].dt.strftime("%Y-%m-%d") + " " + time_str, utc=True)
++        # Guardar directamente en UTC (como FMP)
++        cal["date"] = pd.to_datetime(
++            cal["date"].dt.strftime("%Y-%m-%d") + " " + time_str,
++            utc=True
++        )
+@@
+-def _to_local_df(df: pd.DataFrame) -> pd.DataFrame:
+-    if df is None or df.empty:
+-        return df
+-    out = df.copy()
+-    out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce").dt.tz_convert(_local_tz())
+-    out["date_country"] = out["date"]
+-    return out
++def _to_local_df(df: pd.DataFrame) -> pd.DataFrame:
++    """Backend en UTC: NO convertir. Se duplica 'date' en 'date_country' en UTC."""
++    if df is None or df.empty:
++        return df
++    out = df.copy()
++    out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
++    out["date_country"] = out["date"]
++    return out
+@@
+-def obtener_dias_habiles_mercado() -> list:
++def obtener_dias_habiles_mercado() -> list:
+@@
+-    now_utc = datetime.now(timezone.utc)
++    now_utc = datetime.now(timezone.utc)
+@@
+-def obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin) -> pd.DataFrame:
++def obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin) -> pd.DataFrame:
+@@
+-    # normalize inputs to local tz
+-    fi = pd.to_datetime(fecha_inicio, errors="coerce")
+-    ff = pd.to_datetime(fecha_fin, errors="coerce")
+-    if fi.tzinfo is None: fi = fi.tz_localize(_local_tz())
+-    else: fi = fi.tz_convert(_local_tz())
+-    if ff.tzinfo is None: ff = ff.tz_localize(_local_tz())
+-    else: ff = ff.tz_convert(_local_tz())
+-    # include full end day
+-    ff = ff + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+-
+-    # to UTC date strings
+-    fi_utc = fi.astimezone(timezone.utc).strftime("%Y-%m-%d")
+-    ff_utc = ff.astimezone(timezone.utc).strftime("%Y-%m-%d")
++    # Entradas y rango en **UTC** directo (nada de tz de usuario)
++    fi = pd.to_datetime(fecha_inicio, errors="coerce", utc=True)
++    ff = pd.to_datetime(fecha_fin, errors="coerce", utc=True)
++    # incluir día final completo
++    ff = ff + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
++    fi_utc = fi.strftime("%Y-%m-%d")
++    ff_utc = ff.strftime("%Y-%m-%d")
+@@
+-    df = pd.concat(parts, ignore_index=True)
+-    df = _to_local_df(df)
++    df = pd.concat(parts, ignore_index=True)
++    df = _to_local_df(df)  # sigue dejando UTC en date/date_country
+     df = _dedupe_events(df)
+@@
+-        if "date_utc" in s.columns:
+-            s["date"] = pd.to_datetime(s["date_utc"], errors="coerce", utc=True).dt.tz_convert(get_local_tz())
+-        elif "date" in s.columns:
+-            s["date"] = pd.to_datetime(s["date"], errors="coerce", utc=True).dt.tz_convert(get_local_tz())
++        if "date_utc" in s.columns:
++            s["date"] = pd.to_datetime(s["date_utc"], errors="coerce", utc=True)
++        elif "date" in s.columns:
++            s["date"] = pd.to_datetime(s["date"], errors="coerce", utc=True)
+         else:
+             s["date"] = pd.NaT
+-        s["date_country"] = s["date"]
++        s["date_country"] = s["date"]  # seguimos en UTC
+@@
+-async def enviar_eventos_y_archivo_calendar(df, context, user_chat_id):
++async def enviar_eventos_y_archivo_calendar(df, context, user_chat_id):
+@@
+-        # Generar el link de Google Calendar para el evento individual
+-        link = generar_link_google_calendar(row['event'], row['date_country'], row['currency'], row['ponderacion'])
++        # Link de Calendar: dejamos tiempos en UTC (no convertir al país)
++        link = generar_link_google_calendar(row['event'], row['date'], row['currency'], row['ponderacion'])
+@@
+-            fecha_country_str = row['date_country'].strftime('%Y-%m-%d %H:%M:%S')
++            fecha_country_str = row['date'].strftime('%Y-%m-%d %H:%M:%S')
+@@
+-        event.add('dtstart', row['date_country'])
+-        event.add('dtend', row['date_country'])  # Puedes modificar esto si los eventos tienen duración
++        event.add('dtstart', row['date'])       # UTC
++        event.add('dtend', row['date'])         # UTC
+@@
+-def generar_link_google_calendar(event, date, currency, ponderacion):
++def generar_link_google_calendar(event, date, currency, ponderacion):
+@@
+-    # Convertir la fecha al formato adecuado en la zona horaria del pais seleccionado
+-    date_country = date.astimezone(timezone_country)
+-
+-    # Configurar la fecha de inicio y fin en formato ISO8601
+-    start_date_str = date_country.strftime('%Y%m%dT%H%M%S')
++    # Mantener UTC en el back; Calendar interpretará con cuenta del usuario
++    start_date_str = pd.to_datetime(date, utc=True).strftime('%Y%m%dT%H%M%SZ')
+     end_date_str = start_date_str
+@@
+-async def seleccionar_zona_horaria(update, context):
++async def seleccionar_zona_horaria(update, context):
+@@
+-    user_chat_id = str(query.message.chat_id)
+-    await actualizar_timezone(user_chat_id, zona_seleccionada)
+-
+-     # Actualizar la variable global para el usuario actual
+-    global timezone_country
+-    timezone_country = pytz.timezone(zona_seleccionada)
+-
+-    now = datetime.now(pytz.timezone(zona_seleccionada)).strftime('%Y-%m-%d %H:%M:%S')
++    # ⚠️ Ya no mutamos timezone del backend. Solo persistimos preferencia del usuario si quieres
++    user_chat_id = str(query.message.chat_id)
++    await actualizar_timezone(user_chat_id, zona_seleccionada)
++
++    now = datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+@@
+-async def cargar_timezone_por_defecto(chat_id):
++async def cargar_timezone_por_defecto(chat_id):
+@@
+-    return chat_ids.get(chat_id, {}).get("timezone", "America/Santiago")
++    # Se mantiene por compat, pero el back no convierte fechas con esto
++    return chat_ids.get(chat_id, {}).get("timezone", "UTC")
+@@
+-def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=3, tiempo_espera_inicial=5):
++def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=3, tiempo_espera_inicial=5):
+@@
+-                        # Convertir las fechas a la zona horaria configurada
+-                        df_nuevas['publishedDate'] = df_nuevas['publishedDate'].dt.tz_convert(timezone_country)
++                        # ⚠️ No convertir al país/usuario; mantener UTC en backend
++                        df_nuevas['publishedDate'] = df_nuevas['publishedDate']
+@@
+-def obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=3, tiempo_espera_inicial=5):
++def obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=3, tiempo_espera_inicial=5):
+@@
+-                        # Convertir las fechas a la zona horaria configurada
+-                        df_nuevas['publishedDate'] = df_nuevas['publishedDate'].dt.tz_convert(timezone_country)
++                        # ⚠️ Mantener UTC
++                        df_nuevas['publishedDate'] = df_nuevas['publishedDate']
+@@
+ def df_to_ohlcv_records_ext(
+@@
+-    d['date'] = d['time'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
++    d['date'] = d['time'].dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')  # UTC→Z (sin tz de usuario)

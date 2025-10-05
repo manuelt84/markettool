@@ -1,663 +1,91 @@
-
-import os
-import sys
-import math
-import time
-import json
-import logging
-import signal
-import functools
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Tuple, List, Callable, Iterable
-from datetime import datetime, timedelta, timezone
-import pytz
+# -*- coding: utf-8 -*-
+import matplotlib as mpl
+#mpl.rcParams['figure.max_open_warning'] = 200
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from urllib.parse import urlencode
 import requests
 import pandas as pd
+pd.set_option('future.no_silent_downcasting', True)
 import numpy as np
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
-from asgiref.wsgi import WsgiToAsgi
-from asyncio import Lock, Semaphore
-from collections import Counter
-from collections import defaultdict
-from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta, date, datetime, timezone, UTC, timezone as dt_timezone
-from flask import Flask, request, jsonify
-from functools import partial
-from google.cloud import firestore
-from google.cloud.firestore_v1 import FieldFilter
-from google.cloud import firestore as gcf
-from google.cloud import storage
-from icalendar import Calendar, Event
+import datetime as _dt
+from statsmodels.tsa.arima.model import ARIMA
+import concurrent.futures
+import telegram
 from io import StringIO, BytesIO
-from joblib import Parallel, delayed, parallel_backend
-from numba import njit
+import os
+import json
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand, BotCommandScopeChat
+from telegram.ext import  ApplicationBuilder, Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters, CallbackContext
+from telegram.helpers import escape_markdown
+import pytz  # Para manejar las zonas horarias
+from urllib.parse import urlencode
+import investpy
+import matplotlib.dates as mdates
+import warnings
+warnings.filterwarnings("ignore", message="Maximum Likelihood optimization failed to converge")
+from textblob import TextBlob
+import asyncio
 from pandas.tseries.offsets import CustomBusinessDay
 from scipy.signal import argrelextrema
-from statsmodels.tsa.arima.model import ARIMA
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand, BotCommandScopeChat
-from telegram import InputFile
-from telegram.error import TimedOut
-from telegram.ext import ApplicationBuilder, Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters, CallbackContext
-from telegram.helpers import escape_markdown
-from textblob import TextBlob
-from textwrap import wrap
-from threading import Lock
-from typing import Any, Iterable, Mapping, Optional, Callable, Dict, Tuple, List
-from ultralytics import YOLO
-from urllib.parse import urlencode
-from uvicorn.config import LOGGING_CONFIG
-import aiofiles
-import asyncio
-import base64
-import concurrent.futures
-import csv as _csv
-import cv2
-import datetime as _dt
-import easyocr
-import hashlib
-import investpy
-import matplotlib
-import matplotlib as mpl
-import matplotlib.dates as mdates
-import matplotlib.pyplot as plt
-import pytz # Para manejar las zonas horarias
+from collections import Counter
+from numba import njit
+from joblib import Parallel, delayed, parallel_backend
 import re
-import socket
-import statistics
-import telegram
+from telegram.error import TimedOut
+import threading
+from scipy.signal import argrelextrema
+import hashlib
+import time
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.schedulers.background import BackgroundScheduler
+from asyncio import Lock, Semaphore
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
+import aiofiles
+from collections import defaultdict
+import logging
+from flask import Flask, request, jsonify
+from asgiref.wsgi import WsgiToAsgi
+import sys
+import uvicorn
+from uvicorn.config import LOGGING_CONFIG
+from google.cloud import firestore
+from icalendar import Calendar, Event
 import tempfile
+from google.cloud import storage
+from ultralytics import YOLO
+import cv2
+from telegram import InputFile
+import base64
+import easyocr
+import cv2
+import socket
 import torch
 import uuid
-import uvicorn
-import warnings
-import threading
-
-
-# ======================================================================
-# Config & Infra (Production-grade)
-# ======================================================================
-
-@dataclass
-class AppConfig:
-    storage_format: str = field(default_factory=lambda: os.environ.get("STORAGE_FORMAT", "json").strip().lower())
-    fmp_plan: str = field(default_factory=lambda: (os.environ.get("FMP_PLAN") or "premium").strip().lower())
-    fmp_api_key: str = field(default_factory=lambda: os.environ.get("API_FMP", ""))
-    http_timeout: int = field(default_factory=lambda: int(os.environ.get("HTTP_TIMEOUT", "10")))
-    http_retries: int = field(default_factory=lambda: int(os.environ.get("HTTP_RETRIES", "3")))
-    http_backoff: float = field(default_factory=lambda: float(os.environ.get("HTTP_BACKOFF", "1.8")))
-    hist_dir: str = field(default_factory=lambda: os.environ.get("HIST_DIR", "historicos"))
-    log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
-    econ_chunk_days: int= field(default_factory=lambda: int(os.environ.get("ECON_CHUNK_DAYS","31")))
-
-
-
-# --------- .env loader (supports --env / -env) ---------
-import sys, argparse
-try:
-    from dotenv import load_dotenv
-except Exception:
-    load_dotenv = None
-
-def _early_load_env():
-    # Allow: python script.py --env .env   or   -env .env
-    env_path = None
-    if ('--env' in sys.argv) or ('-env' in sys.argv):
-        p = argparse.ArgumentParser(add_help=False)
-        p.add_argument('--env','-env', dest='env_path', default='.env')
-        args, _ = p.parse_known_args()
-        env_path = args.env_path
-    # If dotenv is present, load either explicit or default .env
-    if load_dotenv:
-        if env_path:
-            load_dotenv(env_path)
-        else:
-            # Load default .env if exists
-            import os
-            if os.path.exists('.env'):
-                load_dotenv('.env')
-
-_early_load_env()
-# -------------------------------------------------------
-APP_CONFIG = AppConfig()
-FMP_INTRADAY_SOURCE_TZ = os.getenv("FMP_INTRADAY_SOURCE_TZ", "America/New_York")
-
-
-# Structured logging
-ECON_CHUNK_DAYS = int(os.environ.get("ECON_CHUNK_DAYS","31"))
-_LOGGER_FORMAT = "%(levelname)s:%(asctime)s:%(name)s:%(message)s"
-logging.basicConfig(level=getattr(logging, APP_CONFIG.log_level.upper(), logging.INFO),
-                    format=_LOGGER_FORMAT)
-logger = logging.getLogger("MarketTool")
-
-# HTTP Session with retries
-def _build_session(retries: int, backoff: float) -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        read=retries,
-        connect=retries,
-        status=retries,
-        backoff_factor=backoff,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET","POST","PUT","DELETE","HEAD","OPTIONS"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-HTTP_SESSION = _build_session(APP_CONFIG.http_retries, APP_CONFIG.http_backoff)
-
-# Graceful shutdown hooks (optional for long-running services)
-_SHOULD_STOP = False
-def _signal_handler(signum, frame):
-    global _SHOULD_STOP
-    logger.warning("Received signal %s — initiating graceful shutdown...", signum)
-    _SHOULD_STOP = True
-
-try:
-    signal.signal(signal.SIGTERM, _signal_handler)
-    signal.signal(signal.SIGINT, _signal_handler)
-except Exception:
-    pass  # Not all environments allow signal handling (e.g., Windows/threads)
-
-# ======================================================================
-# Timezone/Datetime utilities — UTC-first
-# ======================================================================
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-def ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return df
-    out = df.copy()
-    idx = pd.to_datetime(out.index, utc=True, errors="coerce")
-    out.index = idx
-    if out.index.tz is None:
-        out.index = out.index.tz_localize(pytz.UTC)
-    return out
-
-def get_local_tz() -> pytz.BaseTzInfo:
-    return pytz.UTC
-
-
-# ======================================================================
-# Error-handling decorator
-# ======================================================================
-def safe_op(default=None, log: logging.Logger | None = None):
-    log = log or logger
-    def _decorator(fn: Callable):
-        @functools.wraps(fn)
-        def _wrapped(*args, **kwargs):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as e:
-                log.warning("%s failed: %s", fn.__name__, e, exc_info=False)
-                return default
-        return _wrapped
-    return _decorator
-
-
-
-# ======================================================================
-# FMP historicals — UTC-first with cache & resampling
-# ======================================================================
-
-class FMPError(Exception): ...
-class FMPPlanNotAllowed(FMPError): ...
-
-def normalize_tf(tf: str) -> str:
-    m = (tf or "").strip().lower()
-    tf_map = {
-        "1m":"1min","1min":"1min",
-        "5m":"5min","5min":"5min",
-        "15m":"15min","15min":"15min",
-        "30m":"30min","30min":"30min",
-        "1h":"1hour","h1":"1hour","1hour":"1hour",
-        "4h":"4hour","h4":"4hour","4hour":"4hour",
-        "1d":"1day","d1":"1day","1day":"1day",
-        "1w":"1week","w1":"1week","1week":"1week",
-        "1mo":"1month","1month":"1month",
-    }
-    return tf_map.get(m, m)
-
-def _is_intraday(tf: str) -> bool:
-    return normalize_tf(tf) in {"1min","5min","15min","30min","1hour","4hour"}
-
-DEFAULT_FMP_WINDOWS: Dict[str, int] = {
-    "1min":  2400, "5min": 2000, "15min": 1600, "30min": 1600,
-    "1hour": 1600, "4hour": 2200, "1day": 2000, "1week": 520, "1month": 240
-}
-RESAMPLE_PLAN: Dict[str, Tuple[str, str]] = {
-    "15min": ("5min",  "15min"),
-    "30min": ("5min",  "30min"),
-    "4hour": ("1hour", "4h"),
-}
-EOD_RESAMPLE_RULE: Dict[str, str] = {"1week": "W", "1month": "M"}
-
-@dataclass
-class FMPClient:
-    api_key: str
-    plan: str = "premium"
-    timeout: int = field(default_factory=lambda: APP_CONFIG.http_timeout)
-
-    def _get(self, url: str, params: Dict[str, Any] | None = None) -> requests.Response:
-        params = dict(params or {})
-        params.setdefault("apikey", self.api_key)
-        r = HTTP_SESSION.get(url, params=params, timeout=self.timeout)
-        if r.status_code == 402:
-            raise FMPPlanNotAllowed(f"402 Payment Required: {url}")
-        return r
-
-    @safe_op(default=pd.DataFrame(), log=logging.getLogger("MarketTool.FMP"))
-    def historical_intraday(self, symbol: str, interval: str,
-                            from_utc: datetime, to_utc: datetime) -> pd.DataFrame:
-        interval = normalize_tf(interval)
-        assert interval in {"1min","5min","15min","30min","1hour","4hour"}
-        fmt = "%Y-%m-%d %H:%M:%S"
-        url = f"https://financialmodelingprep.com/api/v3/historical-chart/{interval}/{symbol}"
-        r = self._get(url, {"from": from_utc.strftime(fmt), "to": to_utc.strftime(fmt)})
-        if r.status_code != 200: return pd.DataFrame()
-        data = r.json() or []
-        if not isinstance(data, list) or not data: return pd.DataFrame()
-        df = pd.DataFrame(data)
-        if "date" not in df.columns: return pd.DataFrame()
-        cols = [c for c in ["date","open","high","low","close","volume"] if c in df.columns]
-        df = df[cols].copy()
-        # Parse naive timestamp from FMP intraday, localize to source tz, then convert to UTC
-        s = pd.to_datetime(df["date"], errors="coerce")
-        try:
-            tz_src = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)
-        except Exception:
-            tz_src = pytz.UTC
-        try:
-            # If series is tz-naive, localize; if tz-aware, convert
-            if getattr(s.dt, "tz", None) is None:
-                try:
-                    s = s.dt.tz_localize(tz_src, ambiguous="infer", nonexistent="shift_forward")
-                except Exception:
-                    s = s.dt.tz_localize(tz_src, ambiguous="NaT", nonexistent="shift_forward")
-            else:
-                s = s.dt.tz_convert(tz_src)
-        except Exception:
-            try:
-                s = s.dt.tz_localize(tz_src)
-            except Exception:
-                pass
-        s = s.dt.tz_convert(pytz.UTC)
-        df["date"] = s
-        df = df.dropna(subset=["date"]).set_index("date").sort_index()
-        for c in ["open","high","low","close","volume"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-                return df
-
-    @safe_op(default=pd.DataFrame(), log=logging.getLogger("MarketTool.FMP"))
-    def historical_eod(self, symbol: str, from_date: datetime, to_date: datetime) -> pd.DataFrame:
-        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
-        r = self._get(url, {"from": from_date.strftime("%Y-%m-%d"), "to": to_date.strftime("%Y-%m-%d")})
-        if r.status_code != 200: return pd.DataFrame()
-        payload = r.json() or {}; hist = payload.get("historical") or []
-        if not hist: return pd.DataFrame()
-        df = pd.DataFrame(hist)
-        if "date" not in df.columns: return pd.DataFrame()
-        cols = [c for c in ["date","open","high","low","close","volume"] if c in df.columns]
-        df = df[cols].copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(pytz.UTC)
-        df = df.dropna(subset=["date"]).set_index("date").sort_index()
-        for c in ["open","high","low","close","volume"]:
-            if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df
-
-    @safe_op(default=None, log=logging.getLogger("MarketTool.FMP"))
-    def quote_last(self, symbol: str) -> Optional[float]:
-        url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}"
-        r = self._get(url, {})
-        if r.status_code != 200: return None
-        arr = r.json() or []
-        if not arr or not isinstance(arr, list): return None
-        q = arr[0]
-        for k in ("price","c","close","previousClose"):
-            if k in q and q[k] is not None:
-                try: return float(q[k])
-                except Exception: continue
-        return None
-
-# Cache CSV
-def _safe_symbol_for_filename(symbol: str) -> str:
-    import string
-    allowed = set(string.ascii_letters + string.digits + "._-")
-    return "".join(ch if ch in allowed else "_" for ch in symbol)
-
-
-def _hist_base(symbol: str, tf: str) -> str:
-    os.makedirs(APP_CONFIG.hist_dir, exist_ok=True)
-    return os.path.join(APP_CONFIG.hist_dir, f"{_safe_symbol_for_filename(symbol)}__{normalize_tf(tf)}")
-
-def _hist_path_csv(symbol: str, tf: str) -> str:
-    return _hist_base(symbol, tf) + ".csv"
-
-def _hist_path_json(symbol: str, tf: str) -> str:
-    return _hist_base(symbol, tf) + ".json"
-
-def _hist_path(symbol: str, tf: str) -> str:
-    if hasattr(APP_CONFIG, "storage_format") and APP_CONFIG.storage_format == "json":
-        return _hist_path_json(symbol, tf)
-    return _hist_path_csv(symbol, tf)
-
-def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for c in ["open","high","low","close","volume"]:
-        if c in out.columns: out[c] = pd.to_numeric(out[c], errors="coerce")
-        else: out[c] = np.nan
-    return out[["open","high","low","close","volume"]]
-
-@safe_op(default=pd.DataFrame(columns=["open","high","low","close","volume"]))
-def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
-    import json
-    primary = _hist_path(symbol, tf)
-    alt = _hist_path_json(symbol, tf) if primary.endswith(".csv") else _hist_path_csv(symbol, tf)
-
-    def _from_df(df):
-        df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
-        df = df.dropna(subset=["time"]).set_index("time").sort_index()
-        df = _ensure_cols(df)
-        if df.index.tz is None: df.index = df.index.tz_localize(pytz.UTC)
-        return df
-
-    # Try primary
-    if os.path.exists(primary):
-        if primary.endswith(".csv"):
-            df = pd.read_csv(primary)
-            if "time" not in df.columns: return pd.DataFrame(columns=["open","high","low","close","volume"])
-            return _from_df(df)
-        else:
-            raw = Path(primary).read_text(encoding="utf-8")
-            data = json.loads(raw) if raw.strip() else []
-            if isinstance(data, dict): data = data.get("data", [])
-            df = pd.DataFrame(data)
-            if "time" not in df.columns: return pd.DataFrame(columns=["open","high","low","close","volume"])
-            return _from_df(df)
-
-    # Fallback to alternative format
-    if os.path.exists(alt):
-        if alt.endswith(".csv"):
-            df = pd.read_csv(alt)
-            if "time" not in df.columns: return pd.DataFrame(columns=["open","high","low","close","volume"])
-            return _from_df(df)
-        else:
-            raw = Path(alt).read_text(encoding="utf-8")
-            data = json.loads(raw) if raw.strip() else []
-            if isinstance(data, dict): data = data.get("data", [])
-            df = pd.DataFrame(data)
-            if "time" not in df.columns: return pd.DataFrame(columns=["open","high","low","close","volume"])
-            return _from_df(df)
-
-    return pd.DataFrame(columns=["open","high","low","close","volume"])
-    df = pd.read_csv(p)
-    if "time" not in df.columns:
-        return pd.DataFrame(columns=["open","high","low","close","volume"])
-    df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
-    df = df.dropna(subset=["time"]).set_index("time").sort_index()
-    df = _ensure_cols(df)
-    if df.index.tz is None: df.index = df.index.tz_localize(pytz.UTC)
-    return df
-
-@safe_op(default=None)
-def save_cached_history(symbol: str, tf: str, out: pd.DataFrame, *, storage_dir: str | None = None) -> None:
-    """
-    Persiste un recorte de historia ya combinada.
-    - Asegura índice tz-aware UTC
-    - Crea columna 'time' como ISO8601 sin usar .dt sobre DatetimeIndex
-    - Guarda JSON enriquecido en carpeta temporal del SO (no asume /tmp)
-    """
-    try:
-        if out is None or out.empty:
-            return
-
-        # Normaliza índice -> DatetimeIndex UTC
-        idx_utc = pd.DatetimeIndex(pd.to_datetime(out.index, utc=True, errors="coerce"))
-        # Filtra NaT por si acaso
-        mask = ~idx_utc.isna()
-        if not mask.all():
-            out = out.loc[mask].copy()
-            idx_utc = idx_utc[mask]
-
-        # 'time' como string ISO (sin .dt)
-        out = out.copy()
-        out["time"] = idx_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        # Columnas estándar
-        for c in ("open", "high", "low", "close", "volume"):
-            if c not in out.columns:
-                out[c] = pd.NA
-
-        out = out[["time", "open", "high", "low", "close", "volume"]]
-
-        # Nombre de archivo “enriched” y carpeta temporal cross-platform
-        import re, os, json, tempfile
-        safe_sym = re.sub(r"[^A-Za-z0-9_]+", "_", str(symbol))
-        safe_tf  = re.sub(r"[^A-Za-z0-9_]+", "_", str(tf))
-        nombre   = f"{safe_sym}_{safe_tf}_enriched.json"
-        local_json = os.path.join(tempfile.gettempdir(), nombre)
-
-        payload = out.tail(1000).to_dict(orient="records")
-        with open(local_json, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-
-        logger.debug("[save_cached_history] guardado %s filas=%d", local_json, len(payload))
-
-    except Exception as e:
-        # MUY importante mantener este mensaje, porque tus logs lo buscan por texto
-        logger.warning("save_cached_history failed: %s", e)
-        return
-
-
-@dataclass
-class HistoryConfig:
-    bars: Optional[int] = None
-    append_realtime: bool = True
-    allow_refresh: bool = True
-
-
-# --------------------------- Historical merge helpers ---------------------------
-def merge_histories(*parts):
-    """
-    Acepta múltiples DataFrames OHLCV (o una lista como primer argumento) y devuelve
-    un único DataFrame con índice UTC, ordenado y sin duplicados.
-    """
-    import pandas as pd, numpy as np
-    # Soporta llamada merge_histories([df1, df2]) o merge_histories(df1, df2)
-    if len(parts) == 1 and isinstance(parts[0], (list, tuple)):
-        parts = tuple(parts[0])
-
-    valid = []
-    for df in parts:
-        if df is None:
-            continue
-        if getattr(df, "empty", True):
-            continue
-        d = df.copy()
-        # normaliza índice/columna time
-        if not isinstance(d.index, pd.DatetimeIndex):
-            if "time" in d.columns:
-                d["time"] = pd.to_datetime(d["time"], errors="coerce", utc=True)
-                d = d.dropna(subset=["time"]).set_index("time")
-            else:
-                d.index = pd.to_datetime(d.index, errors="coerce", utc=True)
-        if d.index.tz is None:
-            d.index = d.index.tz_localize(pytz.UTC)
-
-        # columnas estándar
-        for c in ["open","high","low","close","volume"]:
-            if c not in d.columns:
-                d[c] = np.nan
-            else:
-                d[c] = pd.to_numeric(d[c], errors="coerce")
-        d = d[["open","high","low","close","volume"]]
-        valid.append(d)
-
-    if not valid:
-        import pandas as pd
-        return pd.DataFrame(columns=["open","high","low","close","volume"])
-
-    out = valid[0]
-    if len(valid) > 1:
-        out = pd.concat(valid, axis=0, ignore_index=False)
-    out = out[~out.index.isna()].sort_index()
-    out = out[~out.index.duplicated(keep="last")]
-    return out
-# --------------------------------------------------------------------------------
-
-
-def normalize_resample_rule(rule: str) -> str:
-    if not rule:
-        return rule
-    return rule.replace("H","h")
-
-class HistoryManager:
-    def __init__(self, client: FMPClient):
-        self.client = client
-
-    def _base_interval_for(self, tf: str) -> str:
-        tf = normalize_tf(tf)
-        return RESAMPLE_PLAN.get(tf, (tf, ""))[0]
-
-    def _timedelta_for(self, tf: str, units: int) -> timedelta:
-        tf = normalize_tf(tf)
-        return {
-            "1min": timedelta(minutes=units),
-            "5min": timedelta(minutes=5*units),
-            "15min": timedelta(minutes=15*units),
-            "30min": timedelta(minutes=30*units),
-            "1hour": timedelta(hours=units),
-            "4hour": timedelta(hours=4*units),
-            "1day": timedelta(days=units),
-            "1week": timedelta(weeks=units),
-            "1month": timedelta(days=30*units),
-        }.get(tf, timedelta(days=units))
-
-    def _maybe_resample(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
-        tf = normalize_tf(tf)
-        if df is None or df.empty: return df
-        if tf not in RESAMPLE_PLAN: return df
-        _, rule = RESAMPLE_PLAN[tf]
-        g = df.resample(normalize_resample_rule(rule), label="right", closed="right").agg({
-            "open":"first","high":"max","low":"min","close":"last","volume":"sum"
-        })
-        return g.dropna(subset=["open","high","low","close"])
-
-    def _maybe_resample_eod(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
-        rule = EOD_RESAMPLE_RULE.get(normalize_tf(tf))
-        if not rule or df is None or df.empty: return df
-        g = df.resample(normalize_resample_rule(rule), label="right", closed="right").agg({
-            "open":"first","high":"max","low":"min","close":"last","volume":"sum"
-        })
-        return g.dropna(subset=["open","high","low","close"])
-
-    def _append_realtime_last_bar(self, symbol: str, tf: str, df: pd.DataFrame) -> pd.DataFrame:
-        try:
-            last_ts = df.index[-1]; now = utc_now()
-            lag_min = (now - last_ts).total_seconds() / 60.0
-            tol = {"1min":3,"5min":7,"15min":18,"30min":35,"1hour":70,"4hour":260}.get(normalize_tf(tf), 180)
-            if lag_min > tol: return df
-            px = self.client.quote_last(symbol)
-            if px is None or math.isnan(px) or px <= 0: return df
-            out = df.copy()
-            h = float(out.iloc[-1]["high"]); l = float(out.iloc[-1]["low"])
-            out.iloc[-1, out.columns.get_loc("high")]  = max(h, px)
-            out.iloc[-1, out.columns.get_loc("low")]   = min(l, px)
-            out.iloc[-1, out.columns.get_loc("close")] = px
-            return out
-        except Exception:
-            return df
-
-    def get(self, symbol: str, tf: str, cfg: HistoryConfig | None = None) -> pd.DataFrame:
-        cfg = cfg or HistoryConfig()
-        tf = normalize_tf(tf)
-        cache_df = load_cached_history(symbol, tf)
-
-        now = utc_now()
-        if cache_df.empty:
-            win = DEFAULT_FMP_WINDOWS.get(tf, 1000)
-            from_dt = now - self._timedelta_for(tf, win)
-        else:
-            last = cache_df.index[-1]
-            base_tf = self._base_interval_for(tf)
-            from_dt = last + self._timedelta_for(base_tf, 1)
-
-        to_dt = now
-        new_df = pd.DataFrame()
-        if cfg.allow_refresh and from_dt < to_dt:
-            try:
-                if _is_intraday(tf):
-                    base_tf = self._base_interval_for(tf)
-                    raw = self.client.historical_intraday(symbol, base_tf, from_dt, to_dt)
-                    raw = ensure_utc_index(raw)
-                    new_df = self._maybe_resample(raw, tf)
-                else:
-                    raw = self.client.historical_eod(symbol, from_dt, to_dt)
-                    raw = ensure_utc_index(raw)
-                    new_df = self._maybe_resample_eod(raw, tf) if tf in EOD_RESAMPLE_RULE else raw
-            except FMPPlanNotAllowed:
-                logger.info("Plan no permite intradía para %s (%s).", symbol, tf)
-                new_df = pd.DataFrame()
-            except Exception as e:
-                logger.warning("Descarga fallida %s %s: %s", symbol, tf, e)
-                new_df = pd.DataFrame()
-
-        out = merge_histories(cache_df, new_df)
-        if cfg.bars and isinstance(cfg.bars, int) and cfg.bars > 0 and len(out) > cfg.bars:
-            out = out.tail(cfg.bars)
-        if cfg.append_realtime and not out.empty:
-            out = self._append_realtime_last_bar(symbol, tf, out)
-        if not out.empty:
-            save_cached_history(symbol, tf, out)
-        return out
-
-# Public API (overrides legacy)
-_FMP = FMPClient(api_key=APP_CONFIG.fmp_api_key, plan=APP_CONFIG.fmp_plan)
-_HIST = HistoryManager(client=_FMP)
-
-def obtener_datos_historicos(symbol: str, temporalidad: str,
-                             bars: Optional[int] = None,
-                             append_realtime: bool = True,
-                             allow_refresh: bool = True) -> pd.DataFrame:
-    cfg = HistoryConfig(bars=bars, append_realtime=append_realtime, allow_refresh=allow_refresh)
-    return _HIST.get(symbol, temporalidad, cfg=cfg)
-
-def obtener_datos_historicos_fmp(symbol: str, temporalidad: str, *,
-                                 bars: int | None = None, **kwargs):
-    return obtener_datos_historicos(symbol, temporalidad, bars=bars, append_realtime=True, allow_refresh=True)
-
-
-#mpl.rcParams['figure.max_open_warning'] = 200
-
-matplotlib.use('Agg')
-
-pd.set_option('future.no_silent_downcasting', True)
-
-warnings.filterwarnings("ignore", message="Maximum Likelihood optimization failed to converge")
-
+from typing import Any, Iterable, Mapping, Optional, Callable, Dict, Tuple, List
+from datetime import timedelta, date, datetime, timezone, UTC, timezone as dt_timezone
+from textwrap import wrap
+from functools import partial
+import math
+import statistics
+from collections.abc import Sequence
+import csv as _csv
 #from pathlib import Path
 #from dotenv import load_dotenv
 #load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 try:
     # Si usas firebase_admin con google-cloud-firestore detrás:
-
+    from google.cloud import firestore as gcf
     SERVER_TS = gcf.SERVER_TIMESTAMP
 except Exception:
     SERVER_TS = None  # fallback si no está disponible
 
-timezone_country = pytz.UTC
+timezone_country = pytz.timezone('America/Santiago')
 user_states = {}
 timeout_request_global = 2 # Tiempo máximo de espera en segundos
 max_workers_global = min(32, (os.cpu_count() or 1) * 2) #puede tener 64
@@ -695,9 +123,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # Para httpx
 logging.getLogger("urllib3").setLevel(logging.WARNING)  # Para requests
 
 # API Key de FMP (Premium)
-API_KEY = (os.environ.get("API_FMP") or os.environ.get("FMP_API_KEY") or "").strip()
-if not API_KEY:
-    raise RuntimeError("Falta API_FMP (o FMP_API_KEY) en el entorno/.env. Usa --env .env o define la variable antes de ejecutar.")
+API_KEY =  os.environ["API_FMP"]
+
 db = firestore.Client()
 
 # Personalizar los logs
@@ -1185,6 +612,17 @@ FILAS_POR_IMG_OPPS   = 40
 FILAS_POR_IMG_EVENTO = 40
 WRAP_HDR = 16
 WRAP_CELL = 22
+
+#@profile
+def _fmt_num(x, nd=5):
+    if x is None or (isinstance(x, float) and np.isnan(x)): 
+        return ""
+    try:
+        # evita notación científica y quita ceros innecesarios
+        s = f"{float(x):.{nd}f}".rstrip('0').rstrip('.')
+        return s
+    except Exception:
+        return str(x)
 
 #@profile
 def _fmt_pct(x):
@@ -2353,7 +1791,7 @@ async def seleccionar_zona_horaria(update, context):
 async def cargar_timezone_por_defecto(chat_id):
     """Carga la zona horaria predeterminada para un chat_id."""
     chat_ids = await cargar_chat_ids()
-    return chat_ids.get(chat_id, {}).get("timezone", "UTC")
+    return chat_ids.get(chat_id, {}).get("timezone", "America/Santiago")
 
 #@profile
 def detectar_categoria(event):
@@ -2518,10 +1956,10 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
         fecha_fin = datetime.now().strftime('%Y-%m-%d')  # Hasta la fecha actual
 
     # Convertir fechas de inicio y fin a UTC
-    fecha_inicio = pd.to_datetime(fecha_inicio).tz_localize(pytz.UTC) if pd.to_datetime(fecha_inicio).tzinfo is None else pd.to_datetime(fecha_inicio)
+    fecha_inicio = pd.to_datetime(fecha_inicio).tz_localize('UTC') if pd.to_datetime(fecha_inicio).tzinfo is None else pd.to_datetime(fecha_inicio)
 
     # Ajustar fecha_fin para incluir todo el día 23
-    fecha_fin = pd.to_datetime(fecha_fin).tz_localize(pytz.UTC) if pd.to_datetime(fecha_fin).tzinfo is None else pd.to_datetime(fecha_fin)
+    fecha_fin = pd.to_datetime(fecha_fin).tz_localize('UTC') if pd.to_datetime(fecha_fin).tzinfo is None else pd.to_datetime(fecha_fin)
     fecha_fin = fecha_fin + timedelta(days=1)  # Aumentar un día
     fecha_fin = fecha_fin.replace(hour=0, minute=0, second=0)  # Establecer a las 00:00:00 del siguiente día
 
@@ -2559,10 +1997,7 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
                         # Validar si las fechas son tz-naive o ya tienen información de zona horaria
                         if df_nuevas['publishedDate'].dt.tz is None:
                             # Si es tz-naive, localiza primero en UTC
-                            df_nuevas['publishedDate'] = df_nuevas['publishedDate'].dt.tz_localize(pytz.UTC)
-
-                        # Convertir las fechas a la zona horaria configurada
-                        df_nuevas['publishedDate'] = df_nuevas['publishedDate'].dt.tz_convert(pytz.UTC)
+                            df_nuevas['publishedDate'] = df_nuevas['publishedDate'].dt.tz_localize('UTC', ambiguous='NaT', nonexistent='shift_forward')
 
                     # Eliminar filas con fechas inválidas
                     df_nuevas = df_nuevas.dropna(subset=['publishedDate'])
@@ -2595,7 +2030,7 @@ def obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=50, max_rei
     """
 
     # Convertir fechas de inicio y fin a UTC
-    fecha_inicio = pd.to_datetime(fecha_inicio).tz_localize(pytz.UTC) if pd.to_datetime(fecha_inicio).tzinfo is None else pd.to_datetime(fecha_inicio)
+    fecha_inicio = pd.to_datetime(fecha_inicio).tz_localize('UTC') if pd.to_datetime(fecha_inicio).tzinfo is None else pd.to_datetime(fecha_inicio)
     fecha_fin = fecha_inicio
 
     # Determinar el endpoint adecuado según la categoría del símbolo
@@ -2631,10 +2066,10 @@ def obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=50, max_rei
                         # Validar si las fechas son tz-naive o ya tienen información de zona horaria
                         if df_nuevas['publishedDate'].dt.tz is None:
                             # Si es tz-naive, localiza primero en UTC
-                            df_nuevas['publishedDate'] = df_nuevas['publishedDate'].dt.tz_localize(pytz.UTC)
+                            df_nuevas['publishedDate'] = df_nuevas['publishedDate'].dt.tz_localize('UTC', ambiguous='NaT', nonexistent='shift_forward')
 
                         # Convertir las fechas a la zona horaria configurada
-                        df_nuevas['publishedDate'] = df_nuevas['publishedDate'].dt.tz_convert(pytz.UTC)
+                        df_nuevas['publishedDate'] = df_nuevas['publishedDate'].dt.tz_convert(timezone_country)
 
                     # Eliminar filas con fechas inválidas
                     df_nuevas = df_nuevas.dropna(subset=['publishedDate'])
@@ -2762,6 +2197,234 @@ async def cargar_datos_historicos_inicial():
     logging.info("Datos históricos cargados en memoria: %d símbolos.", len(cache_historicos))
 
 
+
+#@profile
+def obtener_datos_historicos_fmp(
+    symbol: str,
+    temporalidad: str,
+    max_reintentos: int = 5,
+    tiempo_espera_inicial: int = 5,
+    *,
+    bars: int | None = None
+):
+    """
+    - Si 'bars' > 0: NO usa caché; pide ventana exacta y devuelve 'bars' velas.
+    - Si 'bars' es None: modo incremental con caché.
+    """
+    try:
+        tf = _norm_tf(temporalidad)  # '1min','5min','15min','30min','1hour','4hour','1day','1week'
+        use_bars = isinstance(bars, int) and bars > 0 and tf in _TF_MINUTES
+
+        # -------------------------
+        # MODO 'bars': sin caché
+        # -------------------------
+        if use_bars:
+            now_utc = datetime.now(pytz.utc)
+            total_min = _TF_MINUTES[tf] * (bars + 5)  # margen
+            from_dt = now_utc - timedelta(minutes=total_min)
+            to_dt   = now_utc
+
+            fmt = _fmt_for_tf(tf)
+            from_str = from_dt.strftime(fmt)
+            to_str   = to_dt.strftime(fmt)
+
+            url = (
+                f"https://financialmodelingprep.com/api/v3/historical-chart/"
+                f"{tf}/{symbol}?from={from_str}&to={to_str}&apikey={API_KEY}"
+            )
+
+            reintento = 0
+            tiempo_espera = tiempo_espera_inicial
+            while reintento < max_reintentos:
+                try:
+                    resp = requests.get(url, timeout=timeout_request_global)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if isinstance(data, list) and len(data) > 0:
+                            df = pd.DataFrame(data)[['date','open','high','low','close','volume']]
+                            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+                            df = df.dropna(subset=['date']).set_index('date').sort_index()
+                            if len(df) > bars:
+                                df = df.tail(bars)
+                            out = df.copy()
+                            out.index = out.index.tz_localize(pytz.utc)
+                            return out
+                        else:
+                            logger.info(f"[FMP bars] Sin datos API para {symbol} {tf}.")
+                            return pd.DataFrame()
+                    elif resp.status_code == 429:
+                        retry_after = int(resp.headers.get("Retry-After", tiempo_espera))
+                        logger.info(f"[FMP bars] 429; espero {retry_after}s y reintento.")
+                        time.sleep(retry_after)
+                        reintento += 1
+                    else:
+                        logger.info(f"[FMP bars] Error {resp.status_code} URL: {url}")
+                        return pd.DataFrame()
+                except requests.exceptions.RequestException as e:
+                    logger.info(f"[FMP bars] Error de conexión: {e}")
+                    reintento += 1
+                    if reintento < max_reintentos:
+                        logger.info(f"[FMP bars] Reintento en {tiempo_espera}s…")
+                        time.sleep(tiempo_espera)
+                        tiempo_espera *= 2
+
+            logger.info(f"[FMP bars] Falló tras {max_reintentos} reintentos {symbol} {tf}.")
+            return pd.DataFrame()
+
+        # -------------------------------------------
+        # MODO incremental (sin 'bars'): con caché
+        # -------------------------------------------
+        df_local = None
+        ultima_fecha = None
+
+        if symbol in cache_historicos and tf in cache_historicos[symbol]:
+            df_local = cache_historicos[symbol][tf]
+
+            if df_local is not None and not df_local.empty:
+                df_local = df_local.copy()
+
+                if 'date' in df_local.columns:
+                    # ⬇ Normaliza serie a UTC y luego quita tz → índice naive
+                    df_local['date'] = pd.to_datetime(df_local['date'], errors='coerce', utc=True).dt.tz_convert(None)
+                    df_local = df_local.dropna(subset=['date']).set_index('date')
+                else:
+                    # ⬇ Caso en que ya venía con índice datetime (posible tz-aware)
+                    idx = pd.to_datetime(df_local.index, utc=True).tz_convert(None)
+                    df_local.index = idx
+
+            ultima_fecha = (df_local.index.max() if (df_local is not None and not df_local.empty) else None)
+            logger.info(f"Última fecha en caché {symbol} {tf}: {ultima_fecha}")
+        else:
+            logger.info(f"Sin caché para {symbol} {tf}")
+
+        if ultima_fecha is not None:
+            # ultima_fecha ya es naive UTC
+            from_str = pd.Timestamp(ultima_fecha).strftime("%Y-%m-%d")
+            to_str   = datetime.now(pytz.utc).strftime("%Y-%m-%d")
+            url = (
+                f"https://financialmodelingprep.com/api/v3/historical-chart/"
+                f"{tf}/{symbol}?from={from_str}&to={to_str}&apikey={API_KEY}"
+            )
+        else:
+            url = (
+                f"https://financialmodelingprep.com/api/v3/historical-chart/"
+                f"{tf}/{symbol}?apikey={API_KEY}"
+            )
+
+        reintento = 0
+        tiempo_espera = tiempo_espera_inicial
+        while reintento < max_reintentos:
+            try:
+                response = requests.get(url, timeout=timeout_request_global)
+                if response.status_code == 200:
+                    data_api = response.json()
+                    if isinstance(data_api, list) and len(data_api) > 0:
+                        df_api = pd.DataFrame(data_api)[['date','open','high','low','close','volume']]
+                        # ⬇ Normaliza a UTC y luego sin tz → índice naive
+                        df_api['date'] = pd.to_datetime(df_api['date'], errors='coerce', utc=True).dt.tz_convert(None)
+                        df_api = df_api.dropna(subset=['date']).set_index('date')
+
+                        if ultima_fecha is not None:
+                            # Ambas partes naive → comparación válida
+                            df_api = df_api[df_api.index > ultima_fecha]
+
+                        if df_local is not None and not df_local.empty and not df_api.empty:
+                            df_combinado = pd.concat([df_local, df_api]).drop_duplicates().sort_index()
+                        elif df_local is not None and not df_local.empty:
+                            df_combinado = df_local
+                        elif not df_api.empty:
+                            df_combinado = df_api
+                        else:
+                            df_combinado = pd.DataFrame()
+
+                        # Guarda en caché con índice naive (UTC sin tz)
+                        if symbol not in cache_historicos:
+                            cache_historicos[symbol] = {}
+                        cache_historicos[symbol][tf] = df_combinado
+
+                        # Al devolver: localiza a UTC y convierte a timezone_country
+                        out = df_combinado.copy()
+                        out.index = out.index.tz_localize(pytz.utc)
+                        return out
+                    else:
+                        logger.info("No se encontraron datos nuevos desde la API.")
+                        return df_local if df_local is not None else pd.DataFrame()
+
+                elif response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", tiempo_espera))
+                    logger.info(f"Se excedió el límite de la API. Esperando {retry_after}s…")
+                    time.sleep(retry_after)
+                    reintento += 1
+                else:
+                    logger.info(f"Error API FMP: {response.status_code}, URL: {url}")
+                    return df_local if df_local is not None else pd.DataFrame()
+
+            except requests.exceptions.RequestException as e:
+                logger.info(f"Error de conexión: {e}")
+                reintento += 1
+                if reintento < max_reintentos:
+                    logger.info(f"Reintentando url:{url} en {tiempo_espera}s…")
+                    time.sleep(tiempo_espera)
+                    tiempo_espera *= 2
+
+        logger.info(f"Falló la obtención de datos para {symbol} {tf} tras {max_reintentos} reintentos.")
+        return df_local if df_local is not None else pd.DataFrame()
+
+    except Exception as e:
+        logger.info(f"Error inesperado al procesar datos para {symbol} en temporalidad {temporalidad}: {e}")
+        return pd.DataFrame()
+
+
+        
+# Función para obtener datos en tiempo real
+#@profile
+def obtener_dato_realtime_fmp(symbol, max_reintentos=3, tiempo_espera_inicial=5):
+    url = f'https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={API_KEY}'
+
+    reintento = 0
+    tiempo_espera = tiempo_espera_inicial
+
+    while reintento < max_reintentos:
+        try:
+            response = requests.get(url, timeout=timeout_request_global)
+
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list) and len(data) > 0:
+                    # Obtener el timestamp del JSON y convertirlo a pd.Timestamp
+                    timestamp_unix = data[0].get('timestamp', None)
+                    if timestamp_unix is not None:
+                        fecha_actual = pd.to_datetime(timestamp_unix, unit='s', utc=True)
+                    else:
+                        # Si no hay timestamp, usar la fecha y hora actual ajustada al país seleccionado
+                        fecha_actual = pd.Timestamp.now(tz=pytz.UTC)
+
+                    return pd.DataFrame([{
+                        'date': fecha_actual,
+                        'close': data[0]['price']
+                    }]).set_index('date')
+
+            elif response.status_code == 429:
+                # Manejo del error 429 (Too Many Requests)
+                retry_after = int(response.headers.get("Retry-After", tiempo_espera))
+                logger.info(f"Se excedió el límite de la API para {symbol}. Esperando {retry_after} segundos antes de reintentar.")
+                time.sleep(retry_after)
+                reintento += 1
+            else:
+                logger.info(f"Error al consultar la API para {symbol}: {response.status_code}.")
+                return pd.DataFrame()
+
+        except requests.exceptions.RequestException as e:
+            logger.info(f"Error de conexión: {e}")
+            reintento += 1
+            if reintento < max_reintentos:
+                logger.info(f"Reintentando url:{url}  en {tiempo_espera} segundos...")
+                time.sleep(tiempo_espera)
+                tiempo_espera *= 2
+
+    logger.info(f"Falló la obtención de datos en tiempo real para {symbol} después de {max_reintentos} reintentos.")
+    return pd.DataFrame()
+
 #@profile
 async def obtener_dias_habiles_mercado():
     """
@@ -2800,495 +2463,252 @@ async def obtener_dias_habiles_mercado():
     return dias_habiles
 
 
-
-# ======================================================================
-# Economic Events — FMP + (optional) investpy, UTC-first + local presentation
-# ======================================================================
-
-# Invariants:
-# - Use UTC for network/API timestamps.
-# - Convert to local timezone for presentation/DF columns exposed to caller.
-# - Cache by local-day key, with de-duplication by logical keys.
-# - Persist/Load fallback in JSON file (APP_CONFIG.events_file).
-# Logical keys to deduplicate events
-_EVENT_DEDUP_KEYS = ["currency", "event", "date_country"]
-
-# In-memory cache (by local day key "YYYY-MM-DD")
-_cache_eventos_economicos = {}
-_cache_eventos_lock = threading.Lock()
-
-
-def _local_tz():
-    # Reuse application's configured local tz
-    return get_local_tz()
-
-
-def _local_day_key(dt_like) -> str:
-    ts = pd.to_datetime(dt_like, errors="coerce")
-    if ts.tzinfo is None:
-        ts = ts.tz_localize(pytz.UTC)
-    else:
-        ts = ts.tz_convert(pytz.UTC)
-    return ts.strftime("%Y-%m-%d")
-
-
-def _dedupe_events(df: pd.DataFrame, keys=None) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    keys = keys or _EVENT_DEDUP_KEYS
-    df = df.copy()
-    for k in keys:
-        if k not in df.columns:
-            df[k] = pd.NA
-    # stable sort then drop dups
-    sort_cols = [c for c in ["date_country", "date"] if c in df.columns]
-    if sort_cols:
-        df = df.sort_values(sort_cols, ascending=True, kind="mergesort")
-    return df.drop_duplicates(subset=keys, keep="last").reset_index(drop=True)
-
-
-def _split_by_local_day(df: pd.DataFrame) -> dict:
-    if df is None or df.empty:
-        return {}
-    if "date_country" not in df.columns:
-        if "date" in df.columns:
-            df = df.copy()
-            df["date_country"] = df["date"]
-        else:
-            return {}
-    buckets = {}
-    for _, row in df.iterrows():
-        try:
-            key = _local_day_key(row["date_country"])
-        except Exception:
-            continue
-        buckets.setdefault(key, []).append(row)
-    for k in list(buckets.keys()):
-        buckets[k] = pd.DataFrame(buckets[k])
-    return buckets
-
-
-def cargar_eventos_completos() -> list[dict]:
-    """
-    Retorna eventos de ~últimos 365 días desde Firestore (colección 'eventos_completos').
-    Backend en UTC (sin conversiones locales).
-    """
-    try:
-        col = db.collection("eventos_completos")
-
-        now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
-        fi_utc = (now_utc - pd.Timedelta(days=365)).to_pydatetime()
-        ff_utc = now_utc.to_pydatetime()
-
-        q = col.where("date_utc", ">=", fi_utc).where("date_utc", "<=", ff_utc)
-        docs = q.stream()
-        return [doc.to_dict() for doc in docs if getattr(doc, "exists", True)]
-    except Exception as e:
-        logger.info("[Firestore] cargar_eventos_completos error: %s", e)
-        return []
-
-
-def cache_eventos_merge(df: pd.DataFrame) -> None:
-    """Thread-safe merge into cache by local day key."""
-    if df is None or df.empty:
-        return
-    groups = _split_by_local_day(df)
-    if not groups:
-        return
-    with _cache_eventos_lock:
-        for day_key, part in groups.items():
-            existing = _cache_eventos_economicos.get(day_key)
-            if existing is not None and not existing.empty:
-                merged = pd.concat([existing, part], ignore_index=True)
-            else:
-                merged = part
-            _cache_eventos_economicos[day_key] = _dedupe_events(merged)
-        logger.info("[Eventos] Cached days: %d", len(_cache_eventos_economicos))
-
-
-def _fmp_econ_fetch(from_date: str, to_date: str, *, timeout: int) -> pd.DataFrame:
-    """Fetch one calendar window from FMP with HTTP_SESSION (retry-enabled)."""
-    url = "https://financialmodelingprep.com/api/v3/economic_calendar"
-    params = {"from": from_date, "to": to_date, "apikey": APP_CONFIG.fmp_api_key}
-    try:
-        r = HTTP_SESSION.get(url, params=params, timeout=timeout)
-        if r.status_code != 200:
-            logger.info("[FMP-econ] HTTP %s params=%s", r.status_code, params)
-            return pd.DataFrame()
-        data = r.json()
-        if not isinstance(data, list) or not data:
-            return pd.DataFrame()
-        df = pd.DataFrame(data)
-        for c in ["date","currency","event","impact","actual","estimate","previous"]:
-            if c not in df.columns:
-                df[c] = pd.NA
-        # API is UTC timestamps
-        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-        df = df.dropna(subset=["date"])
-        df["impact"] = df["impact"].astype(str).str.capitalize()
-        df = df[df["impact"].isin(["High","Medium","Low"])].copy()
-        for c in ["actual","estimate","previous"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df.sort_values("date", ascending=True).reset_index(drop=True)
-    except Exception as e:
-        logger.warning("[FMP-econ] Error: %s", e)
-        return pd.DataFrame()
-
-
-def _investing_econ_fetch() -> pd.DataFrame:
-    """Optional investpy calendar (GMT base)."""
-    if not globals().get("_HAS_INVESTPY", False):
-        return pd.DataFrame()
-    try:
-        cal = investpy.economic_calendar(time_zone="GMT")
-        cal = cal[cal["importance"].isin(["high","medium","low"])].copy()
-        cal["date"] = pd.to_datetime(cal["date"], format="%d/%m/%Y", errors="coerce")
-        time_str = cal["time"].where(cal["time"].str.match(r"^\d{2}:\d{2}$", na=False), "00:00")
-        cal["date"] = pd.to_datetime(cal["date"].dt.strftime("%Y-%m-%d") + " " + time_str, utc=True)
-        cal = cal.rename(columns={"importance":"impact", "forecast":"estimate"})
-        keep = ["date","currency","event","actual","estimate","previous","impact"]
-        for c in keep:
-            if c not in cal.columns:
-                cal[c] = pd.NA
-        for c in ["actual","estimate","previous"]:
-            cal[c] = pd.to_numeric(cal[c], errors="coerce")
-        cal["impact"] = cal["impact"].astype(str).str.capitalize()
-        return cal[keep].sort_values("date", ascending=True).reset_index(drop=True)
-    except Exception as e:
-        logger.info("[Investing] Error economic calendar: %s", e)
-        return pd.DataFrame()
-
-
-def _to_local_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce").dt.tz_convert(pytz.UTC)
-    out["date_country"] = out["date"]
-    return out
-
-
-def obtener_dias_habiles_mercado() -> list:
-    """Return [yesterday, tomorrow] dates considering FX 17:00 UTC window loosely."""
-    now_utc = datetime.now(timezone.utc)
-    today = now_utc.date()
-    y = today - timedelta(days=1)
-    t = today + timedelta(days=1)
-    # Loosely assume weekdays, but include late Sunday/early Friday window
-    days = []
-    # yesterday-ish
-    while True:
-        d = y.weekday()  # 0 Mon ... 6 Sun
-        if (d == 6 and now_utc.hour >= 17) or (0 <= d <= 4) or (d == 5 and now_utc.hour < 17):
-            days.append(y); break
-        y -= timedelta(days=1)
-    # tomorrow-ish
-    while True:
-        d = t.weekday()
-        if (d == 6 and now_utc.hour >= 17) or (0 <= d <= 4) or (d == 5 and now_utc.hour < 17):
-            days.append(t); break
-        t += timedelta(days=1)
-    return days
-
-
-def obtener_eventos_economicos(*, plan: str | None = None, desde_inicio: bool = False) -> pd.DataFrame:
-    """
-    Pulls economic events around the FX window:
-      - starter: only [yesterday, tomorrow]
-      - premium + desde_inicio: paginate from 1900-01-01 to tomorrow in APP_CONFIG.econ_chunk_days
-    Returns local-tz DataFrame with columns:
-      ['date','currency','event','actual','estimate','previous','impact','date_country']
-    """
-    plan = (plan or APP_CONFIG.fmp_plan).lower()
-
-    dias = obtener_dias_habiles_mercado()
-    y = dias[0].strftime("%Y-%m-%d")
-    tm = dias[1].strftime("%Y-%m-%d")
-    if plan == "premium" and desde_inicio:
-        start, end = "1900-01-01", tm
-    else:
-        start, end = y, tm
-
-    # paginate if needed
-    parts = []
-    if plan == "premium" and desde_inicio:
-        fi = pd.to_datetime(start)
-        ff = pd.to_datetime(end)
-        cur = fi
-        step = APP_CONFIG.econ_chunk_days
-        while cur <= ff:
-            a = cur.strftime("%Y-%m-%d")
-            b = min(cur + timedelta(days=step-1), ff).strftime("%Y-%m-%d")
-            d = _fmp_econ_fetch(a, b, timeout=APP_CONFIG.http_timeout)
-            if not d.empty: parts.append(d)
-            cur = pd.to_datetime(b) + timedelta(days=1)
-    else:
-        d = _fmp_econ_fetch(start, end, timeout=APP_CONFIG.http_timeout)
-        if not d.empty: parts.append(d)
-
-    # optional investing layer
-    inv = _investing_econ_fetch()
-    if not inv.empty:
-        parts.append(inv)
-
-    if not parts:
-        return pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
-
-    df = pd.concat(parts, ignore_index=True)
-    df = _to_local_df(df)
-    df = _dedupe_events(df)
-    cache_eventos_merge(df)
-    return df.reset_index(drop=True)
-
-
-def obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin) -> pd.DataFrame:
-    """
-    Future window [fecha_inicio, fecha_fin] ingresada en timezone_country (usuario).
-    La ventana de consulta a FMP se calcula en America/New_York (FMP_TZ).
-    Se consulta en chunks y se filtra a impactos High/Medium.
-    """
-    FMP_TZ = pytz.timezone('America/New_York')
-
-    # --- Parseo y TZ del usuario ---
-    fi = pd.to_datetime(fecha_inicio, errors="coerce")
-    ff = pd.to_datetime(fecha_fin, errors="coerce")
-    if fi is pd.NaT or ff is pd.NaT:
-        return pd.DataFrame(columns=[
-            "date","currency","event","actual","estimate","previous",
-            "impact","ponderacion","date_country"
-        ])
-
-    # Si vienen naive, asume timezone_country; si no, convierte a esa tz
-    if fi.tzinfo is None: fi = timezone_country.localize(fi)
-    else:                 fi = fi.tz_convert(timezone_country)
-    if ff.tzinfo is None: ff = timezone_country.localize(ff)
-    else:                 ff = ff.tz_convert(timezone_country)
-
-    # --- Proyectar el rango a la TZ de FMP para construir fechas de consulta ---
-    fi_fmp = fi.astimezone(FMP_TZ)
-    ff_fmp = ff.astimezone(FMP_TZ)
-
-    # Cerrar al fin de día **en la TZ de FMP**
-    ff_fmp = ff_fmp.normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-
-    # Asegurar orden
-    if fi_fmp > ff_fmp:
-        fi_fmp, ff_fmp = ff_fmp, fi_fmp
-
-    # Fechas (solo día) para las consultas chunked (en FMP_TZ)
-    fi_day = fi_fmp.strftime("%Y-%m-%d")
-    ff_day = ff_fmp.strftime("%Y-%m-%d")
-
-    # --- Loop chunked ---
-    parts = []
-    cur = pd.to_datetime(fi_day)  # naive date; solo usamos la parte de fecha
-    end = pd.to_datetime(ff_day)
-    step = APP_CONFIG.econ_chunk_days
-
-    while cur <= end:
-        a = cur.strftime("%Y-%m-%d")
-        b = min(cur + timedelta(days=step - 1), end).strftime("%Y-%m-%d")
-
-        d = _fmp_econ_fetch(a, b, timeout=APP_CONFIG.http_timeout)
-        if not d.empty:
-            # Impacto robusto (case-insensitive) + ponderación
-            impact_norm = d["impact"].astype(str).str.strip().str.lower()
-            d = d[impact_norm.isin({"high", "medium"})].copy()
-            if not d.empty:
-                d["ponderacion"] = impact_norm.map({"high": 1.0, "medium": 0.5}).fillna(0.25).values
-                parts.append(d)
-
-        cur = pd.to_datetime(b) + timedelta(days=1)
-
-    if not parts:
-        return pd.DataFrame(columns=[
-            "date","currency","event","actual","estimate","previous",
-            "impact","ponderacion","date_country"
-        ])
-
-    df = pd.concat(parts, ignore_index=True)
-
-    # Tu pipeline: aquí conviertes fechas del evento a timezone_country y deduplicas
-    df = _to_local_df(df)      # asegúrate que genere 'date_country' en timezone_country
-    df = _dedupe_events(df)
-    cache_eventos_merge(df)
-
-    # Columnas garantizadas
-    for c in ["ponderacion", "date_country"]:
-        if c not in df.columns:
-            df[c] = pd.NA
-
-    return df.reset_index(drop=True)
-
-
-
-def _slugify_event(s: str) -> str:
-    import re
-    s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return s or "event"
-
-def _event_doc_id(row: dict) -> str:
-    # Deterministic doc id to avoid duplicates on re-saves
-    # Use epoch seconds of date_utc + currency + slugified event
-    try:
-        dt = row.get("date_utc") or row.get("date") or row.get("date_country")
-        if dt is None:
-            return _slugify_event(row.get("event","event"))
-        ts = pd.Timestamp(dt)
-        if ts.tzinfo is None:
-            # assume UTC
-            ts = ts.tz_localize(pytz.UTC)
-        epoch = int(ts.timestamp())
-    except Exception:
-        epoch = 0
-    cur = str(row.get("currency") or "XX")
-    ev = _slugify_event(str(row.get("event") or "event"))
-    return f"{epoch}_{cur}_{ev}"
-
-def _to_utc_datetime(dt_like) -> datetime | None:
-    """Convierte cualquier valor de fecha a datetime timezone-aware en UTC (o None si no se puede)."""
-    try:
-        ts = pd.to_datetime(dt_like, errors="coerce", utc=True)
-        if pd.isna(ts):
-            return None
-        return ts.to_pydatetime()
-    except Exception:
-        return None
-
-def _firestore_save_events(events: list[dict]) -> None:
-    """
-    Persiste eventos en 'eventos_completos' usando batch en trozos de 400.
-    Asegura date_utc en UTC, normaliza numéricos y capitaliza 'impact'.
-    """
-    try:
-        col = db.collection("eventos_completos")
-    except Exception:
-        col = None
-
-    if not col or not events:
-        return
-
-    chunk = 400  # por debajo del límite 500
-    for i in range(0, len(events), chunk):
-        batch = db.batch()
-        for row in events[i:i + chunk]:
-            data = dict(row)  # copia defensiva
-
-            # 2.1) Asegurar date_utc (preferida para queries)
-            date_val = data.get("date_utc") or data.get("date")
-            utc_dt = _to_utc_datetime(date_val)
-            if utc_dt is not None:
-                data["date_utc"] = utc_dt
-            else:
-                # si no hay fecha válida, evita grabar basura
-                continue
-
-            # 2.2) Normalizar numéricos
-            for key in ("actual", "estimate", "previous"):
-                if key in data:
-                    try:
-                        data[key] = float(data[key]) if data[key] is not None else None
-                    except Exception:
-                        data[key] = None
-
-            # 2.3) Impact capitalizado
-            if isinstance(data.get("impact"), str):
-                data["impact"] = data["impact"].capitalize()
-
-            # 2.4) Doc ID estable
-            doc_id = _event_doc_id(data)  # se asume que ya existe en tu código
-            ref = col.document(doc_id)
-            batch.set(ref, data, merge=True)
-
-        batch.commit()
-
-def _firestore_load_events_range(fecha_inicio, fecha_fin) -> list[dict]:
-    """
-    Carga eventos por rango [fecha_inicio, fecha_fin] usando 'date_utc' (UTC).
-    Incluye fin de día completo.
-    """
-    try:
-        col = db.collection("eventos_completos")
-    except Exception:
-        return []
-
-    # Rango → UTC aware
-    fi = pd.to_datetime(fecha_inicio, errors="coerce", utc=True)
-    ff = pd.to_datetime(fecha_fin, errors="coerce", utc=True)
-    if pd.isna(fi) or pd.isna(ff):
-        return []
-
-    # Incluir día final completo
-    ff = ff + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-
-    fi_utc = fi.to_pydatetime()
-    ff_utc = ff.to_pydatetime()
-
-    try:
-        q = col.where("date_utc", ">=", fi_utc).where("date_utc", "<=", ff_utc)
-        docs = q.stream()
-        return [doc.to_dict() for doc in docs if getattr(doc, "exists", True)]
-    except Exception as e:
-        logger.info("[Firestore] load range error: %s", e)
-        return []
-
-
-def guardar_eventos_completos(eventos: list[dict]) -> None:
-    """Persist events to Firestore (batch writes)."""
-    try:
-        _firestore_save_events(eventos)
-    except Exception as e:
-        logger.info("[Firestore] save error: %s", e)
+# Función para obtener eventos económicos de los últimos 7 días y ponderarlos por importancia
+#@profile
+async def obtener_eventos_economicos(max_reintentos=3, tiempo_espera_inicial=5):
+    dias_habiles = await obtener_dias_habiles_mercado()
+
+    # Obtener la fecha de ayer y de mañana
+    fecha_ayer = dias_habiles[0].strftime('%Y-%m-%d')
+    fecha_manana = dias_habiles[1].strftime('%Y-%m-%d')
     
+    url = f'https://financialmodelingprep.com/api/v3/economic_calendar?from={fecha_ayer}&to={fecha_manana}&apikey={API_KEY}'
+    #logger.info(f"MTORO esta es la url: {url}")
 
+    reintento = 0
+    tiempo_espera = tiempo_espera_inicial
+    
+    while reintento < max_reintentos:
+        try:
+            response = requests.get(url, timeout_request_global)
+            
+            fmp_df = pd.DataFrame()  # Inicializar vacío por si no hay eventos
+            investing_df = pd.DataFrame()  # Inicializar vacío por si falla la obtención
+            
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        fmp_df = pd.DataFrame(data)
+                        fmp_df['date'] = pd.to_datetime(fmp_df['date'])  # Convertir la fecha a datetime
+                        fmp_df = fmp_df[fmp_df['impact'].isin(['High', 'Medium', 'Low'])].copy()
+                        fmp_df['impact'] = fmp_df['impact'].str.capitalize()  # Homogeneizar "High", "Medium", etc.
+                        fmp_df = fmp_df[['date', 'currency', 'event', 'actual', 'estimate', 'previous', 'impact']]
+                        fmp_df = fmp_df.sort_values(by='date', ascending=False).copy()
+                        fmp_df['date'] = fmp_df['date'].dt.tz_localize('GMT')
+                    else:
+                        logger.info("Advertencia: La respuesta de FMP no contiene datos válidos.")
+                except ValueError as e:
+                    logger.info(f"Error al parsear JSON de FMP: {e}")
 
-def obtener_eventos_guardados_o_futuros(fecha_inicio, fecha_fin) -> pd.DataFrame:
-    """
-    Try API future fetch first; if empty/error, fall back to Firestore for the range.
-    """
-    # 1) Try pulling from API
-    try:
-        df = obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin)
-        if not df.empty:
-            # Save to Firestore
+            # Obtener eventos de Investing
             try:
-                guardar_eventos_completos(df.to_dict(orient="records"))
+                calendar = investpy.economic_calendar(time_zone='GMT')
+                calendar = calendar[(calendar['importance'].isin(['high', 'medium', 'low']))].copy()
+                calendar['date'] = pd.to_datetime(calendar['date'], format='%d/%m/%Y', errors='coerce')
+                calendar['date'] = pd.to_datetime(calendar['date'].dt.strftime('%Y-%m-%d') + ' ' + calendar['time'], errors='coerce')
+                calendar['date'] = calendar['date'].dt.tz_localize('GMT')
+                calendar = calendar.rename(columns={'importance': 'impact', 'forecast': 'estimate'})
+                calendar['impact'] = calendar['impact'].str.capitalize()
+                investing_df = calendar[['date', 'currency', 'event', 'actual', 'estimate', 'previous', 'impact']].copy()
             except Exception as e:
-                logger.info("[Eventos] Could not persist to Firestore: %s", e)
-            return df
-    except Exception as e:
-        logger.info("[Eventos] API error future fetch: %s", e)
+                logger.info(f"Error inesperado al obtener datos del calendario económico: {e}")
+                
+            if fmp_df is not None:
+                fmp_df = fmp_df.dropna(axis=1, how='all')
+            if investing_df is not None:
+                investing_df = investing_df.dropna(axis=1, how='all')
 
-    # 2) Fallback: load from Firestore
-    try:
-        saved = _firestore_load_events_range(fecha_inicio, fecha_fin)
-        if saved:
-            s = pd.DataFrame(saved)
-            # Rebuild DataFrame schema and local tz
-            if "date_utc" in s.columns:
-                s["date"] = pd.to_datetime(s["date_utc"], errors="coerce", utc=True).dt.tz_convert(pytz.UTC)
-            elif "date" in s.columns:
-                s["date"] = pd.to_datetime(s["date"], errors="coerce", utc=True).dt.tz_convert(pytz.UTC)
+            # Concatenar los DataFrames después de eliminar columnas vacías
+            eventos_totales_df = pd.concat([fmp_df, investing_df], ignore_index=True)
+        #    eventos_totales_df = fmp_df
+
+            eventos_totales_df['date'] = eventos_totales_df['date'].dt.tz_localize(pytz.utc)
+            
+            # Validar si las columnas 'actual' y 'previous' existen antes de aplicar dropna
+            if all(col in eventos_totales_df.columns for col in ['actual', 'previous']):
+                # Eliminar filas donde actual o previous sea NaN
+                eventos_totales_df = eventos_totales_df.dropna(subset=['actual', 'previous']).copy()
             else:
-                s["date"] = pd.NaT
-            s["date_country"] = s["date"]
-            keep = ["date","currency","event","actual","estimate","previous","impact","date_country"]
-            for c in keep:
-                if c not in s.columns:
-                    s[c] = pd.NA
-            s = s[keep]
-            s = s.sort_values("date", ascending=True).reset_index(drop=True)
-            return s
-    except Exception as e:
-        logger.info("[Firestore] fallback error: %s", e)
+                logging.warning("Las columnas 'actual' y/o 'previous' no están presentes en los datos.")
 
-    return pd.DataFrame()
+            #logger.info(f"Eventos económicos unificados: {eventos_totales_df}")
+            return eventos_totales_df
+        
+        except requests.exceptions.RequestException as e:
+                logger.info(f"Error de conexión: {e}")
+                reintento += 1
+                if reintento < max_reintentos:
+                    logger.info(f"Reintentando url:{url} en {tiempo_espera} segundos...")
+                    time.sleep(tiempo_espera)
+                    tiempo_espera *= 2
+
+    # Si todos los intentos fallaron
+    logging.warning("Todos los intentos de obtener eventos económicos fallaron.")
+    # Devolver un DataFrame vacío con las columnas esperadas para evitar errores posteriores
+    columnas_esperadas = ['date', 'currency', 'event', 'actual', 'estimate', 'previous', 'impact']
+    return pd.DataFrame(columns=columnas_esperadas)
+
+
+#@profile
+def guardar_eventos_completos(eventos):
+    """Guarda todos los eventos en Firestore."""
+    try:
+        collection_ref = db.collection("eventos_completos")
+        for evento in eventos:
+            # Crear un ID único basado en el evento
+            doc_id = f"{evento['currency']}_{evento['date_country']}_{evento['event']}".replace(" ", "_")
+            
+            # Guardar o actualizar el evento en Firestore
+            collection_ref.document(doc_id).set(evento, merge=True)
+
+        print("Eventos guardados/actualizados con éxito en Firestore.")
+    except Exception as e:
+        print(f"Error al guardar eventos en Firestore: {e}")
 
 
 
 #@profile
+async def cargar_eventos_completos():
+    """Carga todos los eventos desde Firestore."""
+    try:
+        collection_ref = db.collection("eventos_completos")
+        docs = collection_ref.stream()
+        return [doc.to_dict() for doc in docs if doc.exists]
+    except Exception as e:
+        print(f"Error al cargar eventos: {e}")
+        return []
 
+
+#@profile
+async def obtener_eventos_guardados_o_futuros(fecha_inicio, fecha_fin):
+    """Obtiene eventos desde la API o el archivo local si la API no está disponible."""
+    try:
+        eventos = await obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin)
+        if not eventos.empty:
+            guardar_eventos_completos(eventos.to_dict(orient="records"))
+            return eventos
+        else:
+            logger.info("No se encontraron eventos en la API. Intentando cargar desde el archivo local.")
+            eventos_guardados = await cargar_eventos_completos()
+            if eventos_guardados:
+                df_guardados = pd.DataFrame(eventos_guardados)
+                df_guardados['date_country'] = pd.to_datetime(df_guardados['date_country'])
+                return df_guardados[
+                    (df_guardados['date_country'] >= fecha_inicio) &
+                    (df_guardados['date_country'] <= fecha_fin)
+                ]
+    except Exception as e:
+        logger.info(f"Error al obtener eventos futuros: {e}")
+        eventos_guardados = await cargar_eventos_completos()
+        if eventos_guardados:
+            df_guardados = pd.DataFrame(eventos_guardados)
+            df_guardados['date_country'] = pd.to_datetime(df_guardados['date_country'])
+            return df_guardados[
+                (df_guardados['date_country'] >= fecha_inicio) &
+                (df_guardados['date_country'] <= fecha_fin)
+            ]
+    return pd.DataFrame()
+
+
+# Función para obtener eventos económicos de los próximos 7 días solo para las divisas listadas y con impacto High y Medium
+#@profile
+async def obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin, max_reintentos=3, tiempo_espera_inicial=5):
+    try:
+        # Asegurar que las fechas de entrada estén localizadas
+        if fecha_inicio.tzinfo is None:
+            fecha_inicio = timezone_country.localize(fecha_inicio)
+        if fecha_fin.tzinfo is None:
+            fecha_fin = timezone_country.localize(fecha_fin)
+
+        # Ajustar la fecha de fin al final del día
+        fecha_fin = fecha_fin + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
+        fecha_inicio_utc = fecha_inicio.astimezone(pytz.UTC)
+        fecha_fin_utc = fecha_fin.astimezone(pytz.UTC)
+
+        logger.info(f"Filtrando eventos entre {fecha_inicio_utc} y {fecha_fin_utc} (UTC)")
+
+        # URL de la API
+        url = f'https://financialmodelingprep.com/api/v3/economic_calendar?apikey={API_KEY}'
+        #logger.info(f"MTORO esta es la url: {url}")
+
+        reintento = 0
+        tiempo_espera = tiempo_espera_inicial
+
+        while reintento < max_reintentos:
+            try:
+                response = requests.get(url, timeout=timeout_request_global)
+                if response.status_code == 200:
+                    data = response.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        df = pd.DataFrame(data)
+
+                        # Convertir fechas a datetime y localizarlas en UTC
+                        if df['date'].dtype == 'O':
+                            df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.tz_localize('UTC')
+
+                        # Obtener rango mínimo y máximo de la API
+                        min_date_api = df['date'].min()
+                        max_date_api = df['date'].max()
+                        logger.info(f"Rango mínimo de fechas en la API: {min_date_api}")
+                        logger.info(f"Rango máximo de fechas en la API: {max_date_api}")
+
+                        # Validar si el rango solicitado tiene datos disponibles
+                        if fecha_fin_utc < min_date_api or fecha_inicio_utc > max_date_api:
+                            logger.info("El rango solicitado no coincide con el rango disponible en la API.")
+                            logger.info(f"Fechas disponibles: {min_date_api} a {max_date_api}")
+                            return pd.DataFrame()  # Devuelve un DataFrame vacío
+
+                        # Ajustar el rango solicitado al rango disponible en la API
+                        fecha_inicio_utc = max(fecha_inicio_utc, min_date_api)
+                        fecha_fin_utc = min(fecha_fin_utc, max_date_api)
+
+                        logger.info(f"Rango ajustado: {fecha_inicio_utc} a {fecha_fin_utc}")
+
+                        # Filtrar por impacto y rango de fechas
+                        df = df[df['impact'].isin(['High', 'Medium'])]
+                        df = df[(df['date'] >= fecha_inicio_utc) & (df['date'] <= fecha_fin_utc)]
+                        logger.info(f"Registros tras filtrar por impacto y rango de fechas: {len(df)}")
+
+                        # Convertir fechas a la zona horaria del pais seleccionado
+                        df['date_country'] = df['date'].dt.tz_convert(timezone_country)
+
+                        # Filtrar por divisas relevantes
+                        divisas_relevantes = set(
+                            [symbol[:3] for symbol in activos] +
+                            [symbol[-3:] for symbol in activos if len(symbol) > 3]
+                        )
+                        df = df[df['currency'].isin(divisas_relevantes)]
+                        logger.info(f"Registros tras filtrar por divisas relevantes: {len(df)}")
+
+                        # Calcular ponderación y ordenar
+                        df['ponderacion'] = df['impact'].apply(lambda x: 1.0 if x == 'High' else 0.5)
+                        df = df.sort_values(by=['currency', 'date_country'])
+
+                        logger.info("Datos finales procesados:")
+                        logger.info(df[['currency', 'ponderacion', 'date_country', 'event']].head())
+
+                        return df[['currency', 'ponderacion', 'date_country', 'event']]
+                else:
+                    logger.info(f"Error al consultar la API: {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                logger.info(f"Error de conexión: {e}")
+                reintento += 1
+                if reintento < max_reintentos:
+                    logger.info(f"Reintentando url:{url} en {tiempo_espera} segundos...")
+                    time.sleep(tiempo_espera)
+                    tiempo_espera *= 2
+    except Exception as e:
+        logger.info(f"Error al obtener eventos económicos futuros: {e}")
+
+    return pd.DataFrame()  # Retornar un DataFrame vacío en caso de error
+
+
+
+
+# Función para generar una imagen por currency
+#@profile
 def generar_imagen_por_currency(df, currency, max_filas=50):
     """
     Genera imágenes para eventos económicos filtrados por moneda con ajustes dinámicos de ancho de columna y contenido.
@@ -3401,11 +2821,12 @@ async def enviar_imagenes_por_currency_a_usuario(df, context, user_chat_id=None,
 def generar_link_google_calendar(event, date, currency, ponderacion):
     base_url = "https://www.google.com/calendar/render"
 
-    # Fuerza UTC para Calendar
-    dt_utc = pd.to_datetime(date, errors='coerce', utc=True)
+    # Convertir la fecha al formato adecuado en la zona horaria del pais seleccionado
+    date_country = date.astimezone(timezone_country)
 
-    start_date_str = dt_utc.strftime('%Y%m%dT%H%M%SZ')
-    end_date_str   = start_date_str
+    # Configurar la fecha de inicio y fin en formato ISO8601
+    start_date_str = date_country.strftime('%Y%m%dT%H%M%S')
+    end_date_str = start_date_str
 
     query = {
         "action": "TEMPLATE",
@@ -3415,112 +2836,127 @@ def generar_link_google_calendar(event, date, currency, ponderacion):
         "sf": "true",
         "output": "xml"
     }
-    return f"{base_url}?{urlencode(query)}"
 
+    return f"{base_url}?{urlencode(query)}"
     
 #@profile
 async def enviar_eventos_y_archivo_calendar(df, context, user_chat_id):
-    # --- Normalización defensiva del DF ---
-    if df is None or getattr(df, "empty", True):
-        return
-
-    df = df.copy()  # evitar chained assignments
-
-    # 1) Fecha: prioriza UTC para Calendar
-    if "date" not in df.columns or not pd.api.types.is_datetime64_any_dtype(df["date"]):
-        if "date_utc" in df.columns and pd.api.types.is_datetime64_any_dtype(df["date_utc"]):
-            df["date"] = df["date_utc"]
-        elif "date_country" in df.columns and pd.api.types.is_datetime64_any_dtype(df["date_country"]):
-            # si solo tienes la local, conviértela a UTC para Calendar
-            df["date"] = df["date_country"].dt.tz_convert(pytz.UTC)
-        else:
-            # intenta parsear y forzar UTC
-            df["date"] = pd.to_datetime(df.get("date"), errors="coerce", utc=True)
-
-    # Asegura que 'date' sea tz-aware UTC
-    if not hasattr(df["date"].dtype, "tz") or df["date"].dt.tz is None:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-    else:
-        df["date"] = df["date"].dt.tz_convert(pytz.UTC)
-
-    # 2) Currency y Event como columnas existentes
-    if "currency" not in df.columns:
-        df["currency"] = ""
-    if "event" not in df.columns:
-        df["event"] = ""
-
-    # 3) Ponderación: si falta, deriva de 'impact'
-    if "ponderacion" not in df.columns:
-        if "impact" in df.columns:
-            impact_norm = df["impact"].astype(str).str.strip().str.lower()
-            df["ponderacion"] = impact_norm.map({"high": 1.0, "medium": 0.5}).fillna(0.25)
-        else:
-            df["ponderacion"] = 0.5  # valor seguro
-
-    # 4) Filtra filas válidas
-    df = df[df["date"].notna()]
-    if df.empty:
-        return
-
-    # --- Resto de tu función, con pequeñas defensas al acceder a la fila ---
     cal = Calendar()
     cal.add('prodid', '-//Mi Sistema de Trading//ES')
     cal.add('version', '2.0')
 
     for _, row in df.iterrows():
-        # lee con .get() y defaults seguros
-        ev   = row.get('event', '')
-        cur  = row.get('currency', '')
-        peso = row.get('ponderacion', 0.5)
-        dt_utc = row.get('date')
 
-        # Generar link usando SIEMPRE UTC
-        link = generar_link_google_calendar(ev, dt_utc, cur, peso)
+        # Generar el link de Google Calendar para el evento individual
+        link = generar_link_google_calendar(row['event'], row['date_country'], row['currency'], row['ponderacion'])
 
         if link:
-            # Mostrar la fecha al usuario en su zona local, pero marcando zona
-            fecha_local_str = (
-                pd.to_datetime(dt_utc)
-                  .tz_convert(timezone_country)
-                  .strftime('%Y-%m-%d %H:%M:%S %Z')
-            )
-            ponderacion_str = "Alta" if peso == 1.0 else ("Media" if peso == 0.5 else str(peso))
-
-            evento_msg = (
-                f"Evento: {escape_markdown(ev, version=2)}\n"
-                f"Divisa: {escape_markdown(cur, version=2)}\n"
-                f"Fecha: {escape_markdown(fecha_local_str, version=2)}\n"
+            fecha_country_str = row['date_country'].strftime('%Y-%m-%d %H:%M:%S')
+            ponderacion_str = "Media" if row['ponderacion'] == 0.5 else "Alta" if row['ponderacion'] == 1 else str(row['ponderacion'])
+            
+            # Formato del mensaje con escape para Markdown V2
+            evento = (
+                f"Evento: {escape_markdown(row['event'], version=2)}\n"
+                f"Divisa: {escape_markdown(row['currency'], version=2)}\n"
+                f"Fecha: {escape_markdown(fecha_country_str, version=2)}\n"
                 f"Ponderación: {escape_markdown(ponderacion_str, version=2)}\n"
                 f"[Agregar a Google Calendar]({escape_markdown(link, version=2)})\n"
             )
 
+            # Enviar evento individual por Telegram
             try:
-                await context.bot.send_message(chat_id=user_chat_id, text=evento_msg, parse_mode='MarkdownV2')
+                await context.bot.send_message(chat_id=user_chat_id, text=evento, parse_mode='MarkdownV2')
             except Exception as e:
                 logger.info(f"Error al enviar texto de eventos a {user_chat_id}: {e}")
 
-        # Agregar evento al .ics (en UTC como pediste)
+        # Agregar evento al archivo .ics
         event = Event()
-        event.add('summary', ev)
-        event.add('dtstart', pd.to_datetime(dt_utc).to_pydatetime())  # aware UTC
-        event.add('dtend',   pd.to_datetime(dt_utc).to_pydatetime())
-        event.add('description', f"Recordatorio para el evento: {ev} ({cur}). Peso: {peso}")
+        event.add('summary', row['event'])
+        event.add('dtstart', row['date_country'])
+        event.add('dtend', row['date_country'])  # Puedes modificar esto si los eventos tienen duración
+        event.add('description', f"Recordatorio para el evento: {row['event']} ({row['currency']}). Peso: {row['ponderacion']}")
         event.add('location', "Google Calendar")
 
         cal.add_component(event)
 
-    # Guardado y envío del .ics (igual que tu código)
+    # Guardar el archivo .ics en un archivo temporal
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ics") as f:
         f.write(cal.to_ical())
         file_path = f.name
 
+    # Enviar el archivo .ics a Telegram
     try:
         await context.bot.send_document(chat_id=user_chat_id, document=open(file_path, 'rb'), filename="eventos_calendar.ics")
     except Exception as e:
         logger.info(f"Error al enviar el archivo de calendario a {user_chat_id}: {e}")
     finally:
-        os.remove(file_path)
+        os.remove(file_path)  # Eliminar el archivo después de enviarlo
 
+
+
+#@profile
+def obtener_valor_realtime_unificado(symbol: str, user_chat_id: str | None = None, *, intentos: int = 1):
+
+    logging.info(f"[RT][IN] symbol={symbol!r} user_chat_id={user_chat_id!r} intentos={intentos}")
+
+    # --- preparar caches (global hermano + bucket de usuario) ---
+    global_cache = user_states.setdefault("cache_realtime", {})
+    if user_chat_id:
+        user_bucket = user_states.setdefault(user_chat_id, {})
+        user_cache  = user_bucket.setdefault("cache_realtime", {})
+    else:
+        user_cache  = global_cache
+
+    # Logs de estado inicial
+    logging.info("[RT][STATE] keys(user_states)=%s", list(user_states.keys())[:10])
+
+    # --- preferir valor ya cacheado (usuario -> global) ---
+    v = user_cache.get(symbol)
+    if _is_finite_number(v):
+        logging.info("[RT][HIT] user_cache[%s]=%s", symbol, v)
+        return float(v)
+
+    v = global_cache.get(symbol)
+    if _is_finite_number(v):
+        logging.info("[RT][HIT] global_cache[%s]=%s", symbol, v)
+        if user_cache is not global_cache:
+            user_cache[symbol] = v        # seed al cache del usuario
+            logging.info("[RT][SEED] user_cache[%s] <- %s (desde global)", symbol, v)
+        return float(v)
+
+    # --- consultar a la fuente realtime (FMP) ---
+    muestras = []
+    for i in range(max(1, int(intentos))):
+        try:
+            df = obtener_dato_realtime_fmp(symbol)
+            logging.info("[RT][FMP] intento=%d df_none=%s df_empty=%s",
+                         i+1, df is None, (getattr(df, "empty", True) if df is not None else True))
+            if df is not None and not df.empty:
+                val = float(df.iloc[0]["close"])
+                if _is_finite_number(val):
+                    muestras.append(val)
+                    logging.info("[RT][FMP] intento=%d close=%s (acum=%d)", i+1, val, len(muestras))
+                else:
+                    logging.info("[RT][FMP] intento=%d close inválido=%s", i+1, val)
+        except Exception as e:
+            logging.exception("[RT][ERR] fallo FMP %s intento %d", symbol, i+1)
+
+    if not muestras:
+        logging.info("[RT][MISS] Sin muestras válidas para %s -> None", symbol)
+        return None
+
+    # Si hay varias muestras, usa mediana; si no, la última.
+    valor = statistics.median(muestras) if len(muestras) >= 3 else muestras[-1]
+    logging.info("[RT][RESOLVE] muestras=%s -> valor=%s", muestras, valor)
+
+    # --- guardar en ambos caches ---
+    user_cache[symbol]   = valor
+    global_cache[symbol] = valor
+    logging.info("[RT][SAVE] user_cache[%s]=%s | global_cache[%s]=%s",
+                 symbol, user_cache.get(symbol), symbol, global_cache.get(symbol))
+
+    logging.info(f"[RT] {symbol} = {valor}")
+    return valor
 
 #@profile
 def _is_finite_number(x) -> bool:
@@ -3573,45 +3009,118 @@ def _lookup_rt_tick(cache_rt: dict, symbol: str):
 def obtener_datos_con_hilos(
     symbol: str,
     temporalidad: str,
-    user_chat_id: str | None = None,  # ya no se usa (conservado por compatibilidad)
+    user_chat_id: str | None = None,
     cfg: dict | None = None
 ):
-    """
-    Obtiene únicamente histórico desde FMP y aplica recorte final por `bars` si corresponde.
-    Se eliminó todo el manejo de cache/tick realtime y la mezcla de última vela.
-    """
+
     try:
+        # --- preparar caches: global (hermano) y usuario ---
+        global_cache = user_states.setdefault("cache_realtime", {})
+
+        if user_chat_id is not None:
+            user_bucket = user_states.setdefault(user_chat_id, {})
+            cache_rt = user_bucket.setdefault("cache_realtime", {})  # cache del usuario
+        else:
+            cache_rt = global_cache  # cache global
+
+        logging.info(
+            "[RT][CACHE] users=%d global_size=%d user_size=%d is_global=%s",
+            sum(1 for k in user_states if k != "cache_realtime"),
+            len(global_cache),
+            len(cache_rt),
+            cache_rt is global_cache
+        )
+
         # 1) normalizar TF
         tf = _norm_tf(temporalidad)
 
         # 2) resolver bars desde cfg; si no hay → None
         bars = get_bars_for_tf(cfg, tf)
 
-        # 3) histórico (acepta bars=None; si tu fetch ya respeta bars, igual hacemos tail defensivo)
+        # 3) histórico (acepta bars=None)
         df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars)
         if df_historico is None or df_historico.empty:
             logger.info("Datos históricos no disponibles para %s en %s", symbol, tf)
             return pd.DataFrame()
+        df_historico = df_historico.sort_index()
 
-        df_out = df_historico.sort_index()
+        # 4) tick realtime: primero user, luego global (y sembrar si aplica)
+        raw_tick = _lookup_rt_tick(cache_rt, symbol)
+        tick_src = "user"
+        if raw_tick is None and cache_rt is not global_cache:
+            raw_tick = _lookup_rt_tick(global_cache, symbol)
+            if raw_tick is not None:
+                cache_rt[symbol] = raw_tick  # siembra al cache del usuario
+                tick_src = "global->seeded"
+            else:
+                tick_src = "none"
 
-        # 4) recorte final si bars es numérico
+        last_close = _coerce_float(raw_tick)
+
+        try:
+            last_hist = float(df_historico["close"].iloc[-1])
+        except Exception:
+            last_hist = None
+
+        logging.info(
+            "[RT][TICK] %s-%s src=%s tick_cache=%r parsed=%s last_hist=%s bars=%s",
+            symbol, tf, tick_src, raw_tick, last_close, last_hist, bars
+        )
+
+        if last_close is not None:
+            try:
+                df_mix = actualizar_ultima_vela_con_realtime(
+                    df_historico, pd.DataFrame([{"close": last_close}]), symbol, tf
+                )
+                df_out = df_mix.sort_index()
+            except Exception as e:
+                logger.info("actualizar_ultima_vela_con_realtime falló para %s-%s: %s", symbol, tf, e)
+                df_out = df_historico
+        else:
+            df_out = df_historico
+
+        # 5) recorte final si bars es numérico
         if isinstance(bars, int) and bars > 0 and len(df_out) > bars:
             before = len(df_out)
             df_out = df_out.tail(bars)
-            logging.info("[HIST][TAIL] recortado de %d a %d por bars=%d", before, len(df_out), bars)
+            logging.info("[RT][TAIL] recortado de %d a %d por bars=%d", before, len(df_out), bars)
 
         logging.info(
-            "[HIST][RETURN] %s-%s len=%d last_ts=%s last_close=%s",
+            "[RT][RETURN] %s-%s len=%d last_ts=%s last_close=%s tick_aplicado=%s",
             symbol, tf, len(df_out),
             (df_out.index[-1] if not df_out.empty else None),
-            (df_out['close'].iloc[-1] if not df_out.empty else None),
+            (df_out["close"].iloc[-1] if not df_out.empty else None),
+            last_close is not None
         )
         return df_out
 
     except Exception as e:
         logger.info("Se cayó en obtener_datos_con_hilos %s-%s – error: %s", symbol, temporalidad, e)
         return pd.DataFrame()
+
+
+#@profile
+def actualizar_ultima_vela_con_realtime(df, df_realtime, symbol, temporalidad):
+
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        logger.info(f"El DataFrame histórico está vacío o no es válido. activo:{symbol} temporalidad:{temporalidad}")
+        return df
+
+    if not isinstance(df_realtime, pd.DataFrame) or df_realtime.empty:
+        logger.info("El DataFrame de tiempo real está vacío o no es válido.")
+        return df
+    
+    df = df.sort_index(ascending=True)
+
+    # Procesar datos
+    price_realtime = df_realtime.iloc[0]['close']
+    ultima_vela_index = df.index[-1]
+
+    df.loc[ultima_vela_index, 'high'] = max(df.loc[ultima_vela_index, 'high'], price_realtime)
+    df.loc[ultima_vela_index, 'low'] = min(df.loc[ultima_vela_index, 'low'], price_realtime)
+    df.loc[ultima_vela_index, 'close'] = price_realtime
+
+    return df
 
 # Función para calcular indicadores
 #@profile
@@ -3945,7 +3454,7 @@ def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, tem
     df['previous'] = pd.to_numeric(df['previous'].apply(limpiar_valores), errors='coerce')
 
     # Filtrar por ventana temporal
-    now = datetime.now(pytz.UTC)
+    now = datetime.now(timezone_country)
     if fund["consider_events_hours"] is not None:
         cutoff = now - timedelta(hours=int(fund["consider_events_hours"]))
         df = df[df['date'] >= cutoff]
@@ -6170,7 +5679,8 @@ def generar_imagen_eventos_oportunidades(
     dpi: int = 170,
     font_size: int = 9
 ):
-
+    import numpy as np
+    import re
 
     # 1) Validaciones y filtro por divisas
     try:
@@ -6199,11 +5709,11 @@ def generar_imagen_eventos_oportunidades(
             try:
                 df[cand] = pd.to_datetime(df[cand], errors="coerce", utc=True)
                 try:
-
+                    import pytz
                     tz = pytz.timezone(tz_name)
-                    df[cand] = df[cand].dt.tz_convert(pytz.UTC)
+                    df[cand] = df[cand].dt.tz_convert(tz)
                 except Exception:
-                    df[cand] = df[cand].dt.tz_localize(pytz.UTC)
+                    df[cand] = df[cand].dt.tz_localize(None)
                 df = df.sort_values(cand)
                 df["Fecha/Hora"] = df[cand].dt.strftime("%Y-%m-%d %H:%M")
             except Exception:
@@ -6948,6 +6458,18 @@ async def ejecutar_analisis_con_hilos(
 
     loop = asyncio.get_running_loop()
 
+    # --- Realtime (opcional) ---
+    realtime_tasks = [
+        loop.run_in_executor(None, obtener_valor_realtime_unificado, symbol, user_chat_id)
+        for symbol in activos_filtrados
+    ]
+    realtime_results = await asyncio.gather(*realtime_tasks, return_exceptions=True)
+    for idx, result in enumerate(realtime_results):
+        if isinstance(result, Exception):
+            logger.info(f"Error en realtime para símbolo {activos_filtrados[idx]}: {result}")
+        elif result is None:
+            logger.info(f"Resultado de realtime vacío para símbolo {activos_filtrados[idx]}.")
+
     # --- Análisis principal ---
     analisis_tasks = []
     meta = []  # (symbol, temporalidad) alineado con analisis_tasks
@@ -7161,6 +6683,42 @@ def save_df_as_csv(df: pd.DataFrame, path: str, cfg: dict):
     )
 
 
+def df_to_csv_buffer(df: pd.DataFrame, cfg: dict) -> BytesIO:
+    """Devuelve BytesIO con CSV formateado; respeta cfg.csv y cfg.locale."""
+    if df is None or df.empty:
+        return BytesIO()
+
+    csv_cfg        = (cfg.get("csv") or {})
+    sep            = csv_cfg.get("delimiter", ",")
+    if sep == "\\t": sep = "\t"
+    quotechar      = csv_cfg.get("quote", '"')
+    header         = bool(csv_cfg.get("header", True))
+    encoding       = (csv_cfg.get("encoding", "utf-8") or "utf-8").lower()
+    newline        = (csv_cfg.get("newline", "LF") or "LF").upper()
+    lineterminator = "\r\n" if newline == "CRLF" else "\n"
+
+    df_out = _prepare_df_for_csv(df, cfg)
+
+    s_buf = StringIO()
+    df_out.to_csv(
+        s_buf,
+        sep=sep,
+        index=False,
+        header=header,
+        lineterminator=lineterminator,
+        quoting=_csv.QUOTE_MINIMAL,
+        quotechar=quotechar,
+    )
+
+    bin_buf = BytesIO(
+        s_buf.getvalue().encode("ISO-8859-1" if encoding in ("iso-8859-1", "latin-1") else "utf-8")
+    )
+    bin_buf.seek(0)
+    return bin_buf
+
+
+
+
 def _read_telegram_id_prefer_subscription(user_id: str) -> Optional[str]:
     """Lee telegram_id priorizando suscripciones_user, luego user_ids."""
     try:
@@ -7263,7 +6821,7 @@ async def procesar_resultado(
         # Serializadores locales (no crean funciones globales)
     def _fmt_toques_cell(v):
         try:
-
+            import pandas as pd
             if isinstance(v, (list, tuple, set, pd.Series)):
                 parts = []
                 for item in v:
@@ -7284,7 +6842,7 @@ async def procesar_resultado(
     def _fmt_niveles_cell(v):
         # admite lista de niveles, lista de tuplas, dicts, etc.
         try:
-
+            import pandas as pd
             if isinstance(v, (list, tuple, set, pd.Series)):
                 parts = []
                 for item in v:
@@ -8003,7 +7561,6 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
     except Exception:
         timezone_country = pytz.utc
 
-
     # Si no hay un estado esperando, cortamos.
     current_state = return_state(chat_id=user_chat_id)
     if current_state == "disponible":
@@ -8087,7 +7644,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             mark_user_state(chat_id=uid_chat, estado="en ejecución")
 
             # Traer/filtrar eventos
-            df_eventos = obtener_eventos_guardados_o_futuros(fecha_inicio, fecha_fin)
+            df_eventos = await obtener_eventos_guardados_o_futuros(fecha_inicio, fecha_fin)
             if df_eventos is None or getattr(df_eventos, "empty", True):
                 await update.message.reply_text(
                     f"No se encontraron eventos económicos entre {fecha_inicio.strftime('%Y-%m-%d')} y {fecha_fin.strftime('%Y-%m-%d')}."
@@ -8132,7 +7689,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             if pd.isnull(fecha_inicio):
                 raise ValueError("Formato de fecha inválido.")
             # Aware en tz del usuario
-            fecha_inicio = fecha_inicio.tz_localize(pytz.UTC)
+            fecha_inicio = fecha_inicio.tz_localize(timezone_country)
             fecha_fin = fecha_inicio
 
             hoy_local = datetime.now(timezone_country).date()
@@ -8221,7 +7778,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             fecha_inicio = pd.to_datetime(partes[0], format="%Y-%m-%d", errors='coerce')
             if pd.isnull(fecha_inicio):
                 raise ValueError("Formato de fecha inválido.")
-            fecha_inicio = fecha_inicio.tz_localize(pytz.UTC)
+            fecha_inicio = fecha_inicio.tz_localize(timezone_country)
             fecha_fin = fecha_inicio
 
             hoy_local = datetime.now(timezone_country).date()
@@ -8806,7 +8363,7 @@ async def ejecutar_recurrente(
 
         # Eventos económicos (tolerante a error)
         try:
-            df_eventos = obtener_eventos_economicos()
+            df_eventos = await obtener_eventos_economicos()
         except Exception as e:
             logger.warning(f"Error al obtener eventos económicos: {e}")
             df_eventos = None
@@ -10736,8 +10293,7 @@ async def cargar_noticias_en_memoria():
                                 df_local = df_local.dropna(subset=["publishedDate"])
                                 df_local["publishedDate"] = (
                                     df_local["publishedDate"]
-                                    .dt.tz_localize(pytz.UTC)  # Asignar timezone UTC
-                                    .dt.tz_convert(pytz.UTC)  # Convertir al timezone del usuario
+                                    .dt.tz_localize(pytz.utc)  # Asignar timezone UTC
                                 )
                             if symbol not in cache_noticias:
                                 cache_noticias[symbol] = {}
@@ -10757,7 +10313,7 @@ async def guardar_noticias_forex():
         for symbol, df_local in cache_noticias.items():
             archivo_cache = os.path.join(CARPETA_FOREX_NEWS, f"{symbol}_noticias.json")
             if 'publishedDate' in df_local.columns:
-                df_local["publishedDate"] = df_local["publishedDate"].dt.tz_localize(pytz.UTC)  # Eliminar timezone
+                df_local["publishedDate"] = df_local["publishedDate"].dt.tz_localize(None)  # Eliminar timezone
             async with aiofiles.open(archivo_cache, "w", encoding="utf-8") as file:
                 await file.write(df_local.to_json(orient="records", date_format="iso"))
             logger.info(f"Noticias guardadas para {symbol}.")
@@ -10839,6 +10395,19 @@ async def cancelar_envio_mensaje(update: Update, context: ContextTypes.DEFAULT_T
 
 
     await query.edit_message_text("🚫 Envío de mensaje cancelado.")
+
+
+#@profile
+async def enviar_mensaje_segmentado(chat_id, mensaje, bot):
+    """Envía un mensaje en partes si excede el límite de 4096 caracteres."""
+    max_length = 4096  # Límite de Telegram
+    partes = [mensaje[i:i + max_length] for i in range(0, len(mensaje), max_length)]
+    
+    for parte in partes:
+        try:
+            await bot.send_message(chat_id=chat_id, text=parte)
+        except Exception as e:
+            print(f"Error al enviar mensaje a {chat_id}: {e}")
 
 
 #@profile
@@ -11129,8 +10698,6 @@ async def initialize_bot():
 
 @webhook_app.route('/analisis/ejecutar', methods=['POST'])
 #@profile
-@webhook_app.route('/analisis/ejecutar', methods=['POST'])
-#@profile
 async def ejecutar_analisis_desde_app():
     chat_id_local = None
     acquired_lock = False
@@ -11312,7 +10879,8 @@ async def ejecutar_analisis_desde_app():
             try:
                 ocupado_lock.release()
             except Exception:
-                pass    
+                pass
+    
 
 @webhook_app.route('/analisis/stop', methods=['POST'])
 async def detener_analisis_desde_app():
