@@ -275,6 +275,7 @@ class FMPClient:
         assert interval in {"1min","5min","15min","30min","1hour","4hour"}
         fmt = "%Y-%m-%d %H:%M:%S"
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{interval}/{symbol}"
+        logging.info(f"MTORO5 {url}")
         r = self._get(url, {"from": from_utc.strftime(fmt), "to": to_utc.strftime(fmt)})
         if r.status_code != 200: return pd.DataFrame()
         data = r.json() or []
@@ -314,6 +315,7 @@ class FMPClient:
     @safe_op(default=pd.DataFrame(), log=logging.getLogger("MarketTool.FMP"))
     def historical_eod(self, symbol: str, from_date: datetime, to_date: datetime) -> pd.DataFrame:
         url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
+        logging.info(f"MTORO6 {url}")
         r = self._get(url, {"from": from_date.strftime("%Y-%m-%d"), "to": to_date.strftime("%Y-%m-%d")})
         if r.status_code != 200: return pd.DataFrame()
         payload = r.json() or {}; hist = payload.get("historical") or []
@@ -331,6 +333,7 @@ class FMPClient:
     @safe_op(default=None, log=logging.getLogger("MarketTool.FMP"))
     def quote_last(self, symbol: str) -> Optional[float]:
         url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}"
+        logging.info(f"MTORO7 {url}")
         r = self._get(url, {})
         if r.status_code != 200: return None
         arr = r.json() or []
@@ -2541,10 +2544,13 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
     # Determinar el endpoint adecuado según la categoría del símbolo
     if symbol in categorias["Cripto"]:
         endpoint = "https://financialmodelingprep.com/api/v4/crypto_news"
+        logging.info(f"MTORO9 {endpoint}")
     elif any(symbol in categorias[categoria] for categoria in ["Principales", "Cruces", "Exóticos", "OilAndGas", "Agricultura", "Indices"]):
         endpoint = "https://financialmodelingprep.com/api/v4/forex_news"
+        logging.info(f"MTORO10 {endpoint}")
     else:
         endpoint = "https://financialmodelingprep.com/api/v3/stock_news"
+        logging.info(f"MTORO11 {endpoint}")
 
 
     # Llamar a la API para obtener nuevas noticias
@@ -11559,6 +11565,7 @@ def _normalize_fmp_bars(raw: list) -> list:
 
 def _fmp_hist_chart_url(symbol: str, fmp_interval: str) -> str:
     # Endpoint clásico de FMP (válido para acciones y muchas cripto/forex soportadas por su API)
+    logging.info(f"MTORO4 URL: https://financialmodelingprep.com/api/v3/historical-chart/{fmp_interval}/{symbol}")
     return f"https://financialmodelingprep.com/api/v3/historical-chart/{fmp_interval}/{symbol}"
 
 def fetch_fmp_candles(symbol: str, timeframe: str, since_ms: int) -> list:
@@ -11800,13 +11807,21 @@ def merge_bars_series(series: list, incoming: list, tf: str) -> int:
         last_bucket = _bucket_ts(last["t"], tfms)
         b_bucket    = _bucket_ts(t, tfms)
         if b_bucket == last_bucket:
-            last["h"] = max(last["h"], h)
-            last["l"] = min(last["l"], l)
-            last["c"] = c
-            last["v"] = max(last.get("v", 0), v)
+            last["h"] = max(float(last["h"]), float(h), float(last.get("o", h)), float(c))
+            last["l"] = min(float(last["l"]), float(l), float(last.get("o", l)), float(c))
+            last["c"] = float(c)
+            last["v"] = float(last.get("v", 0) or 0) + float(v or 0)
             changed += 1
         elif b_bucket > last_bucket:
-            series.append({"t": b_bucket, "o": o, "h": h, "l": l, "c": c, "v": v})
+            o,h_,l_,c_ = float(o), float(h), float(l), float(c)
+            series.append({
+                "t": b_bucket,
+                "o": o,
+                "h": max(h_, o, c_),
+                "l": min(l_, o, c_),
+                "c": c_,
+                "v": float(v),
+            })
             changed += 1
     return changed
 
@@ -11821,6 +11836,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
     try:
         # 1) estable/realtime (forex)
         url1 = f"https://financialmodelingprep.com/stable/quote?symbol={symbol}&apikey={API_KEY}"
+        logging.info(f"MTORO1 URL: {url1}")
         r = requests.get(url1, timeout=8)
         if r.ok:
             arr = r.json() or []
@@ -11829,6 +11845,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
                 if p: return float(p)
         # 2) fallback v3
         url2 = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={API_KEY}"
+        logging.info(f"MTORO2 URL: {url2}")
         r = requests.get(url2, timeout=8)
         if r.ok:
             arr = r.json() or []
@@ -11846,6 +11863,7 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
     try:
         iv = _fmp_interval(tf)
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}?apikey={API_KEY}"
+        logging.info(f"MTORO3 URL: {url}")
         r = requests.get(url, timeout=10)
         if not r.ok:
             return []
@@ -11871,26 +11889,46 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
     except Exception:
         return []
 
+
 def _maybe_tick_quote(exec_id: str, symbol: str, tf: str, st: dict) -> bool:
-    """Usa quote para mover la última vela (cada TTL). Devuelve True si hubo cambios."""
     key = (exec_id, symbol, tf)
     now = time.time()
     ttl = QUOTE_TTL.get(tf, 3)
     last = _LAST_QUOTE_TICK.get(key, 0)
     if now - last < ttl:
         return False
+
     price = _fetch_quote(symbol)
+    _LAST_QUOTE_TICK[key] = now
     if price is None:
-        _LAST_QUOTE_TICK[key] = now
         return False
+
     series = st.get("series") or []
-    t = int(time.time() * 1000)
-    # crea barra “de tick” mínima para mergear
-    incoming = [{"t": t, "o": series[-1]["c"] if series else price, "h": price, "l": price, "c": price, "v": 0.0}]
+    t_ms = int(now * 1000)
+    tfms = _tf_ms(tf)
+    new_bucket = _bucket_ts(t_ms, tfms)
+    last_bucket = _bucket_ts(series[-1]["t"], tfms) if series else None
+
+    # Si abre bucket nuevo → o = price (primer precio del bucket).
+    # Si es mismo bucket → el open no importa (no se usa en el merge), igual lo pasamos como el open vigente.
+    if series and new_bucket == last_bucket:
+        o_open = float(series[-1].get("o", price))
+    else:
+        o_open = float(price)
+
+    incoming = [{
+        "t": t_ms,
+        "o": o_open,
+        "h": float(price),
+        "l": float(price),
+        "c": float(price),
+        "v": 0.0,
+    }]
+
     changed = merge_bars_series(series, incoming, tf)
     st["series"] = series
-    _LAST_QUOTE_TICK[key] = now
     return changed > 0
+
 
 def _bucket_border_delay_ok(tf: str) -> bool:
     # evita sellar en los primeros N segundos del bucket actual
@@ -12036,14 +12074,14 @@ async def monitoreo_incremental():
 
         changed = changed or changed_by_reload
 
-        # 6) decide inc
+        EPS = 1  # ms
         if last_ts is None:
             inc = series_ms
+        elif last_server_t is not None and last_server_t > last_ts + EPS:
+            inc = [c for c in series_ms if c["t"] > last_ts]
         else:
-            if last_server_t is not None and last_server_t > last_ts:
-                inc = [c for c in series_ms if c["t"] > last_ts]
-            else:
-                inc = [last_server] if (changed and last_server_t == last_ts and last_server) else []
+            # si cambió la última y estamos en el mismo bucket (>=), mándala
+            inc = [last_server] if (changed and last_server_t and last_server_t >= last_ts - EPS) else []
 
         logging.info(
             f"INC {symbol} {timeframe} last_ts={last_ts} "
