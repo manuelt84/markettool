@@ -29,5 +29,6 @@ google-cloud-storage
 icalendar
 mplfinance
 easyocr
+pydantic>=1.10,<3
 
 --extra-index-url https://download.pytorch.org/whl/cu121

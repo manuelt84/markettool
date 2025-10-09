@@ -52,6 +52,7 @@ from typing import Any, Iterable, Mapping, Optional, Callable, Dict, Tuple, List
 from ultralytics import YOLO
 from urllib.parse import urlencode
 from uvicorn.config import LOGGING_CONFIG
+from pydantic import BaseModel  
 import aiofiles
 import asyncio
 import base64
@@ -241,6 +242,17 @@ RESAMPLE_PLAN: Dict[str, Tuple[str, str]] = {
     "4hour": ("1hour", "4h"),
 }
 EOD_RESAMPLE_RULE: Dict[str, str] = {"1week": "W", "1month": "M"}
+
+QUOTE_TTL = { "1min": 2, "5min": 2, "15min": 3, "30min": 5, "1hour": 5, "4hour": 5 }
+SYNC_TTL  = { "1min": 35, "5min": 150, "15min": 480, "30min": 900, "1hour": 1800, "4hour": 5400 }
+# Ventana de gracia (segundos) al inicio del bucket para evitar “sellar” demasiado pronto
+HIST_GRACE_S = {
+    "1min": 6, "5min": 8, "15min": 10, "30min": 12, "1hour": 15, "4hour": 20,
+}
+
+# últimos ticks por (exec,symbol,tf)
+_LAST_QUOTE_TICK: dict[tuple[str,str,str], float] = {}
+_LAST_SYNC:       dict[tuple[str,str,str], float] = {}
 
 @dataclass
 class FMPClient:
@@ -695,7 +707,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # Para httpx
 logging.getLogger("urllib3").setLevel(logging.WARNING)  # Para requests
 
 # API Key de FMP (Premium)
-API_KEY = (os.environ.get("API_FMP") or os.environ.get("FMP_API_KEY") or "").strip()
+API_KEY = (os.environ.get("API_FMP") or os.environ.get("API_FMP") or "").strip()
 if not API_KEY:
     raise RuntimeError("Falta API_FMP (o FMP_API_KEY) en el entorno/.env. Usa --env .env o define la variable antes de ejecutar.")
 db = firestore.Client()
@@ -2071,7 +2083,7 @@ async def subir_a_bucket_y_obtener_url(nombre_local, nombre_remoto=None, carpeta
     bucket_name = "markettool_bucket"  # 🔁 Reemplazar con el nombre real de tu bucket
 
     client = storage.Client()
-    bucket = client.bucket(bucket_name)
+    bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(f"{carpeta}/{nombre_remoto}")
     blob.upload_from_filename(nombre_local)
     blob.make_public()  # O usar signed_url si prefieres enlaces temporales
@@ -11125,10 +11137,1121 @@ async def initialize_bot():
         logger.info("Bot inicializado correctamente.")
     except Exception as e:
         logger.info(f"Error durante la inicialización del bot: {e}")
+
+
+BUCKET_NAME = "markettool_bucket"
+
+# Mapea los nombres de timeframe que te gustan en el app
+TIMEFRAME_MAP = {
+    "1min": "1min",
+    "5min": "5min",
+    "15min": "15min",
+    "30min": "30min",
+    "1hour": "1hour",
+    "1day": "1day",
+    "1week": "1week",
+}
+
+# -------------------------
+# Utilidades GCS
+# -------------------------
+
+# --- cache en memoria (compartido por proceso) ---
+_MON_CACHE_LOCK = threading.RLock()
+# estructura: { (exec_id, SYMBOL, timeframe): {"series": [candles], "dirty": False, "source": "gcs|memory", "ts_loaded": int} }
+_MON_CACHE: Dict[tuple, Dict[str, Any]] = {}
+
+# ---------- Helpers NO destructivos (solo definen si no existen) ----------
+
+def _gcs_exec_base(exec_id: str) -> str:
+    # Path base donde guardas los archivos del análisis (según tus capturas):
+    # gs://markettool_bucket/analisis/exec/<exec_id>/
+    return f"analisis/exec/{exec_id}/"
+
+def _gcs_file_name_for(symbol: str, timeframe: str) -> str:
+    # Usa los nombres que vi en tu bucket: BTCUSD_1min_enriched.json, etc.
+    tf_map = {
+        "1min": "1min",
+        "5min": "5min",
+        "15min": "15min",
+        "30min": "30min",
+        "1hour": "1hour",
+        "1day": "1day",
+        "4hour": "4hour",
+        "1week": "1week",
+    }
+    norm = tf_map.get(timeframe, timeframe)
+    return f"{symbol.upper()}_{norm}_enriched.json"
+
+
+def _download_json_from_gcs(path: str) -> Any:
+    client = storage.Client()
+    """
+    Lee un JSON de GCS (usando storage_client global si ya existe).
+    Retorna dict/list. Lanza excepción si falla.
+    """
+    # Requiere google-cloud-storage y que tengas storage_client global (ya suele existir en tu app).
+    bucket = client.bucket(BUCKET_NAME)
+    blob = bucket.blob(path)
+    data = blob.download_as_bytes()
+    return json.loads(data.decode("utf-8"))
+
+
+
+def _persist_if_needed(exec_id: str, symbol: str, timeframe: str, force: bool = False) -> Optional[str]:
+    client = storage.Client()
+    """
+    Persiste la cache a GCS si está 'dirty' o si force=True.
+    Retorna la ruta GCS escrita o None si no escribió.
+    """
+    key = (exec_id, symbol.upper(), timeframe)
+    with _MON_CACHE_LOCK:
+        state = _MON_CACHE.get(key)
+        if not state:
+            return None
+        if not state.get("dirty") and not force:
+            return None
+        # Serializa como la lista de velas (state["series"])
+        path = _gcs_stream_path(exec_id, symbol, timeframe)
+        payload = json.dumps(state["series"], ensure_ascii=False).encode("utf-8")
+        bucket = client.bucket(BUCKET_NAME)
+        blob = bucket.blob(path)
+        blob.upload_from_string(payload, content_type="application/json")
+        state["dirty"] = False
+        return path
+
+
+def _load_cache(exec_id: str, symbol: str, tf: str) -> dict:
+    key = (exec_id, symbol, tf)
+    with _MON_CACHE_LOCK:
+        if key in _MON_CACHE:
+            return _MON_CACHE[key]
+
+    # 1) intenta stream primero
+    stream_path = _gcs_stream_path(exec_id, symbol, tf)
+    if _gcs_exists(stream_path):
+        raw = _gcs_read_json(stream_path) or {"series": []}
+        data = _coerce_series_container(raw)
+        data["source"] = "stream"
+    else:
+        # 2) si no hay stream, cae a enriched
+        enriched_path = _gcs_enriched_path(exec_id, symbol, tf)
+        if _gcs_exists(enriched_path):
+            raw = _gcs_read_json(enriched_path) or {"series": []}
+            data = _coerce_series_container(raw)
+            data["source"] = "enriched"
+            # Promueve enriched->stream una única vez (para que el resto ya use stream)
+            try:
+                _ensure_stream_initialized(exec_id, symbol, tf, data)
+            except Exception:
+                pass
+        else:
+            data = {"series": [], "source": "empty"}
+
+    with _MON_CACHE_LOCK:
+        _MON_CACHE[key] = data
+    return data
+
+
+
+# ---------- Opcional: actualizar doc de monitoreo en Firestore ----------
+if "fs_touch_monitoreo" not in globals():
+    def fs_touch_monitoreo(exec_id: str, symbol: str, data: Dict[str, Any]) -> None:
+        try:
+            doc_id = f"{exec_id}__{symbol.upper()}"
+            ref = db.collection("monitoreos").document(doc_id)
+            cur = ref.get().to_dict() if ref.get().exists else {}
+            cur = cur or {}
+            cur.update(data)
+            cur["updated_at"] = int(time.time())
+            ref.set(cur, merge=True)
+        except Exception:
+            pass
+
+
+def _maybe_refresh_from_gcs(exec_id: str, symbol: str, timeframe: str, st: dict, max_age_s: int = 30):
+    try:
+        client = storage.Client()
+        for path in (
+            _gcs_stream_path(exec_id, symbol, timeframe),
+            f"{_gcs_exec_base(exec_id)}{_gcs_file_name_for(symbol, timeframe)}",
+        ):
+            bucket = client.bucket(BUCKET_NAME)
+            blob = bucket.blob(path)
+            if not blob.exists():
+                continue
+            blob.reload()
+            changed = (st.get("gcs_generation") != blob.generation) or \
+                      (st.get("gcs_updated", 0) < (blob.updated.timestamp() if blob.updated else 0))
+            too_old = (time.time() - st.get("ts_loaded", 0)) > max_age_s
+            if not (changed or too_old):
+                return
+            js = _download_json_from_gcs(path)
+            if isinstance(js, dict) and "series" in js and "candles" in js["series"]:
+                arr = js["series"]["candles"]
+            elif isinstance(js, dict) and "candles" in js:
+                arr = js["candles"]
+            elif isinstance(js, list):
+                arr = js
+            else:
+                arr = []
+            arr = [_normalize_candle(c) for c in arr if isinstance(c, dict)]
+            st.update({
+                "series": arr,
+                "gcs_path": path,
+                "gcs_generation": blob.generation,
+                "gcs_updated": blob.updated.timestamp() if blob.updated else time.time(),
+                "ts_loaded": time.time(),
+            })
+            return
+    except Exception:
+        pass
+
+
+
+
+def _to_ms(t):
+    """
+    Convierte múltiples formatos de tiempo a epoch ms.
+    Soporta:
+      - int/float en segundos o milisegundos
+      - str numérico o ISO ('YYYY-MM-DD HH:MM:SS' / 'YYYY-MM-DDTHH:MM:SSZ')
+      - Firestore Timestamp (objeto con .seconds/.nanoseconds o dict {'seconds','nanoseconds'})
+      - datetime (naive -> UTC, aware -> su tz)
+    Devuelve int ms o None si no puede convertir.
+    """
+    if t is None:
+        return None
+
+    # Firestore Timestamp objeto
+    try:
+        # google.cloud.firestore_v1._helpers.Timestamp o similares
+        if hasattr(t, "seconds") and hasattr(t, "nanoseconds"):
+            return int(t.seconds * 1000 + t.nanoseconds / 1_000_000)
+    except Exception:
+        pass
+
+    # Firestore Timestamp dict
+    if isinstance(t, dict) and ("seconds" in t or "nanoseconds" in t):
+        try:
+            seconds = int(t.get("seconds", 0))
+            nanos   = int(t.get("nanoseconds", 0))
+            return int(seconds * 1000 + nanos / 1_000_000)
+        except Exception:
+            return None
+
+    # datetime
+    if isinstance(t, datetime):
+        try:
+            dt = t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return None
+
+    # numérico (int/float)
+    if isinstance(t, (int, float)):
+        # Heurística: si es < 1e12 asumimos segundos, si no, milisegundos
+        ts = float(t)
+        return int(ts * 1000) if ts < 1_000_000_000_000 else int(ts)
+
+    # string
+    if isinstance(t, str):
+        s = t.strip()
+        # 1) numérico en string
+        try:
+            # permite floats en string
+            num = float(s)
+            return int(num * 1000) if num < 1_000_000_000_000 else int(num)
+        except Exception:
+            pass
+        # 2) ISO/fechas comunes
+        try:
+            # normaliza 'T' y 'Z'
+            s2 = s.replace("T", " ").replace("Z", "")
+            # formatos más comunes de FMP y otros
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(s2, fmt).replace(tzinfo=timezone.utc)
+                    return int(dt.timestamp() * 1000)
+                except Exception:
+                    continue
+            # última chance: fromisoformat (soporta fracciones de segundo)
+            try:
+                dt = datetime.fromisoformat(s2).replace(tzinfo=timezone.utc)
+                return int(dt.timestamp() * 1000)
+            except Exception:
+                pass
+        except Exception:
+            return None
+
+    # tipo no soportado
+    return None
+
+
+def _as_list(obj):
+    # Convierte cualquier iteración rara en lista simple
+    if obj is None:
+        return []
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, tuple):
+        return list(obj)
+    return [obj]
+
+def _coerce_series_container(js: Any) -> dict:
+    """
+    Normaliza lo que venga de GCS a un contenedor dict {'series': list}.
+    Acepta:
+      - list                      -> {'series': list}
+      - {'series': list}          -> idem
+      - {'candles': list}         -> {'series': list}
+      - {'series': {'candles': list}} -> {'series': list}
+      - cualquier otro            -> {'series': []}
+    """
+    try:
+        if isinstance(js, list):
+            return {"series": js}
+        if isinstance(js, dict):
+            if isinstance(js.get("series"), list):
+                return {"series": js["series"]}
+            if isinstance(js.get("candles"), list):
+                return {"series": js["candles"]}
+            if isinstance(js.get("series"), dict) and isinstance(js["series"].get("candles"), list):
+                return {"series": js["series"]["candles"]}
+    except Exception:
+        pass
+    return {"series": []}
+
+
+def _coerce_series(series_any) -> list:
+    """
+    Acepta múltiples formatos y devuelve SIEMPRE list[dict] con llaves {t,o,h,l,c,v?}.
+    Soporta:
+      - str con JSON
+      - dict con 'series' o 'candles'
+      - list de dicts ya normalizados
+      - list de dicts "simples" que solo tienen 't' y 'c'
+      - list de timestamps/strings (se convierte a [{'t': ts}])
+    """
+    try:
+        s = series_any
+        # 1) Si es string, intenta parsear JSON
+        if isinstance(s, str):
+            try:
+                s = json.loads(s)
+            except Exception:
+                # no es JSON válido → devolver lista vacía para no romper
+                return []
+
+        # 2) Si es dict que contiene 'series' o 'candles'
+        if isinstance(s, dict):
+            if "series" in s and isinstance(s["series"], dict) and "candles" in s["series"]:
+                s = s["series"]["candles"]
+            elif "series" in s and isinstance(s["series"], list):
+                s = s["series"]
+            elif "candles" in s and isinstance(s["candles"], list):
+                s = s["candles"]
+            else:
+                # dict sin estructura conocida → lista vacía
+                return []
+
+        # 3) Si es lista, normaliza cada item
+        s = _as_list(s)
+        out = []
+        for item in s:
+            if isinstance(item, dict):
+                # Clonar y dejar pasar las llaves reconocidas
+                t = item.get("t") if "t" in item else item.get("time") or item.get("timestamp")
+                if t is None:
+                    # a veces FMP trae 'date' ISO, conviértelo
+                    if "date" in item:
+                        try:
+                            t = _parse_iso_to_ms(str(item["date"]))
+                        except Exception:
+                            continue
+                d = {
+                    "t": t,
+                    "o": item.get("o", item.get("open")),
+                    "h": item.get("h", item.get("high")),
+                    "l": item.get("l", item.get("low")),
+                    "c": item.get("c", item.get("close")),
+                    "v": item.get("v", item.get("volume", 0)),
+                }
+                out.append(d)
+            else:
+                # si es un escalar (timestamp numérico o str), úsalo como 't'
+                try:
+                    ts = _to_ms(item)
+                    if ts is not None:
+                        out.append({"t": ts})
+                except Exception:
+                    continue
+        return out
+    except Exception:
+        return []
+
+
+def _series_to_ms(series_any):
+    """
+    Garantiza list[dict] y convierte 't' a ms, orden ascendente.
+    Ignora elementos sin 't' válido.
+    """
+    series = _coerce_series(series_any)
+    out = []
+    for c in (series or []):
+        t = _to_ms(c.get("t"))
+        if t is None:
+            continue
+        # clona y fija 't' en ms
+        cc = dict(c)
+        cc["t"] = t
+        out.append(cc)
+    out.sort(key=lambda x: x["t"])
+    return out
+
+
+_TF_MAP = {
+    "1m":"1min", "5m":"5min", "15m":"15min", "30m":"30min",
+    "1h":"1hour", "4h":"4hour", "1d":"1day", "1w":"1week",
+    "1min":"1min", "5min":"5min", "15min":"15min", "30min":"30min",
+    "1hour":"1hour", "4hour":"4hour", "1day":"1day", "1week":"1week",
+}
+def _norm_tf(tf):
+    tf = (tf or "").lower()
+    return _TF_MAP.get(tf, tf)
+
+
+_TF_MAP_MS = {
+    "1min":  ("1min",   60_000),
+    "5min":  ("5min",  5*60_000),
+    "15min": ("15min",15*60_000),
+    "30min": ("30min",30*60_000),
+    "1hour": ("1hour",60*60_000),
+    "4hour": ("4hour",4*60*60_000),  # si decides soportarlo
+}
+
+
+def _parse_iso_to_ms(s: str) -> int:
+    """Convierte ISO (FMP 'date') a epoch ms."""
+    # FMP devuelve '2024-09-30 15:45:00' (UTC) o a veces con 'T'/'Z'
+    s = s.replace("T", " ").replace("Z", "")
+    # asume UTC
+    dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+def _normalize_fmp_bars(raw: list) -> list:
+    """Normaliza barras FMP -> [{'t','o','h','l','c','v'}] en orden ascendente."""
+    out = []
+    for r in (raw or []):
+        try:
+            t = _parse_iso_to_ms(str(r.get("date")))
+            o = float(r.get("open", 0))
+            h = float(r.get("high", 0))
+            l = float(r.get("low",  0))
+            c = float(r.get("close",0))
+            v = float(r.get("volume",0))
+            out.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v})
+        except Exception:
+            continue
+    # FMP suele venir en orden descendente; lo dejamos ascendente
+    out.sort(key=lambda x: x["t"])
+    return out
+
+def _fmp_hist_chart_url(symbol: str, fmp_interval: str) -> str:
+    # Endpoint clásico de FMP (válido para acciones y muchas cripto/forex soportadas por su API)
+    return f"https://financialmodelingprep.com/api/v3/historical-chart/{fmp_interval}/{symbol}"
+
+def fetch_fmp_candles(symbol: str, timeframe: str, since_ms: int) -> list:
+    """
+    Llama a FMP y devuelve velas normalizadas > since_ms.
+    - NO expone FMP a clientes (solo server-side).
+    - Rate limit/backoff simple.
+    """
+    if not API_KEY:
+        logging.warning("API_KEY no configurado; se omite top-up.")
+        return []
+
+    fmp_interval, _ = _TF_MAP_MS.get(timeframe, (None, None))
+    if not fmp_interval:
+        logging.warning(f"Timeframe {timeframe} no soportado para FMP.")
+        return []
+
+    url = _fmp_hist_chart_url(symbol, fmp_interval)
+    params = {"apikey": API_KEY}
+    tries = 0
+    while tries < 3:
+        tries += 1
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code == 429:
+                # rate limit: espera exponencial y reintenta
+                time.sleep(1.5 * tries)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            bars = _normalize_fmp_bars(data)
+            # filtra solo > since_ms
+            return [b for b in bars if b["t"] > since_ms]
+        except requests.RequestException as e:
+            logging.warning(f"FMP request error (try {tries}): {e}")
+            time.sleep(1.0 * tries)
+        except Exception as e:
+            logging.warning(f"FMP parse error (try {tries}): {e}")
+            time.sleep(0.8 * tries)
+    return []
+
+def _merge_incremental(series: list, new_bars: list) -> int:
+    """
+    Merge ordenado por 't' sin duplicados. Devuelve cuántas barras se agregaron.
+    Asume series está en orden ascendente.
+    """
+    if not new_bars:
+        return 0
+    added = 0
+    last_t = series[-1]["t"] if series else -1
+    for b in new_bars:
+        t = b["t"]
+        if t <= last_t:
+            # si quieres reemplazar la última (misma t) con una más completa, podrías:
+            # if t == last_t: series[-1] = b
+            continue
+        series.append(b)
+        last_t = t
+        added += 1
+    return added
+
+def fetch_fmp_candles_seed(symbol: str, timeframe: str) -> list:
+    """
+    Pide a FMP las velas recientes (sin filtro), normaliza y devuelve en formato [{'t','o','h','l','c','v'}].
+    Úsalo para 'sembrar' cuando la serie está vacía.
+    """
+    if not API_KEY:
+        logging.warning("API_KEY no configurado; seed omitido.")
+        return []
+
+    fmp_interval, _ = _TF_MAP_MS.get(timeframe, (None, None))
+    if not fmp_interval:
+        logging.warning(f"Timeframe {timeframe} no soportado para FMP (seed).")
+        return []
+
+    url = _fmp_hist_chart_url(symbol, fmp_interval)
+    params = {"apikey": API_KEY}
+    tries = 0
+    while tries < 3:
+        tries += 1
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code in (402, 429):
+                # 402: plan insuficiente; 429: rate limit
+                logging.warning(f"FMP seed {symbol} {timeframe} HTTP {r.status_code}: {r.text[:120]}")
+                time.sleep(1.5 * tries)
+                continue
+            r.raise_for_status()
+            return _normalize_fmp_bars(r.json())
+        except requests.RequestException as e:
+            logging.warning(f"FMP seed request error (try {tries}): {e}")
+            time.sleep(1.0 * tries)
+        except Exception as e:
+            logging.warning(f"FMP seed parse error (try {tries}): {e}")
+            time.sleep(0.8 * tries)
+    return []
+
+
+def _topup_with_fmp_if_needed(cache: dict, symbol: str, timeframe: str, seed_bars: int = 180) -> int:
+    """
+    Si no hay serie, 'siembra' con un lookback corto (seed_bars) desde FMP.
+    Si hay serie, trae solo lo nuevo > last_ms.
+    Marca cache['dirty']=True si agregó.
+    """
+    try:
+        series = cache.get("series") or []
+        # Asegura orden ascendente
+        series.sort(key=lambda x: x["t"]) if series else None
+
+        if not series:
+            # --------- caso "stream" vacío: siembra ---------
+            # Pedimos a FMP sin filtro de fecha; FMP devuelve las más recientes (desc).
+            # Luego nos quedamos con las últimas 'seed_bars' en ascendente.
+            raw = fetch_fmp_candles_seed(symbol, timeframe)  # ver func nueva abajo
+            if not raw:
+                return 0
+            raw.sort(key=lambda x: x["t"])
+            seeded = raw[-seed_bars:]
+            cache["series"] = seeded
+            cache["dirty"]  = True
+            return len(seeded)
+
+        # --------- caso normal: incremental ---------
+        last_ms = series[-1]["t"]
+        new_bars = fetch_fmp_candles(symbol, timeframe, since_ms=last_ms)
+        added = _merge_incremental(series, new_bars)
+        if added:
+            cache["series"] = series
+            cache["dirty"] = True
+        return added
+
+    except Exception as e:
+        logging.warning(f"_topup_with_fmp_if_needed error: {e}")
+        return 0
+
+
+_FLUSHER_STARTED = False
+
+async def _stream_flusher_loop(interval_s: int = 30):
+    while True:
+        try:
+            with _MON_CACHE_LOCK:
+                items = list(_MON_CACHE.items())
+            for (exec_id, sym, tf), st in items:
+                if st.get("dirty"):
+                    await asyncio.to_thread(_persist_if_needed, exec_id, sym, tf, False)
+        except Exception as e:
+            logging.warning(f"stream flusher error: {e}")
+        await asyncio.sleep(interval_s)
+
+def _ensure_flusher_started():
+    global _FLUSHER_STARTED
+    if _FLUSHER_STARTED:
+        return
+    _FLUSHER_STARTED = True
+    loop = asyncio.get_event_loop()
+    loop.create_task(_stream_flusher_loop(30))  # cada 30s
+
+
+def _ensure_flusher_started_once_from_handler():
+    global _FLUSHER_STARTED
+    if _FLUSHER_STARTED:
+        return
+    _FLUSHER_STARTED = True
+    try:
+        # si ya hay loop corriendo (async view), programa la tarea directo
+        asyncio.get_running_loop()
+        asyncio.create_task(_stream_flusher_loop(30))
+    except RuntimeError:
+        # no hay loop corriendo aquí (entorno sync) → programa sobre el loop por defecto
+        loop = asyncio.get_event_loop()
+        loop.create_task(_stream_flusher_loop(30))
+
+
+# ---------- paths ----------
+def _gcs_enriched_path(exec_id: str, symbol: str, tf: str) -> str:
+    # gs://markettool_bucket/analisis/exec/{exec_id}/{SYMBOL}_{TF}_enriched.json
+    return f"analisis/exec/{exec_id}/{symbol}_{tf}_enriched.json"
+
+def _gcs_stream_path(exec_id: str, symbol: str, tf: str) -> str:
+    return f"analisis/stream/{exec_id}/{symbol}_{tf}.json"
+
+# ---------- IO ----------
+def _gcs_exists(path: str) -> bool:
+    return gcs_blob_exists(BUCKET_NAME, path)  # usa tu helper real
+
+def _gcs_read_json(path: str) -> dict:
+    return read_json_from_gcs(BUCKET_NAME, path)  # usa tu helper real
+
+def _gcs_write_json(path: str, obj: dict):
+    write_json_to_gcs(BUCKET_NAME, path, obj)  # usa tu helper real
+
+
+def _ensure_stream_initialized(exec_id: str, symbol: str, tf: str, st: dict):
+    """
+    Si NO existe stream, intenta copiar enriched -> stream UNA sola vez.
+    'st' es el state in-memory (series ya cargada); si viene vacío, lee enriched y lo copia.
+    """
+    stream_path = _gcs_stream_path(exec_id, symbol, tf)
+    if _gcs_exists(stream_path):
+        return  # ya existe
+
+    enriched_path = _gcs_enriched_path(exec_id, symbol, tf)
+    if not _gcs_exists(enriched_path):
+        # no hay enriched, no podemos inicializar (lo dejará vacío)
+        return
+
+    data = st if st and isinstance(st, dict) else {"series": []}
+    series = data.get("series") if isinstance(data.get("series"), list) else []
+    _gcs_write_json(stream_path, series)  # << stream guarda SOLO la lista
+
+
+def _tf_ms(tf: str) -> int:
+    return {
+        "1min": 60_000, "5min": 5*60_000, "15min": 15*60_000,
+        "30min": 30*60_000, "1hour": 60*60_000, "4hour": 4*60*60_000
+    }.get(tf, 60_000)
+
+def _bucket_ts(ts_ms: int, tf_ms: int) -> int:
+    return (ts_ms // tf_ms) * tf_ms
+
+def merge_bars_series(series: list, incoming: list, tf: str) -> int:
+    """Actualiza última vela si cae en el mismo bucket; agrega si es nueva."""
+    if not incoming:
+        return 0
+    tfms = _tf_ms(tf)
+    changed = 0
+    if series:
+        series.sort(key=lambda x: x["t"])
+    for b in incoming:
+        t  = int(b["t"])
+        o,h,l,c = float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"])
+        v  = float(b.get("v", 0))
+        if not series:
+            series.append({"t": _bucket_ts(t, tfms), "o": o, "h": h, "l": l, "c": c, "v": v})
+            changed += 1
+            continue
+        last = series[-1]
+        last_bucket = _bucket_ts(last["t"], tfms)
+        b_bucket    = _bucket_ts(t, tfms)
+        if b_bucket == last_bucket:
+            last["h"] = max(last["h"], h)
+            last["l"] = min(last["l"], l)
+            last["c"] = c
+            last["v"] = max(last.get("v", 0), v)
+            changed += 1
+        elif b_bucket > last_bucket:
+            series.append({"t": b_bucket, "o": o, "h": h, "l": l, "c": c, "v": v})
+            changed += 1
+    return changed
+
+
+def _fmp_interval(tf: str) -> str:
+    return {"1min":"1min","5min":"5min","15min":"15min","30min":"30min","1hour":"1hour","4hour":"4hour"}.get(tf,"1min")
+
+def _fetch_quote(symbol: str) -> Optional[float]:
+    """Intenta stable/quote (forex), fallback a v3/quote. Devuelve last price."""
+    if not API_KEY:
+        return None
+    try:
+        # 1) estable/realtime (forex)
+        url1 = f"https://financialmodelingprep.com/stable/quote?symbol={symbol}&apikey={API_KEY}"
+        r = requests.get(url1, timeout=8)
+        if r.ok:
+            arr = r.json() or []
+            if isinstance(arr, list) and arr:
+                p = arr[0].get("price") or arr[0].get("last") or arr[0].get("bid") or arr[0].get("ask")
+                if p: return float(p)
+        # 2) fallback v3
+        url2 = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={API_KEY}"
+        r = requests.get(url2, timeout=8)
+        if r.ok:
+            arr = r.json() or []
+            if isinstance(arr, list) and arr:
+                p = arr[0].get("price") or arr[0].get("previousClose") or arr[0].get("dayHigh")
+                if p: return float(p)
+    except Exception:
+        pass
+    return None
+
+def _fetch_historical(symbol: str, tf: str) -> list[dict]:
+    """Barras recientes para sellar/ajustar."""
+    if not API_KEY:
+        return []
+    try:
+        iv = _fmp_interval(tf)
+        url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}?apikey={API_KEY}"
+        r = requests.get(url, timeout=10)
+        if not r.ok:
+            return []
+        arr = r.json() or []
+        # FMP devuelve más reciente primero, normaliza
+        out = []
+        for x in reversed(arr[-120:]):  # limita
+            # x = {date:'2025-10-08 14:01:00', open, high, low, close, volume}
+            try:
+                dt = x.get("date") or x.get("timestamp")
+                # convierte a ms (UTC)
+                if isinstance(dt, str):
+                    ts = int(datetime.datetime.fromisoformat(dt.replace("Z","")).timestamp() * 1000)
+                else:
+                    ts = int(float(dt) * 1000)
+                out.append({
+                    "t": ts, "o": float(x["open"]), "h": float(x["high"]),
+                    "l": float(x["low"]), "c": float(x["close"]), "v": float(x.get("volume",0))
+                })
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+def _maybe_tick_quote(exec_id: str, symbol: str, tf: str, st: dict) -> bool:
+    """Usa quote para mover la última vela (cada TTL). Devuelve True si hubo cambios."""
+    key = (exec_id, symbol, tf)
+    now = time.time()
+    ttl = QUOTE_TTL.get(tf, 3)
+    last = _LAST_QUOTE_TICK.get(key, 0)
+    if now - last < ttl:
+        return False
+    price = _fetch_quote(symbol)
+    if price is None:
+        _LAST_QUOTE_TICK[key] = now
+        return False
+    series = st.get("series") or []
+    t = int(time.time() * 1000)
+    # crea barra “de tick” mínima para mergear
+    incoming = [{"t": t, "o": series[-1]["c"] if series else price, "h": price, "l": price, "c": price, "v": 0.0}]
+    changed = merge_bars_series(series, incoming, tf)
+    st["series"] = series
+    _LAST_QUOTE_TICK[key] = now
+    return changed > 0
+
+def _bucket_border_delay_ok(tf: str) -> bool:
+    # evita sellar en los primeros N segundos del bucket actual
+    delay = HIST_GRACE_S.get(tf, 5)
+    now = time.time()
+    tfms = _tf_ms(tf) / 1000.0
+    # segundos transcurridos desde el inicio del bucket actual
+    s_into_bucket = now % (tfms)
+    return s_into_bucket > delay
+
+def _maybe_sync_historical(exec_id: str, symbol: str, tf: str, st: dict) -> bool:
+    key = (exec_id, symbol, tf)
+    now = time.time()
+    ttl = SYNC_TTL.get(tf, 60)
+    last = _LAST_SYNC.get(key, 0)
+    if now - last < ttl:
+        return False
+    if not _bucket_border_delay_ok(tf):
+        return False
+    bars = _fetch_historical(symbol, tf)
+    if not bars:
+        _LAST_SYNC[key] = now
+        return False
+    changed = merge_bars_series(st.get("series") or [], bars, tf)
+    _LAST_SYNC[key] = now
+    return changed > 0
+
+
+# ---- Exists ----
+def gcs_blob_exists(bucket_name: str, path: str) -> bool:
+    """
+    Verifica si existe un blob en GCS.
+    """
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(path)
+        return blob.exists()
+    except Exception:
+        return False
+
+
+# ---- Read JSON ----
+def read_json_from_gcs(bucket_name: str, path: str) -> Any:
+    """
+    Lee un JSON (UTF-8) desde GCS y lo parsea.
+    Retorna list/dict o {} si falla.
+    """
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(path)
+        if not blob.exists():
+            return {}
+        data = blob.download_as_bytes()
+        # Si algún día subes gz, aquí podrías detectar y descomprimir
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+# ---- Write JSON ----
+def write_json_to_gcs(bucket_name: str, path: str, obj: Any, content_type: str = "application/json") -> Optional[str]:
+    """
+    Escribe un objeto como JSON (UTF-8) en GCS.
+    Devuelve la generación (o None) si algo falla.
+    """
+    try:
+        payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        client =  storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(path)
+        blob.upload_from_string(payload, content_type=content_type)
+        # Devuelve la generación para control de cambios
+        blob.reload()  # actualiza metadata local
+        return str(blob.generation) if getattr(blob, "generation", None) else None
+    except Exception:
+        return None
+
+# ==========================
+#  ENDPOINTS
+# ==========================
+@webhook_app.route("/monitoreo/incremental", methods=["POST"])
+async def monitoreo_incremental():
+    try:
+        body = request.get_json(force=True) or {}
+        user_id  = str(body.get("user_id") or "").strip()
+        exec_id  = str(body.get("exec_id") or "").strip()
+        symbol   = str(body.get("symbol") or "").strip().upper()
+        timeframe = _norm_tf(body.get("timeframe"))
+        last_ts  = body.get("last_ts")
+        persist  = bool(body.get("persist", False))
+
+        if not user_id:  return jsonify({"status":"error","message":"user_id es obligatorio"}), 400
+        if not exec_id:  return jsonify({"status":"error","message":"exec_id es obligatorio"}), 400
+        if not symbol or not timeframe:
+            return jsonify({"status":"error","message":"symbol y timeframe son obligatorios"}), 400
+
+        # 1) carga/refresh
+        st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
+
+        # --- guarda snapshot de la última vela ANTES del refresh ---
+        prev_series_ms = _series_to_ms(st.get("series", []))
+        prev_last = prev_series_ms[-1] if prev_series_ms else None
+
+        age = {"1min":20, "5min":60, "15min":180, "30min":360, "1hour":900, "4hour":1800}.get(timeframe, 60)
+        await asyncio.to_thread(_maybe_refresh_from_gcs, exec_id, symbol, timeframe, st, age)
+
+        # 2) asegura stream inicializado
+        await asyncio.to_thread(_ensure_stream_initialized, exec_id, symbol, timeframe, st)
+
+        # 3) normaliza last_ts
+        try:
+            last_ts = int(last_ts) if last_ts is not None else None
+        except Exception:
+            last_ts = None
+
+        # 4) tick/sync (baratos)
+        changed = False
+        try:
+            if _maybe_tick_quote(exec_id, symbol, timeframe, st):
+                changed = True
+            if _maybe_sync_historical(exec_id, symbol, timeframe, st):
+                changed = True
+        except Exception:
+            pass
+
+        # 5) serie final y comparación de contenido
+        series_ms = _series_to_ms(st.get("series", []))
+        with _MON_CACHE_LOCK:
+            st["series"] = series_ms
+
+        last_server_t = series_ms[-1]["t"] if series_ms else None
+        last_server = series_ms[-1] if series_ms else None
+
+        # detecta cambio de contenido en misma vela (mismo t, OHLCV distintos)
+        changed_by_reload = False
+        if prev_last and last_server and last_server_t == prev_last["t"]:
+            for k in ("o","h","l","c","v"):
+                if float(last_server.get(k, 0)) != float(prev_last.get(k, 0)):
+                    changed_by_reload = True
+                    break
+
+        changed = changed or changed_by_reload
+
+        # 6) decide inc
+        if last_ts is None:
+            inc = series_ms
+        else:
+            if last_server_t is not None and last_server_t > last_ts:
+                inc = [c for c in series_ms if c["t"] > last_ts]
+            else:
+                inc = [last_server] if (changed and last_server_t == last_ts and last_server) else []
+
+        logging.info(
+            f"INC {symbol} {timeframe} last_ts={last_ts} "
+            f"last_server_t={last_server_t} changed={changed} -> inc_len={len(inc)}"
+        )
+
+        # 7) persist opcional
+        if changed or persist:
+            with _MON_CACHE_LOCK:
+                st["dirty"] = True
+            await asyncio.to_thread(_persist_if_needed, exec_id, symbol, timeframe, True)
+
+        # 6) heartbeat + estado por TF
+        await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
+            "estado": "running",
+            "last_ts_served": (inc[-1]["t"] if inc else last_ts),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "user_id": user_id,
+            # <<< per TF >>>
+            "tf_states": {
+                timeframe: {
+                    "estado": "running",
+                    "last_ts": (inc[-1]["t"] if inc else last_ts),
+                    "count_served": len(inc),
+                    "updated_at": int(time.time()*1000),
+                }
+            }
+        })
+
+        resp = {
+            "status": "ok",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "exec_id": exec_id,
+            "from_ts": (inc[0]["t"] if inc else last_ts),
+            "to_ts": (inc[-1]["t"] if inc else last_ts),
+            "candles": inc,
+        }
+        
+        return jsonify(resp), 200
+
+    except Exception as e:
+        logging.exception("Error en /monitoreo/incremental")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@webhook_app.route("/monitoreo/describe", methods=["GET"])
+def monitoreo_describe():
+    exec_id = request.args.get("exec_id","").strip()
+    symbol  = request.args.get("symbol","").strip().upper()
+    if not exec_id or not symbol:
+        return jsonify({"status":"error","message":"exec_id y symbol son obligatorios"}), 400
+    doc = db.collection("monitoreos").document(f"{exec_id}__{symbol}").get()
+    data = doc.to_dict() or {}
+    return jsonify({"status":"ok","doc": data}), 200
+
+
+
+@webhook_app.route("/monitoreo/resume", methods=["GET"])
+async def monitoreo_resume():
+    """
+    GET /monitoreo/resume?symbol=BTCUSD&timeframe=1min&exec_id=xxxx
+    Respuesta: { status, symbol, timeframe, exec_id, last_ts (ms), count, source }
+    """
+    try:
+        symbol = str((request.args.get("symbol") or "")).strip().upper()
+        timeframe = _norm_tf(request.args.get("timeframe"))
+        exec_id = str((request.args.get("exec_id") or "")).strip()
+        if not symbol or not timeframe or not exec_id:
+            return jsonify({"status":"error","message":"symbol, timeframe y exec_id son obligatorios"}), 400
+
+        st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
+        series_ms = _series_to_ms(st.get("series", []))
+        last_ts = series_ms[-1]["t"] if series_ms else None
+
+        # Heartbeat lightweight
+        await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
+            "estado": "idle",
+            "symbol": symbol, "timeframe": timeframe
+        })
+
+        return jsonify({
+            "status":"ok",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "exec_id": exec_id,
+            "last_ts": last_ts,
+            "count": len(series_ms),
+            "source": st.get("source","unknown"),
+        }), 200
+    except Exception as e:
+        logging.exception("Error en /monitoreo/resume")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+
+@webhook_app.route("/monitoreo/history", methods=["POST"])
+async def monitoreo_history():
+    """
+    POST /monitoreo/history
+    Body {
+      user_id: str,
+      exec_id: str,
+      symbol: str,
+      timeframe: "1min"|"5min"|...|"1hour",
+      limit?: int = 600,
+      from_ts?: int (ms),
+      to_ts?: int (ms),
+      persist?: bool
+    }
+    Respuesta: {
+      status, symbol, timeframe, exec_id,
+      from_ts, to_ts, count, candles, persisted_path?
+    }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+
+        user_id   = str(body.get("user_id") or "").strip()
+        exec_id   = str(body.get("exec_id") or "").strip()
+        symbol    = str(body.get("symbol")  or "").strip().upper()
+        timeframe = _norm_tf(body.get("timeframe"))
+
+        limit     = body.get("limit", 600)
+        from_ts   = body.get("from_ts", None)   # epoch ms
+        to_ts     = body.get("to_ts", None)     # epoch ms
+        persist   = bool(body.get("persist", False))
+
+        if not user_id:
+            return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
+        if not exec_id:
+            return jsonify({"status": "error", "message": "exec_id es obligatorio"}), 400
+        if not symbol or not timeframe:
+            return jsonify({"status": "error", "message": "symbol y timeframe son obligatorios"}), 400
+
+        try:
+            limit = int(limit)
+        except Exception:
+            limit = 600
+        limit = max(1, min(limit, 5000))
+
+        # Carga cache y normaliza a ms
+        st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
+        age = {"1min": 20, "5min": 60, "15min": 180, "30min": 360, "1hour": 900, "4hour": 1800}.get(timeframe, 60)
+        await asyncio.to_thread(_maybe_refresh_from_gcs, exec_id, symbol, timeframe, st, age)
+        series_ms = _series_to_ms(st.get("series", []))
+
+        # Filtrado por ventana (en ms si viene)
+        if from_ts is not None:
+            try: from_ts = int(from_ts)
+            except Exception: from_ts = None
+        if to_ts is not None:
+            try: to_ts = int(to_ts)
+            except Exception: to_ts = None
+
+        if from_ts is not None or to_ts is not None:
+            lo = float("-inf") if from_ts is None else from_ts
+            hi = float("inf")  if to_ts   is None else to_ts
+            filt = [c for c in series_ms if lo <= c["t"] <= hi]
+        else:
+            filt = series_ms
+
+        # Aplica límite (últimas N) preservando orden ascendente
+        if limit and len(filt) > limit:
+            filt = filt[-limit:]
+
+        from_out = filt[0]["t"] if filt else from_ts
+        to_out   = filt[-1]["t"] if filt else to_ts
+
+        # Persistencia opcional
+        persisted = None
+        if persist:
+            with _MON_CACHE_LOCK:
+                st["dirty"] = True
+            persisted = await asyncio.to_thread(_persist_if_needed, exec_id, symbol, timeframe, True)
+
+        # Heartbeat
+        await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
+            "estado": "history",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "user_id": user_id,
+            "count_served": len(filt),
+            "last_ts_served": (filt[-1]["t"] if filt else None),
+        })
+
+        resp = {
+            "status": "ok",
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "exec_id": exec_id,
+            "from_ts": from_out,
+            "to_ts": to_out,
+            "count": len(filt),
+            "candles": filt,
+        }
+        if persisted:
+            resp["persisted_path"] = f"gs://{BUCKET_NAME}/{persisted}"
+        return jsonify(resp), 200
+
+    except Exception as e:
+        logging.exception("Error en /monitoreo/history")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
         
 
-@webhook_app.route('/analisis/ejecutar', methods=['POST'])
-#@profile
 @webhook_app.route('/analisis/ejecutar', methods=['POST'])
 #@profile
 async def ejecutar_analisis_desde_app():
