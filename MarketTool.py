@@ -243,16 +243,12 @@ RESAMPLE_PLAN: Dict[str, Tuple[str, str]] = {
 }
 EOD_RESAMPLE_RULE: Dict[str, str] = {"1week": "W", "1month": "M"}
 
-QUOTE_TTL = { "1min": 2, "5min": 2, "15min": 3, "30min": 5, "1hour": 5, "4hour": 5 }
-SYNC_TTL  = { "1min": 35, "5min": 150, "15min": 480, "30min": 900, "1hour": 1800, "4hour": 5400 }
-# Ventana de gracia (segundos) al inicio del bucket para evitar “sellar” demasiado pronto
-HIST_GRACE_S = {
-    "1min": 6, "5min": 8, "15min": 10, "30min": 12, "1hour": 15, "4hour": 20,
-}
+HIST_GRACE_S = {"1min": 5, "5min": 5, "15min": 8, "30min": 10, "1hour": 15, "4hour": 20}
+QUOTE_TTL    = {"1min": 3, "5min": 5, "15min": 10, "30min": 15, "1hour": 20, "4hour": 30}
+SYNC_TTL     = {"1min": 60, "5min": 120, "15min": 240, "30min": 300, "1hour": 600, "4hour": 1200}
 
-# últimos ticks por (exec,symbol,tf)
-_LAST_QUOTE_TICK: dict[tuple[str,str,str], float] = {}
-_LAST_SYNC:       dict[tuple[str,str,str], float] = {}
+_LAST_QUOTE_TICK: Dict[tuple, float] = {}  # (exec_id, symbol, tf) -> epoch_s
+_LAST_SYNC: Dict[tuple, float] = {}
 
 @dataclass
 class FMPClient:
@@ -11259,20 +11255,17 @@ def _load_cache(exec_id: str, symbol: str, tf: str) -> dict:
     return data
 
 
-
-# ---------- Opcional: actualizar doc de monitoreo en Firestore ----------
-if "fs_touch_monitoreo" not in globals():
-    def fs_touch_monitoreo(exec_id: str, symbol: str, data: Dict[str, Any]) -> None:
-        try:
-            doc_id = f"{exec_id}__{symbol.upper()}"
-            ref = db.collection("monitoreos").document(doc_id)
-            cur = ref.get().to_dict() if ref.get().exists else {}
-            cur = cur or {}
-            cur.update(data)
-            cur["updated_at"] = int(time.time())
-            ref.set(cur, merge=True)
-        except Exception:
-            pass
+def fs_touch_monitoreo(exec_id: str, symbol: str, data: Dict[str, Any]) -> None:
+    try:
+        doc_id = f"{exec_id}__{symbol.upper()}"
+        ref = db.collection("monitoreos").document(doc_id)
+        cur = ref.get().to_dict() if ref.get().exists else {}
+        cur = cur or {}
+        cur.update(data)
+        cur["updated_at"] = int(time.time())
+        ref.set(cur, merge=True)
+    except Exception:
+        pass
 
 
 def _maybe_refresh_from_gcs(exec_id: str, symbol: str, timeframe: str, st: dict, max_age_s: int = 30):
@@ -11301,9 +11294,9 @@ def _maybe_refresh_from_gcs(exec_id: str, symbol: str, timeframe: str, st: dict,
                 arr = js
             else:
                 arr = []
-            arr = [_normalize_candle(c) for c in arr if isinstance(c, dict)]
+            norm = _series_to_ms(arr)
             st.update({
-                "series": arr,
+                "series": norm,
                 "gcs_path": path,
                 "gcs_generation": blob.generation,
                 "gcs_updated": blob.updated.timestamp() if blob.updated else time.time(),
@@ -11527,16 +11520,6 @@ def _norm_tf(tf):
     return _TF_MAP.get(tf, tf)
 
 
-_TF_MAP_MS = {
-    "1min":  ("1min",   60_000),
-    "5min":  ("5min",  5*60_000),
-    "15min": ("15min",15*60_000),
-    "30min": ("30min",30*60_000),
-    "1hour": ("1hour",60*60_000),
-    "4hour": ("4hour",4*60*60_000),  # si decides soportarlo
-}
-
-
 def _parse_iso_to_ms(s: str) -> int:
     """Convierte ISO (FMP 'date') a epoch ms."""
     # FMP devuelve '2024-09-30 15:45:00' (UTC) o a veces con 'T'/'Z'
@@ -11563,182 +11546,8 @@ def _normalize_fmp_bars(raw: list) -> list:
     out.sort(key=lambda x: x["t"])
     return out
 
-def _fmp_hist_chart_url(symbol: str, fmp_interval: str) -> str:
-    # Endpoint clásico de FMP (válido para acciones y muchas cripto/forex soportadas por su API)
-    logging.info(f"MTORO4 URL: https://financialmodelingprep.com/api/v3/historical-chart/{fmp_interval}/{symbol}")
-    return f"https://financialmodelingprep.com/api/v3/historical-chart/{fmp_interval}/{symbol}"
-
-def fetch_fmp_candles(symbol: str, timeframe: str, since_ms: int) -> list:
-    """
-    Llama a FMP y devuelve velas normalizadas > since_ms.
-    - NO expone FMP a clientes (solo server-side).
-    - Rate limit/backoff simple.
-    """
-    if not API_KEY:
-        logging.warning("API_KEY no configurado; se omite top-up.")
-        return []
-
-    fmp_interval, _ = _TF_MAP_MS.get(timeframe, (None, None))
-    if not fmp_interval:
-        logging.warning(f"Timeframe {timeframe} no soportado para FMP.")
-        return []
-
-    url = _fmp_hist_chart_url(symbol, fmp_interval)
-    params = {"apikey": API_KEY}
-    tries = 0
-    while tries < 3:
-        tries += 1
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            if r.status_code == 429:
-                # rate limit: espera exponencial y reintenta
-                time.sleep(1.5 * tries)
-                continue
-            r.raise_for_status()
-            data = r.json()
-            bars = _normalize_fmp_bars(data)
-            # filtra solo > since_ms
-            return [b for b in bars if b["t"] > since_ms]
-        except requests.RequestException as e:
-            logging.warning(f"FMP request error (try {tries}): {e}")
-            time.sleep(1.0 * tries)
-        except Exception as e:
-            logging.warning(f"FMP parse error (try {tries}): {e}")
-            time.sleep(0.8 * tries)
-    return []
-
-def _merge_incremental(series: list, new_bars: list) -> int:
-    """
-    Merge ordenado por 't' sin duplicados. Devuelve cuántas barras se agregaron.
-    Asume series está en orden ascendente.
-    """
-    if not new_bars:
-        return 0
-    added = 0
-    last_t = series[-1]["t"] if series else -1
-    for b in new_bars:
-        t = b["t"]
-        if t <= last_t:
-            # si quieres reemplazar la última (misma t) con una más completa, podrías:
-            # if t == last_t: series[-1] = b
-            continue
-        series.append(b)
-        last_t = t
-        added += 1
-    return added
-
-def fetch_fmp_candles_seed(symbol: str, timeframe: str) -> list:
-    """
-    Pide a FMP las velas recientes (sin filtro), normaliza y devuelve en formato [{'t','o','h','l','c','v'}].
-    Úsalo para 'sembrar' cuando la serie está vacía.
-    """
-    if not API_KEY:
-        logging.warning("API_KEY no configurado; seed omitido.")
-        return []
-
-    fmp_interval, _ = _TF_MAP_MS.get(timeframe, (None, None))
-    if not fmp_interval:
-        logging.warning(f"Timeframe {timeframe} no soportado para FMP (seed).")
-        return []
-
-    url = _fmp_hist_chart_url(symbol, fmp_interval)
-    params = {"apikey": API_KEY}
-    tries = 0
-    while tries < 3:
-        tries += 1
-        try:
-            r = requests.get(url, params=params, timeout=20)
-            if r.status_code in (402, 429):
-                # 402: plan insuficiente; 429: rate limit
-                logging.warning(f"FMP seed {symbol} {timeframe} HTTP {r.status_code}: {r.text[:120]}")
-                time.sleep(1.5 * tries)
-                continue
-            r.raise_for_status()
-            return _normalize_fmp_bars(r.json())
-        except requests.RequestException as e:
-            logging.warning(f"FMP seed request error (try {tries}): {e}")
-            time.sleep(1.0 * tries)
-        except Exception as e:
-            logging.warning(f"FMP seed parse error (try {tries}): {e}")
-            time.sleep(0.8 * tries)
-    return []
-
-
-def _topup_with_fmp_if_needed(cache: dict, symbol: str, timeframe: str, seed_bars: int = 180) -> int:
-    """
-    Si no hay serie, 'siembra' con un lookback corto (seed_bars) desde FMP.
-    Si hay serie, trae solo lo nuevo > last_ms.
-    Marca cache['dirty']=True si agregó.
-    """
-    try:
-        series = cache.get("series") or []
-        # Asegura orden ascendente
-        series.sort(key=lambda x: x["t"]) if series else None
-
-        if not series:
-            # --------- caso "stream" vacío: siembra ---------
-            # Pedimos a FMP sin filtro de fecha; FMP devuelve las más recientes (desc).
-            # Luego nos quedamos con las últimas 'seed_bars' en ascendente.
-            raw = fetch_fmp_candles_seed(symbol, timeframe)  # ver func nueva abajo
-            if not raw:
-                return 0
-            raw.sort(key=lambda x: x["t"])
-            seeded = raw[-seed_bars:]
-            cache["series"] = seeded
-            cache["dirty"]  = True
-            return len(seeded)
-
-        # --------- caso normal: incremental ---------
-        last_ms = series[-1]["t"]
-        new_bars = fetch_fmp_candles(symbol, timeframe, since_ms=last_ms)
-        added = _merge_incremental(series, new_bars)
-        if added:
-            cache["series"] = series
-            cache["dirty"] = True
-        return added
-
-    except Exception as e:
-        logging.warning(f"_topup_with_fmp_if_needed error: {e}")
-        return 0
-
 
 _FLUSHER_STARTED = False
-
-async def _stream_flusher_loop(interval_s: int = 30):
-    while True:
-        try:
-            with _MON_CACHE_LOCK:
-                items = list(_MON_CACHE.items())
-            for (exec_id, sym, tf), st in items:
-                if st.get("dirty"):
-                    await asyncio.to_thread(_persist_if_needed, exec_id, sym, tf, False)
-        except Exception as e:
-            logging.warning(f"stream flusher error: {e}")
-        await asyncio.sleep(interval_s)
-
-def _ensure_flusher_started():
-    global _FLUSHER_STARTED
-    if _FLUSHER_STARTED:
-        return
-    _FLUSHER_STARTED = True
-    loop = asyncio.get_event_loop()
-    loop.create_task(_stream_flusher_loop(30))  # cada 30s
-
-
-def _ensure_flusher_started_once_from_handler():
-    global _FLUSHER_STARTED
-    if _FLUSHER_STARTED:
-        return
-    _FLUSHER_STARTED = True
-    try:
-        # si ya hay loop corriendo (async view), programa la tarea directo
-        asyncio.get_running_loop()
-        asyncio.create_task(_stream_flusher_loop(30))
-    except RuntimeError:
-        # no hay loop corriendo aquí (entorno sync) → programa sobre el loop por defecto
-        loop = asyncio.get_event_loop()
-        loop.create_task(_stream_flusher_loop(30))
-
 
 # ---------- paths ----------
 def _gcs_enriched_path(exec_id: str, symbol: str, tf: str) -> str:
@@ -11876,7 +11685,7 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
                 dt = x.get("date") or x.get("timestamp")
                 # convierte a ms (UTC)
                 if isinstance(dt, str):
-                    ts = int(datetime.datetime.fromisoformat(dt.replace("Z","")).timestamp() * 1000)
+                    ts = int(datetime.fromisoformat(dt.replace("Z","")).timestamp() * 1000)
                 else:
                     ts = int(float(dt) * 1000)
                 out.append({
@@ -11927,33 +11736,6 @@ def _maybe_tick_quote(exec_id: str, symbol: str, tf: str, st: dict) -> bool:
 
     changed = merge_bars_series(series, incoming, tf)
     st["series"] = series
-    return changed > 0
-
-
-def _bucket_border_delay_ok(tf: str) -> bool:
-    # evita sellar en los primeros N segundos del bucket actual
-    delay = HIST_GRACE_S.get(tf, 5)
-    now = time.time()
-    tfms = _tf_ms(tf) / 1000.0
-    # segundos transcurridos desde el inicio del bucket actual
-    s_into_bucket = now % (tfms)
-    return s_into_bucket > delay
-
-def _maybe_sync_historical(exec_id: str, symbol: str, tf: str, st: dict) -> bool:
-    key = (exec_id, symbol, tf)
-    now = time.time()
-    ttl = SYNC_TTL.get(tf, 60)
-    last = _LAST_SYNC.get(key, 0)
-    if now - last < ttl:
-        return False
-    if not _bucket_border_delay_ok(tf):
-        return False
-    bars = _fetch_historical(symbol, tf)
-    if not bars:
-        _LAST_SYNC[key] = now
-        return False
-    changed = merge_bars_series(st.get("series") or [], bars, tf)
-    _LAST_SYNC[key] = now
     return changed > 0
 
 
@@ -12008,6 +11790,295 @@ def write_json_to_gcs(bucket_name: str, path: str, obj: Any, content_type: str =
     except Exception:
         return None
 
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _tfms(tf: str) -> int:
+    return _tf_ms(tf)
+
+def _bucket_start(ts_ms: int, tfms: int) -> int:
+    return (ts_ms // tfms) * tfms
+
+def _current_bucket_start(tfms: int) -> int:
+    return _bucket_start(_now_ms(), tfms)
+
+def _prefer(a: dict, b: dict) -> dict:
+    """
+    Elige la mejor vela para un bucket:
+    - Prefiere la que tenga v>0 (histórico) sobre v=0 (tick).
+    - A igualdad de v, quédate con la más "completa" (max(h), min(l)) y el último close.
+    """
+    if (a.get("v",0) > 0) and (b.get("v",0) == 0): return a
+    if (b.get("v",0) > 0) and (a.get("v",0) == 0): return b
+    # combinar envolvente, close del más nuevo
+    o = a.get("o", b.get("o"))
+    h = max(float(a.get("h", o)), float(b.get("h", o)), float(o))
+    l = min(float(a.get("l", o)), float(b.get("l", o)), float(o))
+    c = float(b.get("c", a.get("c", o)))  # último close
+    v = float(a.get("v",0)) + float(b.get("v",0))  # suma (tick-volume + histórico si aplica)
+    return {"t": a["t"], "o": float(o), "h": h, "l": l, "c": c, "v": v}
+
+def _snap_and_dedupe_to_minutes(series: list[dict], tf: str) -> list[dict]:
+    """
+    - 'Snapea' todo t al inicio de bucket.
+    - Dedup por bucket conservando la mejor vela (prefer histórico con v>0).
+    - Ordena ascendente.
+    """
+    if not series: return []
+    tfms = _tfms(tf)
+    by_bucket = {}
+    for c in series:
+        t = _bucket_start(int(c["t"]), tfms)
+        norm = {"t": t, "o": float(c["o"]), "h": float(c["h"]), "l": float(c["l"]), "c": float(c["c"]), "v": float(c.get("v",0))}
+        if t in by_bucket:
+            by_bucket[t] = _prefer(by_bucket[t], norm)
+        else:
+            by_bucket[t] = norm
+    out = list(by_bucket.values())
+    out.sort(key=lambda x: x["t"])
+    return out
+
+def _densify_minutes(series: list[dict], tf: str, max_fill:int = 10, max_gap_minutes:int = 10) -> list[dict]:
+    """
+    Rellena SOLO huecos pequeños (<= max_gap_minutes) y como mucho max_fill velas sintéticas.
+    No toca el bucket en curso. Asume series ordenada y bucketizada.
+    """
+    if not series:
+        return series
+
+    tfms = _tf_ms(tf)
+    cur_bucket = _current_bucket_start(tfms)
+    out = [series[0]]
+    filled = 0
+
+    for i in range(1, len(series)):
+        prev = out[-1]
+        cur  = series[i]
+        expected = prev["t"] + tfms
+
+        # si el hueco es grande, lo dejamos para historical
+        gap_minutes = (cur["t"] - prev["t"]) // tfms
+        if gap_minutes > max_gap_minutes:
+            out.append(cur)
+            continue
+
+        while expected < cur["t"] and expected < cur_bucket and filled < max_fill:
+            cprev = float(prev["c"])
+            out.append({"t": expected, "o": cprev, "h": cprev, "l": cprev, "c": cprev, "v": 0.0})
+            expected += tfms
+            prev = out[-1]
+            filled += 1
+
+        out.append(cur)
+
+    return out
+
+def _overlay_historical_for_closed(series: list[dict], hist: list[dict], tf: str) -> list[dict]:
+    """
+    Reemplaza (o crea) los buckets ya CERRADOS usando barras de historical (que suelen traer v>0).
+    Mantiene la vela del bucket en curso tal como estaba (tick).
+    """
+    if not series: return series
+    tfms = _tfms(tf)
+    cur_bucket = _current_bucket_start(tfms)
+    # index por bucket
+    s_map = {c["t"]: dict(c) for c in series}
+    for b in (hist or []):
+        t = _bucket_start(int(b["t"]), tfms)
+        if t >= cur_bucket:
+            continue  # no sobreescribas el bucket vigente
+        cand = {"t": t, "o": float(b["o"]), "h": float(b["h"]), "l": float(b["l"]), "c": float(b["c"]), "v": float(b.get("v",0))}
+        if t in s_map:
+            s_map[t] = _prefer(s_map[t], cand)
+        else:
+            s_map[t] = cand
+    out = list(s_map.values())
+    out.sort(key=lambda x: x["t"])
+    return out
+
+def _closed_signature(series: list[dict], tf: str) -> tuple:
+    """
+    Firma barata de 'buckets cerrados' para detectar cambios reales tras overlay/backfill.
+    Devuelve (count_closed, last_closed_ts, checksum_int)
+    """
+    if not series:
+        return (0, None, 0)
+    tfms = _tf_ms(tf)
+    cur_bucket = _current_closed_bucket_start(tf)
+    count = 0
+    last_t = None
+    checksum = 0
+    for c in series:
+        t = int(c["t"])
+        if t >= cur_bucket:
+            break
+        count += 1
+        last_t = t
+        # checksum liviano y determinista
+        # redondeo para evitar ruido por floats
+        o = int(round(float(c.get("o", 0))*1e5))
+        h = int(round(float(c.get("h", 0))*1e5))
+        l = int(round(float(c.get("l", 0))*1e5))
+        v = int(round(float(c.get("v", 0))*1e2))
+        checksum = (checksum * 1315423911 + t + o + h + l + v) & 0xFFFFFFFF
+    return (count, last_t, checksum)
+
+
+def _ms_to_iso(ms: int) -> str:
+    return datetime.utcfromtimestamp(ms/1000.0).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _current_closed_bucket_start(tf: str) -> int:
+    tfms = _tf_ms(tf)
+    now_bucket = (_now_ms() // tfms) * tfms
+    return now_bucket  # este es el inicio del bucket en curso; 'cerrados' son < now_bucket
+
+
+def _backfill_large_gap(series: list[dict], symbol: str, tf: str, max_minutes:int = 10_000) -> int:
+    """
+    Si hay un hueco grande entre la última vela y la primera barra de 'hist' corto,
+    trae el histórico por RANGO (from/to) y mergea. Devuelve cuántas velas se agregaron o reemplazaron.
+    - Respeta buckets cerrados (no toca el bucket en curso).
+    - Acota el rango máximo a max_minutes para no abusar.
+    """
+    if not series:
+        return 0
+    tfms = _tf_ms(tf)
+    cur_bucket = _current_closed_bucket_start(tf)
+    last_t = int(series[-1]["t"])
+    # solo rellenamos hasta el último bucket CERRADO (no tocamos el en curso)
+    to_fill_ms = min(cur_bucket - tfms, _now_ms() - tfms)
+    if to_fill_ms <= last_t + tfms:
+        return 0  # no hay nada que rellenar
+
+    gap_minutes = int((to_fill_ms - last_t) // tfms)
+    if gap_minutes <= 1:
+        return 0
+    # límite para no pedir rangos enormes en una sola llamada
+    cap_ms = last_t + min(gap_minutes, max_minutes) * tfms
+    to_ms = min(to_fill_ms, cap_ms)
+
+    rng = _fetch_historical_range(symbol, tf, last_t + tfms, to_ms)
+    if not rng:
+        return 0
+
+    # merge ordenado por bucket
+    # como rng viene en ascendente normalizado {t,o,h,l,c,v}, reutilizamos merge_bars_series
+    added = merge_bars_series(series, rng, tf)
+    if added:
+        # aseguremos bucketización + dedup por si habían duplicados
+        series[:] = _snap_and_dedupe_to_minutes(series, tf)
+    return added
+
+
+def _ms_to_iso_utc(ts_ms: int) -> str:
+    # "YYYY-MM-DD HH:MM:SS" en UTC (formato que acepta FMP en historical-chart)
+    return datetime.utcfromtimestamp(ts_ms/1000).strftime("%Y-%m-%d %H:%M:%S")
+
+def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> list[dict]:
+    """
+    Descarga historical-chart con from/to (si el plan lo soporta) y normaliza ascendente.
+    Si falla (402/429 o similar), devuelve []
+    """
+    if not API_KEY:
+        return []
+    try:
+        iv = _fmp_interval(tf)
+        # defensivo: acotar rangos absurdos
+        if to_ms <= from_ms:
+            return []
+        # FMP acepta "from" y "to" como string ISO UTC
+        url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}"
+        params = {
+            "apikey": API_KEY,
+            "from": _ms_to_iso_utc(from_ms),
+            "to":   _ms_to_iso_utc(to_ms)
+        }
+        logging.info(f"MTORO10 url: {url}")
+        r = requests.get(url, params=params, timeout=20)
+        if not r.ok:
+            return []
+        return _normalize_fmp_bars(r.json())
+    except Exception:
+        return []
+
+
+def _fmp_hist_with_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> list[dict]:
+    if not API_KEY: 
+        return []
+    iv = _fmp_interval(tf)
+    def _to_iso(ms: int) -> str:
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(ms/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}"
+    params = {"apikey": API_KEY, "from": _to_iso(from_ms), "to": _to_iso(to_ms)}
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if not r.ok:
+            return []
+        return _normalize_fmp_bars(r.json())  # ya devuelve ascendente
+    except Exception:
+        return []
+
+
+def _detect_closed_gaps(series: list[dict], tf: str) -> list[tuple[int, int]]:
+    """
+    Lista los huecos entre buckets YA CERRADOS: [(from_ms, to_ms)].
+    La serie debe venir snap/dedup y ordenada.
+    """
+    if not series:
+        return []
+    tfms = _tf_ms(tf)
+    cur_bucket = _current_bucket_start(tfms)
+    gaps = []
+    for i in range(1, len(series)):
+        a = series[i-1]["t"]
+        b = series[i]["t"]
+        if b >= cur_bucket:
+            break  # no miramos gaps que toquen el bucket en curso
+        delta = (b - a) // tfms
+        if delta > 1:
+            from_ms = a + tfms
+            to_ms   = b
+            gaps.append((from_ms, to_ms))
+    return gaps
+
+
+def _backfill_gaps_with_fmp(series: list[dict], symbol: str, tf: str, max_iters: int = 2) -> int:
+    """
+    Rellena huecos INTERNOS usando historical-chart con from/to.
+    Itera un par de veces por si se encadenan.
+    Devuelve cantidad de velas agregadas.
+    """
+    if not series:
+        return 0
+    added_total = 0
+    for _ in range(max_iters):
+        # asegurar base “limpia”
+        s = _snap_and_dedupe_to_minutes(series, tf)
+        gaps = _detect_closed_gaps(s, tf)
+        if not gaps:
+            break
+        tfms = _tf_ms(tf)
+        for (from_ms, to_ms) in gaps:
+            # si el gap es gigante, divide la petición en 2 para no abusar
+            if (to_ms - from_ms) // tfms > 10_000:
+                mid = from_ms + (5_000 * tfms)
+                bars = (_fmp_hist_with_range(symbol, tf, from_ms, mid) or []) + \
+                       (_fmp_hist_with_range(symbol, tf, mid + tfms, to_ms) or [])
+            else:
+                bars = _fmp_hist_with_range(symbol, tf, from_ms, to_ms)
+            if not bars:
+                continue
+            bars.sort(key=lambda x: x["t"])
+            merge_bars_series(s, bars, tf)
+
+        s = _snap_and_dedupe_to_minutes(s, tf)
+        grown = max(0, len(s) - len(series))
+        added_total += grown
+        series[:] = s  # in-place
+    return added_total
+
 # ==========================
 #  ENDPOINTS
 # ==========================
@@ -12027,81 +12098,100 @@ async def monitoreo_incremental():
         if not symbol or not timeframe:
             return jsonify({"status":"error","message":"symbol y timeframe son obligatorios"}), 400
 
-        # 1) carga/refresh
+        # 0) carga/refresh base
         st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
-
-        # --- guarda snapshot de la última vela ANTES del refresh ---
         prev_series_ms = _series_to_ms(st.get("series", []))
         prev_last = prev_series_ms[-1] if prev_series_ms else None
 
         age = {"1min":20, "5min":60, "15min":180, "30min":360, "1hour":900, "4hour":1800}.get(timeframe, 60)
         await asyncio.to_thread(_maybe_refresh_from_gcs, exec_id, symbol, timeframe, st, age)
-
-        # 2) asegura stream inicializado
         await asyncio.to_thread(_ensure_stream_initialized, exec_id, symbol, timeframe, st)
 
-        # 3) normaliza last_ts
-        try:
+        # 1) normaliza last_ts
+        try: 
             last_ts = int(last_ts) if last_ts is not None else None
-        except Exception:
+        except:
             last_ts = None
 
-        # 4) tick/sync (baratos)
-        changed = False
+        # 2) SNAP + DEDUP base de trabajo
+        base_ms = _series_to_ms(st.get("series", []))
+        base_ms = _snap_and_dedupe_to_minutes(base_ms, timeframe)
+
+        # >>> firma de 'cerrados' ANTES (sobre base_ms real, no prev_series_ms)
+        before_sig = _closed_signature(base_ms, timeframe)
+
+        # 3) overlay histórico corto para buckets CERRADOS (corrige velas sin volumen del tick)
+        hist = _fetch_historical(symbol, timeframe)
+        if hist:
+            base_ms = _overlay_historical_for_closed(base_ms, hist, timeframe)
+
+        # 3.b) backfill por RANGO si hay gap grande entre lo último y la primera de hist
+        if base_ms and hist:
+            tfms = _tf_ms(timeframe)
+            # OJO: tu _fetch_historical devuelve lista ascendente (por tu normalización)
+            first_hist_t = hist[0]["t"]
+            if first_hist_t > base_ms[-1]["t"] + tfms:
+                added = _backfill_large_gap(base_ms, symbol, timeframe)
+                if added:
+                    base_ms = _snap_and_dedupe_to_minutes(base_ms, timeframe)
+
+        # 4) densificar SOLO huecos chicos (temporal, no toca el bucket en curso)
+        base_ms = _densify_minutes(base_ms, timeframe, max_fill=10, max_gap_minutes=10)
+
+        # >>> firma de 'cerrados' DESPUÉS
+        after_sig = _closed_signature(base_ms, timeframe)
+
+        # 5) tick del minuto en curso (realtime) para que el último bucket “respire”
         try:
-            if _maybe_tick_quote(exec_id, symbol, timeframe, st):
-                changed = True
-            if _maybe_sync_historical(exec_id, symbol, timeframe, st):
-                changed = True
+            if _maybe_tick_quote(exec_id, symbol, timeframe, {"series": base_ms}):
+                base_ms = _snap_and_dedupe_to_minutes(base_ms, timeframe)
         except Exception:
             pass
 
-        # 5) serie final y comparación de contenido
-        series_ms = _series_to_ms(st.get("series", []))
+        # 6) actualiza estado en memoria
         with _MON_CACHE_LOCK:
-            st["series"] = series_ms
+            st["series"] = base_ms
 
-        last_server_t = series_ms[-1]["t"] if series_ms else None
-        last_server = series_ms[-1] if series_ms else None
+        # --- cálculo de INC
+        last_server_t = base_ms[-1]["t"] if base_ms else None
+        last_server = base_ms[-1] if base_ms else None
 
-        # detecta cambio de contenido en misma vela (mismo t, OHLCV distintos)
+        # detecta cambio en misma vela
         changed_by_reload = False
         if prev_last and last_server and last_server_t == prev_last["t"]:
             for k in ("o","h","l","c","v"):
-                if float(last_server.get(k, 0)) != float(prev_last.get(k, 0)):
+                if float(last_server.get(k,0)) != float(prev_last.get(k,0)):
                     changed_by_reload = True
                     break
 
-        changed = changed or changed_by_reload
+        changed = changed_by_reload or (not prev_last and bool(last_server)) or (prev_last and last_server and last_server_t > prev_last["t"])
 
-        EPS = 1  # ms
+        EPS = 1
         if last_ts is None:
-            inc = series_ms
+            inc = base_ms
         elif last_server_t is not None and last_server_t > last_ts + EPS:
-            inc = [c for c in series_ms if c["t"] > last_ts]
+            inc = [c for c in base_ms if c["t"] > last_ts]
         else:
-            # si cambió la última y estamos en el mismo bucket (>=), mándala
             inc = [last_server] if (changed and last_server_t and last_server_t >= last_ts - EPS) else []
 
-        logging.info(
-            f"INC {symbol} {timeframe} last_ts={last_ts} "
-            f"last_server_t={last_server_t} changed={changed} -> inc_len={len(inc)}"
-        )
+        logging.info(f"INC {symbol} {timeframe} last_ts={last_ts} last_server_t={last_server_t} changed={changed} -> inc_len={len(inc)}")
 
-        # 7) persist opcional
-        if changed or persist:
+        # 7) Persistencia
+        new_bucket_started = bool(prev_last and last_server and last_server["t"] > prev_last["t"])
+        changed_closed = (before_sig != after_sig)
+        if changed or changed_closed:
             with _MON_CACHE_LOCK:
                 st["dirty"] = True
+        if new_bucket_started or persist or changed_closed:
             await asyncio.to_thread(_persist_if_needed, exec_id, symbol, timeframe, True)
 
-        # 6) heartbeat + estado por TF
+        # 8) Heartbeat + estado por TF
         await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
             "estado": "running",
             "last_ts_served": (inc[-1]["t"] if inc else last_ts),
             "symbol": symbol,
             "timeframe": timeframe,
             "user_id": user_id,
-            # <<< per TF >>>
             "tf_states": {
                 timeframe: {
                     "estado": "running",
@@ -12112,7 +12202,7 @@ async def monitoreo_incremental():
             }
         })
 
-        resp = {
+        return jsonify({
             "status": "ok",
             "symbol": symbol,
             "timeframe": timeframe,
@@ -12120,13 +12210,13 @@ async def monitoreo_incremental():
             "from_ts": (inc[0]["t"] if inc else last_ts),
             "to_ts": (inc[-1]["t"] if inc else last_ts),
             "candles": inc,
-        }
-        
-        return jsonify(resp), 200
+        }), 200
 
     except Exception as e:
         logging.exception("Error en /monitoreo/incremental")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
 
 
 @webhook_app.route("/monitoreo/describe", methods=["GET"])
@@ -12287,8 +12377,6 @@ async def monitoreo_history():
         logging.exception("Error en /monitoreo/history")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-
-        
 
 @webhook_app.route('/analisis/ejecutar', methods=['POST'])
 #@profile
