@@ -52,7 +52,8 @@ from typing import Any, Iterable, Mapping, Optional, Callable, Dict, Tuple, List
 from ultralytics import YOLO
 from urllib.parse import urlencode
 from uvicorn.config import LOGGING_CONFIG
-from pydantic import BaseModel  
+from pydantic import BaseModel
+from zoneinfo import ZoneInfo
 import aiofiles
 import asyncio
 import base64
@@ -316,11 +317,22 @@ class FMPClient:
         if r.status_code != 200: return pd.DataFrame()
         payload = r.json() or {}; hist = payload.get("historical") or []
         if not hist: return pd.DataFrame()
+
         df = pd.DataFrame(hist)
         if "date" not in df.columns: return pd.DataFrame()
+
         cols = [c for c in ["date","open","high","low","close","volume"] if c in df.columns]
         df = df[cols].copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(pytz.UTC)
+
+        ny = ZoneInfo("America/New_York")
+        dt_day =  pd.to_datetime(df["date"], errors="coerce")
+
+        df["date"] = (
+        dt_day.dt.tz_localize(ny)
+              .dt.tz_convert("UTC")
+              .dt.normalize() + pd.Timedelta(hours=20)
+              )
+              
         df = df.dropna(subset=["date"]).set_index("date").sort_index()
         for c in ["open","high","low","close","volume"]:
             if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -11154,6 +11166,53 @@ TIMEFRAME_MAP = {
     "1week": "1week",
 }
 
+_LAST_INTERNAL_GAP_ATTEMPT = {}  # dict[(symbol, tf, from_ms, to_ms)] = epoch_s
+_INTERNAL_GAP_COOLDOWN_S = {
+    "1min": 90, "5min": 180, "15min": 240, "30min": 300, "1hour": 600, "4hour": 900,
+}
+
+_BACKFILL_IN_FLIGHT = set()  # set([(symbol, tf)])
+
+_LAST_BACKFILL_EMPTY = {}  # dict[(symbol, tf)] = (from_ms, to_ms, epoch_s)
+_EMPTY_SUPPRESS_S = 60
+
+
+_LAST_RANGE_BACKFILL_ATTEMPT = {}  # {(symbol, tf): epoch_s}
+_LAST_BACKFILL_ATTEMPT = {}   # dict[ (symbol, tf) ] -> epoch_seconds
+_LAST_BACKFILL_RANGE   = {}   # dict[ (symbol, tf) ] -> (from_ms, to_ms)
+
+_BACKFILL_COOLDOWN_S = {
+    "1min": 180,  # 3 min
+    "5min": 300,
+    "15min": 600,
+    "30min": 900,
+    "1hour": 1200,
+    "4hour": 1800,
+}
+_MAX_BACKFILL_BARS = {
+    "1min": 1500,  # limita tamaño de cada rango para evitar timeouts
+    "5min": 1500,
+    "15min": 1500,
+    "30min": 1500,
+    "1hour": 1500,
+    "4hour": 1500,
+}
+
+_FLUSHER_STARTED = False
+
+from contextlib import contextmanager
+@contextmanager
+def _backfill_guard(symbol: str, tf: str):
+    key = (symbol, tf)
+    if key in _BACKFILL_IN_FLIGHT:
+        yield False
+        return
+    _BACKFILL_IN_FLIGHT.add(key)
+    try:
+        yield True
+    finally:
+        _BACKFILL_IN_FLIGHT.discard(key)
+
 # -------------------------
 # Utilidades GCS
 # -------------------------
@@ -11202,10 +11261,6 @@ def _download_json_from_gcs(path: str) -> Any:
 
 def _persist_if_needed(exec_id: str, symbol: str, timeframe: str, force: bool = False) -> Optional[str]:
     client = storage.Client()
-    """
-    Persiste la cache a GCS si está 'dirty' o si force=True.
-    Retorna la ruta GCS escrita o None si no escribió.
-    """
     key = (exec_id, symbol.upper(), timeframe)
     with _MON_CACHE_LOCK:
         state = _MON_CACHE.get(key)
@@ -11213,18 +11268,27 @@ def _persist_if_needed(exec_id: str, symbol: str, timeframe: str, force: bool = 
             return None
         if not state.get("dirty") and not force:
             return None
-        # Serializa como la lista de velas (state["series"])
         path = _gcs_stream_path(exec_id, symbol, timeframe)
         payload = json.dumps(state["series"], ensure_ascii=False).encode("utf-8")
         bucket = client.bucket(BUCKET_NAME)
         blob = bucket.blob(path)
         blob.upload_from_string(payload, content_type="application/json")
+        blob.reload()
         state["dirty"] = False
+        # >>> reflejar metadata para que _maybe_refresh_from_gcs no re-baje de inmediato
+        state["gcs_path"] = path
+        try:
+            state["gcs_generation"] = blob.generation
+            state["gcs_updated"] = blob.updated.timestamp() if blob.updated else time.time()
+        except Exception:
+            state["gcs_updated"] = time.time()
+        state["ts_loaded"] = time.time()
         return path
 
 
+
 def _load_cache(exec_id: str, symbol: str, tf: str) -> dict:
-    key = (exec_id, symbol, tf)
+    key = (exec_id, symbol.upper(), tf)
     with _MON_CACHE_LOCK:
         if key in _MON_CACHE:
             return _MON_CACHE[key]
@@ -11295,12 +11359,22 @@ def _maybe_refresh_from_gcs(exec_id: str, symbol: str, timeframe: str, st: dict,
             else:
                 arr = []
             norm = _series_to_ms(arr)
+
+            prev = st.get("series") or []
+            if prev:
+                merged = _snap_and_dedupe_to_minutes(prev + norm, timeframe)  # usa tu tf actual si lo tienes en alcance
+                st_series = merged
+            else:
+                st_series = norm
+
+            src = "stream" if path.endswith(f"{symbol}_{timeframe}.json") else "enriched"
             st.update({
-                "series": norm,
+                "series": st_series,
                 "gcs_path": path,
                 "gcs_generation": blob.generation,
                 "gcs_updated": blob.updated.timestamp() if blob.updated else time.time(),
                 "ts_loaded": time.time(),
+                "source": src
             })
             return
     except Exception:
@@ -11465,7 +11539,7 @@ def _coerce_series(series_any) -> list:
                     # a veces FMP trae 'date' ISO, conviértelo
                     if "date" in item:
                         try:
-                            t = _parse_iso_to_ms(str(item["date"]))
+                            t = _parse_fmp_datetime_to_ms(str(item["date"]))
                         except Exception:
                             continue
                 d = {
@@ -11520,34 +11594,25 @@ def _norm_tf(tf):
     return _TF_MAP.get(tf, tf)
 
 
-def _parse_iso_to_ms(s: str) -> int:
-    """Convierte ISO (FMP 'date') a epoch ms."""
-    # FMP devuelve '2024-09-30 15:45:00' (UTC) o a veces con 'T'/'Z'
-    s = s.replace("T", " ").replace("Z", "")
-    # asume UTC
-    dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
-
 def _normalize_fmp_bars(raw: list) -> list:
     """Normaliza barras FMP -> [{'t','o','h','l','c','v'}] en orden ascendente."""
     out = []
     for r in (raw or []):
         try:
-            t = _parse_iso_to_ms(str(r.get("date")))
+            t = _parse_fmp_datetime_to_ms(str(r.get("date")))
             o = float(r.get("open", 0))
             h = float(r.get("high", 0))
             l = float(r.get("low",  0))
             c = float(r.get("close",0))
             v = float(r.get("volume",0))
+            # Ajuste de envolvente por robustez
+            h = max(h, o, c); l = min(l, o, c)
             out.append({"t": t, "o": o, "h": h, "l": l, "c": c, "v": v})
         except Exception:
             continue
     # FMP suele venir en orden descendente; lo dejamos ascendente
     out.sort(key=lambda x: x["t"])
     return out
-
-
-_FLUSHER_STARTED = False
 
 # ---------- paths ----------
 def _gcs_enriched_path(exec_id: str, symbol: str, tf: str) -> str:
@@ -11597,42 +11662,50 @@ def _bucket_ts(ts_ms: int, tf_ms: int) -> int:
     return (ts_ms // tf_ms) * tf_ms
 
 def merge_bars_series(series: list, incoming: list, tf: str) -> int:
-    """Actualiza última vela si cae en el mismo bucket; agrega si es nueva."""
+    """Mergea por bucket en toda la serie y retorna cuántos BUCKETS NUEVOS se agregaron."""
     if not incoming:
         return 0
+
     tfms = _tf_ms(tf)
-    changed = 0
-    if series:
-        series.sort(key=lambda x: x["t"])
+
+    def _norm(c):
+        b = _bucket_ts(int(c["t"]), tfms)
+        o = float(c["o"]); h = float(c["h"]); l = float(c["l"]); c_ = float(c["c"]); v = float(c.get("v", 0))
+        # Envolvente básica por si llega OHLC “degenerado”
+        h = max(h, o, c_)
+        l = min(l, o, c_)
+        return {"t": b, "o": o, "h": h, "l": l, "c": c_, "v": v}
+
+    # --- claves (buckets) que ya existen ANTES del merge
+    old_keys = set()
+    by_bucket = {}
+
+    for c in series or []:
+        nc = _norm(c)
+        t  = nc["t"]
+        old_keys.add(t)
+        by_bucket[t] = _prefer(by_bucket[t], nc) if t in by_bucket else nc
+
+    # merge del incoming
     for b in incoming:
-        t  = int(b["t"])
-        o,h,l,c = float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"])
-        v  = float(b.get("v", 0))
-        if not series:
-            series.append({"t": _bucket_ts(t, tfms), "o": o, "h": h, "l": l, "c": c, "v": v})
-            changed += 1
+        try:
+            nb = _norm(b)
+        except Exception:
             continue
-        last = series[-1]
-        last_bucket = _bucket_ts(last["t"], tfms)
-        b_bucket    = _bucket_ts(t, tfms)
-        if b_bucket == last_bucket:
-            last["h"] = max(float(last["h"]), float(h), float(last.get("o", h)), float(c))
-            last["l"] = min(float(last["l"]), float(l), float(last.get("o", l)), float(c))
-            last["c"] = float(c)
-            last["v"] = float(last.get("v", 0) or 0) + float(v or 0)
-            changed += 1
-        elif b_bucket > last_bucket:
-            o,h_,l_,c_ = float(o), float(h), float(l), float(c)
-            series.append({
-                "t": b_bucket,
-                "o": o,
-                "h": max(h_, o, c_),
-                "l": min(l_, o, c_),
-                "c": c_,
-                "v": float(v),
-            })
-            changed += 1
-    return changed
+        t = nb["t"]
+        by_bucket[t] = _prefer(by_bucket[t], nb) if t in by_bucket else nb
+
+    # reconstruye lista ordenada
+    new_series = list(by_bucket.values())
+    new_series.sort(key=lambda x: x["t"])
+
+    # --- cuántos buckets NUEVOS aparecen tras el merge
+    new_keys = set(x["t"] for x in new_series)
+    added_count = len(new_keys - old_keys)
+
+    # escribe in-place y regresa conteo real
+    series[:] = new_series
+    return added_count
 
 
 def _fmp_interval(tf: str) -> str:
@@ -11666,7 +11739,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
     return None
 
 def _fetch_historical(symbol: str, tf: str) -> list[dict]:
-    """Barras recientes para sellar/ajustar."""
+    """Barras recientes para sellar/ajustar (toma las MÁS NUEVAS correctamente)."""
     if not API_KEY:
         return []
     try:
@@ -11677,26 +11750,31 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
         if not r.ok:
             return []
         arr = r.json() or []
-        # FMP devuelve más reciente primero, normaliza
+        # FMP devuelve MÁS RECIENTE primero → tomar las N MÁS NUEVAS con [:N]
+        arr = arr[:120]  # <-- no usar [-120:]
         out = []
-        for x in reversed(arr[-120:]):  # limita
-            # x = {date:'2025-10-08 14:01:00', open, high, low, close, volume}
+        for x in reversed(arr):  # y ahora sí a ascendente (viejo → nuevo)
             try:
                 dt = x.get("date") or x.get("timestamp")
-                # convierte a ms (UTC)
                 if isinstance(dt, str):
-                    ts = int(datetime.fromisoformat(dt.replace("Z","")).timestamp() * 1000)
+                    # dt viene como 'YYYY-MM-DD HH:MM:SS' (UTC) → hazlo UTC explícito
+                    ts = _parse_fmp_datetime_to_ms(dt) 
                 else:
                     ts = int(float(dt) * 1000)
                 out.append({
-                    "t": ts, "o": float(x["open"]), "h": float(x["high"]),
-                    "l": float(x["low"]), "c": float(x["close"]), "v": float(x.get("volume",0))
+                    "t": ts,
+                    "o": float(x["open"]),
+                    "h": float(x["high"]),
+                    "l": float(x["low"]),
+                    "c": float(x["close"]),
+                    "v": float(x.get("volume", 0))
                 })
             except Exception:
                 continue
         return out
     except Exception:
         return []
+
 
 
 def _maybe_tick_quote(exec_id: str, symbol: str, tf: str, st: dict) -> bool:
@@ -11803,20 +11881,28 @@ def _current_bucket_start(tfms: int) -> int:
     return _bucket_start(_now_ms(), tfms)
 
 def _prefer(a: dict, b: dict) -> dict:
-    """
-    Elige la mejor vela para un bucket:
-    - Prefiere la que tenga v>0 (histórico) sobre v=0 (tick).
-    - A igualdad de v, quédate con la más "completa" (max(h), min(l)) y el último close.
-    """
-    if (a.get("v",0) > 0) and (b.get("v",0) == 0): return a
-    if (b.get("v",0) > 0) and (a.get("v",0) == 0): return b
-    # combinar envolvente, close del más nuevo
+    # Caso 1: histórico vs tick
+    if (a.get("v", 0) > 0) and (b.get("v", 0) == 0):
+        return a
+    if (b.get("v", 0) > 0) and (a.get("v", 0) == 0):
+        return b
+
+    # Caso 2: ambos del mismo “tipo” (ambos v=0 o ambos v>0)
     o = a.get("o", b.get("o"))
     h = max(float(a.get("h", o)), float(b.get("h", o)), float(o))
     l = min(float(a.get("l", o)), float(b.get("l", o)), float(o))
-    c = float(b.get("c", a.get("c", o)))  # último close
-    v = float(a.get("v",0)) + float(b.get("v",0))  # suma (tick-volume + histórico si aplica)
+    c = float(b.get("c", a.get("c", o)))  # último close prevalece
+
+    # ⚠️ clave: NO sumar si ambos tienen v>0 → evita inflar volumen
+    va = float(a.get("v", 0) or 0)
+    vb = float(b.get("v", 0) or 0)
+    if va > 0 and vb > 0:
+        v = max(va, vb)   # o v = vb (si quieres “el más reciente”)
+    else:
+        v = va + vb       # tick + histórico o tick + tick
+
     return {"t": a["t"], "o": float(o), "h": h, "l": l, "c": c, "v": v}
+
 
 def _snap_and_dedupe_to_minutes(series: list[dict], tf: str) -> list[dict]:
     """
@@ -11858,6 +11944,7 @@ def _densify_minutes(series: list[dict], tf: str, max_fill:int = 10, max_gap_min
 
         # si el hueco es grande, lo dejamos para historical
         gap_minutes = (cur["t"] - prev["t"]) // tfms
+        
         if gap_minutes > max_gap_minutes:
             out.append(cur)
             continue
@@ -11934,72 +12021,53 @@ def _current_closed_bucket_start(tf: str) -> int:
     return now_bucket  # este es el inicio del bucket en curso; 'cerrados' son < now_bucket
 
 
-def _backfill_large_gap(series: list[dict], symbol: str, tf: str, max_minutes:int = 10_000) -> int:
+def _backfill_range_once(series: list[dict], symbol: str, tf: str, from_ms: int, to_ms: int) -> int:
     """
-    Si hay un hueco grande entre la última vela y la primera barra de 'hist' corto,
-    trae el histórico por RANGO (from/to) y mergea. Devuelve cuántas velas se agregaron o reemplazaron.
-    - Respeta buckets cerrados (no toca el bucket en curso).
-    - Acota el rango máximo a max_minutes para no abusar.
+    Backfill de una sola llamada con rango exacto [from_ms, to_ms].
+    - No depende de que 'series' ya tenga datos (puede sembrar).
+    - No toca el bucket en curso (filtra por seguridad).
     """
-    if not series:
+    if to_ms <= from_ms:
         return 0
-    tfms = _tf_ms(tf)
-    cur_bucket = _current_closed_bucket_start(tf)
-    last_t = int(series[-1]["t"])
-    # solo rellenamos hasta el último bucket CERRADO (no tocamos el en curso)
-    to_fill_ms = min(cur_bucket - tfms, _now_ms() - tfms)
-    if to_fill_ms <= last_t + tfms:
-        return 0  # no hay nada que rellenar
 
-    gap_minutes = int((to_fill_ms - last_t) // tfms)
-    if gap_minutes <= 1:
-        return 0
-    # límite para no pedir rangos enormes en una sola llamada
-    cap_ms = last_t + min(gap_minutes, max_minutes) * tfms
-    to_ms = min(to_fill_ms, cap_ms)
-
-    rng = _fetch_historical_range(symbol, tf, last_t + tfms, to_ms)
+    rng = _fetch_historical_range(symbol, tf, from_ms, to_ms)
     if not rng:
         return 0
 
-    # merge ordenado por bucket
-    # como rng viene en ascendente normalizado {t,o,h,l,c,v}, reutilizamos merge_bars_series
+    # Blindaje opcional: evita afectar el bucket vigente
+    cur_open = _current_closed_bucket_start(tf)  # inicio del bucket en curso
+    rng = [b for b in rng if int(b["t"]) < cur_open]
+    if not rng:
+        return 0
+
     added = merge_bars_series(series, rng, tf)
     if added:
-        # aseguremos bucketización + dedup por si habían duplicados
         series[:] = _snap_and_dedupe_to_minutes(series, tf)
     return added
-
 
 def _ms_to_iso_utc(ts_ms: int) -> str:
     # "YYYY-MM-DD HH:MM:SS" en UTC (formato que acepta FMP en historical-chart)
     return datetime.utcfromtimestamp(ts_ms/1000).strftime("%Y-%m-%d %H:%M:%S")
-
 def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> list[dict]:
-    """
-    Descarga historical-chart con from/to (si el plan lo soporta) y normaliza ascendente.
-    Si falla (402/429 o similar), devuelve []
-    """
-    if not API_KEY:
-        return []
+    if not API_KEY: return []
     try:
         iv = _fmp_interval(tf)
-        # defensivo: acotar rangos absurdos
         if to_ms <= from_ms:
             return []
-        # FMP acepta "from" y "to" como string ISO UTC
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}"
         params = {
             "apikey": API_KEY,
-            "from": _ms_to_iso_utc(from_ms),
-            "to":   _ms_to_iso_utc(to_ms)
+            "from": _ms_to_fmp_local(from_ms),
+            "to":   _ms_to_fmp_local(to_ms)
         }
-        logging.info(f"MTORO10 url: {url}")
+        logging.info(f"MTORO10 url: {url} params: from={params['from']} to={params['to']}")
         r = requests.get(url, params=params, timeout=20)
         if not r.ok:
+            logging.info(f"MTORO10 HTTP {r.status_code}: {r.text[:200]}")
             return []
         return _normalize_fmp_bars(r.json())
-    except Exception:
+    except Exception as e:
+        logging.warning(f"MTORO10 error: {e}")
         return []
 
 
@@ -12007,11 +12075,8 @@ def _fmp_hist_with_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> list
     if not API_KEY: 
         return []
     iv = _fmp_interval(tf)
-    def _to_iso(ms: int) -> str:
-        from datetime import datetime, timezone
-        return datetime.fromtimestamp(ms/1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}"
-    params = {"apikey": API_KEY, "from": _to_iso(from_ms), "to": _to_iso(to_ms)}
+    params = {"apikey": API_KEY, "from": _ms_to_fmp_local(from_ms), "to": _ms_to_fmp_local(to_ms)}
     try:
         r = requests.get(url, params=params, timeout=20)
         if not r.ok:
@@ -12079,6 +12144,82 @@ def _backfill_gaps_with_fmp(series: list[dict], symbol: str, tf: str, max_iters:
         series[:] = s  # in-place
     return added_total
 
+
+def _backfill_internal_gaps(base_ms: list[dict], symbol: str, tf: str, max_minutes_per_call: int = 10_000) -> int:
+    if not base_ms:
+        return 0
+    tfms = _tf_ms(tf)
+    closed_end = _current_closed_bucket_start(tf) - tfms
+    total_added = 0
+
+    cooldown = _INTERNAL_GAP_COOLDOWN_S.get(tf, 300)
+    now_s = time.time()
+
+    i = 0
+    while i < len(base_ms) - 1:
+        a = base_ms[i]
+        b = base_ms[i + 1]
+        gap_buckets = (b["t"] - a["t"]) // tfms - 1
+        if gap_buckets > 0:
+            from_ms = a["t"] + tfms
+            to_ms   = min(b["t"] - tfms, closed_end)
+            if to_ms >= from_ms:
+                cap_to_ms = min(from_ms + max_minutes_per_call * tfms, to_ms)
+
+                key = (symbol, tf, from_ms, cap_to_ms)
+                last_try = _LAST_INTERNAL_GAP_ATTEMPT.get(key, 0)
+                if (now_s - last_try) < cooldown:
+                    # evita reintentar inmediatamente el mismo hueco
+                    i += 1
+                    continue
+
+                _LAST_INTERNAL_GAP_ATTEMPT[key] = now_s
+                logging.info(f"GAPFILL {symbol} {tf} from={_ms_to_iso_utc(from_ms)} to={_ms_to_iso_utc(cap_to_ms)} gap_bars={gap_buckets} (INT)")
+                rng = _fetch_historical_range(symbol, tf, from_ms, cap_to_ms)
+
+                # después (muestra UTC y lo que se envía a FMP en ET)
+                et_from = _ms_to_fmp_local(from_ms)     # UTC -> America/New_York "YYYY-MM-DD HH:MM:SS"
+                et_to   = _ms_to_fmp_local(cap_to_ms)
+
+                logging.info(
+                    "GAPFILL %s %s UTC:[%s → %s] ET:[%s → %s] gap_bars=%d (INT)",
+                    symbol, tf, _ms_to_iso_utc(from_ms), _ms_to_iso_utc(cap_to_ms),
+                    et_from, et_to, gap_buckets
+                )
+
+                added = 0
+                if rng:
+                    added = merge_bars_series(base_ms, rng, tf)
+                    if added:
+                        base_ms[:] = _snap_and_dedupe_to_minutes(base_ms, tf)
+                        total_added += added
+                        # retrocede para revalidar alrededor del hueco rellenado
+                        i = max(i - 1, 0)
+                        continue
+
+                # Si no agregó nada, no sigas martillando: el cooldown ya quedó marcado
+        i += 1
+
+    return total_added
+
+
+def _parse_fmp_datetime_to_ms(s: str, src_tz: str = FMP_INTRADAY_SOURCE_TZ) -> int:
+    """
+    Convierte 'YYYY-MM-DD HH:MM:SS' de FMP (ET) a epoch ms UTC.
+    """
+    s2 = s.replace("T", " ").replace("Z", "")  # FMP no trae Z, pero por si acaso
+    dt_local = datetime.strptime(s2, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo(src_tz))
+    return int(dt_local.astimezone(timezone.utc).timestamp() * 1000)
+
+def _ms_to_fmp_local(ms: int, dst_tz: str = FMP_INTRADAY_SOURCE_TZ) -> str:
+    """
+    Convierte epoch ms UTC a string 'YYYY-MM-DD HH:MM:SS' en ET para pasar a FMP.
+    """
+    dt_utc = datetime.fromtimestamp(ms/1000, tz=timezone.utc)
+    dt_loc = dt_utc.astimezone(ZoneInfo(dst_tz))
+    return dt_loc.strftime("%Y-%m-%d %H:%M:%S")
+
+
 # ==========================
 #  ENDPOINTS
 # ==========================
@@ -12108,7 +12249,7 @@ async def monitoreo_incremental():
         await asyncio.to_thread(_ensure_stream_initialized, exec_id, symbol, timeframe, st)
 
         # 1) normaliza last_ts
-        try: 
+        try:
             last_ts = int(last_ts) if last_ts is not None else None
         except:
             last_ts = None
@@ -12117,31 +12258,157 @@ async def monitoreo_incremental():
         base_ms = _series_to_ms(st.get("series", []))
         base_ms = _snap_and_dedupe_to_minutes(base_ms, timeframe)
 
-        # >>> firma de 'cerrados' ANTES (sobre base_ms real, no prev_series_ms)
+        # Firma de 'cerrados' ANTES
         before_sig = _closed_signature(base_ms, timeframe)
 
-        # 3) overlay histórico corto para buckets CERRADOS (corrige velas sin volumen del tick)
+        # 3) Overlay histórico corto para buckets CERRADOS (corrige velas tick)
         hist = _fetch_historical(symbol, timeframe)
         if hist:
             base_ms = _overlay_historical_for_closed(base_ms, hist, timeframe)
 
-        # 3.b) backfill por RANGO si hay gap grande entre lo último y la primera de hist
-        if base_ms and hist:
-            tfms = _tf_ms(timeframe)
-            # OJO: tu _fetch_historical devuelve lista ascendente (por tu normalización)
-            first_hist_t = hist[0]["t"]
-            if first_hist_t > base_ms[-1]["t"] + tfms:
-                added = _backfill_large_gap(base_ms, symbol, timeframe)
-                if added:
-                    base_ms = _snap_and_dedupe_to_minutes(base_ms, timeframe)
 
-        # 4) densificar SOLO huecos chicos (temporal, no toca el bucket en curso)
+        # 3.1) NUEVO: rellenar gaps internos con rangos from/to
+        # (Antes de densificar con sintéticas)
+        added_internal = _backfill_internal_gaps(base_ms, symbol, timeframe)
+        if added_internal:
+            # Si agregaste, conviene re-sellar cerrados otra vez por si FMP trajo volumen
+            hist2 = _fetch_historical(symbol, timeframe)
+            if hist2:
+                base_ms = _overlay_historical_for_closed(base_ms, hist2, timeframe)
+
+
+        # ===== DETECCIÓN Y BACKFILL DE GAPS GRANDES POR RANGO =====
+        tfms = _tf_ms(timeframe)
+        cur_bucket = _current_closed_bucket_start(timeframe)   # inicio del bucket en curso
+        closed_end = cur_bucket - tfms                         # último bucket cerrado
+
+        last_have_t   = base_ms[-1]["t"] if base_ms else None
+        newest_hist_t = hist[-1]["t"] if hist else None
+
+        # último bucket CERRADO que ya tenemos
+        last_closed_ts = None
+        for i in range(len(base_ms) - 1, -1, -1):
+            t = int(base_ms[i]["t"])
+            if t < cur_bucket:
+                last_closed_ts = t
+                break
+
+        condA = (newest_hist_t is not None and last_have_t is not None and newest_hist_t > last_have_t + tfms)
+        logging.info(
+            f"GAPCHK2 {symbol} {timeframe} last_have_t={last_have_t} newest_hist_t={newest_hist_t} "
+            f"closed_end={closed_end} last_closed_ts={last_closed_ts} tfms={tfms} condA={condA}"
+        )
+
+        # ---- throttle / cooldown por TF
+        key = (symbol, timeframe)
+        now_s = time.time()
+        # ajusta cooldown por TF (más agresivo en 1min)
+        cooldown = { "1min": 60, "5min": 120, "15min": 180, "30min": 240, "1hour": 300, "4hour": 600 }.get(timeframe, 180)
+        last_try = _LAST_BACKFILL_ATTEMPT.get(key, 0)
+        max_bars = _MAX_BACKFILL_BARS.get(timeframe, 1500)
+
+        def _ranges_overlap(a_from, a_to, b_from, b_to):
+            return not (a_to <= b_from or b_to <= a_from)
+
+        def _throttle_and_call(from_ms:int, to_ms:int, label:str) -> int:
+            """Devuelve 'added'. Solo setea cooldown si added>0. Evita duplicados/solapes y suprime rangos vacíos recientes."""
+            nonlocal base_ms, last_try
+            if to_ms <= from_ms:
+                return 0
+
+            # limitar tamaño del rango
+            if to_ms > from_ms + max_bars * tfms:
+                to_ms = from_ms + max_bars * tfms
+
+            # evitar repetir exactamente el mismo rango o uno que se solape con el último exitoso
+            last_range = _LAST_BACKFILL_RANGE.get(key)
+            same_or_overlap = False
+            if last_range:
+                lr_from, lr_to = last_range
+                same_or_overlap = _ranges_overlap(from_ms, to_ms, lr_from, lr_to)
+
+            # cooldown solo si el último intento exitoso fue reciente Y el rango se solapa
+            use_cooldown = same_or_overlap and ((now_s - last_try) < cooldown)
+
+            # además: suprime si el mismo rango (o muy parecido) fue VACÍO hace poco
+            empty = _LAST_BACKFILL_EMPTY.get(key)
+            suppress_empty = False
+            if empty:
+                e_from, e_to, e_ts = empty
+                suppress_empty = ((now_s - e_ts) < _EMPTY_SUPPRESS_S) and _ranges_overlap(from_ms, to_ms, e_from, e_to)
+
+            logging.info(
+                f"GAPCHK2.B {symbol} {timeframe} from_ms={from_ms} to_ms={to_ms} "
+                f"cooldown={cooldown}s last_try={last_try} use_cooldown={use_cooldown} "
+                f"suppress_empty={suppress_empty} label={label}"
+            )
+            if use_cooldown or suppress_empty:
+                return 0
+
+            logging.info(
+                f"MTORO10 url: https://financialmodelingprep.com/api/v3/historical-chart/{_fmp_interval(timeframe)}/{symbol} "
+                f"params: from={_ms_to_fmp_local(from_ms)} to={_ms_to_fmp_local(to_ms)}"
+            )
+            added = _backfill_range_once(base_ms, symbol, timeframe, from_ms, to_ms)
+
+            # marca “éxito” (enfriar/recordar rango) SOLO si agregó algo
+            if added > 0:
+                _LAST_BACKFILL_ATTEMPT[key] = now_s
+                last_try = now_s
+                _LAST_BACKFILL_RANGE[key] = (from_ms, to_ms)
+                # al haber éxito, limpia el recordatorio de vacío (opcional)
+                if key in _LAST_BACKFILL_EMPTY:
+                    del _LAST_BACKFILL_EMPTY[key]
+            else:
+                # si no agregó nada, recuerda este rango como vacío para suprimir martilleo breve
+                _LAST_BACKFILL_EMPTY[key] = (from_ms, to_ms, now_s)
+
+            logging.info(
+                f"GAPFILL {symbol} {timeframe} from={_ms_to_fmp_local(from_ms)} to={_ms_to_fmp_local(to_ms)} "
+                f"gap_bars={int((to_ms-from_ms)//tfms)} added={added} label={label}"
+            )
+            if added > 0:
+                # Reaplicar overlay para sellar cerrados con volumen
+                hist2 = _fetch_historical(symbol, timeframe)
+                if hist2:
+                    base_ms = _overlay_historical_for_closed(base_ms, hist2, timeframe)
+
+            return added
+
+        
+        with _backfill_guard(symbol, timeframe) as allowed:
+            if allowed:
+
+                # Calcula ambos rangos, pero ejecuta máximo uno:
+                did_backfill = 0
+
+                # ROLLO-1: FMP tiene minutos más nuevos que lo que yo tengo
+                if condA and last_have_t is not None:
+                    from1 = last_have_t + tfms
+                    to1   = min(newest_hist_t, closed_end)
+                    did_backfill = _throttle_and_call(from1, to1, "R1")
+
+                # ROLLO-2: si no hubo backfill en R1, intentá rellenar entre tu último cerrado y closed_end
+                if did_backfill == 0 and last_closed_ts is not None and last_closed_ts < closed_end - tfms:
+                    from2 = max(last_closed_ts + tfms, (last_have_t + tfms) if last_have_t is not None else last_closed_ts + tfms)
+                    to2   = closed_end
+                    # Evita overlap innecesario por las dudas (si R1 calculó un rango parecido)
+                    did_backfill = _throttle_and_call(from2, to2, "R2")
+
+                if did_backfill == 0:
+                    _backfill_internal_gaps(base_ms, symbol, timeframe, max_minutes_per_call=1500)
+
+        # Log post-backfill
+        closed_after = [c for c in base_ms if c["t"] < _current_closed_bucket_start(timeframe)]
+        logging.info(f"CLOSED {symbol} {timeframe} count={len(closed_after)} last_t={closed_after[-1]['t'] if closed_after else None}")
+
+        # 4) Densificar huecos chicos
         base_ms = _densify_minutes(base_ms, timeframe, max_fill=10, max_gap_minutes=10)
 
-        # >>> firma de 'cerrados' DESPUÉS
+        # Firma de 'cerrados' DESPUÉS
         after_sig = _closed_signature(base_ms, timeframe)
 
-        # 5) tick del minuto en curso (realtime) para que el último bucket “respire”
+        # 5) Tick del minuto en curso (realtime)
         try:
             if _maybe_tick_quote(exec_id, symbol, timeframe, {"series": base_ms}):
                 base_ms = _snap_and_dedupe_to_minutes(base_ms, timeframe)
@@ -12156,7 +12423,6 @@ async def monitoreo_incremental():
         last_server_t = base_ms[-1]["t"] if base_ms else None
         last_server = base_ms[-1] if base_ms else None
 
-        # detecta cambio en misma vela
         changed_by_reload = False
         if prev_last and last_server and last_server_t == prev_last["t"]:
             for k in ("o","h","l","c","v"):
