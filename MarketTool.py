@@ -3119,9 +3119,11 @@ def obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin) -> pd.DataFrame:
         if not d.empty:
             # Impacto robusto (case-insensitive) + ponderación
             impact_norm = d["impact"].astype(str).str.strip().str.lower()
-            d = d[impact_norm.isin({"high", "medium"})].copy()
+            mask = impact_norm.isin({"high", "medium"})
+            d = d.loc[mask].copy()
             if not d.empty:
-                d["ponderacion"] = impact_norm.map({"high": 1.0, "medium": 0.5}).fillna(0.25).values
+                # solo aplica el map sobre las filas filtradas, usando el mismo índice
+                d["ponderacion"] = impact_norm.loc[mask].map({"high": 1.0, "medium": 0.5}).fillna(0.25)
                 parts.append(d)
 
         cur = pd.to_datetime(b) + timedelta(days=1)
