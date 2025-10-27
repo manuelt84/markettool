@@ -12319,15 +12319,6 @@ def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) ->
         _EVENTS_MEMO[symbol] = {"df": df.copy(), "ts": time.time()}
     return df
 
-def _filter_by_symbol_currencies(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    """ Mantiene eventos cuyas 'currency' coinciden con base o secundaria del símbolo. """
-    try:
-        base, quote = obtener_monedas(symbol)
-    except Exception:
-        base, quote = symbol[:3], symbol[3:6]
-    cur_ok = {str(base).upper(), str(quote).upper()}
-    return df[df["currency"].astype(str).str.upper().isin(cur_ok)].copy()
-
 def _detect_new_results(symbol: str, df: pd.DataFrame) -> List[dict]:
     """
     Devuelve filas donde 'actual' apareció/cambió respecto de lo último visto.
@@ -12574,11 +12565,60 @@ def evaluar_evento_para_symbol(
     reason = f"{cat} | impact={impact} | adj={adj:.2f} iw={iw:.2f} rec={recent_mult:.2f} dec={decay:.2f} sign={mult_sign:+.0f}"
     return {"score": float(score), "direction": direction, "reason": reason}
 
+
+_SYMBOL_SPECIAL_CURRENCIES = {
+    "DX-Y.NYB": {"USD"},  # US Dollar Index (FMP)
+    "USDX": {"USD"},
+    "DXY": {"USD"},
+    # agrega tus índices/commodities aquí si quieres forzar moneda
+}
+
+def _split_base_quote(symbol: str) -> tuple[str | None, str | None]:
+    """
+    FOREX clásico: 6 letras A-Z, p.ej. EURUSD, GBPJPY.
+    Devuelve (base, quote) o (None, None) si no es FOREX 3+3.
+    """
+    sym = (symbol or "").upper()
+    m = re.fullmatch(r"([A-Z]{3})([A-Z]{3})", sym)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
+
+def _filter_by_symbol_currencies(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """
+    Mantiene eventos cuya 'currency' coincide con la base o la secundaria del símbolo (FOREX).
+    Para símbolos no-FOREX, usa mapping especial si existe; si no, NO filtra (deja High/Medium de la ventana).
+    """
+    if df is None or df.empty:
+        return df
+
+    symU = str(symbol or "").upper()
+
+    # Casos especiales (índices, etc.)
+    if symU in _SYMBOL_SPECIAL_CURRENCIES:
+        wanted = {c.upper() for c in _SYMBOL_SPECIAL_CURRENCIES[symU]}
+        return df[df["currency"].astype(str).str.upper().isin(wanted)].copy()
+
+    # FOREX puro 3+3
+    base, quote = _split_base_quote(symU)
+    if base and quote:
+        wanted = {base, quote}
+        return df[df["currency"].astype(str).str.upper().isin(wanted)].copy()
+
+    # No-FOREX y sin mapping → no filtres
+    return df.copy()
+
 # ==========================
 # ENDPOINT
 # ==========================
 
-from flask import request, jsonify
+@webhook_app.errorhandler(404)
+def _not_found(e):
+    return jsonify({"status":"error","message":"not found"}), 404
+
+@webhook_app.errorhandler(500)
+def _server_err(e):
+    return jsonify({"status":"error","message":"internal error"}), 500
 
 @webhook_app.route("/monitoreo/eventos", methods=["POST"])
 def monitoreo_eventos():
@@ -12623,7 +12663,7 @@ def monitoreo_eventos():
 
         df = _fetch_events_for(symbol, hours_back=hours_back, minutes_fwd=minutes_fwd)
         if df.empty:
-            out = {"status":"ok","exec_id":exec_id,"symbol":symbol,"server_time":int(time.time()*1000),"hash":"0"*8,"count":0,"new_results":[],"events":[],"signals":[],"agg_score":0.0,"agg_direction":"neutral"}
+            out = {"status":"ok","exec_id":exec_id,"symbol":symbol,"server_time":int(time.time()*1000),"hash":"0"*8,"count":0,"new_results":[],"events":[]}
             return jsonify(out), 200
 
         # impacto alto/medio y filtro por monedas del símbolo
