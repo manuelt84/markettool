@@ -11153,6 +11153,20 @@ async def initialize_bot():
         logger.info(f"Error durante la inicialización del bot: {e}")
 
 
+
+# Cache de DF por símbolo (evita martillar FMP si poleás cada 1s)
+_EVENTS_MEMO: Dict[str, Dict[str, Any]] = {}   # symbol -> {"df": DataFrame, "ts": epoch_s}
+# Últimos valores 'actual' vistos por (symbol, event_key) para detectar cambios
+# event_key = (currency, event, date_ms UTC)
+_LAST_ACTUAL: Dict[Tuple[str, Tuple[str,str,int]], float] = {}
+# Último hash enviado al cliente por (exec_id, symbol)
+_LAST_HASH: Dict[Tuple[str,str], str] = {}
+
+
+# Intervalo mínimo entre llamados “caros” a FMP por símbolo
+MIN_FETCH_INTERVAL_S = 5
+
+
 BUCKET_NAME = "markettool_bucket"
 
 # Mapea los nombres de timeframe que te gustan en el app
@@ -12221,8 +12235,499 @@ def _ms_to_fmp_local(ms: int, dst_tz: str = FMP_INTRADAY_SOURCE_TZ) -> str:
 
 
 # ==========================
-#  ENDPOINTS
+# Helpers de tiempo y hash
 # ==========================
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+def _hash_payload(rows: list) -> str:
+    """ Hash FNV-1a simple para snapshots; evita renders innecesarios """
+    acc = 2166136261
+    for r in rows:
+        s = json.dumps(r, sort_keys=True, ensure_ascii=False, default=str)
+        for ch in s:
+            acc ^= ord(ch)
+            acc = (acc * 16777619) & 0xFFFFFFFF
+    return f"{acc:08x}"
+
+def _numeric_or_nan(x):
+    try:
+        return float(x)
+    except Exception:
+        return math.nan
+
+# ==========================
+# Forex helper
+# ==========================
+
+def obtener_monedas(symbol: str) -> Tuple[str,str]:
+    # Forex: EURUSD -> (EUR, USD). Metales/commodities: XAUUSD → (XAU, USD). Intenta fallbacks
+    s = (symbol or "").upper()
+    if len(s) >= 6:
+        return s[:3], s[3:6]
+    # fallback genérico
+    return s, "USD"
+
+# ==========================
+# Memo y dedupe
+# ==========================
+
+MIN_FETCH_INTERVAL_S = 5  # memo 5 segundos por símbolo
+_EVENTS_MEMO: Dict[str, Dict[str, Any]] = {}  # {symbol: {"df":DataFrame,"ts":epoch}}
+_LAST_ACTUAL: Dict[Tuple[str, Tuple[str,str,int]], float] = {}  # (symbol,(cur,event,ms)) -> actual
+_LAST_HASH: Dict[Tuple[str,str], str] = {}  # (exec_id,symbol) -> hash
+
+def _event_row_key(row: pd.Series) -> Tuple[str,str,int]:
+    """ Llave estable por fila de evento (currency, event, date_ms UTC). """
+    currency = str(row.get("currency") or "")
+    event    = str(row.get("event") or "")
+    date     = pd.to_datetime(row.get("date"), errors="coerce", utc=True)
+    ms = int(date.value//1_000_000) if not pd.isna(date) else 0
+    return (currency, event, ms)
+
+# ==========================
+# Fetch de eventos (API o Firestore)
+# ==========================
+
+def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) -> pd.DataFrame:
+    """
+    Obtiene eventos en ventana [now - hours_back, now + minutes_fwd] normalizados.
+    Aplica memoización de 5s por símbolo para soportar polling de 1s.
+    """
+
+    now = _now_utc()
+    a = now - timedelta(hours=int(hours_back))
+    b = now + timedelta(minutes=int(minutes_fwd))
+
+    memo = _EVENTS_MEMO.get(symbol)
+    if memo and (time.time() - memo.get("ts", 0) < MIN_FETCH_INTERVAL_S):
+        df = memo["df"].copy()
+    else:
+        df = obtener_eventos_guardados_o_futuros(_iso(a), _iso(b))
+        if df is None or df.empty:
+            df = pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
+        # normaliza tipos
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+        for c in ["actual","estimate","previous"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["impact"] = df["impact"].astype(str).str.capitalize()
+        df = df.sort_values("date", ascending=True).reset_index(drop=True)
+        _EVENTS_MEMO[symbol] = {"df": df.copy(), "ts": time.time()}
+    return df
+
+def _filter_by_symbol_currencies(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """ Mantiene eventos cuyas 'currency' coinciden con base o secundaria del símbolo. """
+    try:
+        base, quote = obtener_monedas(symbol)
+    except Exception:
+        base, quote = symbol[:3], symbol[3:6]
+    cur_ok = {str(base).upper(), str(quote).upper()}
+    return df[df["currency"].astype(str).str.upper().isin(cur_ok)].copy()
+
+def _detect_new_results(symbol: str, df: pd.DataFrame) -> List[dict]:
+    """
+    Devuelve filas donde 'actual' apareció/cambió respecto de lo último visto.
+    """
+    new_rows = []
+    for _, row in df.iterrows():
+        k = (symbol, _event_row_key(row))
+        actual = _numeric_or_nan(row.get("actual"))
+        if math.isnan(actual):
+            continue
+        prev = _LAST_ACTUAL.get(k, math.nan)
+        if math.isnan(prev) or not math.isclose(prev, actual, rel_tol=0, abs_tol=1e-12):
+            _LAST_ACTUAL[k] = actual
+            new_rows.append({
+                "date": row["date"].isoformat(),
+                "currency": row.get("currency"),
+                "event": row.get("event"),
+                "impact": row.get("impact"),
+                "actual": actual,
+                "estimate": _numeric_or_nan(row.get("estimate")),
+                "previous": _numeric_or_nan(row.get("previous")),
+            })
+    return new_rows
+
+# ==========================
+# Scoring y dirección por evento
+# ==========================
+
+# pesos por impacto (puedes ajustar por config)
+IMPACT_WEIGHTS = {
+    "high": 1.0,
+    "medium": 0.6,
+    "low": 0.3,
+}
+
+# pesos por categoría (good/bad) base
+CATEGORY_WEIGHTS = {
+    "unemployment": {"good": +0.35, "bad": -0.35},
+    "employment":   {"good": +0.35, "bad": -0.35},
+    "inflation":    {"good": +0.30, "bad": -0.30},
+    "gdp":          {"good": +0.25, "bad": -0.25},
+    "retail":       {"good": +0.20, "bad": -0.20},
+    "rates":        {"good": +0.25, "bad": -0.25},
+    "generic": {
+        "better_both": +0.25,
+        "better_estimate": +0.18,
+        "better_prev": +0.12,
+        "worse": -0.18,
+    },
+    # commodities especiales:
+    "crude_oil_inventories": {"draw_good": +0.30, "build_bad": -0.30},
+}
+
+def detectar_categoria(event_name: Any) -> str:
+    if not event_name:
+        return "Generic"
+    s = str(event_name).lower()
+    if "unemployment" in s or "jobless" in s:
+        return "Unemployment Rate"
+    if "nonfarm" in s or "employment" in s or "payrolls" in s or "jobs" in s:
+        return "Employment Report"
+    if "inflation" in s or "cpi" in s or "consumer price" in s or "ppi" in s:
+        return "Inflation Rate"
+    if "gdp" in s or "gross domestic" in s:
+        return "GDP"
+    if "retail" in s or "sales" in s:
+        return "Retail Sales"
+    if "rate decision" in s or "interest rate" in s or "policy rate" in s or "refi rate" in s or "overnight rate" in s:
+        return "Interest Rate"
+    if "crude" in s and "inventory" in s:  # EIA
+        return "Crude Oil Inventories"
+    return "Generic"
+
+def _cap(x: float, limit: float) -> float:
+    return max(min(x, limit), -limit)
+
+def evaluar_evento_para_symbol(
+    symbol: str,
+    ev: Dict[str, Any],
+    *,
+    consider_hours: int = 6,
+    recent_minutes_boost: int = 30,
+    recent_boost: float = 1.15,
+    decay_floor: float = 0.6,
+    per_event_cap: float = 0.35,
+    flip_secondary_currency: bool = True
+) -> Dict[str, Any]:
+    """
+    Devuelve dict con:
+     - score: float ([-cap, +cap])
+     - direction: 'bullish'|'bearish'|'neutral'
+     - reason: texto breve
+    """
+    now = _now_utc()
+    base, quote = obtener_monedas(symbol)
+
+    try:
+        dt = pd.to_datetime(ev.get("date"), errors="coerce", utc=True)
+    except Exception:
+        dt = pd.NaT
+
+    actual   = _numeric_or_nan(ev.get("actual"))
+    estimate = _numeric_or_nan(ev.get("estimate"))
+    previous = _numeric_or_nan(ev.get("previous"))
+    impact   = str(ev.get("impact") or "").strip().lower()
+    iw       = IMPACT_WEIGHTS.get(impact, 0.4)
+
+    # ventana temporal
+    if not pd.isna(dt):
+        if consider_hours is not None:
+            cutoff = now - timedelta(hours=int(consider_hours))
+            if dt < cutoff:
+                return {"score": 0.0, "direction": "neutral", "reason": "out_of_window"}
+        # recency
+        recent_mult = 1.0
+        if (now - dt).total_seconds() / 60.0 < float(recent_minutes_boost):
+            recent_mult *= float(recent_boost)
+    else:
+        recent_mult = 1.0
+
+    # decaimiento relativo a la “edad” vs la primera fecha de df (aquí aproximamos 6h)
+    tmax = float(max(1.0, consider_hours * 3600))
+    age = float((now - dt).total_seconds()) if not pd.isna(dt) else tmax
+    decay = max(1.0 - (age / tmax), float(decay_floor))
+
+    # signo por moneda (si el dato es de la cotizada, invierte)
+    mult_sign = -1.0 if (flip_secondary_currency and str(ev.get("currency","")).upper() == str(quote).upper()) else 1.0
+
+    cat = detectar_categoria(ev.get("event"))
+    cw  = CATEGORY_WEIGHTS
+
+    # regla base: si faltan números, no puntúa
+    if math.isnan(actual) or math.isnan(previous):
+        return {"score": 0.0, "direction": "neutral", "reason": "missing_values"}
+
+    # lógica por categoría
+    adj = 0.0
+    if cat == "Unemployment Rate":
+        good, bad = cw["unemployment"]["good"], cw["unemployment"]["bad"]
+        if math.isnan(estimate):
+            adj = good if actual < previous else bad
+        else:
+            if actual < estimate and actual < previous:
+                adj = good
+            elif actual < estimate:
+                adj = +0.20
+            else:
+                adj = bad
+
+    elif cat == "Employment Report":
+        good, bad = cw["employment"]["good"], cw["employment"]["bad"]
+        if math.isnan(estimate):
+            adj = good if actual > previous else bad
+        else:
+            if actual > estimate and actual > previous:
+                adj = good
+            elif actual > estimate:
+                adj = +0.20
+            else:
+                adj = bad
+
+    elif cat == "Inflation Rate":
+        good, bad = cw["inflation"]["good"], cw["inflation"]["bad"]
+        if math.isnan(estimate):
+            adj = good if actual < previous else bad
+        else:
+            if actual < estimate and actual < previous:
+                adj = good
+            elif actual < estimate:
+                adj = +0.20
+            else:
+                adj = bad
+
+    elif cat == "GDP":
+        good, bad = cw["gdp"]["good"], cw["gdp"]["bad"]
+        if math.isnan(estimate):
+            adj = good if actual > previous else bad
+        else:
+            if actual > estimate and actual > previous:
+                adj = good
+            elif actual > estimate:
+                adj = +0.20
+            else:
+                adj = -0.20
+
+    elif cat == "Retail Sales":
+        good, bad = cw["retail"]["good"], cw["retail"]["bad"]
+        if math.isnan(estimate):
+            adj = good if actual > previous else bad
+        else:
+            if actual > estimate and actual > previous:
+                adj = good
+            elif actual > estimate:
+                adj = +0.20
+            else:
+                adj = bad
+
+    elif cat == "Interest Rate":
+        # Para tasas: menor que est/prv = bueno (apoya crecimiento/bolsa),
+        # mayor = malo (aprecia divisa pero enfría activos de riesgo).
+        good, bad = cw["rates"]["good"], cw["rates"]["bad"]
+        if math.isnan(estimate):
+            adj = good if actual < previous else bad
+        else:
+            if actual < estimate and actual < previous:
+                adj = good
+            elif actual < estimate:
+                adj = +0.20
+            else:
+                adj = bad
+
+    elif cat == "Crude Oil Inventories":
+        # draw (actual < 0 o menor a est/prv) = bullish WTI/Brent
+        inv = cw["crude_oil_inventories"]
+        if math.isnan(estimate):
+            adj = inv["draw_good"] if actual < previous else inv["build_bad"]
+        else:
+            if actual < estimate and actual < previous:
+                adj = inv["draw_good"]
+            elif actual < estimate:
+                adj = +0.20
+            else:
+                adj = inv["build_bad"]
+
+    else:
+        gg = cw["generic"]
+        if math.isnan(estimate):
+            adj = gg["better_prev"] if actual > previous else gg["worse"]
+        else:
+            if actual > estimate and actual > previous:
+                adj = gg["better_both"]
+            elif actual > estimate:
+                adj = gg["better_estimate"]
+            elif actual > previous:
+                adj = gg["better_prev"]
+            else:
+                adj = gg["worse"]
+
+    # componer y capear
+    score = adj * iw * recent_mult * decay * mult_sign
+    score = _cap(score, per_event_cap)
+
+    direction = "bullish" if score > 0.01 else ("bearish" if score < -0.01 else "neutral")
+    reason = f"{cat} | impact={impact} | adj={adj:.2f} iw={iw:.2f} rec={recent_mult:.2f} dec={decay:.2f} sign={mult_sign:+.0f}"
+    return {"score": float(score), "direction": direction, "reason": reason}
+
+# ==========================
+# ENDPOINT
+# ==========================
+
+from flask import request, jsonify
+
+@webhook_app.route("/monitoreo/eventos", methods=["POST"])
+def monitoreo_eventos():
+    """
+    POST /monitoreo/eventos
+    Body:
+      {
+        "user_id": "...",
+        "exec_id": "...",
+        "symbol": "EURUSD",
+        "hours_back": 6,        # opcional (default 6)
+        "minutes_fwd": 5,       # opcional (default 5)
+        "cursor_hash": "..."    # opcional: hash del último snapshot recibido por el front
+      }
+
+    Respuesta:
+      {
+        "status": "ok",
+        "exec_id": "...",
+        "symbol": "EURUSD",
+        "server_time": ms_utc,
+        "hash": "abcd1234",
+        "count": N,
+        "new_results": [...],   # filas nuevas con 'actual' presente/cambiado
+        "events": [...],        # snapshot High/Medium para base/quote del símbolo
+        "signals": [...],       # señales con score/direction por cada fila con actual
+        "agg_score": float,     # agregado reciente (suma cap)
+        "agg_direction": "bullish"|"bearish"|"neutral"
+      }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        user_id  = str(body.get("user_id") or "").strip()
+        exec_id  = str(body.get("exec_id") or "").strip()
+        symbol   = str(body.get("symbol") or "").strip().upper()
+        hours_back = int(body.get("hours_back", 6))
+        minutes_fwd = int(body.get("minutes_fwd", 5))
+        cursor_hash = str(body.get("cursor_hash") or "").strip()
+
+        if not user_id or not exec_id or not symbol:
+            return jsonify({"status":"error","message":"user_id, exec_id y symbol son obligatorios"}), 400
+
+        df = _fetch_events_for(symbol, hours_back=hours_back, minutes_fwd=minutes_fwd)
+        if df.empty:
+            out = {"status":"ok","exec_id":exec_id,"symbol":symbol,"server_time":int(time.time()*1000),"hash":"0"*8,"count":0,"new_results":[],"events":[],"signals":[],"agg_score":0.0,"agg_direction":"neutral"}
+            return jsonify(out), 200
+
+        # impacto alto/medio y filtro por monedas del símbolo
+        df = df[df["impact"].isin(["High","Medium"])].copy()
+        df = _filter_by_symbol_currencies(df, symbol)
+
+        # snapshot compacto
+        events = []
+        for _, row in df.iterrows():
+            events.append({
+                "date": (row["date"].isoformat() if pd.notna(row["date"]) else None),
+                "currency": row.get("currency"),
+                "event": row.get("event"),
+                "impact": row.get("impact"),
+                "actual": (float(row.get("actual")) if pd.notna(row.get("actual")) else None),
+                "estimate": (float(row.get("estimate")) if pd.notna(row.get("estimate")) else None),
+                "previous": (float(row.get("previous")) if pd.notna(row.get("previous")) else None),
+            })
+
+        h = _hash_payload(events)
+        key = (exec_id, symbol)
+        _LAST_HASH[key] = h
+
+        # cambios "actual" desde la última vez
+        new_results = _detect_new_results(symbol, df)
+
+        # señales por fila (cuando actual existe)
+        signals = []
+        agg = 0.0
+        for _, row in df.iterrows():
+            if pd.notna(row.get("actual")):
+                sig = evaluar_evento_para_symbol(symbol, {
+                    "date": row["date"],
+                    "currency": row.get("currency"),
+                    "event": row.get("event"),
+                    "impact": row.get("impact"),
+                    "actual": row.get("actual"),
+                    "estimate": row.get("estimate"),
+                    "previous": row.get("previous"),
+                })
+                sig_out = {
+                    "date": (row["date"].isoformat() if pd.notna(row["date"]) else None),
+                    "currency": row.get("currency"),
+                    "event": row.get("event"),
+                    "impact": row.get("impact"),
+                    "score": sig["score"],
+                    "direction": sig["direction"],
+                    "reason": sig["reason"],
+                }
+                signals.append(sig_out)
+                agg += float(sig["score"])
+
+        agg_direction = "bullish" if agg > 0.02 else ("bearish" if agg < -0.02 else "neutral")
+
+        # heartbeat opcional
+        try:
+            if db is not None:
+                doc_id = f"{exec_id}__{symbol}"
+                db.collection("monitoreos").document(doc_id).set({
+                    "eventos_hash": h,
+                    "eventos_count": len(events),
+                    "eventos_updated_at": int(time.time()*1000),
+                    "eventos_agg_score": float(agg),
+                    "eventos_agg_direction": agg_direction,
+                }, merge=True)
+        except Exception:
+            pass
+
+        # Si no hay cambios y el front ya tiene el hash → responde vacío
+        if cursor_hash and cursor_hash == h and not new_results:
+            return jsonify({
+                "status":"ok",
+                "exec_id": exec_id,
+                "symbol": symbol,
+                "server_time": int(time.time()*1000),
+                "hash": h,
+                "count": len(events),
+                "new_results": [],
+                "events": [],
+                "signals": [],
+                "agg_score": float(agg),
+                "agg_direction": agg_direction,
+            }), 200
+
+        return jsonify({
+            "status":"ok",
+            "exec_id": exec_id,
+            "symbol": symbol,
+            "server_time": int(time.time()*1000),
+            "hash": h,
+            "count": len(events),
+            "new_results": new_results,
+            "events": events,
+            "signals": signals,
+            "agg_score": float(agg),
+            "agg_direction": agg_direction,
+        }), 200
+
+    except Exception as e:
+        logger.exception("Error en /monitoreo/eventos")
+        return jsonify({"status":"error","message":str(e)}), 500
+
+
+
 @webhook_app.route("/monitoreo/incremental", methods=["POST"])
 async def monitoreo_incremental():
     try:
