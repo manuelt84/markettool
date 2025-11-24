@@ -2937,7 +2937,11 @@ def _fmp_econ_fetch(from_date: str, to_date: str, *, timeout: int) -> pd.DataFra
     url = "https://financialmodelingprep.com/api/v3/economic_calendar"
     params = {"from": from_date, "to": to_date, "apikey": APP_CONFIG.fmp_api_key}
     try:
+        t0 = time.time()
+        logger.info("[FMP-econ] GET %s params=%s timeout=%s", url, params, timeout)
         r = HTTP_SESSION.get(url, params=params, timeout=timeout)
+        logger.info("[FMP-econ] respuesta status=%s en %.3fs", r.status_code, time.time()-t0)
+
         if r.status_code != 200:
             logger.info("[FMP-econ] HTTP %s params=%s", r.status_code, params)
             return pd.DataFrame()
@@ -2957,6 +2961,7 @@ def _fmp_econ_fetch(from_date: str, to_date: str, *, timeout: int) -> pd.DataFra
             df[c] = pd.to_numeric(df[c], errors="coerce")
         return df.sort_values("date", ascending=True).reset_index(drop=True)
     except Exception as e:
+        logger.warning("[FMP-econ] Error tras %.3fs: %s", time.time()-t0, e)
         logger.warning("[FMP-econ] Error: %s", e)
         return pd.DataFrame()
 
@@ -12291,6 +12296,37 @@ def _event_row_key(row: pd.Series) -> Tuple[str,str,int]:
     ms = int(date.value//1_000_000) if not pd.isna(date) else 0
     return (currency, event, ms)
 
+TZ_NY = ZoneInfo("America/New_York")
+def _trading_now_utc() -> datetime:
+    """
+    'Ahora' pensado en términos de día bursátil NY.
+    Si en NY son las 17:00 o más, considera el día de trading como mañana.
+    Devuelve un datetime en UTC.
+    """
+    raw_now_utc = _now_utc()
+    if raw_now_utc.tzinfo is None:
+        raw_now_utc = raw_now_utc.replace(tzinfo=timezone.utc)
+
+    now_ny = raw_now_utc.astimezone(TZ_NY)
+
+    # Opción B: después de las 17:00 NY, usamos "mañana"
+    if now_ny.hour >= 17:
+        trading_ny = now_ny + timedelta(days=1)
+    else:
+        trading_ny = now_ny
+
+    trading_utc = trading_ny.astimezone(timezone.utc)
+
+    logger.info(
+        "[eventos] _trading_now_utc raw_now_utc=%s now_ny=%s trading_ny=%s trading_utc=%s",
+        raw_now_utc.isoformat(),
+        now_ny.isoformat(),
+        trading_ny.isoformat(),
+        trading_utc.isoformat(),
+    )
+
+    return trading_utc
+
 # ==========================
 # Fetch de eventos (API o Firestore)
 # ==========================
@@ -12301,7 +12337,10 @@ def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) ->
     Aplica memoización de 5s por símbolo para soportar polling de 1s.
     """
 
-    now = _now_utc()
+    t0 = time.time()
+
+    # 🔹 aquí usamos el "now bursátil" (Opción B)
+    now = _trading_now_utc()
     a = now - timedelta(hours=int(hours_back))
     b = now + timedelta(minutes=int(minutes_fwd))
 
@@ -12319,6 +12358,9 @@ def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) ->
         df["impact"] = df["impact"].astype(str).str.capitalize()
         df = df.sort_values("date", ascending=True).reset_index(drop=True)
         _EVENTS_MEMO[symbol] = {"df": df.copy(), "ts": time.time()}
+
+        logger.info("[eventos] _fetch_events_for %s tardó %.3fs", symbol, time.time() - t0)
+
     return df
 
 def _detect_new_results(symbol: str, df: pd.DataFrame) -> List[dict]:
@@ -12610,6 +12652,31 @@ def _filter_by_symbol_currencies(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     # No-FOREX y sin mapping → no filtres
     return df.copy()
 
+
+def _tf_is_enabled(exec_id: str, symbol: str, timeframe: str) -> bool:
+    try:
+        doc_id = f"{exec_id}__{symbol}"
+        snap = db.collection("monitoreos").document(doc_id).get()
+        if not snap.exists:
+            return True  # si no hay doc, asumimos habilitado
+
+        data = snap.to_dict() or {}
+        running = data.get("running") or []
+        estado = str(data.get("estado") or "").lower()
+
+        # si el estado global es "stopped" y la tf no está en running → apagado
+        if estado.startswith("stop") and timeframe not in running:
+            return False
+
+        # si existe running y esta tf no está incluida → apagado para esta tf
+        if running and timeframe not in running:
+            return False
+
+        return True
+    except Exception:
+        # ante error, mejor no bloquear el endpoint
+        return True
+
 # ==========================
 # ENDPOINT
 # ==========================
@@ -12663,7 +12730,10 @@ def monitoreo_eventos():
         if not user_id or not exec_id or not symbol:
             return jsonify({"status":"error","message":"user_id, exec_id y symbol son obligatorios"}), 400
 
+        logger.info(f"Llamando _fetch_events_for({symbol}, hb={hours_back}, mf={minutes_fwd})")
         df = _fetch_events_for(symbol, hours_back=hours_back, minutes_fwd=minutes_fwd)
+        logger.info("_fetch_events_for terminó")
+        
         if df.empty:
             out = {"status":"ok","exec_id":exec_id,"symbol":symbol,"server_time":int(time.time()*1000),"hash":"0"*8,"count":0,"new_results":[],"events":[]}
             return jsonify(out), 200
@@ -12785,6 +12855,34 @@ async def monitoreo_incremental():
         if not exec_id:  return jsonify({"status":"error","message":"exec_id es obligatorio"}), 400
         if not symbol or not timeframe:
             return jsonify({"status":"error","message":"symbol y timeframe son obligatorios"}), 400
+
+
+        if not _tf_is_enabled(exec_id, symbol, timeframe):
+            # Opcional: actualizar estado en FS como "stopped"
+            await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
+                "estado": "stopped",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "user_id": user_id,
+                "tf_states": {
+                    timeframe: {
+                        "estado": "stopped",
+                        "last_ts": last_ts,
+                        "count_served": 0,
+                        "updated_at": int(time.time() * 1000),
+                    }
+                }
+            })
+            return jsonify({
+                "status": "ok",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "exec_id": exec_id,
+                "from_ts": None,
+                "to_ts": None,
+                "candles": [],
+            }), 200
+
 
         # 0) carga/refresh base
         st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
@@ -12998,9 +13096,12 @@ async def monitoreo_incremental():
         if new_bucket_started or persist or changed_closed:
             await asyncio.to_thread(_persist_if_needed, exec_id, symbol, timeframe, True)
 
+        estado_doc = _estado_actual_desde_firestore(exec_id, symbol)  # helper simple
+        new_estado = "running" if estado_doc != "stopped" else "stopped"
+
         # 8) Heartbeat + estado por TF
         await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
-            "estado": "running",
+            "estado": new_estado,
             "last_ts_served": (inc[-1]["t"] if inc else last_ts),
             "symbol": symbol,
             "timeframe": timeframe,
@@ -13663,7 +13764,7 @@ if __name__ == "__main__":
                 lifespan="off",
                 log_config=LOGGING_CONFIG, 
                 timeout_keep_alive=900,  # Espera hasta 5 minutos en keep-alive
-                timeout_graceful_shutdown=900  # Permite apagar tareas con 5 minutos de gracia
+                timeout_graceful_shutdown=900
                 )
             logger.info("Webhook con Server Web configurado...")
         
