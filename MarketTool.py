@@ -251,6 +251,130 @@ SYNC_TTL     = {"1min": 60, "5min": 120, "15min": 240, "30min": 300, "1hour": 60
 _LAST_QUOTE_TICK: Dict[tuple, float] = {}  # (exec_id, symbol, tf) -> epoch_s
 _LAST_SYNC: Dict[tuple, float] = {}
 
+_STOP_WORDS = {"stopped", "paused", "off", "detenido", "parado"}
+
+def _norm_tf_allowed(tf: str) -> str:
+    """
+    Forma CANÓNICA para allowed_timeframes:
+    1min/1m/1hour/1h/1day/1d/1week/1w -> 1m,1h,1d,1w, etc.
+    (lo que estás guardando en allowed_timeframes)
+    """
+    s = (tf or "").lower()
+    if s in ("1m", "1min"):      return "1m"
+    if s in ("5m", "5min"):      return "5m"
+    if s in ("15m", "15min"):    return "15m"
+    if s in ("30m", "30min"):    return "30m"
+    if s in ("1h", "1hour", "h1"):   return "1h"
+    if s in ("4h", "4hour", "h4"):   return "4h"
+    if s in ("1d", "1day", "d1"):    return "1d"
+    if s in ("1w", "1week", "w1"):   return "1w"
+    return s
+
+
+def _norm_tf_backend(tf: str) -> str:
+    """
+    Normaliza TF hacia lo que escribe el front en tf_states (1min, 1day, 1week, etc.)
+    """
+    s = (tf or "").lower()
+    if s in ("1m", "1min", "1"):    return "1min"
+    if s in ("5m", "5min"):         return "5min"
+    if s in ("15m", "15min"):       return "15min"
+    if s in ("30m", "30min"):       return "30min"
+    if s in ("1h", "1hour"):        return "1hour"
+    if s in ("4h", "4hour"):        return "4hour"
+    if s in ("1d", "1day", "d1"):   return "1day"
+    if s in ("1w", "1week", "w1"):  return "1week"
+    return s
+
+
+TF_TTL_MINUTES = {
+    "1m":  5,
+    "5m":  10,
+    "15m": 30,
+    "30m": 60,
+    "1h":  180,
+    "4h":  360,
+    "1d":  1440,
+    "1w":  10080,
+}
+
+
+def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
+    """
+    Devuelve True si ese TF se considera activo según monitoreos/{exec_id}__{symbol}.
+
+    Regla:
+      1) Si estado global está 'stopped'/etc → False
+      2) Si tf_states[tf] dice 'stopped' o enabled=False → False
+      3) Si tf_states[tf].enabled=True → True
+      4) Si no hay info específica → miramos allowed_timeframes
+      5) Opcional: TTL por last_ts/updated_at (en ms)
+    """
+    # Normalizaciones básicas
+    symbol = (symbol or "").upper()
+    tf_backend = _norm_tf_backend(tf)   # p.ej "1" / "1m" -> "1min"
+    tf_allowed = _norm_tf_allowed(tf)   # p.ej "1" / "1min" -> "1m"
+
+    # Cargamos el documento de monitoreo
+    doc_id = f"{exec_id}__{symbol}"
+    snap = db.collection("monitoreos").document(doc_id).get()
+    if not snap.exists:
+        return False
+
+    doc = snap.to_dict() or {}
+
+    # 1) estado global (apagado → todo False)
+    estado_global = str(doc.get("estado") or doc.get("status") or "").lower()
+    if any(w in estado_global for w in _STOP_WORDS):
+        return False
+
+    # 2) Obtenemos el estado particular del TF
+    tf_states = doc.get("tf_states") or {}
+
+    # Prioridad:
+    #   a) tf_states["1min"]
+    #   b) tf_states["1m"]
+    #   c) doc["1min"]  (campo raíz)
+    #   d) doc["1m"]    (campo raíz)
+    st = (
+        tf_states.get(tf_backend)
+        or tf_states.get(tf)
+        or doc.get(tf_backend)
+        or doc.get(tf)
+        or {}
+    )
+
+    # 3) estado particular del TF
+    estado_tf = str(st.get("estado") or "").lower()
+    if any(w in estado_tf for w in _STOP_WORDS):
+        return False
+
+    enabled = st.get("enabled")
+    if enabled is False:
+        return False
+    if enabled is True:
+        # Si explícitamente está en True, ya consideramos habilitado
+        # (sin mirar allowed_timeframes ni TTL, como en tu lógica original)
+        return True
+
+    # 4) Fallback: allowed_timeframes
+    allowed_list = doc.get("allowed_timeframes") or []
+    allowed_norm = {_norm_tf_allowed(x) for x in allowed_list}
+    if tf_allowed not in allowed_norm:
+        return False
+
+    # 5) Opcional: TTL (en ms)
+    last = st.get("last_heartbeat") or st.get("last_ts") or st.get("updated_at")
+    if isinstance(last, (int, float)):
+        now_ms = int(time.time() * 1000)
+        tf_key = tf_backend  # "1min", "5min", etc.
+        ttl_minutes = TF_TTL_MINUTES.get(tf_key, 60)
+        if now_ms - last > ttl_minutes * 60_000:
+            return False
+
+    return True
+
+
 @dataclass
 class FMPClient:
     api_key: str
@@ -1154,6 +1278,7 @@ def normalize_operatoria_payload(cfg: dict | None) -> dict:
         'fmpWindows': fmpWindows,
         'calcWindows': calcWindows,
     }
+
 
 
 #@profile
@@ -2639,6 +2764,9 @@ def obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=50, max_rei
         url = f"{endpoint}?tickers={symbol}&from={fecha_inicio.strftime('%Y-%m-%d')}&to={fecha_fin.strftime('%Y-%m-%d')}&limit={limite}&apikey={API_KEY}"
     else:
         url = f"{endpoint}?symbol={symbol}&from={fecha_inicio.strftime('%Y-%m-%d')}&to={fecha_fin.strftime('%Y-%m-%d')}&limit={limite}&apikey={API_KEY}"
+
+    logging.info(f"MTORO stock URL: {url}")
+
     reintento = 0
     tiempo_espera = tiempo_espera_inicial
 
@@ -11767,7 +11895,7 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
         iv = _fmp_interval(tf)
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}?apikey={API_KEY}"
         logging.info(f"MTORO3 URL: {url}")
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=5)
         if not r.ok:
             return []
         arr = r.json() or []
@@ -12082,7 +12210,7 @@ def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> l
             "to":   _ms_to_fmp_local(to_ms)
         }
         logging.info(f"MTORO10 url: {url} params: from={params['from']} to={params['to']}")
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(url, params=params, timeout=5)
         if not r.ok:
             logging.info(f"MTORO10 HTTP {r.status_code}: {r.text[:200]}")
             return []
@@ -12097,6 +12225,7 @@ def _fmp_hist_with_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> list
         return []
     iv = _fmp_interval(tf)
     url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}"
+    logging.info(f"MTORO _fmp_hist_with_range URL: {url}")
     params = {"apikey": API_KEY, "from": _ms_to_fmp_local(from_ms), "to": _ms_to_fmp_local(to_ms)}
     try:
         r = requests.get(url, params=params, timeout=20)
@@ -12130,43 +12259,14 @@ def _detect_closed_gaps(series: list[dict], tf: str) -> list[tuple[int, int]]:
     return gaps
 
 
-def _backfill_gaps_with_fmp(series: list[dict], symbol: str, tf: str, max_iters: int = 2) -> int:
-    """
-    Rellena huecos INTERNOS usando historical-chart con from/to.
-    Itera un par de veces por si se encadenan.
-    Devuelve cantidad de velas agregadas.
-    """
-    if not series:
-        return 0
-    added_total = 0
-    for _ in range(max_iters):
-        # asegurar base “limpia”
-        s = _snap_and_dedupe_to_minutes(series, tf)
-        gaps = _detect_closed_gaps(s, tf)
-        if not gaps:
-            break
-        tfms = _tf_ms(tf)
-        for (from_ms, to_ms) in gaps:
-            # si el gap es gigante, divide la petición en 2 para no abusar
-            if (to_ms - from_ms) // tfms > 10_000:
-                mid = from_ms + (5_000 * tfms)
-                bars = (_fmp_hist_with_range(symbol, tf, from_ms, mid) or []) + \
-                       (_fmp_hist_with_range(symbol, tf, mid + tfms, to_ms) or [])
-            else:
-                bars = _fmp_hist_with_range(symbol, tf, from_ms, to_ms)
-            if not bars:
-                continue
-            bars.sort(key=lambda x: x["t"])
-            merge_bars_series(s, bars, tf)
+def _backfill_internal_gaps(
+    base_ms: list[dict],
+    symbol: str,
+    tf: str,
+    exec_id: str | None = None,
+    max_minutes_per_call: int = 10_000,
+) -> int:
 
-        s = _snap_and_dedupe_to_minutes(s, tf)
-        grown = max(0, len(s) - len(series))
-        added_total += grown
-        series[:] = s  # in-place
-    return added_total
-
-
-def _backfill_internal_gaps(base_ms: list[dict], symbol: str, tf: str, max_minutes_per_call: int = 10_000) -> int:
     if not base_ms:
         return 0
     tfms = _tf_ms(tf)
@@ -12176,8 +12276,28 @@ def _backfill_internal_gaps(base_ms: list[dict], symbol: str, tf: str, max_minut
     cooldown = _INTERNAL_GAP_COOLDOWN_S.get(tf, 300)
     now_s = time.time()
 
+    start = now_s
+
     i = 0
     while i < len(base_ms) - 1:
+
+        if time.time() - start > 5:  # o 8, como prefieras
+            logging.info(
+                "BACKFILL_INTERNAL_GAPS time budget exceeded (%.3fs), "
+                "symbol=%s tf=%s total_added=%d; saliendo",
+                time.time() - start, symbol, tf, total_added
+            )
+            break
+
+        # antes de seguir escaneando gaps, revisamos Firestore
+        if exec_id and not _tf_is_enabled(exec_id, symbol, tf):
+            logging.info(
+                "BACKFILL_INTERNAL_GAPS abortado: TF deshabilitada en Firestore "
+                "exec=%s symbol=%s tf=%s",
+                exec_id, symbol, tf,
+            )
+            break
+
         a = base_ms[i]
         b = base_ms[i + 1]
         gap_buckets = (b["t"] - a["t"]) // tfms - 1
@@ -12653,30 +12773,6 @@ def _filter_by_symbol_currencies(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df.copy()
 
 
-def _tf_is_enabled(exec_id: str, symbol: str, timeframe: str) -> bool:
-    try:
-        doc_id = f"{exec_id}__{symbol}"
-        snap = db.collection("monitoreos").document(doc_id).get()
-        if not snap.exists:
-            return True  # si no hay doc, asumimos habilitado
-
-        data = snap.to_dict() or {}
-        running = data.get("running") or []
-        estado = str(data.get("estado") or "").lower()
-
-        # si el estado global es "stopped" y la tf no está en running → apagado
-        if estado.startswith("stop") and timeframe not in running:
-            return False
-
-        # si existe running y esta tf no está incluida → apagado para esta tf
-        if running and timeframe not in running:
-            return False
-
-        return True
-    except Exception:
-        # ante error, mejor no bloquear el endpoint
-        return True
-
 # ==========================
 # ENDPOINT
 # ==========================
@@ -12842,6 +12938,8 @@ def monitoreo_eventos():
 
 @webhook_app.route("/monitoreo/incremental", methods=["POST"])
 async def monitoreo_incremental():
+    start = time.time()
+    
     try:
         body = request.get_json(force=True) or {}
         user_id  = str(body.get("user_id") or "").strip()
@@ -12856,8 +12954,22 @@ async def monitoreo_incremental():
         if not symbol or not timeframe:
             return jsonify({"status":"error","message":"symbol y timeframe son obligatorios"}), 400
 
+        logging.info("INC START user=%s exec=%s body=%s", 
+                 body.get("user_id"), body.get("exec_id"), body)
 
-        if not _tf_is_enabled(exec_id, symbol, timeframe):
+        timeframe = (body.get("timeframe") or "").lower()   # "1min", "1day", etc.
+        tf_api = timeframe
+
+        enabled = True
+        if exec_id:
+            enabled = _tf_is_enabled(exec_id, symbol, tf_api)
+
+        logging.info(
+            f"INC TFCHK sym={symbol} tf={timeframe} enabled={enabled} "
+            f"user_id={user_id} exec_id={exec_id}"
+        )
+
+        if not enabled:
             # Opcional: actualizar estado en FS como "stopped"
             await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
                 "estado": "stopped",
@@ -12914,7 +13026,7 @@ async def monitoreo_incremental():
 
         # 3.1) NUEVO: rellenar gaps internos con rangos from/to
         # (Antes de densificar con sintéticas)
-        added_internal = _backfill_internal_gaps(base_ms, symbol, timeframe)
+        added_internal = _backfill_internal_gaps(base_ms, symbol, timeframe, exec_id=exec_id)
         if added_internal:
             # Si agregaste, conviene re-sellar cerrados otra vez por si FMP trajo volumen
             hist2 = _fetch_historical(symbol, timeframe)
@@ -12955,9 +13067,18 @@ async def monitoreo_incremental():
         def _ranges_overlap(a_from, a_to, b_from, b_to):
             return not (a_to <= b_from or b_to <= a_from)
 
+        backfill_start = time.time()
         def _throttle_and_call(from_ms:int, to_ms:int, label:str) -> int:
             """Devuelve 'added'. Solo setea cooldown si added>0. Evita duplicados/solapes y suprime rangos vacíos recientes."""
             nonlocal base_ms, last_try
+            
+            if time.time() - backfill_start > 5:  # o 10
+                logging.info(
+                    "BACKFILL RANGO abortado por time budget (%.3fs) sym=%s tf=%s label=%s",
+                    time.time() - backfill_start, symbol, timeframe, label
+                )
+                return 0
+            
             if to_ms <= from_ms:
                 return 0
 
@@ -13041,7 +13162,7 @@ async def monitoreo_incremental():
                     did_backfill = _throttle_and_call(from2, to2, "R2")
 
                 if did_backfill == 0:
-                    _backfill_internal_gaps(base_ms, symbol, timeframe, max_minutes_per_call=1500)
+                    _backfill_internal_gaps(base_ms, symbol, timeframe, exec_id=exec_id, max_minutes_per_call=1500)
 
         # Log post-backfill
         closed_after = [c for c in base_ms if c["t"] < _current_closed_bucket_start(timeframe)]
@@ -13096,8 +13217,7 @@ async def monitoreo_incremental():
         if new_bucket_started or persist or changed_closed:
             await asyncio.to_thread(_persist_if_needed, exec_id, symbol, timeframe, True)
 
-        estado_doc = _estado_actual_desde_firestore(exec_id, symbol)  # helper simple
-        new_estado = "running" if estado_doc != "stopped" else "stopped"
+        new_estado = "running"
 
         # 8) Heartbeat + estado por TF
         await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
@@ -13116,6 +13236,25 @@ async def monitoreo_incremental():
             }
         })
 
+        if last_ts is None:
+            # o devolvés todo base_ms, o desde last_closed_ts/last_server_t
+            inc_ms = base_ms
+        else:
+            inc_ms = [b for b in base_ms if b["t"] > last_ts]
+
+            logging.info(
+                "INC RESP sym=%s tf=%s candles=%d from_ts=%s to_ts=%s",
+                symbol, timeframe, len(inc_ms), inc_ms[0]["t"] if inc_ms else None,
+                inc_ms[-1]["t"] if inc_ms else None,
+            )
+
+            logging.info(
+                "INC DONE sym=%s tf=%s candles=%d dur=%.3fs",
+                symbol, timeframe, len(inc),
+                time.time() - start,
+            )
+
+
         return jsonify({
             "status": "ok",
             "symbol": symbol,
@@ -13127,10 +13266,8 @@ async def monitoreo_incremental():
         }), 200
 
     except Exception as e:
-        logging.exception("Error en /monitoreo/incremental")
+        logging.exception("Error en /monitoreo/incremental (dur=%.3fs)", time.time() - start)
         return jsonify({"status": "error", "message": str(e)}), 500
-
-
 
 
 @webhook_app.route("/monitoreo/describe", methods=["GET"])
@@ -13222,6 +13359,54 @@ async def monitoreo_history():
         if not symbol or not timeframe:
             return jsonify({"status": "error", "message": "symbol y timeframe son obligatorios"}), 400
 
+
+        timeframe = (body.get("timeframe") or "").lower()   # "1min", "1day", etc.
+        tf_api = timeframe
+
+        enabled = True
+        if exec_id:
+            enabled = _tf_is_enabled(exec_id, symbol, tf_api)
+        
+        logging.info(
+            "INC TFCHK sym=%s tf=%s enabled=%s user_id=%s exec_id=%s",
+            symbol, tf_api, enabled, user_id, exec_id,
+        )
+
+        if not enabled:
+            # Opcional (pero útil): marcar la TF como parada en Firestore
+            await asyncio.to_thread(
+                fs_touch_monitoreo,
+                exec_id,
+                symbol,
+                {
+                    "estado": "stopped",
+                    "symbol": symbol,
+                    "timeframe": tf_api,
+                    "user_id": user_id,
+                    "tf_states": {
+                        tf_api: {
+                            "estado": "stopped",
+                            "enabled": False,
+                            "last_ts": None,
+                            "count_served": 0,
+                            "updated_at": int(time.time() * 1000),
+                        }
+                    },
+                },
+            )
+
+            return jsonify(
+                {
+                    "status": "ok",
+                    "symbol": symbol,
+                    "timeframe": tf_api,
+                    "exec_id": exec_id,
+                    "from_ts": None,
+                    "to_ts": None,
+                    "candles": [],
+                }
+            ), 200
+
         try:
             limit = int(limit)
         except Exception:
@@ -13265,7 +13450,7 @@ async def monitoreo_history():
 
         # Heartbeat
         await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
-            "estado": "history",
+            "estado": "running",
             "symbol": symbol,
             "timeframe": timeframe,
             "user_id": user_id,
