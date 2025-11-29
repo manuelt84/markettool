@@ -245,8 +245,22 @@ RESAMPLE_PLAN: Dict[str, Tuple[str, str]] = {
 EOD_RESAMPLE_RULE: Dict[str, str] = {"1week": "W", "1month": "M"}
 
 HIST_GRACE_S = {"1min": 5, "5min": 5, "15min": 8, "30min": 10, "1hour": 15, "4hour": 20}
-QUOTE_TTL    = {"1min": 3, "5min": 5, "15min": 10, "30min": 15, "1hour": 20, "4hour": 30}
-SYNC_TTL     = {"1min": 60, "5min": 120, "15min": 240, "30min": 300, "1hour": 600, "4hour": 1200}
+QUOTE_TTL    = {
+    "1min": 0.15,   # antes 0.3 → hasta ~10 ticks/s
+    "5min": 1,     # antes 2
+    "15min": 5,    # antes 10
+    "30min": 10,   # antes 15
+    "1hour": 15,   # antes 20
+    "4hour": 20,   # antes 30
+}
+SYNC_TTL     = {
+    "1min": 30,    # antes 60
+    "5min": 90,    # antes 120
+    "15min": 180,  # antes 240
+    "30min": 240,  # antes 300
+    "1hour": 480,  # antes 600
+    "4hour": 900,  # antes 1200
+}
 
 _LAST_QUOTE_TICK: Dict[tuple, float] = {}  # (exec_id, symbol, tf) -> epoch_s
 _LAST_SYNC: Dict[tuple, float] = {}
@@ -11925,6 +11939,32 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
         return []
 
 
+# Cache muy simple para histórico FMP por (symbol, timeframe) para no pegarle en cada incremental
+_HIST_CACHE: Dict[Tuple[str, str], dict] = {}
+_HIST_CACHE_TTL: Dict[str, int] = {
+    "1min":  20,   # 1m: como mucho 1 llamada nueva cada ~20s
+    "5min":  60,
+    "15min": 120,
+    "30min": 180,
+    "1hour": 300,
+    "4hour": 600,
+}
+
+def _fetch_historical_cached(symbol: str, tf: str) -> list[dict]:
+    """Envuelve _fetch_historical con un TTL simple por símbolo/TF."""
+    tf_norm = _norm_tf(tf)
+    key = (symbol.upper(), tf_norm)
+    now = time.time()
+    ttl = _HIST_CACHE_TTL.get(tf_norm, 120)
+
+    cached = _HIST_CACHE.get(key)
+    if cached and (now - cached.get("ts", 0)) < ttl:
+        return cached.get("data", [])
+
+    data = _fetch_historical(symbol, tf_norm)
+    _HIST_CACHE[key] = {"ts": now, "data": data}
+    return data
+
 
 def _maybe_tick_quote(exec_id: str, symbol: str, tf: str, st: dict) -> bool:
     key = (exec_id, symbol, tf)
@@ -12266,7 +12306,8 @@ def _backfill_internal_gaps(
     exec_id: str | None = None,
     max_minutes_per_call: int = 10_000,
 ) -> int:
-
+    if tf in ("1min", "1m", "5min", "5m"):
+        return 0
     if not base_ms:
         return 0
     tfms = _tf_ms(tf)
@@ -12939,7 +12980,7 @@ def monitoreo_eventos():
 @webhook_app.route("/monitoreo/incremental", methods=["POST"])
 async def monitoreo_incremental():
     start = time.time()
-    
+
     try:
         body = request.get_json(force=True) or {}
         user_id  = str(body.get("user_id") or "").strip()
@@ -12949,15 +12990,19 @@ async def monitoreo_incremental():
         last_ts  = body.get("last_ts")
         persist  = bool(body.get("persist", False))
 
-        if not user_id:  return jsonify({"status":"error","message":"user_id es obligatorio"}), 400
-        if not exec_id:  return jsonify({"status":"error","message":"exec_id es obligatorio"}), 400
+        if not user_id:
+            return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
+        if not exec_id:
+            return jsonify({"status": "error", "message": "exec_id es obligatorio"}), 400
         if not symbol or not timeframe:
-            return jsonify({"status":"error","message":"symbol y timeframe son obligatorios"}), 400
+            return jsonify({"status": "error", "message": "symbol y timeframe son obligatorios"}), 400
 
-        logging.info("INC START user=%s exec=%s body=%s", 
-                 body.get("user_id"), body.get("exec_id"), body)
+        logging.info(
+            "INC START user=%s exec=%s body=%s",
+            body.get("user_id"), body.get("exec_id"), body,
+        )
 
-        timeframe = (body.get("timeframe") or "").lower()   # "1min", "1day", etc.
+        # normalizamos TF para usar en feature-flag
         tf_api = timeframe
 
         enabled = True
@@ -12965,309 +13010,272 @@ async def monitoreo_incremental():
             enabled = _tf_is_enabled(exec_id, symbol, tf_api)
 
         logging.info(
-            f"INC TFCHK sym={symbol} tf={timeframe} enabled={enabled} "
-            f"user_id={user_id} exec_id={exec_id}"
+            "INC TFCHK sym=%s tf=%s enabled=%s user_id=%s exec_id=%s",
+            symbol, timeframe, enabled, user_id, exec_id,
         )
 
         if not enabled:
-            # Opcional: actualizar estado en FS como "stopped"
-            await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
-                "estado": "stopped",
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "user_id": user_id,
-                "tf_states": {
-                    timeframe: {
-                        "estado": "stopped",
-                        "last_ts": last_ts,
-                        "count_served": 0,
-                        "updated_at": int(time.time() * 1000),
-                    }
+            now_ms = int(time.time() * 1000)
+            await asyncio.to_thread(
+                fs_touch_monitoreo,
+                exec_id,
+                symbol,
+                {
+                    "estado": "stopped",
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "user_id": user_id,
+                    "tf_states": {
+                        timeframe: {
+                            "estado": "stopped",
+                            "last_ts": last_ts,
+                            "count_served": 0,
+                            "updated_at": now_ms,
+                        }
+                    },
+                },
+            )
+            return jsonify(
+                {
+                    "status": "ok",
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "exec_id": exec_id,
+                    "from_ts": None,
+                    "to_ts": None,
+                    "candles": [],
                 }
-            })
-            return jsonify({
-                "status": "ok",
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "exec_id": exec_id,
-                "from_ts": None,
-                "to_ts": None,
-                "candles": [],
-            }), 200
+            ), 200
 
-
-        # 0) carga/refresh base
-        st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
+        # ------------------------------------------------------------
+        # 0) Cargar estado base (serie) y refrescar desde GCS si hace falta
+        # ------------------------------------------------------------
+        st: dict = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
         prev_series_ms = _series_to_ms(st.get("series", []))
         prev_last = prev_series_ms[-1] if prev_series_ms else None
 
-        age = {"1min":20, "5min":60, "15min":180, "30min":360, "1hour":900, "4hour":1800}.get(timeframe, 60)
-        await asyncio.to_thread(_maybe_refresh_from_gcs, exec_id, symbol, timeframe, st, age)
-        await asyncio.to_thread(_ensure_stream_initialized, exec_id, symbol, timeframe, st)
+        age = {
+            "1min": 20,
+            "5min": 60,
+            "15min": 180,
+            "30min": 300,
+            "1hour": 600,
+            "4hour": 900,
+        }.get(timeframe, 300)
 
-        # 1) normaliza last_ts
+        try:
+            await asyncio.to_thread(
+                _maybe_refresh_from_gcs, exec_id, symbol, timeframe, st, age
+            )
+        except Exception:
+            logging.exception("INC %s %s: _maybe_refresh_from_gcs falló", symbol, timeframe)
+
+        try:
+            await asyncio.to_thread(
+                _ensure_stream_initialized, exec_id, symbol, timeframe, st
+            )
+        except Exception:
+            logging.exception("INC %s %s: _ensure_stream_initialized falló", symbol, timeframe)
+
+        # ------------------------------------------------------------
+        # 1) Normalizar last_ts
+        # ------------------------------------------------------------
         try:
             last_ts = int(last_ts) if last_ts is not None else None
-        except:
+        except Exception:
             last_ts = None
 
-        # 2) SNAP + DEDUP base de trabajo
-        base_ms = _series_to_ms(st.get("series", []))
+        # ------------------------------------------------------------
+        # 2) Serie base en ms + bucketizada
+        # ------------------------------------------------------------
+        base_ms = _series_to_ms(st.get("series", []) or [])
         base_ms = _snap_and_dedupe_to_minutes(base_ms, timeframe)
 
-        # Firma de 'cerrados' ANTES
-        before_sig = _closed_signature(base_ms, timeframe)
+        # 3) Densificar + último tick de quote (SIN backfills ni FMP pesado)
+        try:
+            base_ms = _densify_minutes(base_ms, timeframe)
+        except Exception:
+            logging.exception("INC %s %s: _densify_minutes falló", symbol, timeframe)
 
-        # 3) Overlay histórico corto para buckets CERRADOS (corrige velas tick)
-        hist = _fetch_historical(symbol, timeframe)
-        if hist:
-            base_ms = _overlay_historical_for_closed(base_ms, hist, timeframe)
+        # Aseguramos que st["series"] tenga la serie base antes del tick
+        st["series"] = base_ms
 
+        try:
+            # Firma: _maybe_tick_quote(exec_id, symbol, tf, st)
+            changed_tick = await asyncio.to_thread(
+                _maybe_tick_quote, exec_id, symbol, timeframe, st
+            )
+            if changed_tick:
+                # _maybe_tick_quote modifica st["series"], la volvemos a tomar
+                base_ms = _snap_and_dedupe_to_minutes(
+                    _series_to_ms(st.get("series", [])), timeframe
+                )
+        except Exception:
+            logging.exception("INC %s %s: _maybe_tick_quote falló", symbol, timeframe)
 
-        # 3.1) NUEVO: rellenar gaps internos con rangos from/to
-        # (Antes de densificar con sintéticas)
-        added_internal = _backfill_internal_gaps(base_ms, symbol, timeframe, exec_id=exec_id)
-        if added_internal:
-            # Si agregaste, conviene re-sellar cerrados otra vez por si FMP trajo volumen
-            hist2 = _fetch_historical(symbol, timeframe)
-            if hist2:
-                base_ms = _overlay_historical_for_closed(base_ms, hist2, timeframe)
+        last_server = base_ms[-1] if base_ms else None
+        last_server_t = int(last_server.get("t")) if last_server and "t" in last_server else None
 
+        # ------------------------------------------------------------
+        # 4) Detectar cambios (nueva vela cerrada o actualización de la última)
+        # ------------------------------------------------------------
+        changed_by_reload = False
+        if (
+            prev_last
+            and last_server
+            and last_server_t
+            and last_server_t > int(prev_last.get("t", 0))
+        ):
+            changed_by_reload = True
+        elif prev_last and last_server:
+            for k in ("o", "h", "l", "c", "v"):
+                try:
+                    if float(last_server.get(k, 0)) != float(prev_last.get(k, 0)):
+                        changed_by_reload = True
+                        break
+                except Exception:
+                    continue
 
-        # ===== DETECCIÓN Y BACKFILL DE GAPS GRANDES POR RANGO =====
-        tfms = _tf_ms(timeframe)
-        cur_bucket = _current_closed_bucket_start(timeframe)   # inicio del bucket en curso
-        closed_end = cur_bucket - tfms                         # último bucket cerrado
-
-        last_have_t   = base_ms[-1]["t"] if base_ms else None
-        newest_hist_t = hist[-1]["t"] if hist else None
-
-        # último bucket CERRADO que ya tenemos
-        last_closed_ts = None
-        for i in range(len(base_ms) - 1, -1, -1):
-            t = int(base_ms[i]["t"])
-            if t < cur_bucket:
-                last_closed_ts = t
-                break
-
-        condA = (newest_hist_t is not None and last_have_t is not None and newest_hist_t > last_have_t + tfms)
-        logging.info(
-            f"GAPCHK2 {symbol} {timeframe} last_have_t={last_have_t} newest_hist_t={newest_hist_t} "
-            f"closed_end={closed_end} last_closed_ts={last_closed_ts} tfms={tfms} condA={condA}"
+        changed = (
+            changed_by_reload
+            or (not prev_last and bool(last_server))
+            or (
+                prev_last
+                and last_server
+                and last_server_t
+                and last_server_t > int(prev_last.get("t", 0))
+            )
         )
 
-        # ---- throttle / cooldown por TF
-        key = (symbol, timeframe)
-        now_s = time.time()
-        # ajusta cooldown por TF (más agresivo en 1min)
-        cooldown = { "1min": 60, "5min": 120, "15min": 180, "30min": 240, "1hour": 300, "4hour": 600 }.get(timeframe, 180)
-        last_try = _LAST_BACKFILL_ATTEMPT.get(key, 0)
-        max_bars = _MAX_BACKFILL_BARS.get(timeframe, 1500)
-
-        def _ranges_overlap(a_from, a_to, b_from, b_to):
-            return not (a_to <= b_from or b_to <= a_from)
-
-        backfill_start = time.time()
-        def _throttle_and_call(from_ms:int, to_ms:int, label:str) -> int:
-            """Devuelve 'added'. Solo setea cooldown si added>0. Evita duplicados/solapes y suprime rangos vacíos recientes."""
-            nonlocal base_ms, last_try
-            
-            if time.time() - backfill_start > 5:  # o 10
-                logging.info(
-                    "BACKFILL RANGO abortado por time budget (%.3fs) sym=%s tf=%s label=%s",
-                    time.time() - backfill_start, symbol, timeframe, label
-                )
-                return 0
-            
-            if to_ms <= from_ms:
-                return 0
-
-            # limitar tamaño del rango
-            if to_ms > from_ms + max_bars * tfms:
-                to_ms = from_ms + max_bars * tfms
-
-            # evitar repetir exactamente el mismo rango o uno que se solape con el último exitoso
-            last_range = _LAST_BACKFILL_RANGE.get(key)
-            same_or_overlap = False
-            if last_range:
-                lr_from, lr_to = last_range
-                same_or_overlap = _ranges_overlap(from_ms, to_ms, lr_from, lr_to)
-
-            # cooldown solo si el último intento exitoso fue reciente Y el rango se solapa
-            use_cooldown = same_or_overlap and ((now_s - last_try) < cooldown)
-
-            # además: suprime si el mismo rango (o muy parecido) fue VACÍO hace poco
-            empty = _LAST_BACKFILL_EMPTY.get(key)
-            suppress_empty = False
-            if empty:
-                e_from, e_to, e_ts = empty
-                suppress_empty = ((now_s - e_ts) < _EMPTY_SUPPRESS_S) and _ranges_overlap(from_ms, to_ms, e_from, e_to)
-
-            logging.info(
-                f"GAPCHK2.B {symbol} {timeframe} from_ms={from_ms} to_ms={to_ms} "
-                f"cooldown={cooldown}s last_try={last_try} use_cooldown={use_cooldown} "
-                f"suppress_empty={suppress_empty} label={label}"
-            )
-            if use_cooldown or suppress_empty:
-                return 0
-
-            logging.info(
-                f"MTORO10 url: https://financialmodelingprep.com/api/v3/historical-chart/{_fmp_interval(timeframe)}/{symbol} "
-                f"params: from={_ms_to_fmp_local(from_ms)} to={_ms_to_fmp_local(to_ms)}"
-            )
-            added = _backfill_range_once(base_ms, symbol, timeframe, from_ms, to_ms)
-
-            # marca “éxito” (enfriar/recordar rango) SOLO si agregó algo
-            if added > 0:
-                _LAST_BACKFILL_ATTEMPT[key] = now_s
-                last_try = now_s
-                _LAST_BACKFILL_RANGE[key] = (from_ms, to_ms)
-                # al haber éxito, limpia el recordatorio de vacío (opcional)
-                if key in _LAST_BACKFILL_EMPTY:
-                    del _LAST_BACKFILL_EMPTY[key]
-            else:
-                # si no agregó nada, recuerda este rango como vacío para suprimir martilleo breve
-                _LAST_BACKFILL_EMPTY[key] = (from_ms, to_ms, now_s)
-
-            logging.info(
-                f"GAPFILL {symbol} {timeframe} from={_ms_to_fmp_local(from_ms)} to={_ms_to_fmp_local(to_ms)} "
-                f"gap_bars={int((to_ms-from_ms)//tfms)} added={added} label={label}"
-            )
-            if added > 0:
-                # Reaplicar overlay para sellar cerrados con volumen
-                hist2 = _fetch_historical(symbol, timeframe)
-                if hist2:
-                    base_ms = _overlay_historical_for_closed(base_ms, hist2, timeframe)
-
-            return added
-
-        
-        with _backfill_guard(symbol, timeframe) as allowed:
-            if allowed:
-
-                # Calcula ambos rangos, pero ejecuta máximo uno:
-                did_backfill = 0
-
-                # ROLLO-1: FMP tiene minutos más nuevos que lo que yo tengo
-                if condA and last_have_t is not None:
-                    from1 = last_have_t + tfms
-                    to1   = min(newest_hist_t, closed_end)
-                    did_backfill = _throttle_and_call(from1, to1, "R1")
-
-                # ROLLO-2: si no hubo backfill en R1, intentá rellenar entre tu último cerrado y closed_end
-                if did_backfill == 0 and last_closed_ts is not None and last_closed_ts < closed_end - tfms:
-                    from2 = max(last_closed_ts + tfms, (last_have_t + tfms) if last_have_t is not None else last_closed_ts + tfms)
-                    to2   = closed_end
-                    # Evita overlap innecesario por las dudas (si R1 calculó un rango parecido)
-                    did_backfill = _throttle_and_call(from2, to2, "R2")
-
-                if did_backfill == 0:
-                    _backfill_internal_gaps(base_ms, symbol, timeframe, exec_id=exec_id, max_minutes_per_call=1500)
-
-        # Log post-backfill
-        closed_after = [c for c in base_ms if c["t"] < _current_closed_bucket_start(timeframe)]
-        logging.info(f"CLOSED {symbol} {timeframe} count={len(closed_after)} last_t={closed_after[-1]['t'] if closed_after else None}")
-
-        # 4) Densificar huecos chicos
-        base_ms = _densify_minutes(base_ms, timeframe, max_fill=10, max_gap_minutes=10)
-
-        # Firma de 'cerrados' DESPUÉS
-        after_sig = _closed_signature(base_ms, timeframe)
-
-        # 5) Tick del minuto en curso (realtime)
-        try:
-            if _maybe_tick_quote(exec_id, symbol, timeframe, {"series": base_ms}):
-                base_ms = _snap_and_dedupe_to_minutes(base_ms, timeframe)
-        except Exception:
-            pass
-
-        # 6) actualiza estado en memoria
-        with _MON_CACHE_LOCK:
-            st["series"] = base_ms
-
-        # --- cálculo de INC
-        last_server_t = base_ms[-1]["t"] if base_ms else None
-        last_server = base_ms[-1] if base_ms else None
-
-        changed_by_reload = False
-        if prev_last and last_server and last_server_t == prev_last["t"]:
-            for k in ("o","h","l","c","v"):
-                if float(last_server.get(k,0)) != float(prev_last.get(k,0)):
-                    changed_by_reload = True
-                    break
-
-        changed = changed_by_reload or (not prev_last and bool(last_server)) or (prev_last and last_server and last_server_t > prev_last["t"])
-
+        # ------------------------------------------------------------
+        # 5) Calcular incremental a devolver
+        #    - Si last_ts es None → devolvemos TODA la serie (seed)
+        #    - Si hay velas nuevas (t > last_ts) → devolvemos sólo esas
+        #    - Si no hay velas nuevas pero cambió la última → devolvemos sólo la última
+        # ------------------------------------------------------------
         EPS = 1
         if last_ts is None:
             inc = base_ms
         elif last_server_t is not None and last_server_t > last_ts + EPS:
-            inc = [c for c in base_ms if c["t"] > last_ts]
+            inc = [c for c in base_ms if int(c.get("t", 0)) > last_ts]
         else:
-            inc = [last_server] if (changed and last_server_t and last_server_t >= last_ts - EPS) else []
+            inc = (
+                [last_server]
+                if (changed and last_server_t and last_server_t >= (last_ts or 0) - EPS)
+                else []
+            )
 
-        logging.info(f"INC {symbol} {timeframe} last_ts={last_ts} last_server_t={last_server_t} changed={changed} -> inc_len={len(inc)}")
+        logging.info(
+            "INC %s %s last_ts=%s last_server_t=%s changed=%s -> inc_len=%d",
+            symbol,
+            timeframe,
+            last_ts,
+            last_server_t,
+            changed,
+            len(inc),
+        )
 
-        # 7) Persistencia
-        new_bucket_started = bool(prev_last and last_server and last_server["t"] > prev_last["t"])
-        changed_closed = (before_sig != after_sig)
-        if changed or changed_closed:
-            with _MON_CACHE_LOCK:
+        # ------------------------------------------------------------
+        # 6) Persistencia ligera en GCS
+        #    Persistimos sólo cuando hay nueva vela cerrada o el cliente lo pide.
+        # ------------------------------------------------------------
+        new_bucket_started = bool(
+            prev_last
+            and last_server
+            and last_server_t
+            and last_server_t > int(prev_last.get("t", 0))
+        )
+
+        if inc:
+            try:
+                with _MON_CACHE_LOCK:
+                    st["dirty"] = True
+            except Exception:
+                # por si _MON_CACHE_LOCK es un dummy en algún entorno
                 st["dirty"] = True
-        if new_bucket_started or persist or changed_closed:
-            await asyncio.to_thread(_persist_if_needed, exec_id, symbol, timeframe, True)
 
-        new_estado = "running"
+        if new_bucket_started or persist:
+            try:
+                await asyncio.to_thread(
+                    _persist_if_needed, exec_id, symbol, timeframe, True
+                )
+            except Exception:
+                logging.exception(
+                    "INC %s %s: _persist_if_needed falló", symbol, timeframe
+                )
 
-        # 8) Heartbeat + estado por TF
-        await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
-            "estado": new_estado,
-            "last_ts_served": (inc[-1]["t"] if inc else last_ts),
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "user_id": user_id,
-            "tf_states": {
-                timeframe: {
+        # ------------------------------------------------------------
+        # 7) Heartbeat / monitoreo en Firestore
+        # ------------------------------------------------------------
+        now_ms = int(time.time() * 1000)
+        last_served_ts = inc[-1]["t"] if inc else last_ts
+
+        try:
+            await asyncio.to_thread(
+                fs_touch_monitoreo,
+                exec_id,
+                symbol,
+                {
                     "estado": "running",
-                    "last_ts": (inc[-1]["t"] if inc else last_ts),
-                    "count_served": len(inc),
-                    "updated_at": int(time.time()*1000),
-                }
-            }
-        })
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "user_id": user_id,
+                    "tf_states": {
+                        timeframe: {
+                            "estado": "running",
+                            "last_ts": last_served_ts,
+                            "count_served": len(inc),
+                            "updated_at": now_ms,
+                        }
+                    },
+                },
+            )
+        except Exception:
+            logging.exception("INC %s %s: fs_touch_monitoreo falló", symbol, timeframe)
 
+        # ------------------------------------------------------------
+        # 8) Log final + respuesta
+        # ------------------------------------------------------------
         if last_ts is None:
-            # o devolvés todo base_ms, o desde last_closed_ts/last_server_t
             inc_ms = base_ms
         else:
-            inc_ms = [b for b in base_ms if b["t"] > last_ts]
+            inc_ms = [b for b in base_ms if int(b.get("t", 0)) > last_ts]
 
-            logging.info(
-                "INC RESP sym=%s tf=%s candles=%d from_ts=%s to_ts=%s",
-                symbol, timeframe, len(inc_ms), inc_ms[0]["t"] if inc_ms else None,
-                inc_ms[-1]["t"] if inc_ms else None,
-            )
+        logging.info(
+            "INC RESP sym=%s tf=%s candles=%d from_ts=%s to_ts=%s",
+            symbol,
+            timeframe,
+            len(inc_ms),
+            inc_ms[0]["t"] if inc_ms else None,
+            inc_ms[-1]["t"] if inc_ms else None,
+        )
+        logging.info(
+            "INC DONE sym=%s tf=%s candles=%d dur=%.3fs",
+            symbol,
+            timeframe,
+            len(inc),
+            time.time() - start,
+        )
 
-            logging.info(
-                "INC DONE sym=%s tf=%s candles=%d dur=%.3fs",
-                symbol, timeframe, len(inc),
-                time.time() - start,
-            )
-
-
-        return jsonify({
-            "status": "ok",
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "exec_id": exec_id,
-            "from_ts": (inc[0]["t"] if inc else last_ts),
-            "to_ts": (inc[-1]["t"] if inc else last_ts),
-            "candles": inc,
-        }), 200
+        return jsonify(
+            {
+                "status": "ok",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "exec_id": exec_id,
+                "from_ts": inc[0]["t"] if inc else last_ts,
+                "to_ts": inc[-1]["t"] if inc else last_ts,
+                "candles": inc,
+            }
+        ), 200
 
     except Exception as e:
-        logging.exception("Error en /monitoreo/incremental (dur=%.3fs)", time.time() - start)
+        logging.exception(
+            "Error en /monitoreo/incremental (dur=%.3fs)",
+            time.time() - start,
+        )
         return jsonify({"status": "error", "message": str(e)}), 500
+
 
 
 @webhook_app.route("/monitoreo/describe", methods=["GET"])
@@ -13415,9 +13423,34 @@ async def monitoreo_history():
 
         # Carga cache y normaliza a ms
         st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
-        age = {"1min": 20, "5min": 60, "15min": 180, "30min": 360, "1hour": 900, "4hour": 1800}.get(timeframe, 60)
-        await asyncio.to_thread(_maybe_refresh_from_gcs, exec_id, symbol, timeframe, st, age)
+
+        # TTL de refresco desde GCS por TF
+        age_map = {
+            "1min": 300,    # ya lo tratamos especial
+            "5min": 120,    # antes 60
+            "15min": 300,   # antes 120
+            "30min": 600,   # antes 240
+            "1hour": 1200,  # antes 600
+            "4hour": 2400,  # antes 1200
+        }
+        age = age_map.get(timeframe, 60)
+
+        # Para 1min: NO refrescamos desde GCS en cada history si ya hay serie en memoria.
+        # Para el resto de TF, o si aún no hay datos, sí refrescamos normalmente.
+        if timeframe not in ("1min", "1m") or not st.get("series"):
+            await asyncio.to_thread(
+                _maybe_refresh_from_gcs,
+                exec_id,
+                symbol,
+                timeframe,
+                st,
+                age,
+            )
+
+        # Normaliza a ms DESPUÉS del posible refresh
         series_ms = _series_to_ms(st.get("series", []))
+
+
 
         # Filtrado por ventana (en ms si viene)
         if from_ts is not None:
