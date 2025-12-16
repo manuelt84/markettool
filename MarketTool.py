@@ -370,13 +370,20 @@ def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
         # Si explícitamente está en True, ya consideramos habilitado
         # (sin mirar allowed_timeframes ni TTL, como en tu lógica original)
         return True
-
-    # 4) Fallback: allowed_timeframes
-    allowed_list = doc.get("allowed_timeframes") or []
-    allowed_norm = {_norm_tf_allowed(x) for x in allowed_list}
-    if tf_allowed not in allowed_norm:
-        return False
-
+    # 4) Fallback: allowlist de timeframes.
+    # Si no definiste allowlist, NO bloqueamos por defecto (evita que el backend
+    # pise "running" → "stopped" solo por no tener allowed_timeframes configurado).
+    allowed_list = (
+        doc.get("allowed_timeframes")
+        or doc.get("timeframes")
+        or doc.get("tf_list")
+        or doc.get("tfs")
+        or []
+    )
+    if allowed_list:
+        allowed_norm = {_norm_tf_allowed(x) for x in allowed_list}
+        if tf_allowed not in allowed_norm:
+            return False
     # 5) Opcional: TTL (en ms)
     last = st.get("last_heartbeat") or st.get("last_ts") or st.get("updated_at")
     if isinstance(last, (int, float)):
@@ -11486,10 +11493,12 @@ def fs_touch_monitoreo(exec_id: str, symbol: str, data: Dict[str, Any]) -> None:
     try:
         doc_id = f"{exec_id}__{symbol.upper()}"
         ref = db.collection("monitoreos").document(doc_id)
-        cur = ref.get().to_dict() if ref.get().exists else {}
+        snap = ref.get()
+        cur = snap.to_dict() if snap.exists else {}
         cur = cur or {}
         cur.update(data)
-        cur["updated_at"] = int(time.time())
+        # ms para consistencia con last_ts/updated_at en tf_states
+        cur["updated_at"] = int(time.time() * 1000)
         ref.set(cur, merge=True)
     except Exception:
         pass
@@ -13015,26 +13024,8 @@ async def monitoreo_incremental():
         )
 
         if not enabled:
-            now_ms = int(time.time() * 1000)
-            await asyncio.to_thread(
-                fs_touch_monitoreo,
-                exec_id,
-                symbol,
-                {
-                    "estado": "stopped",
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "user_id": user_id,
-                    "tf_states": {
-                        timeframe: {
-                            "estado": "stopped",
-                            "last_ts": last_ts,
-                            "count_served": 0,
-                            "updated_at": now_ms,
-                        }
-                    },
-                },
-            )
+            # Endpoint de lectura: no pisamos Firestore (evita que "running" vuelva a "stopped").
+            # Para habilitar una TF, usá tf_states.<tf>.enabled=True o agregala a allowed_timeframes.
             return jsonify(
                 {
                     "status": "ok",
@@ -13381,28 +13372,7 @@ async def monitoreo_history():
         )
 
         if not enabled:
-            # Opcional (pero útil): marcar la TF como parada en Firestore
-            await asyncio.to_thread(
-                fs_touch_monitoreo,
-                exec_id,
-                symbol,
-                {
-                    "estado": "stopped",
-                    "symbol": symbol,
-                    "timeframe": tf_api,
-                    "user_id": user_id,
-                    "tf_states": {
-                        tf_api: {
-                            "estado": "stopped",
-                            "enabled": False,
-                            "last_ts": None,
-                            "count_served": 0,
-                            "updated_at": int(time.time() * 1000),
-                        }
-                    },
-                },
-            )
-
+            # Endpoint de lectura: no pisamos Firestore acá.
             return jsonify(
                 {
                     "status": "ok",
