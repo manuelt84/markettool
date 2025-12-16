@@ -385,12 +385,19 @@ def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
         if tf_allowed not in allowed_norm:
             return False
     # 5) Opcional: TTL (en ms)
-    last = st.get("last_heartbeat") or st.get("last_ts") or st.get("updated_at")
-    if isinstance(last, (int, float)):
+    last = (
+        st.get("last_heartbeat_ms")
+        or st.get("last_heartbeat")
+        or st.get("last_ts")
+        or st.get("updated_at_ms")
+        or st.get("updated_at")
+    )
+    last_ms = _to_ms(last)
+    if last_ms is not None:
         now_ms = int(time.time() * 1000)
         tf_key = tf_backend  # "1min", "5min", etc.
         ttl_minutes = TF_TTL_MINUTES.get(tf_key, 60)
-        if now_ms - last > ttl_minutes * 60_000:
+        if now_ms - last_ms > ttl_minutes * 60_000:
             return False
 
     return True
@@ -11491,13 +11498,26 @@ def _load_cache(exec_id: str, symbol: str, tf: str) -> dict:
 
 def fs_touch_monitoreo(exec_id: str, symbol: str, data: Dict[str, Any]) -> None:
     try:
-        doc_id = f"{exec_id}__{symbol.upper()}"
+        doc_id = f"{exec_id}__{(symbol or '').upper()}"
         ref = db.collection("monitoreos").document(doc_id)
         snap = ref.get()
-        cur = snap.to_dict() if snap.exists else {}
-        cur = cur or {}
+        cur = (snap.to_dict() if snap.exists else {}) or {}
+
+        incoming_tf = data.get("tf_states")
+        if isinstance(incoming_tf, dict):
+            cur_tf = dict(cur.get("tf_states") or {})
+            for tf_k, tf_v in incoming_tf.items():
+                if isinstance(tf_v, dict) and isinstance(cur_tf.get(tf_k), dict):
+                    merged = dict(cur_tf.get(tf_k) or {})
+                    merged.update(tf_v)
+                    cur_tf[tf_k] = merged
+                else:
+                    cur_tf[tf_k] = tf_v
+            cur["tf_states"] = cur_tf
+            data = dict(data)
+            data.pop("tf_states", None)
+
         cur.update(data)
-        # ms para consistencia con last_ts/updated_at en tf_states
         cur["updated_at"] = int(time.time() * 1000)
         ref.set(cur, merge=True)
     except Exception:
@@ -13019,7 +13039,7 @@ async def monitoreo_incremental():
             enabled = _tf_is_enabled(exec_id, symbol, tf_api)
 
         logging.info(
-            "INC TFCHK sym=%s tf=%s enabled=%s user_id=%s exec_id=%s",
+            "HIST TFCHK sym=%s tf=%s enabled=%s user_id=%s exec_id=%s",
             symbol, timeframe, enabled, user_id, exec_id,
         )
 
@@ -13297,11 +13317,11 @@ async def monitoreo_resume():
         st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
         series_ms = _series_to_ms(st.get("series", []))
         last_ts = series_ms[-1]["t"] if series_ms else None
-
-        # Heartbeat lightweight
+        # Nota: /resume es de lectura; no cambiamos 'estado' para no pisar running/stopped.
         await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
-            "estado": "idle",
-            "symbol": symbol, "timeframe": timeframe
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "last_resume_at_ms": int(time.time() * 1000),
         })
 
         return jsonify({
@@ -13357,9 +13377,7 @@ async def monitoreo_history():
             return jsonify({"status": "error", "message": "exec_id es obligatorio"}), 400
         if not symbol or not timeframe:
             return jsonify({"status": "error", "message": "symbol y timeframe son obligatorios"}), 400
-
-
-        timeframe = (body.get("timeframe") or "").lower()   # "1min", "1day", etc.
+        # timeframe ya está normalizado por _norm_tf(...)
         tf_api = timeframe
 
         enabled = True
@@ -13367,7 +13385,7 @@ async def monitoreo_history():
             enabled = _tf_is_enabled(exec_id, symbol, tf_api)
         
         logging.info(
-            "INC TFCHK sym=%s tf=%s enabled=%s user_id=%s exec_id=%s",
+            "HIST TFCHK sym=%s tf=%s enabled=%s user_id=%s exec_id=%s",
             symbol, tf_api, enabled, user_id, exec_id,
         )
 
