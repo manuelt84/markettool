@@ -1720,27 +1720,23 @@ def df_to_ohlcv_records_ext(
     for c in num_extras:
         out[ rename_extras.get(c, c) ] = pd.to_numeric(d[c], errors='coerce')
 
-    # flags
+    # flags (optimizado: sin iterrows)
     if flag_extras:
         if put_flags_inside:
             flags = d[flag_extras].copy()
             for c in flags.columns:
                 flags[c] = flags[c].astype('boolean')
-            # construir dict por fila solo con flags True/False (None si NA)
-            flags_dicts = []
-            for _, row in flags.iterrows():
-                fd = {rename_extras.get(k, k): (None if pd.isna(row[k]) else bool(row[k])) for k in flags.columns}
-                flags_dicts.append(fd)
-            out['flags'] = flags_dicts
+
+            flags = flags.astype(object).where(~flags.isna(), None)
+            flags = flags.rename(columns={k: rename_extras.get(k, k) for k in flags.columns})
+            out['flags'] = flags.to_dict('records')
         else:
             for c in flag_extras:
-                out[ rename_extras.get(c, c) ] = d[c].astype('boolean').astype(object)
+                out[rename_extras.get(c, c)] = d[c].astype('boolean').astype(object)
 
     out = _json_sanitize_df(out)
     return out.to_dict('records')
 
-
-#@profile
 def construir_payload_enriquecido(
     symbol: str,
     tf: str,
@@ -3832,15 +3828,19 @@ def calcular_indicadores(df, temporalidad):
     df['macd'] = df['ema_12'] - df['ema_26']
     df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
 
-    # Detectar cruce del MACD
+    # Detectar cruce del MACD (evita recalcular shift varias veces)
+    macd_prev = df['macd'].shift(1)
+    sig_prev  = df['signal'].shift(1)
+    macd_cur  = df['macd']
+    sig_cur   = df['signal']
     df['macd_cruce'] = np.where(
-        (df['macd'].shift(1) < df['signal'].shift(1)) & (df['macd'] > df['signal']), 'Cruce Alcista',
-        np.where((df['macd'].shift(1) > df['signal'].shift(1)) & (df['macd'] < df['signal']), 'Cruce Bajista', 'No cruce')
+        (macd_prev < sig_prev) & (macd_cur > sig_cur), 'Cruce Alcista',
+        np.where((macd_prev > sig_prev) & (macd_cur < sig_cur), 'Cruce Bajista', 'No cruce')
     )
 
     # Detectar si el MACD está cerca de cruzar la señal
     df['macd_cerca_de_cruzar'] = np.where(
-        abs(df['macd'] - df['signal']) < (df['macd'].std() * 0.05), 'Cerca del cruce', 'No cerca'
+        (macd_cur - sig_cur).abs() < (df['macd'].std() * 0.05), 'Cerca del cruce', 'No cerca'
     )
 
     # Cálculo de RSI
@@ -3857,9 +3857,11 @@ def calcular_indicadores(df, temporalidad):
     df['%D'] = df['%K'].rolling(window=window).mean()
 
     # Cálculo del ATR
-    df['true_range'] = np.maximum(df['high'] - df['low'], 
-                                  np.maximum(abs(df['high'] - df['close'].shift(1)), 
-                                             abs(df['low'] - df['close'].shift(1))))
+    df['true_range'] = np.maximum(
+        df['high'] - df['low'],
+        np.maximum((df['high'] - df['close'].shift(1)).abs(),
+                   (df['low'] - df['close'].shift(1)).abs())
+    )
     df['ATR'] = df['true_range'].rolling(window=window).mean()
 
     # Señales de divergencia
@@ -3871,25 +3873,25 @@ def calcular_indicadores(df, temporalidad):
     df['divergencia_rsi_bull']  = (df['rsi']  > df['rsi'].shift(1))  & (df['close'] < df['close'].shift(1))
     df['divergencia_rsi_bear']  = (df['rsi']  < df['rsi'].shift(1))  & (df['close'] > df['close'].shift(1))
 
-
-    # Convertir todas las columnas a tipo float
+    # Convertir columnas clave a tipo numérico
     for col in ['rsi', '%K', '%D', 'ATR', 'macd', 'signal', 'ema_12', 'ema_26']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # Convertir automáticamente columnas que pueden ser numéricas
+    # Interpolación optimizada: evita df.drop + df.update (costoso en DF grandes)
     cols_excluir = ['macd_cruce', 'macd_cerca_de_cruzar', 'bollinger_signal', 'bollinger_upper', 'bollinger_lower']
-    df_interpolar = df.drop(columns=cols_excluir)
-    df_interpolar.interpolate(method='linear', inplace=True)
-    df.update(df_interpolar)
+    cols_interp = [
+        c for c in df.columns
+        if c not in cols_excluir and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    if cols_interp:
+        df.loc[:, cols_interp] = df.loc[:, cols_interp].interpolate(method='linear')
 
-    # Rellenar valores restantes con forward fill y backward fill
+    # Rellenar valores restantes con forward fill y backward fill (mantiene comportamiento original)
     df.ffill(inplace=True)
     df.bfill(inplace=True)
 
     return df
 
-# Función para asegurar que la probabilidad esté entre 1 y 100
-#@profile
 def limitar_probabilidad(probabilidad_exito):
     return max(1, min(probabilidad_exito, 100))
 
@@ -6740,47 +6742,60 @@ def calcular_ponderacion_incremental_por_divisa(df: pd.DataFrame, cfg: dict | No
         df["Ponderacion Incremental"] = 0
         return df
 
+    # señales_* pueden no estar en scope; respeta comportamiento original
+    try:
+        _ = señales_compra
+        _ = señales_venta
+    except (NameError, TypeError):
+        df["Ponderacion Incremental"] = 0
+        return df
+
     peso_base = max(1, int(inc.get("peso_base", 1)))
     tfs = inc.get("_tfs_list", [])
     if not tfs:
         tfs = [t.strip() for t in DEFAULT_PONDER_INC_CFG["temporalidades"].split(",")]
 
-    # mapa temporalidad -> índice
     idx = {tf.lower(): i for i, tf in enumerate(tfs)}
+    aliases = {"1min":"1m","5min":"5m","15min":"15m","30min":"30m","1hour":"1h","4hour":"4h","1day":"1d","1week":"1w"}
 
-    #@profile
-    def _tf_index(tf_val: str) -> int | None:
-        if not tf_val:
-            return None
-        t = str(tf_val).strip().lower()
-        # intenta normalizar equivalencias comunes
-        aliases = {
-            "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m",
-            "1hour": "1h", "4hour": "4h", "1day": "1d", "1week": "1w"
-        }
-        t = aliases.get(t, t)
-        return idx.get(t)
+    req = {"Temporalidad", "Tipo de Operacion", "Activo"}
+    if not req.issubset(df.columns):
+        df["Ponderacion Incremental"] = 0
+        return df
 
-    # agrupar por activo
-    for activo, data in df.groupby("Activo"):
-        ponder = 0
-        for _, row in data.iterrows():
-            tipo = row.get("Tipo de Operacion")
-            tf_v = row.get("Temporalidad")
-            i = _tf_index(tf_v)
-            if i is None:
-                continue
-            try:
-                if tipo in señales_compra:
-                    ponder += peso_base * (2 ** i)
-                elif tipo in señales_venta:
-                    ponder -= peso_base * (2 ** i)
-            except NameError:
-                # si las listas de señales no están en el scope, no aplica
-                pass
+    tf_ser = df["Temporalidad"].astype(str).str.strip().str.lower().replace(aliases)
+    tf_i = tf_ser.map(idx)  # float/NaN
+    valid_tf = tf_i.notna()
 
-        df.loc[df["Activo"] == activo, "Ponderacion Incremental"] = ponder
+    W = np.zeros(len(df), dtype=np.int64)
+    if valid_tf.any():
+        W[valid_tf.to_numpy()] = (
+            peso_base * (2 ** tf_i[valid_tf].astype(int))
+        ).to_numpy(dtype=np.int64)
 
+    try:
+        buy_set = set(señales_compra)
+        sell_set = set(señales_venta)
+    except NameError:
+        buy_set, sell_set = set(), set()
+
+    tipo_ser = df["Tipo de Operacion"]
+    buy_mask = tipo_ser.isin(buy_set).to_numpy()
+    sell_mask = tipo_ser.isin(sell_set).to_numpy()
+    sell_mask = sell_mask & (~buy_mask)
+
+    signed = np.zeros(len(df), dtype=np.int64)
+    signed[buy_mask] = W[buy_mask]
+    signed[sell_mask] = -W[sell_mask]
+
+    pi = (
+        pd.Series(signed, index=df.index)
+        .groupby(df["Activo"])
+        .transform("sum")
+        .fillna(0)
+        .astype(np.int64)
+    )
+    df["Ponderacion Incremental"] = pi
     return df
 
 
