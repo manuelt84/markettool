@@ -2529,10 +2529,14 @@ async def cargar_timezone_por_defecto(chat_id):
 
 #@profile
 def detectar_categoria(event):
+    """Asigna una categoría (compat)."""
+    if not event:
+        return None
+    s = str(event).lower()
     for palabra_clave, categoria in palabras_clave_categoria.items():
-        if palabra_clave.lower() in event.lower():
+        if str(palabra_clave).lower() in s:
             return categoria
-        return None  # Si no se encuentra una categoría, devuelve None
+    return None
 
 # Cargar la lista de chat_ids desde el archivo
 #@profile
@@ -3801,34 +3805,37 @@ def obtener_datos_con_hilos(
 # Función para calcular indicadores
 #@profile
 def calcular_indicadores(df, temporalidad):
+    """Calcula indicadores de forma consistente (RSI Wilder, ATR Wilder, Bollinger, MACD, Estocástico)."""
     window = min(definir_window(temporalidad), len(df))
+    window = max(int(window), 2)
 
     # Media Móvil Simple (SMA)
-    df['SMA'] = df['close'].rolling(window=window).mean()
+    df['SMA'] = pd.to_numeric(df['close'], errors='coerce').rolling(window=window, min_periods=window).mean()
 
-    # Desviación Estándar para las Bandas de Bollinger
-    df['bollinger_std'] = df['close'].rolling(window=window).std()
+    # Bandas de Bollinger
+    std = pd.to_numeric(df['close'], errors='coerce').rolling(window=window, min_periods=window).std()
+    df['bollinger_upper'] = df['SMA'] + (2 * std)
+    df['bollinger_lower'] = df['SMA'] - (2 * std)
 
-    # Cálculo de Bandas de Bollinger
-    df['bollinger_upper'] = df['SMA'] + (2 * df['bollinger_std'])
-    df['bollinger_lower'] = df['SMA'] - (2 * df['bollinger_std'])
-
-    # Eliminamos la columna temporal de desviación estándar
-    df.drop(columns=['bollinger_std'], inplace=True)
-
-    # Señal de compra/venta basada en Bandas de Bollinger
+    # Señal BB
     df['bollinger_signal'] = 'Neutral'
-    df.loc[df['close'] > df['bollinger_upper'], 'bollinger_signal'] = 'Venta'
-    df.loc[df['close'] < df['bollinger_lower'], 'bollinger_signal'] = 'Compra'
+    df.loc[pd.to_numeric(df['close'], errors='coerce') > df['bollinger_upper'], 'bollinger_signal'] = 'Venta'
+    df.loc[pd.to_numeric(df['close'], errors='coerce') < df['bollinger_lower'], 'bollinger_signal'] = 'Compra'
 
-    
-    # Cálculo de EMAs y MACD
-    df['ema_12'] = df['close'].ewm(span=12, adjust=False).mean()
-    df['ema_26'] = df['close'].ewm(span=26, adjust=False).mean()
+    # Bollinger bandwidth (útil para squeezes)
+    try:
+        df['bollinger_bw'] = (df['bollinger_upper'] - df['bollinger_lower']) / df['SMA'].abs()
+    except Exception:
+        df['bollinger_bw'] = np.nan
+
+    # EMAs y MACD
+    close = pd.to_numeric(df['close'], errors='coerce')
+    df['ema_12'] = close.ewm(span=12, adjust=False).mean()
+    df['ema_26'] = close.ewm(span=26, adjust=False).mean()
     df['macd'] = df['ema_12'] - df['ema_26']
     df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
 
-    # Detectar cruce del MACD (evita recalcular shift varias veces)
+    # Cruce MACD
     macd_prev = df['macd'].shift(1)
     sig_prev  = df['signal'].shift(1)
     macd_cur  = df['macd']
@@ -3838,60 +3845,51 @@ def calcular_indicadores(df, temporalidad):
         np.where((macd_prev > sig_prev) & (macd_cur < sig_cur), 'Cruce Bajista', 'No cruce')
     )
 
-    # Detectar si el MACD está cerca de cruzar la señal
+    # Cerca de cruzar: umbral basado en volatilidad del MACD (fallback seguro)
+    macd_std = df['macd'].rolling(window=window, min_periods=window).std()
+    thr = (macd_std * 0.05).fillna(method="ffill").fillna(method="bfill")
     df['macd_cerca_de_cruzar'] = np.where(
-        (macd_cur - sig_cur).abs() < (df['macd'].std() * 0.05), 'Cerca del cruce', 'No cerca'
+        (macd_cur - sig_cur).abs() < thr, 'Cerca de cruzar', 'No cerca'
     )
 
-    # Cálculo de RSI
-    delta = df['close'].diff(1)
-    gain = delta.where(delta > 0, 0).rolling(window=window).mean()
-    loss = -delta.where(delta < 0, 0).rolling(window=window).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+    # RSI Wilder + Estocástico
+    df = calcular_rsi(df, window)
+    df = calcular_estocastico(df, window)
 
-    # Cálculo del Estocástico
-    low_min = df['low'].rolling(window=window).min()
-    high_max = df['high'].rolling(window=window).max()
-    df['%K'] = 100 * (df['close'] - low_min) / (high_max - low_min)
-    df['%D'] = df['%K'].rolling(window=window).mean()
-
-    # Cálculo del ATR
-    df['true_range'] = np.maximum(
-        df['high'] - df['low'],
-        np.maximum((df['high'] - df['close'].shift(1)).abs(),
-                   (df['low'] - df['close'].shift(1)).abs())
+    # ATR Wilder
+    high = pd.to_numeric(df['high'], errors='coerce')
+    low  = pd.to_numeric(df['low'], errors='coerce')
+    prev_close = close.shift(1)
+    tr = np.maximum(
+        (high - low),
+        np.maximum((high - prev_close).abs(), (low - prev_close).abs())
     )
-    df['ATR'] = df['true_range'].rolling(window=window).mean()
+    df['true_range'] = tr
+    df['ATR'] = pd.Series(tr, index=df.index).ewm(alpha=1/window, adjust=False, min_periods=window).mean()
 
-    # Señales de divergencia
-    df['divergencia_macd'] = (df['macd'] > df['macd'].shift(1)) & (df['close'] < df['close'].shift(1))
-    df['divergencia_rsi'] = (df['rsi'] > df['rsi'].shift(1)) & (df['close'] < df['close'].shift(1))
+    # Divergencias (simple, sin lookahead)
+    df['divergencia_macd_bull'] = (df['macd'] > df['macd'].shift(1)) & (close < close.shift(1))
+    df['divergencia_macd_bear'] = (df['macd'] < df['macd'].shift(1)) & (close > close.shift(1))
 
-    df['divergencia_macd_bull'] = (df['macd'] > df['macd'].shift(1)) & (df['close'] < df['close'].shift(1))
-    df['divergencia_macd_bear'] = (df['macd'] < df['macd'].shift(1)) & (df['close'] > df['close'].shift(1))
-    df['divergencia_rsi_bull']  = (df['rsi']  > df['rsi'].shift(1))  & (df['close'] < df['close'].shift(1))
-    df['divergencia_rsi_bear']  = (df['rsi']  < df['rsi'].shift(1))  & (df['close'] > df['close'].shift(1))
+    rsi_col = 'RSI' if 'RSI' in df.columns else 'rsi'
+    rsi_series = pd.to_numeric(df[rsi_col], errors='coerce')
+    df['divergencia_rsi_bull']  = (rsi_series > rsi_series.shift(1)) & (close < close.shift(1))
+    df['divergencia_rsi_bear']  = (rsi_series < rsi_series.shift(1)) & (close > close.shift(1))
 
-    # Convertir columnas clave a tipo numérico
-    for col in ['rsi', '%K', '%D', 'ATR', 'macd', 'signal', 'ema_12', 'ema_26']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+    # Convertir columnas clave a numérico
+    for col in ['rsi', 'RSI', '%K', '%D', 'ATR', 'macd', 'signal', 'ema_12', 'ema_26', 'bollinger_bw']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # Interpolación optimizada: evita df.drop + df.update (costoso en DF grandes)
-    cols_excluir = ['macd_cruce', 'macd_cerca_de_cruzar', 'bollinger_signal', 'bollinger_upper', 'bollinger_lower']
-    cols_interp = [
-        c for c in df.columns
-        if c not in cols_excluir and pd.api.types.is_numeric_dtype(df[c])
-    ]
+    # Interpolación (mantiene comportamiento original, pero evita tocar flags)
+    cols_excluir = ['macd_cruce', 'macd_cerca_de_cruzar', 'bollinger_signal']
+    cols_interp = [c for c in df.columns if c not in cols_excluir and pd.api.types.is_numeric_dtype(df[c])]
     if cols_interp:
         df.loc[:, cols_interp] = df.loc[:, cols_interp].interpolate(method='linear')
 
-    # Rellenar valores restantes con forward fill y backward fill (mantiene comportamiento original)
     df.ffill(inplace=True)
     df.bfill(inplace=True)
-
     return df
-
 def limitar_probabilidad(probabilidad_exito):
     return max(1, min(probabilidad_exito, 100))
 
@@ -4075,234 +4073,319 @@ def analizar_sentimiento(texto):
 #@profile
 def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, temporalidad,
                                      fecha_inicio=None, fecha_fin=None, cfg: Optional[dict]=None):
+    """
+    Ajuste fundamental profesional:
+      - score continuo (surprise normalizada + tanh)
+      - peso por impacto + recencia + decay
+      - flip correcto si la divisa del evento es la cotizada (quote) del par
+      - agrupación por bucket temporal (una señal compuesta por ventana)
+      - metadata opcional (cfg['fundamental']['return_meta'] = True)
+    """
 
     FUND_DEFAULTS = {
+        # Noticias
         "obtener_noticias": True,
         "calcular_impacto_noticias": True,
-        "impacto_noticias_factor": 0.10,
+        "news_points_scale": 7.5,  # puntos máx aprox por noticias (moderado)
+        # Eventos
         "consider_events_hours": 72,
-        "recency_recent_minutes": 15,
-        "recency_recent_boost": 1.5,
-        "recency_decay_floor": 0.30,
-        "impact_weights": {"high": 2.0, "medium": 1.5, "low": 1.0},
+        "event_score_tanh_k": 1.7,
+        "event_min_abs_score": 0.04,
+        "event_points_scale": 18.0,     # puntos máx aprox por eventos (antes de cap)
+        "event_points_cap": 22.0,       # cap duro final
+        "bucket_by_tf": True,
+        "bucket_minutes_override": None,
+        "impact_weights": {"high": 1.00, "medium": 0.60, "low": 0.30},
+        "recent_minutes": 15,
+        "recent_boost": 1.25,
+        "decay_tau_hours": 24,          # e^-1 cada 24h (suave)
+        "decay_floor": 0.35,
         "flip_secondary_currency": True,
-        "cat_weights": {
-            "unemployment": {"good": 0.3, "bad": -0.2},
-            "employment":   {"good": 0.3, "bad": -0.2},
-            "inflation":    {"good": 0.3, "bad": -0.3},
-            "gdp":          {"good": 0.3, "bad": -0.3},
-            "retail":       {"good": 0.3, "bad": -0.2},
-            "rates":        {"good": 0.3, "bad": -0.3},
-            "generic": {"better_both": 0.25, "better_estimate": 0.15, "better_prev": 0.10, "worse": -0.25},
+        "category_importance": {        # importancia relativa por tipo de dato macro
+            "Unemployment Rate": 1.00,
+            "Employment Report": 1.00,
+            "Inflation Rate": 0.85,
+            "GDP": 0.70,
+            "Retail Sales": 0.60,
+            "Interest Rate": 1.00,
+            "Crude Oil Inventories": 0.60,
+            "Generic": 0.50,
         },
-        "per_event_cap": 0.35,
-        "return_on_no_events": 50.0,
+        # Invertir signo cuando "menos es mejor" (mantiene tu lógica previa)
+        "invert_surprise_for": {"Unemployment Rate", "Inflation Rate", "Crude Oil Inventories"},
+        # Riesgo de evento (para bloquear técnico cerca de high impact, si el caller quiere)
+        "event_risk_minutes_before": 10,
+        "event_risk_minutes_after": 10,
+        "event_risk_impacts": {"high"},
+        # Meta
+        "return_meta": False,
     }
 
-    # Mezclar defaults con cfg
-    fund = {**FUND_DEFAULTS, **(cfg or {}).get("fundamental", {})}
-    impact_weights = {**FUND_DEFAULTS["impact_weights"], **fund.get("impact_weights", {})}
-    catw = FUND_DEFAULTS["cat_weights"].copy()
-    for k, v in fund.get("cat_weights", {}).items():
-        catw[k] = {**catw.get(k, {}), **v}
+    # Mezclar defaults con cfg (compat con cfg['fundamental'])
+    fund_cfg = ((cfg or {}).get("fundamental") or {}) if isinstance(cfg, dict) else {}
+    fund = {**FUND_DEFAULTS, **fund_cfg}
 
-    # --- Noticias (igual que antes pero con factor configurable) ---
+    def _tf_to_minutes(tf: str) -> int:
+        tf = _tf_backend(tf)
+        try:
+            if tf.endswith("min"):
+                return int(tf.replace("min", ""))
+            if tf.endswith("hour"):
+                return int(tf.replace("hour", "")) * 60
+            if tf.endswith("day"):
+                return int(tf.replace("day", "")) * 1440
+            if tf.endswith("week"):
+                return int(tf.replace("week", "")) * 10080
+        except Exception:
+            pass
+        return 60
+
+    def _to_ts(x):
+        try:
+            return pd.to_datetime(x, utc=False, errors="coerce")
+        except Exception:
+            return pd.NaT
+
+    # ---- NEWS ----
+    news_points = 0.0
+    news_meta = {"count": 0, "impact_raw": 0.0}
     try:
-        if fund["obtener_noticias"]:
-            global cache_noticias
-            if "cache_noticias" not in globals() or cache_noticias is None:
-                cache_noticias = {}
-            df_noticias = cache_noticias.get(symbol) or obtener_noticias(symbol, fecha_inicio, fecha_fin)
-            cache_noticias[symbol] = df_noticias
-        else:
-            df_noticias = None
+        if fund["obtener_noticias"] and fecha_inicio and fecha_fin:
+            df_noticias = obtener_noticias(symbol, fecha_inicio, fecha_fin)
+            if isinstance(df_noticias, pd.DataFrame) and not df_noticias.empty and fund["calcular_impacto_noticias"]:
+                imp = float(calcular_impacto_noticias(df_noticias) or 0.0)  # ~[-2.5,+2.5]
+                news_meta["count"] = int(len(df_noticias))
+                news_meta["impact_raw"] = imp
+                # mapear a puntos con tanh
+                news_points = math.tanh(imp / 2.5) * float(fund["news_points_scale"])
+                probabilidad_exito += news_points
+    except Exception:
+        # no frenamos el flujo por fallas de news
+        pass
 
-        if fund["calcular_impacto_noticias"] and df_noticias is not None:
-            imp = calcular_impacto_noticias(df_noticias)
-            if imp is not None:
-                probabilidad_exito += imp * float(fund["impacto_noticias_factor"])
-    except Exception as e:
-        logging.info(f"Noticias/impacto omitidos: {e}")
+    # ---- EVENTS ----
+    meta = {
+        "mode": "pro",
+        "pair": symbol,
+        "timeframe": temporalidad,
+        "news": {"points": float(news_points), **news_meta},
+        "events": {
+            "total_score": 0.0,
+            "points": 0.0,
+            "direction": "neutral",
+            "dominant_event": None,
+            "top_events": [],
+            "buckets": [],
+        },
+        "event_risk": {"avoid_trading": False, "reason": None, "near_events": []},
+    }
 
-    # --- Validación de eventos ---
-    cols = {'date','actual','estimate','previous','currency','event','impact'}
-    if df_eventos is None or df_eventos.empty or not cols.issubset(df_eventos.columns):
-        return limitar_probabilidad(float(fund["return_on_no_events"]))
+    if df_eventos is None or (isinstance(df_eventos, pd.DataFrame) and df_eventos.empty):
+        return (limitar_probabilidad(probabilidad_exito), meta) if fund["return_meta"] else limitar_probabilidad(probabilidad_exito)
 
-    df = df_eventos.copy()
+    # Normalizar DF eventos mínimo
+    df = df_eventos.copy() if isinstance(df_eventos, pd.DataFrame) else pd.DataFrame(df_eventos)
+    cols_need = {'date','actual','estimate','previous','currency','event','impact'}
+    if not cols_need.issubset(set(df.columns)):
+        return (limitar_probabilidad(probabilidad_exito), meta) if fund["return_meta"] else limitar_probabilidad(probabilidad_exito)
+
+    # tz fallback
+    tz = None
+    try:
+        tz = timezone_country if "timezone_country" in globals() else None
+    except Exception:
+        tz = None
+    if tz is None:
+        tz = pytz.timezone("UTC")
+
+    # fechas → tz aware
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    df['actual']   = pd.to_numeric(df['actual'].apply(limpiar_valores),   errors='coerce')
-    df['estimate'] = pd.to_numeric(df['estimate'].apply(limpiar_valores), errors='coerce')
-    df['previous'] = pd.to_numeric(df['previous'].apply(limpiar_valores), errors='coerce')
+    if getattr(df['date'].dt, "tz", None) is None:
+        # si viene naive, asumimos tz local del bot (ya convertiste desde UTC en tu pipeline)
+        try:
+            df['date'] = df['date'].dt.tz_localize(tz)
+        except Exception:
+            pass
+    else:
+        try:
+            df['date'] = df['date'].dt.tz_convert(tz)
+        except Exception:
+            pass
 
-    # Filtrar por ventana temporal
-    now = datetime.now(pytz.UTC)
-    if fund["consider_events_hours"] is not None:
-        cutoff = now - timedelta(hours=int(fund["consider_events_hours"]))
-        df = df[df['date'] >= cutoff]
+    now = pd.Timestamp.now(tz=tz)
 
-    base_empty_return = float(fund["return_on_no_events"])
-    if df.empty:
-        return limitar_probabilidad(base_empty_return)
-
-    # Orden + recencia
-    df = df.sort_values('date')
-    reciente = df.iloc[-1]
-    recent_minutes = (now - reciente['date']).total_seconds()/60.0
-    recent_boost = float(fund["recency_recent_boost"]) if recent_minutes < int(fund["recency_recent_minutes"]) else 1.0
-    tmax = max((now - df['date'].min()).total_seconds(), 1.0)
-
+    # filtrar por divisas del símbolo (si es FX)
     div_p, div_s = obtener_monedas(symbol)
+    if div_p and div_s:
+        df = df[df['currency'].astype(str).str.upper().isin({div_p, div_s})]
+
+    # ventana temporal (pasado)
+    consider_hours = float(fund["consider_events_hours"])
+    if consider_hours > 0:
+        df = df[df['date'] >= (now - pd.Timedelta(hours=consider_hours))]
+
+    if df.empty:
+        return (limitar_probabilidad(probabilidad_exito), meta) if fund["return_meta"] else limitar_probabilidad(probabilidad_exito)
+
+    # riesgo por eventos (pre/post) para bloquear señales técnicas si se quiere
+    try:
+        minutes_before = int(fund["event_risk_minutes_before"])
+        minutes_after  = int(fund["event_risk_minutes_after"])
+        impacts_risk = {str(x).lower() for x in (fund.get("event_risk_impacts") or {"high"})}
+        w_start = now - pd.Timedelta(minutes=minutes_after)
+        w_end   = now + pd.Timedelta(minutes=minutes_before)
+        df_risk = df[(df['date'] >= w_start) & (df['date'] <= w_end) & (df['impact'].astype(str).str.lower().isin(impacts_risk))]
+        if not df_risk.empty:
+            meta["event_risk"]["avoid_trading"] = True
+            meta["event_risk"]["reason"] = f"Evento(s) {', '.join(sorted(list(impacts_risk)))} en ventana {minutes_after}m atrás / {minutes_before}m adelante."
+            meta["event_risk"]["near_events"] = [
+                {
+                    "date": (r['date'].isoformat() if pd.notna(r['date']) else None),
+                    "currency": r.get("currency"),
+                    "event": r.get("event"),
+                    "impact": r.get("impact"),
+                }
+                for _, r in df_risk.sort_values('date', ascending=False).head(5).iterrows()
+            ]
+    except Exception:
+        pass
+
+    # bucket size
+    bucket_minutes = fund.get("bucket_minutes_override")
+    if not bucket_minutes:
+        bucket_minutes = _tf_to_minutes(temporalidad) if fund["bucket_by_tf"] else 30
+    bucket_minutes = max(int(bucket_minutes), 1)
+
+    impact_w = {str(k).lower(): float(v) for k, v in (fund.get("impact_weights") or {}).items()}
+    cat_imp = fund.get("category_importance") or {}
+    invert_set = {str(x) for x in (fund.get("invert_surprise_for") or set())}
+
+    tau_hours = float(fund["decay_tau_hours"])
+    tau = max(tau_hours * 3600.0, 60.0)
+    decay_floor = float(fund["decay_floor"])
+    recent_minutes = float(fund["recent_minutes"])
+    recent_boost = float(fund["recent_boost"])
+    k_tanh = float(fund["event_score_tanh_k"])
+
+    min_abs = float(fund["event_min_abs_score"])
+
+    # --- scoring por evento ---
+    buckets = {}
+    top_events_all = []
 
     for _, ev in df.iterrows():
-        if any(pd.isna(ev[k]) for k in ['actual','estimate','previous']):
+        try:
+            actual = float(ev.get('actual'))
+        except Exception:
             continue
 
-        # impacto base
-        iw = impact_weights.get(str(ev.get('impact','')).lower(), 1.0)
-        mult = iw
+        est = ev.get('estimate')
+        prev = ev.get('previous')
+        estimate = float(est) if (est is not None and not pd.isna(est)) else math.nan
+        previous = float(prev) if (prev is not None and not pd.isna(prev)) else math.nan
 
-        if ev['date'] == reciente['date']:
-            mult *= recent_boost
+        if math.isnan(estimate) and math.isnan(previous):
+            continue
 
-        # decaimiento por antigüedad
-        age = max((now - ev['date']).total_seconds(), 0.0)
-        decay = max(1.0 - (age / tmax), float(fund["recency_decay_floor"]))
-        mult *= decay
+        baseline = estimate if not math.isnan(estimate) else previous
+        denom = max(abs(baseline), abs(previous) if not math.isnan(previous) else 0.0, 1e-9)
 
-        # signo por moneda secundaria
-        if fund["flip_secondary_currency"] and ev['currency'] == div_s:
+        # sorpresa normalizada + tanh
+        surprise_raw = (actual - baseline) / denom
+        surprise = math.tanh(k_tanh * surprise_raw)
+
+        # acuerdo estimate/previous
+        agree_mult = 1.0
+        if (not math.isnan(estimate)) and (not math.isnan(previous)):
+            if (actual - estimate) * (actual - previous) > 0:
+                agree_mult = 1.15
+
+        # categoría e importancia
+        cat = detectar_categoria(ev.get('event'))
+        imp_cat = float(cat_imp.get(cat, cat_imp.get("Generic", 0.5)))
+        if cat in invert_set:
+            surprise *= -1.0
+
+        # impacto + recencia + decay
+        iw = impact_w.get(str(ev.get('impact', '')).lower(), 0.5)
+        dt = ev.get('date')
+        dt = _to_ts(dt)
+        if pd.isna(dt):
+            continue
+        if getattr(dt, "tzinfo", None) is None:
+            try:
+                dt = dt.tz_localize(tz)
+            except Exception:
+                pass
+
+        age_s = max((now - dt).total_seconds(), 0.0)
+        decay = max(math.exp(-age_s / tau), decay_floor)
+
+        rec_mult = recent_boost if (age_s <= recent_minutes * 60.0) else 1.0
+
+        mult = iw * decay * rec_mult * agree_mult
+
+        # flip quote
+        if fund["flip_secondary_currency"] and div_s and str(ev.get('currency','')).upper() == str(div_s).upper():
             mult *= -1.0
 
-        cat = detectar_categoria(ev['event'])
-        adj = 0.0
+        score = surprise * imp_cat * mult
 
-        #@profile
-        def _cap(x):  # limitar por evento
-            cap = float(fund["per_event_cap"])
-            return max(min(x, cap), -cap)
+        if abs(score) < min_abs:
+            continue
 
-        # helpers cat weights
-        cw = catw
-        if symbol in ['WTI','BRENT'] and cat == 'Crude Oil Inventories':
-            # misma lógica; usa 0.3/0.2 pero capea
-            if pd.isna(ev['estimate']):
-                adj = (0.3 if ev['actual'] < ev['previous'] else -0.3) * mult
-            else:
-                if ev['actual'] < ev['estimate'] and ev['actual'] < ev['previous']:
-                    adj = 0.3 * mult
-                elif ev['actual'] < ev['estimate']:
-                    adj = 0.2 * mult
-                else:
-                    adj = -0.3 * mult
+        # bucket
+        bucket_ts = pd.Timestamp(dt).floor(f"{bucket_minutes}min")
+        b = buckets.setdefault(bucket_ts, {"score": 0.0, "events": []})
+        b["score"] += float(score)
+        ev_dict = {
+            "date": dt.isoformat(),
+            "currency": ev.get("currency"),
+            "event": ev.get("event"),
+            "impact": ev.get("impact"),
+            "score": float(score),
+            "category": cat,
+            "surprise_raw": float(surprise_raw),
+        }
+        b["events"].append(ev_dict)
+        top_events_all.append(ev_dict)
 
-        elif symbol == 'SOYB' and cat in ['Crop Production Report','Weather Report']:
-            if cat == 'Crop Production Report':
-                if pd.isna(ev['estimate']):
-                    adj = (0.3 if ev['actual'] < ev['previous'] else -0.3) * mult
-                else:
-                    if ev['actual'] < ev['estimate'] and ev['actual'] < ev['previous']:
-                        adj = 0.3 * mult
-                    elif ev['actual'] < ev['estimate']:
-                        adj = 0.2 * mult
-                    else:
-                        adj = -0.3 * mult
-            else:
-                txt = str(ev['event']).lower()
-                adj = (0.3 if ('drought' in txt or 'storm' in txt) else -0.2) * mult
+    if not buckets:
+        return (limitar_probabilidad(probabilidad_exito), meta) if fund["return_meta"] else limitar_probabilidad(probabilidad_exito)
 
-        else:
-            # categorías macro generales
-            if cat == 'Unemployment Rate':
-                g,b = cw['unemployment']['good'], cw['unemployment']['bad']
-                if pd.isna(ev['estimate']):
-                    adj = (g if ev['actual'] < ev['previous'] else b) * mult
-                else:
-                    if ev['actual'] < ev['estimate'] and ev['actual'] < ev['previous']:
-                        adj = g * mult
-                    elif ev['actual'] < ev['estimate']:
-                        adj = 0.2 * mult
-                    else:
-                        adj = b * mult
+    # construir resumen buckets
+    buckets_list = []
+    for bt, b in sorted(buckets.items(), key=lambda kv: kv[0], reverse=True):
+        evs = sorted(b["events"], key=lambda e: abs(e.get("score", 0.0)), reverse=True)
+        dom = evs[0] if evs else None
+        buckets_list.append({
+            "bucket": bt.isoformat(),
+            "sumScore": float(b["score"]),
+            "dominant": dom,
+            "top3": evs[:3],
+        })
+    meta["events"]["buckets"] = buckets_list[:12]  # limit para payload
 
-            elif cat == 'Employment Report':
-                g,b = cw['employment']['good'], cw['employment']['bad']
-                if pd.isna(ev['estimate']):
-                    adj = (g if ev['actual'] > ev['previous'] else b) * mult
-                else:
-                    if ev['actual'] > ev['estimate'] and ev['actual'] > ev['previous']:
-                        adj = g * mult
-                    elif ev['actual'] > ev['estimate']:
-                        adj = 0.2 * mult
-                    else:
-                        adj = b * mult
+    # total score y puntos
+    total_score = float(sum(b["score"] for b in buckets.values()))
+    meta["events"]["total_score"] = total_score
 
-            elif cat == 'Inflation Rate':
-                g,b = cw['inflation']['good'], cw['inflation']['bad']
-                if pd.isna(ev['estimate']):
-                    adj = (g if ev['actual'] < ev['previous'] else b) * mult
-                else:
-                    if ev['actual'] < ev['estimate'] and ev['actual'] < ev['previous']:
-                        adj = g * mult
-                    elif ev['actual'] < ev['estimate']:
-                        adj = 0.2 * mult
-                    else:
-                        adj = b * mult
+    # convertir a puntos en prob.
+    points = math.tanh(total_score) * float(fund["event_points_scale"])
+    cap = float(fund["event_points_cap"])
+    points = max(min(points, cap), -cap)
 
-            elif cat == 'GDP':
-                g,b = cw['gdp']['good'], cw['gdp']['bad']
-                if pd.isna(ev['estimate']):
-                    adj = (g if ev['actual'] > ev['previous'] else b) * mult
-                else:
-                    if ev['actual'] > ev['estimate'] and ev['actual'] > ev['previous']:
-                        adj = g * mult
-                    elif ev['actual'] > ev['estimate']:
-                        adj = 0.2 * mult
-                    else:
-                        adj = -0.2 * mult
+    meta["events"]["points"] = float(points)
+    meta["events"]["direction"] = "bullish" if points > 0.25 else ("bearish" if points < -0.25 else "neutral")
 
-            elif cat == 'Retail Sales':
-                g,b = cw['retail']['good'], cw['retail']['bad']
-                if pd.isna(ev['estimate']):
-                    adj = (g if ev['actual'] > ev['previous'] else b) * mult
-                else:
-                    if ev['actual'] > ev['estimate'] and ev['actual'] > ev['previous']:
-                        adj = g * mult
-                    elif ev['actual'] > ev['estimate']:
-                        adj = 0.2 * mult
-                    else:
-                        adj = b * mult
+    # dominante global
+    top_events_all = sorted(top_events_all, key=lambda e: abs(e.get("score", 0.0)), reverse=True)
+    meta["events"]["top_events"] = top_events_all[:5]
+    meta["events"]["dominant_event"] = (top_events_all[0] if top_events_all else None)
 
-            elif cat == 'Interest Rate':
-                g,b = cw['rates']['good'], cw['rates']['bad']
-                if pd.isna(ev['estimate']):
-                    adj = (g if ev['actual'] < ev['previous'] else b) * mult
-                else:
-                    if ev['actual'] < ev['estimate'] and ev['actual'] < ev['previous']:
-                        adj = g * mult
-                    elif ev['actual'] < ev['estimate']:
-                        adj = 0.2 * mult
-                    else:
-                        adj = b * mult
+    probabilidad_exito += points
 
-            else:
-                # genérico
-                gg = cw['generic']
-                if pd.isna(ev['estimate']):
-                    adj = (gg['better_prev'] if ev['actual'] > ev['previous'] else gg['worse']) * mult
-                else:
-                    if ev['actual'] > ev['estimate'] and ev['actual'] > ev['previous']:
-                        adj = gg['better_both'] * mult
-                    elif ev['actual'] > ev['estimate']:
-                        adj = gg['better_estimate'] * mult
-                    elif ev['actual'] > ev['previous']:
-                        adj = gg['better_prev'] * mult
-                    else:
-                        adj = gg['worse'] * mult
-
-        probabilidad_exito += _cap(adj)
-
-    return limitar_probabilidad(probabilidad_exito)
+    return (limitar_probabilidad(probabilidad_exito), meta) if fund["return_meta"] else limitar_probabilidad(probabilidad_exito)
 
 # Función para calcular la probabilidad general ponderando más la probabilidad fundamental
 #@profile
@@ -4338,50 +4421,132 @@ def calcular_probabilidad_general(probabilidad_tecnica: float,
 # Implementación de la zona de no trading
 #@profile
 def verificar_zona_no_trading(df, window):
-    # Condiciones para identificar una zona de no trading
-    if df['ATR'].iloc[-1] < df['ATR'].rolling(window=window).mean().iloc[-1] * 0.8:
-        return True  # Baja volatilidad, podría ser una zona de no trading
-    return False
+    """Zona de no-trading por compresión de volatilidad (ATR) y/o squeeze de Bollinger."""
+    if df is None or df.empty:
+        return True
+
+    try:
+        window = int(window)
+    except Exception:
+        window = 14
+    window = max(window, 2)
+
+    low_vol = False
+    try:
+        if 'ATR' in df.columns:
+            atr = pd.to_numeric(df['ATR'].iloc[-1], errors='coerce')
+            atr_mean = pd.to_numeric(df['ATR'].rolling(window=window, min_periods=window).mean().iloc[-1], errors='coerce')
+            if pd.notna(atr) and pd.notna(atr_mean) and atr_mean > 0:
+                low_vol = atr < (atr_mean * 0.80)
+    except Exception:
+        low_vol = False
+
+    squeeze = False
+    try:
+        if {'bollinger_upper','bollinger_lower','SMA'}.issubset(df.columns):
+            upper = pd.to_numeric(df['bollinger_upper'].iloc[-1], errors='coerce')
+            lower = pd.to_numeric(df['bollinger_lower'].iloc[-1], errors='coerce')
+            sma = pd.to_numeric(df['SMA'].iloc[-1], errors='coerce')
+            if pd.notna(upper) and pd.notna(lower) and pd.notna(sma) and sma != 0:
+                bw = (upper - lower) / abs(sma)
+                # comparar contra media reciente de bandwidth
+                bw_series = (pd.to_numeric(df['bollinger_upper'], errors='coerce') - pd.to_numeric(df['bollinger_lower'], errors='coerce')) / pd.to_numeric(df['SMA'].abs(), errors='coerce')
+                bw_mean = bw_series.rolling(window=window, min_periods=window).mean().iloc[-1]
+                if pd.notna(bw_mean) and bw_mean > 0:
+                    squeeze = bw < (bw_mean * 0.70)
+    except Exception:
+        squeeze = False
+
+    return bool(low_vol or squeeze)
 
 # Calcular RSI
 #@profile
 def calcular_rsi(df, window):
-    delta = df['close'].diff(1)
-    ganancia = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    perdida = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = ganancia / perdida
+    """RSI (Wilder). Escribe columnas 'rsi' y 'RSI' para compatibilidad."""
+    try:
+        window = int(window)
+    except Exception:
+        window = 14
+    window = max(window, 2)
+
+    if df is None or len(df) < 2:
+        if df is not None:
+            df['rsi'] = np.nan
+            df['RSI'] = np.nan
+        return df
+
+    close = pd.to_numeric(df['close'], errors='coerce')
+    delta = close.diff()
+
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+
+    avg_gain = gain.ewm(alpha=1/window, adjust=False, min_periods=window).mean()
+    avg_loss = loss.ewm(alpha=1/window, adjust=False, min_periods=window).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    df['RSI'] = rsi  # Agregar RSI al DataFrame
+
+    df['rsi'] = rsi
+    df['RSI'] = rsi
     return df
 
 # Calcular Estocástico %K y %D
 #@profile
 def calcular_estocastico(df, window):
-    low_min = df['low'].rolling(window=window).min()
-    high_max = df['high'].rolling(window=window).max()
-    df['%K'] = 100 * (df['close'] - low_min) / (high_max - low_min)
-    df['%D'] = df['%K'].rolling(window).mean()  # %D es la media de %K
+    """Estocástico %K / %D robusto (maneja denominador cero)."""
+    try:
+        window = int(window)
+    except Exception:
+        window = 14
+    window = max(window, 2)
+
+    low_min = pd.to_numeric(df['low'], errors='coerce').rolling(window=window, min_periods=window).min()
+    high_max = pd.to_numeric(df['high'], errors='coerce').rolling(window=window, min_periods=window).max()
+    denom = (high_max - low_min).replace(0, np.nan)
+
+    k = 100 * (pd.to_numeric(df['close'], errors='coerce') - low_min) / denom
+    d = k.rolling(window=window, min_periods=window).mean()
+
+    df['%K'] = k
+    df['%D'] = d
     return df
 
 # Verificar si el RSI y %K indican sobreventa
 #@profile
 def verificar_zona_sobreventa(df, window, rsi_threshold=30, k_threshold=20):
-    if 'RSI' not in df.columns:
-        df = calcular_rsi(df, window)  # Calcular RSI si no existe
+    rsi_col = 'RSI' if 'RSI' in df.columns else ('rsi' if 'rsi' in df.columns else None)
+    if rsi_col is None:
+        df = calcular_rsi(df, window)
+        rsi_col = 'RSI' if 'RSI' in df.columns else 'rsi'
+
     if '%K' not in df.columns:
-        df = calcular_estocastico(df, window)  # Calcular %K si no existe
-    return df['RSI'].iloc[-1] < rsi_threshold and df['%K'].iloc[-1] < k_threshold
+        df = calcular_estocastico(df, window)
+
+    rsi_v = pd.to_numeric(df[rsi_col].iloc[-1], errors='coerce')
+    k_v = pd.to_numeric(df['%K'].iloc[-1], errors='coerce')
+    if pd.isna(rsi_v) or pd.isna(k_v):
+        return False
+    return (rsi_v < rsi_threshold) and (k_v < k_threshold)
 
 # Verificar si el RSI y %K indican sobrecompra
 #@profile
 def verificar_zona_sobrecompra(df, window, rsi_threshold=70, k_threshold=80):
-    if 'RSI' not in df.columns:
-        df = calcular_rsi(df, window)  # Calcular RSI si no existe
-    if '%K' not in df.columns:
-        df = calcular_estocastico(df, window)  # Calcular %K si no existe
-    return df['RSI'].iloc[-1] > rsi_threshold and df['%K'].iloc[-1] > k_threshold
+    rsi_col = 'RSI' if 'RSI' in df.columns else ('rsi' if 'rsi' in df.columns else None)
+    if rsi_col is None:
+        df = calcular_rsi(df, window)
+        rsi_col = 'RSI' if 'RSI' in df.columns else 'rsi'
 
-# Función para predecir la tendencia basándose en datos en tiempo real
+    if '%K' not in df.columns:
+        df = calcular_estocastico(df, window)
+
+    rsi_v = pd.to_numeric(df[rsi_col].iloc[-1], errors='coerce')
+    k_v = pd.to_numeric(df['%K'].iloc[-1], errors='coerce')
+    if pd.isna(rsi_v) or pd.isna(k_v):
+        return False
+    return (rsi_v > rsi_threshold) and (k_v > k_threshold)
+
+# Función para predecir la tendencia en tiempo real
 #@profile
 def predecir_tendencia_en_tiempo_real(df, temporalidad):
 
@@ -6089,9 +6254,14 @@ def calcular_entradas(
 
         fecha_inicio = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         fecha_fin = datetime.now().strftime("%Y-%m-%d")
-        prob_funda = ajustar_probabilidad_fundamental(
+        prob_funda_res = ajustar_probabilidad_fundamental(
             50, df_eventos, symbol, tf, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin, cfg=cfg
         )
+        fund_meta = None
+        if isinstance(prob_funda_res, (tuple, list)) and len(prob_funda_res) == 2:
+            prob_funda, fund_meta = prob_funda_res
+        else:
+            prob_funda = prob_funda_res
         probabilidad_fundamental = round(prob_funda if prob_funda is not None else 50, 2)
 
         # --- Prob. general (con pesos desde cfg.general) ---
@@ -6111,6 +6281,18 @@ def calcular_entradas(
         zona_sobreventa = verificar_zona_sobreventa(df, window)
         zona_sobrecompra = verificar_zona_sobrecompra(df, window)
 
+        zona_no_trading_reason = None
+        try:
+            bloquear_por_eventos = bool(((cfg or {}).get('entrada') or {}).get('bloquear_por_eventos', True))
+        except Exception:
+            bloquear_por_eventos = True
+
+        if bloquear_por_eventos and fund_meta and isinstance(fund_meta, dict):
+            er = fund_meta.get('event_risk') or {}
+            if er.get('avoid_trading'):
+                zona_no_trading = True
+                zona_no_trading_reason = er.get('reason') or 'Riesgo por evento macro cercano.'
+
         # --- Tipo de operación ---
         tipo_operacion = determinar_tipo_operacion(
             precio_actual,
@@ -6124,6 +6306,45 @@ def calcular_entradas(
             probabilidad_general,
             zona_no_trading,
         )
+
+        conflicto_fundamental = False
+        conflicto_fundamental_reason = None
+        try:
+            penalizar_conflicto_fund = bool(((cfg or {}).get("fundamental") or {}).get("penalizar_conflicto", False))
+        except Exception:
+            penalizar_conflicto_fund = False
+
+        if fund_meta and isinstance(fund_meta, dict):
+            ev_meta = (fund_meta.get("events") or {}) if isinstance(fund_meta.get("events"), dict) else {}
+            fdir = str(ev_meta.get("direction") or "neutral").lower()
+            try:
+                fpts = float(ev_meta.get("points") or 0.0)
+            except Exception:
+                fpts = 0.0
+
+            # solo penalizamos si el sesgo fundamental es claro
+            if fdir in ("bullish", "bearish") and abs(fpts) >= 8:
+                t = str(tipo_operacion).lower()
+                is_buy = "compra" in t
+                is_sell = "venta" in t
+                if (fdir == "bullish" and is_sell) or (fdir == "bearish" and is_buy):
+                    conflicto_fundamental = True
+                    conflicto_fundamental_reason = f"Señal técnica '{tipo_operacion}' contra sesgo fundamental {fdir} (pts={fpts:.1f})."
+                    if penalizar_conflicto_fund:
+                        probabilidad_general = max(1, probabilidad_general - 6)
+                        # recalcular el tipo de operación con la prob ajustada
+                        tipo_operacion = determinar_tipo_operacion(
+                            precio_actual,
+                            predicciones_arima[0] if predicciones_arima else None,
+                            predicciones_media_movil[0] if predicciones_media_movil else None,
+                            probabilidad_alza,
+                            probabilidad_baja,
+                            patrones_detectados,
+                            zona_sobreventa,
+                            zona_sobrecompra,
+                            probabilidad_general,
+                            zona_no_trading,
+                        )
 
         # Bollinger (último)
         bollinger_upper = _coerce_float_safe(salida.get("bollinger_upper")) or _coerce_float_safe(
@@ -6261,6 +6482,13 @@ def calcular_entradas(
             "zona_sobrecompra": zona_sobrecompra,
             "entradas": entradas_mult,
         }
+        if fund_meta is not None:
+            salida["fundamental_meta"] = fund_meta
+        if zona_no_trading_reason:
+            salida["zona_no_trading_reason"] = zona_no_trading_reason
+        if conflicto_fundamental:
+            salida["conflicto_fundamental"] = True
+            salida["conflicto_fundamental_reason"] = conflicto_fundamental_reason
         return json_safe(salida)
 
     except Exception as e:
