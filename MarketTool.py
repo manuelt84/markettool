@@ -12792,8 +12792,9 @@ def _backfill_internal_gaps(
     tf: str,
     exec_id: str | None = None,
     max_minutes_per_call: int = 10_000,
+    allow_small_tf: bool = False,
 ) -> int:
-    if tf in ("1min", "1m", "5min", "5m"):
+    if (not allow_small_tf) and tf in ("1min", "1m", "5min", "5m"):
         return 0
     if not base_ms:
         return 0
@@ -13809,11 +13810,13 @@ async def monitoreo_history():
       limit?: int = 600,
       from_ts?: int (ms),
       to_ts?: int (ms),
-      persist?: bool
+      persist?: bool,
+      fill_gaps?: bool = false,
+      max_minutes_per_call?: int
     }
     Respuesta: {
       status, symbol, timeframe, exec_id,
-      from_ts, to_ts, count, candles, persisted_path?
+      from_ts, to_ts, count, gapfill_requested, gapfill_added, candles, persisted_path?
     }
     """
     try:
@@ -13823,11 +13826,17 @@ async def monitoreo_history():
         exec_id   = str(body.get("exec_id") or "").strip()
         symbol    = str(body.get("symbol")  or "").strip().upper()
         timeframe = _norm_tf(body.get("timeframe"))
-
         limit     = body.get("limit", 600)
         from_ts   = body.get("from_ts", None)   # epoch ms
         to_ts     = body.get("to_ts", None)     # epoch ms
-        persist   = bool(body.get("persist", False))
+
+        # ✅ Bajo demanda: rellena huecos internos consultando histórico (FMP) SIN crear endpoints nuevos.
+        # Se activa sólo cuando el front envía fill_gaps=true.
+        fill_gaps = bool(body.get("fill_gaps") or body.get("backfill") or False)
+        max_minutes_per_call = body.get("max_minutes_per_call", None)
+
+        # Si se pide fill_gaps, por defecto persistimos el cache actualizado (a menos que el body lo fuerce).
+        persist   = bool(body.get("persist", fill_gaps))
 
         if not user_id:
             return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
@@ -13892,9 +13901,45 @@ async def monitoreo_history():
                 st,
                 age,
             )
-
         # Normaliza a ms DESPUÉS del posible refresh
+
         series_ms = _series_to_ms(st.get("series", []))
+
+        gapfill_added = 0
+        if fill_gaps and series_ms:
+            # Snap + dedupe antes de detectar huecos (muy importante para 1m/5m)
+            series_ms = _snap_and_dedupe_to_minutes(series_ms, tf_api)
+
+            # Cap por defecto (en minutos) para no pedir rangos gigantes en 1m/5m
+            default_mm_map = {
+                "1min":  1500,   # ~25h
+                "5min":  6000,   # ~20d
+                "15min": 10000,
+                "30min": 10000,
+                "1hour": 20000,
+                "4hour": 50000,
+            }
+            try:
+                mm = int(max_minutes_per_call) if max_minutes_per_call is not None else int(default_mm_map.get(tf_api, 10000))
+            except Exception:
+                mm = int(default_mm_map.get(tf_api, 10000))
+            mm = max(10, min(mm, 200000))
+
+            gapfill_added = await asyncio.to_thread(
+                _backfill_internal_gaps,
+                series_ms,
+                symbol,
+                tf_api,
+                exec_id,
+                mm,
+                allow_small_tf=True,
+            )
+
+            if gapfill_added:
+                # Actualiza cache en memoria para que incremental y próximos history ya vengan completos
+                with _MON_CACHE_LOCK:
+                    st["series"] = series_ms
+                    st["dirty"] = True
 
 
 
@@ -13945,6 +13990,8 @@ async def monitoreo_history():
             "from_ts": from_out,
             "to_ts": to_out,
             "count": len(filt),
+            "gapfill_requested": bool(fill_gaps),
+            "gapfill_added": int(gapfill_added),
             "candles": filt,
         }
         if persisted:
