@@ -13775,6 +13775,82 @@ async def monitoreo_resume():
 
         st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
         series_ms = _series_to_ms(st.get("series", []))
+
+
+        # --- Gapfill / force fetch (bajo demanda) ---
+        gapfill_meta = {"requested": bool(force_api or fill_gaps), "force_api": bool(force_api), "fill_gaps": bool(fill_gaps), "fetched": 0, "added": 0}
+        if force_api or fill_gaps:
+            try:
+                tfms = _tf_ms(timeframe)
+                if tfms:
+                    # ventana por defecto: últimas N velas cerradas
+                    try:
+                        _limit_i = int(limit) if limit is not None else 600
+                    except Exception:
+                        _limit_i = 600
+                    if _limit_i <= 0:
+                        _limit_i = 600
+
+                    closed_end = _current_closed_bucket_start(timeframe) - tfms
+
+                    # normaliza from/to (ms) si vienen; si no, deriva desde el límite
+                    _from_in = from_ts
+                    _to_in   = to_ts
+                    try:
+                        _from_in = int(_from_in) if _from_in is not None else None
+                    except Exception:
+                        _from_in = None
+                    try:
+                        _to_in = int(_to_in) if _to_in is not None else None
+                    except Exception:
+                        _to_in = None
+
+                    from_eff = _from_in if _from_in is not None else (closed_end - (_limit_i - 1) * tfms)
+                    to_eff   = _to_in   if _to_in   is not None else closed_end
+
+                    # acota a velas cerradas
+                    to_eff = min(to_eff, closed_end)
+                    if from_eff > to_eff:
+                        from_eff, to_eff = to_eff, from_eff
+
+                    # Trae un poco más allá del último bucket para no quedar corto por inclusividad
+                    fetch_to = min(to_eff + tfms, closed_end + tfms)
+
+                    rng = await asyncio.to_thread(_fetch_historical_range, symbol, timeframe, from_eff, fetch_to)
+                    gapfill_meta["fetched"] = len(rng or [])
+
+                    if rng:
+                        added = merge_bars_series(series_ms, rng, timeframe)
+                        if added:
+                            gapfill_meta["added"] += int(added)
+                            series_ms[:] = _snap_and_dedupe_to_minutes(series_ms, timeframe)
+
+                            with _MON_CACHE_LOCK:
+                                st["series"] = series_ms
+                                if persist:
+                                    st["dirty"] = True
+
+                    # Relleno interno (puede hacer varias llamadas pequeñas). Permitimos 1m/5m solo aquí.
+                    if fill_gaps:
+                        added2 = await asyncio.to_thread(
+                            _backfill_internal_gaps,
+                            series_ms,
+                            symbol,
+                            timeframe,
+                            exec_id,
+                            max_minutes_per_call,
+                            True,  # allow_small_tf
+                        )
+                        if added2:
+                            gapfill_meta["added"] += int(added2)
+                            series_ms[:] = _snap_and_dedupe_to_minutes(series_ms, timeframe)
+                            with _MON_CACHE_LOCK:
+                                st["series"] = series_ms
+                                if persist:
+                                    st["dirty"] = True
+
+            except Exception:
+                logging.exception("Gapfill/force_api falló en /monitoreo/history")
         last_ts = series_ms[-1]["t"] if series_ms else None
         # Nota: /resume es de lectura; no cambiamos 'estado' para no pisar running/stopped.
         await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
@@ -13810,13 +13886,11 @@ async def monitoreo_history():
       limit?: int = 600,
       from_ts?: int (ms),
       to_ts?: int (ms),
-      persist?: bool,
-      fill_gaps?: bool = false,
-      max_minutes_per_call?: int
+      persist?: bool
     }
     Respuesta: {
       status, symbol, timeframe, exec_id,
-      from_ts, to_ts, count, gapfill_requested, gapfill_added, candles, persisted_path?
+      from_ts, to_ts, count, candles, persisted_path?
     }
     """
     try:
@@ -13826,17 +13900,18 @@ async def monitoreo_history():
         exec_id   = str(body.get("exec_id") or "").strip()
         symbol    = str(body.get("symbol")  or "").strip().upper()
         timeframe = _norm_tf(body.get("timeframe"))
+
         limit     = body.get("limit", 600)
         from_ts   = body.get("from_ts", None)   # epoch ms
         to_ts     = body.get("to_ts", None)     # epoch ms
+        persist   = bool(body.get("persist", False))
 
-        # ✅ Bajo demanda: rellena huecos internos consultando histórico (FMP) SIN crear endpoints nuevos.
-        # Se activa sólo cuando el front envía fill_gaps=true.
-        fill_gaps = bool(body.get("fill_gaps") or body.get("backfill") or False)
-        max_minutes_per_call = body.get("max_minutes_per_call", None)
-
-        # Si se pide fill_gaps, por defecto persistimos el cache actualizado (a menos que el body lo fuerce).
-        persist   = bool(body.get("persist", fill_gaps))
+        fill_gaps = bool(body.get("fill_gaps", False))
+        force_api = bool(body.get("force_api", False))
+        try:
+            max_minutes_per_call = int(body.get("max_minutes_per_call") or 10_000)
+        except Exception:
+            max_minutes_per_call = 10_000
 
         if not user_id:
             return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
@@ -13901,45 +13976,79 @@ async def monitoreo_history():
                 st,
                 age,
             )
-        # Normaliza a ms DESPUÉS del posible refresh
 
+        # Normaliza a ms DESPUÉS del posible refresh
         series_ms = _series_to_ms(st.get("series", []))
 
-        gapfill_added = 0
-        if fill_gaps and series_ms:
-            # Snap + dedupe antes de detectar huecos (muy importante para 1m/5m)
-            series_ms = _snap_and_dedupe_to_minutes(series_ms, tf_api)
-
-            # Cap por defecto (en minutos) para no pedir rangos gigantes en 1m/5m
-            default_mm_map = {
-                "1min":  1500,   # ~25h
-                "5min":  6000,   # ~20d
-                "15min": 10000,
-                "30min": 10000,
-                "1hour": 20000,
-                "4hour": 50000,
-            }
+        # --- Gapfill / force fetch (bajo demanda) ---
+        gapfill_meta = {"requested": bool(force_api or fill_gaps), "force_api": bool(force_api), "fill_gaps": bool(fill_gaps), "fetched": 0, "added": 0}
+        if force_api or fill_gaps:
             try:
-                mm = int(max_minutes_per_call) if max_minutes_per_call is not None else int(default_mm_map.get(tf_api, 10000))
+                tfms = _tf_ms(timeframe)
+                if tfms:
+                    try:
+                        _limit_i = int(limit) if limit is not None else 600
+                    except Exception:
+                        _limit_i = 600
+                    if _limit_i <= 0:
+                        _limit_i = 600
+
+                    closed_end = _current_closed_bucket_start(timeframe) - tfms
+
+                    _from_in = from_ts
+                    _to_in   = to_ts
+                    try:
+                        _from_in = int(_from_in) if _from_in is not None else None
+                    except Exception:
+                        _from_in = None
+                    try:
+                        _to_in = int(_to_in) if _to_in is not None else None
+                    except Exception:
+                        _to_in = None
+
+                    from_eff = _from_in if _from_in is not None else (closed_end - (_limit_i - 1) * tfms)
+                    to_eff   = _to_in   if _to_in   is not None else closed_end
+
+                    to_eff = min(to_eff, closed_end)
+                    if from_eff > to_eff:
+                        from_eff, to_eff = to_eff, from_eff
+
+                    fetch_to = min(to_eff + tfms, closed_end + tfms)
+
+                    rng = await asyncio.to_thread(_fetch_historical_range, symbol, timeframe, from_eff, fetch_to)
+                    gapfill_meta["fetched"] = len(rng or [])
+
+                    if rng:
+                        added = merge_bars_series(series_ms, rng, timeframe)
+                        if added:
+                            gapfill_meta["added"] += int(added)
+                            series_ms[:] = _snap_and_dedupe_to_minutes(series_ms, timeframe)
+                            with _MON_CACHE_LOCK:
+                                st["series"] = series_ms
+                                if persist:
+                                    st["dirty"] = True
+
+                    if fill_gaps:
+                        added2 = await asyncio.to_thread(
+                            _backfill_internal_gaps,
+                            series_ms,
+                            symbol,
+                            timeframe,
+                            exec_id,
+                            max_minutes_per_call,
+                            True,
+                        )
+                        if added2:
+                            gapfill_meta["added"] += int(added2)
+                            series_ms[:] = _snap_and_dedupe_to_minutes(series_ms, timeframe)
+                            with _MON_CACHE_LOCK:
+                                st["series"] = series_ms
+                                if persist:
+                                    st["dirty"] = True
+
             except Exception:
-                mm = int(default_mm_map.get(tf_api, 10000))
-            mm = max(10, min(mm, 200000))
+                logging.exception("Gapfill/force_api falló en /monitoreo/history")
 
-            gapfill_added = await asyncio.to_thread(
-                _backfill_internal_gaps,
-                series_ms,
-                symbol,
-                tf_api,
-                exec_id,
-                mm,
-                allow_small_tf=True,
-            )
-
-            if gapfill_added:
-                # Actualiza cache en memoria para que incremental y próximos history ya vengan completos
-                with _MON_CACHE_LOCK:
-                    st["series"] = series_ms
-                    st["dirty"] = True
 
 
 
@@ -13990,9 +14099,8 @@ async def monitoreo_history():
             "from_ts": from_out,
             "to_ts": to_out,
             "count": len(filt),
-            "gapfill_requested": bool(fill_gaps),
-            "gapfill_added": int(gapfill_added),
             "candles": filt,
+            "gapfill": (gapfill_meta if "gapfill_meta" in locals() else None),
         }
         if persisted:
             resp["persisted_path"] = f"gs://{BUCKET_NAME}/{persisted}"
