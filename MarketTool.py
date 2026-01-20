@@ -2851,10 +2851,7 @@ def analizar_con_yolo(ruta_imagen: str, stop_cb=None, include_tech: bool=False, 
         label = f'{d["name"]} {d["conf"]:.2f}'
         cv2.putText(out_img, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
 
-    cv2.imwrite(imagen_final_path, out_img)
 
-
-        # -----------------------------
     # C2) Patrones en formación (ventana derecha)
     # -----------------------------
     existentes_xyxy = [d["xyxy"] for d in dets2]
@@ -2883,6 +2880,10 @@ def analizar_con_yolo(ruta_imagen: str, stop_cb=None, include_tech: bool=False, 
     else:
         entradas["patrones_en_formacion"] = []
         entradas["patrones_en_formacion_label"] = []
+
+
+    # Guardar imagen final (incluye confirmados + en formación)
+    cv2.imwrite(imagen_final_path, out_img)
 
     # -----------------------------
     # D) Entradas “panel” (no técnico por defecto)
