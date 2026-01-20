@@ -2611,6 +2611,15 @@ FORM_MAX_AREA_FRAC= float(os.getenv("PATRON_FORM_MAX_AREA_FRAC", "0.35"))
 FORM_EDGE_PX      = int(os.getenv("PATRON_FORM_EDGE_PX", "10"))  # cerca del borde derecho
 FORM_TOPK_POR_CLASE = int(os.getenv("PATRON_FORM_TOPK_POR_CLASE", "2"))
 
+# ROI adaptativo: detectar hasta donde llega realmente el grafico (evita ejes/texto si hay gap)
+FORM_PROBE_FRAC       = float(os.getenv("PATRON_FORM_PROBE_FRAC", "0.35"))     # ventana de sondeo (>= FORM_WIN_FRAC)
+FORM_COL_SMOOTH_WIN   = int(os.getenv("PATRON_FORM_COL_SMOOTH_WIN", "21"))     # suavizado por columnas
+FORM_COL_SCORE_THR    = float(os.getenv("PATRON_FORM_COL_SCORE_THR", "0.025"))  # umbral actividad (no-blanco+bordes)
+FORM_COL_EDGE_W       = float(os.getenv("PATRON_FORM_COL_EDGE_W", "0.60"))     # peso de bordes en score
+FORM_GAP_MIN_PX       = int(os.getenv("PATRON_FORM_GAP_MIN_PX", "40"))         # gap minimo para recortar
+FORM_GAP_MIN_FRAC     = float(os.getenv("PATRON_FORM_GAP_MIN_FRAC", "0.06"))    # gap minimo relativo
+
+
 
 
 # ---- Ajustes anti-falsos positivos (en formacion) ----
@@ -2621,6 +2630,29 @@ FORM_LAST_X_FRAC      = float(os.getenv("PATRON_FORM_LAST_X_FRAC", "0.45"))     
 FORM_MIN_NONWHITE     = float(os.getenv("PATRON_FORM_MIN_NONWHITE", "0.012"))     # % pixeles no-blancos min
 FORM_MIN_EDGE         = float(os.getenv("PATRON_FORM_MIN_EDGE", "0.003"))         # % bordes (Canny) min
 FORM_WHITE_THR        = int(os.getenv("PATRON_FORM_WHITE_THR", "245"))            # umbral de blanco
+
+# ---- Heurística “fin real del gráfico” (evita detectar en eje/espacios) ----
+# Se basa en *pixeles coloreados* (velas rojas/verdes) para no confundir texto/etiquetas.
+FORM_COLOR_S_THR          = int(os.getenv("PATRON_FORM_COLOR_S_THR", "35"))          # saturación mínima para “color”
+FORM_COLOR_V_MAX          = int(os.getenv("PATRON_FORM_COLOR_V_MAX", "250"))         # valor máximo (evita casi-blanco)
+FORM_ACTIVE_DENS_THR      = float(os.getenv("PATRON_FORM_ACTIVE_DENS_THR", "0.0025")) # densidad de color por columna
+FORM_ACTIVE_SPAN_THR      = float(os.getenv("PATRON_FORM_ACTIVE_SPAN_THR", "0.05"))   # span vertical mínimo por columna
+FORM_ACTIVE_SMOOTH_WIN    = int(os.getenv("PATRON_FORM_ACTIVE_SMOOTH_WIN", "31"))     # suavizado columnas
+FORM_ACTIVE_MIN_RUN_PX    = int(os.getenv("PATRON_FORM_ACTIVE_MIN_RUN_PX", "70"))     # largo mínimo (px) para considerar “zona de velas”
+FORM_BOX_MIN_COLORED      = float(os.getenv("PATRON_FORM_BOX_MIN_COLORED", "0.0012")) # % pixeles coloreados mínimos dentro de bbox
+FORM_BOX_S_THR            = int(os.getenv("PATRON_FORM_BOX_S_THR", "30"))             # saturación mínima dentro de bbox
+
+# ---- Anti-linea de precio (horizontal punteada) ----
+FORM_COLOR_V_MIN          = int(os.getenv("PATRON_FORM_COLOR_V_MIN", "45"))             # valor mínimo para considerar vela (evita grises)
+FORM_RED_HI               = int(os.getenv("PATRON_FORM_RED_HI", "10"))                  # H <= 10
+FORM_RED_LO               = int(os.getenv("PATRON_FORM_RED_LO", "170"))                 # H >= 170
+FORM_GREEN_LO             = int(os.getenv("PATRON_FORM_GREEN_LO", "60"))                # H >= 60
+FORM_GREEN_HI             = int(os.getenv("PATRON_FORM_GREEN_HI", "105"))               # H <= 105
+FORM_REMOVE_HLINES        = os.getenv("PATRON_FORM_REMOVE_HLINES", "1") == "1"
+FORM_HLINE_KERNEL_PX      = int(os.getenv("PATRON_FORM_HLINE_KERNEL_PX", "45"))          # largo del kernel horizontal
+FORM_HLINE_DILATE_ITER    = int(os.getenv("PATRON_FORM_HLINE_DILATE_ITER", "1"))        # engrosar mascara de linea
+FORM_BOX_MIN_SPAN_FRAC    = float(os.getenv("PATRON_FORM_BOX_MIN_SPAN_FRAC", "0.12"))    # span vertical minimo dentro bbox (fraccion de alto)
+FORM_BOX_MIN_SPAN_PX      = int(os.getenv("PATRON_FORM_BOX_MIN_SPAN_PX", "6"))           # span vertical minimo absoluto (px)
 
 def _iou_xyxy(a, b) -> float:
     ax1, ay1, ax2, ay2 = a
@@ -2640,8 +2672,14 @@ def _iou_xyxy(a, b) -> float:
     return float(inter / denom)
 
 def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full_w: int, full_h: int, existentes_xyxy: list, stop_now):
-    # Devuelve detecciones "en formacion" en coords de imagen completa.
-    # Anti-falsos positivos: recorta eje/precio (derecha), recorta header/footer, y descarta boxes casi blancos.
+    """Devuelve detecciones "en formacion" en coords de imagen completa.
+
+    Mejora clave:
+    - ROI adaptativo: se ancla al "ultimo contenido real" (velas) y evita detectar sobre
+      margenes/ejes/texto cuando hay un espacio en blanco grande a la derecha.
+    - Si las velas llegan al borde, NO recorta (detecta igual).
+    - Anti-falsos positivos: recorte vertical (header/footer) + filtro de contenido (no-blanco + bordes).
+    """
     if not FORM_ENABLED:
         return []
 
@@ -2649,21 +2687,169 @@ def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full
     if img is None:
         return []
 
-    # Ventana derecha (pero quitando el eje/escala de precio)
-    x0 = int(full_w * (1.0 - FORM_WIN_FRAC))
-    x0 = max(0, min(x0, full_w - 1))
-
-    axis_px = int(full_w * FORM_AXIS_MARGIN_FRAC)
-    x_end = full_w - axis_px if axis_px > 0 else full_w
-    x_end = max(0, min(x_end, full_w))
-    if x_end <= x0 + 50:
-        x_end = full_w
-
     # Recorte vertical para evitar overlays (barra superior e inferior)
     y0 = int(full_h * FORM_TOP_CROP_FRAC)
     y_end = int(full_h * (1.0 - FORM_BOTTOM_CROP_FRAC))
     y0 = max(0, min(y0, full_h - 1))
     y_end = max(y0 + 1, min(y_end, full_h))
+
+    # --- 1) Encuentra el "ultimo contenido" en una ventana de sondeo mas amplia (para detectar gap) ---
+    probe_frac = max(FORM_WIN_FRAC, FORM_PROBE_FRAC)
+    x_probe0 = int(full_w * (1.0 - probe_frac))
+    x_probe0 = max(0, min(x_probe0, full_w - 1))
+
+    probe = img[y0:y_end, x_probe0:full_w]
+    ph, pw = probe.shape[:2]
+    if pw < 60 or ph < 60:
+        return []
+
+    # Buscamos el final real del gráfico. La heurística por *pixeles coloreados* suele
+    # evitar falsos positivos del eje/etiquetas (texto negro, zonas blancas, etc.).
+    # Si por algún motivo no hay color suficiente, caemos al método gris (no-blanco+bordes).
+    yps = int(ph * 0.06)
+    ype = int(ph * 0.94)
+    yps = max(0, min(yps, ph - 1))
+    ype = max(yps + 1, min(ype, ph))
+    probe_mid = probe[yps:ype, :]
+
+    last_idx: int | None = None
+
+    use_color = False
+    try:
+        hsv = cv2.cvtColor(probe_mid, cv2.COLOR_BGR2HSV)
+        hch = hsv[:, :, 0]
+        s = hsv[:, :, 1]
+        v = hsv[:, :, 2]
+
+        # Detecta velas por color (rojo/verde) en HSV, y luego remueve lineas horizontales largas
+        red = (((hch <= FORM_RED_HI) | (hch >= FORM_RED_LO)) & (s > FORM_COLOR_S_THR) & (v >= FORM_COLOR_V_MIN) & (v < FORM_COLOR_V_MAX))
+        green = ((hch >= FORM_GREEN_LO) & (hch <= FORM_GREEN_HI) & (s > FORM_COLOR_S_THR) & (v >= FORM_COLOR_V_MIN) & (v < FORM_COLOR_V_MAX))
+        colored_raw = (red | green)
+
+        if FORM_REMOVE_HLINES:
+            try:
+                m = (colored_raw.astype(np.uint8) * 255)
+                klen = int(min(max(15, FORM_HLINE_KERNEL_PX), max(15, m.shape[1] - 1)))
+                if klen % 2 == 0:
+                    klen += 1
+                k = cv2.getStructuringElement(cv2.MORPH_RECT, (klen, 1))
+                closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
+                hline = cv2.morphologyEx(closed, cv2.MORPH_OPEN, k, iterations=1)
+                if FORM_HLINE_DILATE_ITER > 0:
+                    hline = cv2.dilate(hline, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=int(FORM_HLINE_DILATE_ITER))
+                colored = (m > 0) & (hline == 0)
+            except Exception:
+                colored = colored_raw
+        else:
+            colored = colored_raw
+
+        # Si hay algo de color real (velas), usamos este modo
+        use_color = float(colored.mean()) > 1e-6
+    except Exception:
+        use_color = False
+
+    if use_color:
+        dens = colored.mean(axis=0)  # densidad de “color” por columna
+        any_col = colored.any(axis=0)
+        # span vertical por columna (vectorizado)
+        first = np.argmax(colored, axis=0)
+        last = (colored.shape[0] - 1) - np.argmax(colored[::-1, :], axis=0)
+        denom = float(max(1, colored.shape[0] - 1))
+        span = np.zeros_like(dens, dtype=float)
+        span[any_col] = (last[any_col] - first[any_col]) / denom
+
+        active = (dens >= FORM_ACTIVE_DENS_THR) & (span >= FORM_ACTIVE_SPAN_THR)
+
+        # suavizado (reduce ruido de etiquetas pequeñas)
+        win = int(FORM_ACTIVE_SMOOTH_WIN)
+        win = max(7, min(win, pw))
+        if win % 2 == 0:
+            win += 1
+        act_s = np.convolve(active.astype(float), (np.ones(win) / float(win)), mode='same')
+        active2 = act_s > 0.30
+
+        # encontrar la última “corrida” activa suficientemente larga (evita price-badge)
+        min_run = int(max(25, min(FORM_ACTIVE_MIN_RUN_PX, pw)))
+        run_start = None
+        last_good_end = None
+        for i, val in enumerate(active2.tolist()):
+            if val and run_start is None:
+                run_start = i
+            elif (not val) and (run_start is not None):
+                if (i - run_start) >= min_run:
+                    last_good_end = i - 1
+                run_start = None
+        if run_start is not None:
+            if (pw - run_start) >= min_run:
+                last_good_end = pw - 1
+
+        if last_good_end is not None:
+            last_idx = int(last_good_end)
+        else:
+            # fallback: último índice con algo de color
+            idxs = np.where(dens > (FORM_ACTIVE_DENS_THR * 0.8))[0]
+            if idxs.size:
+                last_idx = int(idxs[-1])
+    else:
+        try:
+            gray_p = cv2.cvtColor(probe, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            return []
+
+        nonwhite_col = (gray_p < FORM_WHITE_THR).mean(axis=0)  # [0..1]
+        edges = cv2.Canny(gray_p, 50, 150)
+        # Remover lineas horizontales (p.ej. linea de precio) tambien en fallback gris
+        if FORM_REMOVE_HLINES:
+            try:
+                klen = int(min(max(15, FORM_HLINE_KERNEL_PX), max(15, edges.shape[1] - 1)))
+                if klen % 2 == 0:
+                    klen += 1
+                k = cv2.getStructuringElement(cv2.MORPH_RECT, (klen, 1))
+                closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, k, iterations=1)
+                hline = cv2.morphologyEx(closed, cv2.MORPH_OPEN, k, iterations=1)
+                if FORM_HLINE_DILATE_ITER > 0:
+                    hline = cv2.dilate(hline, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=int(FORM_HLINE_DILATE_ITER))
+                edges = cv2.bitwise_and(edges, cv2.bitwise_not(hline))
+            except Exception:
+                pass
+
+        edge_col = (edges > 0).mean(axis=0)
+        score = nonwhite_col + (FORM_COL_EDGE_W * edge_col)
+
+        win = int(FORM_COL_SMOOTH_WIN)
+        win = max(5, min(win, pw))
+        if win % 2 == 0:
+            win += 1
+        kernel = (np.ones(win, dtype=float) / float(win))
+        score_s = np.convolve(score, kernel, mode='same')
+
+        idxs = np.where(score_s > FORM_COL_SCORE_THR)[0]
+        if idxs.size:
+            last_idx = int(idxs[-1])
+
+    if last_idx is None:
+        # No hay contenido claro en el probe (probablemente imagen blanca / mal recortada)
+        return []
+    trailing_gap = (pw - 1) - int(last_idx)
+
+    gap_min_px = max(int(FORM_GAP_MIN_PX), int(pw * FORM_GAP_MIN_FRAC))
+
+    # Si hay un espacio grande a la derecha (gap), asumimos que ahi NO hay serie
+    if trailing_gap >= gap_min_px:
+        x_end = x_probe0 + int(last_idx) + 1
+    else:
+        x_end = full_w
+
+    x_end = max(0, min(x_end, full_w))
+
+    # --- 2) ROI final "en formacion": ancho fijo relativo, anclado al final real ---
+    desired_w = int(full_w * FORM_WIN_FRAC)
+    desired_w = max(80, desired_w)
+    x0 = max(0, x_end - desired_w)
+
+    # Seguridad: si por algun motivo quedo muy estrecho, amplia hacia la izquierda
+    if x_end - x0 < 60:
+        x0 = max(0, x_end - 60)
 
     roi = img[y0:y_end, x0:x_end].copy()
     roi_h, roi_w = roi.shape[:2]
@@ -2687,7 +2873,7 @@ def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full
     roi_area = float(roi_h * roi_w) if roi_h and roi_w else 1.0
 
     def _box_has_content(rx1: float, ry1: float, rx2: float, ry2: float) -> bool:
-        # Filtra bboxes que caen en zonas blancas/limpias o dominadas por texto/axes.
+        # Filtra bboxes que caen en zonas blancas/limpias.
         x1 = int(max(0, min(rx1, roi_w - 1)))
         x2 = int(max(0, min(rx2, roi_w)))
         y1 = int(max(0, min(ry1, roi_h - 1)))
@@ -2697,6 +2883,51 @@ def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full
         crop = roi[y1:y2, x1:x2]
         if crop.size == 0:
             return False
+        # 1) Color (candles): evita confundir texto/parches blancos con “patrones”
+        colored_ratio = 0.0
+        try:
+            hsv_c = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            h_c = hsv_c[:, :, 0]
+            s_c = hsv_c[:, :, 1]
+            v_c = hsv_c[:, :, 2]
+
+            red_c = (((h_c <= FORM_RED_HI) | (h_c >= FORM_RED_LO)) & (s_c > FORM_BOX_S_THR) & (v_c >= FORM_COLOR_V_MIN) & (v_c < FORM_COLOR_V_MAX))
+            green_c = ((h_c >= FORM_GREEN_LO) & (h_c <= FORM_GREEN_HI) & (s_c > FORM_BOX_S_THR) & (v_c >= FORM_COLOR_V_MIN) & (v_c < FORM_COLOR_V_MAX))
+            m_raw = (red_c | green_c)
+
+            if FORM_REMOVE_HLINES:
+                try:
+                    m = (m_raw.astype(np.uint8) * 255)
+                    klen = int(min(max(15, FORM_HLINE_KERNEL_PX), max(15, m.shape[1] - 1)))
+                    if klen % 2 == 0:
+                        klen += 1
+                    k = cv2.getStructuringElement(cv2.MORPH_RECT, (klen, 1))
+                    closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
+                    hline = cv2.morphologyEx(closed, cv2.MORPH_OPEN, k, iterations=1)
+                    if FORM_HLINE_DILATE_ITER > 0:
+                        hline = cv2.dilate(hline, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=int(FORM_HLINE_DILATE_ITER))
+                    m2 = (m > 0) & (hline == 0)
+                except Exception:
+                    m2 = m_raw
+            else:
+                m2 = m_raw
+
+            colored_ratio = float(m2.mean())
+
+            # Evita confundir lineas horizontales (precio) con velas: exige span vertical minimo
+            if m2.any():
+                ys = np.where(m2)
+                span_px = int(ys[0].max() - ys[0].min())
+                min_span = max(int(FORM_BOX_MIN_SPAN_PX), int((y2 - y1) * FORM_BOX_MIN_SPAN_FRAC))
+                if span_px < min_span:
+                    return False
+        except Exception:
+            colored_ratio = 0.0
+
+        if colored_ratio < FORM_BOX_MIN_COLORED:
+            return False
+
+        # 2) Estructura: no-blanco + bordes mínimos
         try:
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         except Exception:
@@ -2704,8 +2935,8 @@ def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full
         nonwhite = float((gray < FORM_WHITE_THR).mean())
         if nonwhite < FORM_MIN_NONWHITE:
             return False
-        edges = cv2.Canny(gray, 50, 150)
-        edge_ratio = float((edges > 0).mean())
+        edges2 = cv2.Canny(gray, 50, 150)
+        edge_ratio = float((edges2 > 0).mean())
         if edge_ratio < FORM_MIN_EDGE:
             return False
         return True
@@ -2731,7 +2962,6 @@ def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full
         if (rx2 < (roi_w - FORM_EDGE_PX)) and (cx < (roi_w * (1.0 - FORM_LAST_X_FRAC))):
             continue
 
-        # Evita falsos positivos en zonas en blanco por limpieza/escala
         if not _box_has_content(rx1, ry1, rx2, ry2):
             continue
 
