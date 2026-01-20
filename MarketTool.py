@@ -2611,6 +2611,17 @@ FORM_MAX_AREA_FRAC= float(os.getenv("PATRON_FORM_MAX_AREA_FRAC", "0.35"))
 FORM_EDGE_PX      = int(os.getenv("PATRON_FORM_EDGE_PX", "10"))  # cerca del borde derecho
 FORM_TOPK_POR_CLASE = int(os.getenv("PATRON_FORM_TOPK_POR_CLASE", "2"))
 
+
+
+# ---- Ajustes anti-falsos positivos (en formacion) ----
+FORM_AXIS_MARGIN_FRAC = float(os.getenv("PATRON_FORM_AXIS_MARGIN_FRAC", "0.06"))  # recorta eje/precio (derecha)
+FORM_TOP_CROP_FRAC    = float(os.getenv("PATRON_FORM_TOP_CROP_FRAC", "0.05"))     # recorta header
+FORM_BOTTOM_CROP_FRAC = float(os.getenv("PATRON_FORM_BOTTOM_CROP_FRAC", "0.10"))  # recorta footer
+FORM_LAST_X_FRAC      = float(os.getenv("PATRON_FORM_LAST_X_FRAC", "0.45"))      # exigir tramo final del ROI
+FORM_MIN_NONWHITE     = float(os.getenv("PATRON_FORM_MIN_NONWHITE", "0.012"))     # % pixeles no-blancos min
+FORM_MIN_EDGE         = float(os.getenv("PATRON_FORM_MIN_EDGE", "0.003"))         # % bordes (Canny) min
+FORM_WHITE_THR        = int(os.getenv("PATRON_FORM_WHITE_THR", "245"))            # umbral de blanco
+
 def _iou_xyxy(a, b) -> float:
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
@@ -2629,9 +2640,8 @@ def _iou_xyxy(a, b) -> float:
     return float(inter / denom)
 
 def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full_w: int, full_h: int, existentes_xyxy: list, stop_now):
-    """
-    Devuelve detecciones 'en formación' en coords de imagen completa.
-    """
+    # Devuelve detecciones "en formacion" en coords de imagen completa.
+    # Anti-falsos positivos: recorta eje/precio (derecha), recorta header/footer, y descarta boxes casi blancos.
     if not FORM_ENABLED:
         return []
 
@@ -2639,9 +2649,23 @@ def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full
     if img is None:
         return []
 
+    # Ventana derecha (pero quitando el eje/escala de precio)
     x0 = int(full_w * (1.0 - FORM_WIN_FRAC))
     x0 = max(0, min(x0, full_w - 1))
-    roi = img[:, x0:full_w].copy()
+
+    axis_px = int(full_w * FORM_AXIS_MARGIN_FRAC)
+    x_end = full_w - axis_px if axis_px > 0 else full_w
+    x_end = max(0, min(x_end, full_w))
+    if x_end <= x0 + 50:
+        x_end = full_w
+
+    # Recorte vertical para evitar overlays (barra superior e inferior)
+    y0 = int(full_h * FORM_TOP_CROP_FRAC)
+    y_end = int(full_h * (1.0 - FORM_BOTTOM_CROP_FRAC))
+    y0 = max(0, min(y0, full_h - 1))
+    y_end = max(y0 + 1, min(y_end, full_h))
+
+    roi = img[y0:y_end, x0:x_end].copy()
     roi_h, roi_w = roi.shape[:2]
     if roi_w < 50 or roi_h < 50:
         return []
@@ -2649,7 +2673,7 @@ def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full
     tmp_roi_path = clean_img_path.replace("limpia_", "roi_")
     cv2.imwrite(tmp_roi_path, roi)
 
-    if stop_now(): 
+    if stop_now():
         return []
 
     results_roi = modelo_patrones.predict(
@@ -2662,9 +2686,33 @@ def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full
 
     roi_area = float(roi_h * roi_w) if roi_h and roi_w else 1.0
 
+    def _box_has_content(rx1: float, ry1: float, rx2: float, ry2: float) -> bool:
+        # Filtra bboxes que caen en zonas blancas/limpias o dominadas por texto/axes.
+        x1 = int(max(0, min(rx1, roi_w - 1)))
+        x2 = int(max(0, min(rx2, roi_w)))
+        y1 = int(max(0, min(ry1, roi_h - 1)))
+        y2 = int(max(0, min(ry2, roi_h)))
+        if x2 <= x1 + 4 or y2 <= y1 + 4:
+            return False
+        crop = roi[y1:y2, x1:x2]
+        if crop.size == 0:
+            return False
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            return False
+        nonwhite = float((gray < FORM_WHITE_THR).mean())
+        if nonwhite < FORM_MIN_NONWHITE:
+            return False
+        edges = cv2.Canny(gray, 50, 150)
+        edge_ratio = float((edges > 0).mean())
+        if edge_ratio < FORM_MIN_EDGE:
+            return False
+        return True
+
     dets = []
     for b in results_roi[0].boxes:
-        if stop_now(): 
+        if stop_now():
             return []
 
         cls_id = int(b.cls[0])
@@ -2678,16 +2726,23 @@ def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full
         if area_frac < FORM_MIN_AREA_FRAC or area_frac > FORM_MAX_AREA_FRAC:
             continue
 
-        # Queremos lo "último": cerca del borde derecho del ROI
-        if rx2 < (roi_w - FORM_EDGE_PX) and ((rx1 + rx2) * 0.5) < (roi_w * 0.65):
+        # Queremos lo "ultimo": tramo final del ROI o muy cerca del borde derecho
+        cx = (rx1 + rx2) * 0.5
+        if (rx2 < (roi_w - FORM_EDGE_PX)) and (cx < (roi_w * (1.0 - FORM_LAST_X_FRAC))):
+            continue
+
+        # Evita falsos positivos en zonas en blanco por limpieza/escala
+        if not _box_has_content(rx1, ry1, rx2, ry2):
             continue
 
         name = modelo_patrones.names.get(cls_id, str(cls_id))
 
-        # pasar a coords imagen completa
+        # pasar a coords imagen completa (ajustar offsets x/y)
         x1 = rx1 + x0
         x2 = rx2 + x0
-        det_xyxy = (float(x1), float(ry1), float(x2), float(ry2))
+        y1f = ry1 + y0
+        y2f = ry2 + y0
+        det_xyxy = (float(x1), float(y1f), float(x2), float(y2f))
 
         # evitar duplicados con detecciones confirmadas (solape alto)
         dup = False
@@ -2700,7 +2755,7 @@ def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full
 
         dets.append({"name": name, "conf": conf, "cls": cls_id, "xyxy": det_xyxy, "area_frac": area_frac})
 
-    # Top-K por clase y límite final
+    # Top-K por clase y limite final
     by_cls = defaultdict(list)
     for d in dets:
         by_cls[d["cls"]].append(d)
