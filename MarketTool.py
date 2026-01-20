@@ -8,7 +8,7 @@ import logging
 import signal
 import functools
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Tuple, List, Callable, Iterable
+from typing import Optional, Dict, Any, Tuple, List, Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 import pytz
 import requests
@@ -48,12 +48,12 @@ from telegram.helpers import escape_markdown
 from textblob import TextBlob
 from textwrap import wrap
 from threading import Lock
-from typing import Any, Iterable, Mapping, Optional, Callable, Dict, Tuple, List
 from ultralytics import YOLO
 from urllib.parse import urlencode
 from uvicorn.config import LOGGING_CONFIG
 from pydantic import BaseModel
 from zoneinfo import ZoneInfo
+from types import SimpleNamespace
 import aiofiles
 import asyncio
 import base64
@@ -2191,50 +2191,759 @@ def es_grafico_de_velas(ruta_imagen: str) -> bool:
 
     return False
 
-#@profile
-def analizar_con_yolo(ruta_imagen: str) -> tuple[str, str]:
+# --------------------------
+# Cache de config Firestore
+# --------------------------
+_ACTIVOS_DESC_CACHE = None
+
+def _get_activos_desc() -> dict:
+    global _ACTIVOS_DESC_CACHE
+    if _ACTIVOS_DESC_CACHE is not None:
+        return _ACTIVOS_DESC_CACHE
+    try:
+        doc = db.collection("config").document("activos_con_descripcion").get()
+        _ACTIVOS_DESC_CACHE = (doc.to_dict() or {}).get("data") or {}
+    except Exception:
+        _ACTIVOS_DESC_CACHE = {}
+    return _ACTIVOS_DESC_CACHE
+
+def _universe_symbols() -> set:
+    # Usa tus listas globales si existen; si no, intenta Firestore
+    out = set()
+    try:
+        out.update(activos or [])
+    except Exception:
+        pass
+    try:
+        out.update(forex or [])
+    except Exception:
+        pass
+    # si tienes categorías, agrega todo
+    try:
+        for k, arr in (categorias or {}).items():
+            if isinstance(arr, list):
+                out.update(arr)
+    except Exception:
+        pass
+    return set(s.strip().upper() for s in out if isinstance(s, str) and s.strip())
+
+# temporalidades válidas del sistema
+def _valid_timeframes() -> set:
+    try:
+        return set(normalize_tf(x) for x in (temporalidades or []) if isinstance(x, str))
+    except Exception:
+        return {"1min","5min","15min","30min","1hour","4hour","1day","1week"}
+
+# --------------------------
+# Normalización OCR
+# --------------------------
+_TF_ALIASES = {
+    "1M": "1min", "M1": "1min", "1MIN": "1min",
+    "5M": "5min", "M5": "5min", "5MIN": "5min",
+    "15M": "15min", "M15": "15min", "15MIN": "15min",
+    "30M": "30min", "M30": "30min", "30MIN": "30min",
+    "1H": "1hour", "H1": "1hour",
+    "4H": "4hour", "H4": "4hour",
+    "D": "1day", "1D": "1day",
+    "W": "1week", "1W": "1week",
+}
+
+_PROVIDERS = {"OANDA","FXCM","FOREXCOM","FX","TV","TRADINGVIEW","BINANCE","COINBASE","BITSTAMP","KRAKEN"}
+
+def _clean_token(s: str) -> str:
+    s = (s or "").strip().upper()
+    s = s.replace(" ", "")
+    # si viene "OANDA:EURUSD" -> "EURUSD"
+    if ":" in s:
+        s = s.split(":")[-1]
+    # quita caracteres raros comunes
+    s = re.sub(r"[^A-Z0-9\.\-_\/]", "", s)
+    return s
+
+def _maybe_symbol_variants(tok: str) -> List[str]:
+    """
+    Genera variantes: EUR/USD -> EURUSD, EURUSD=X -> EURUSD, etc.
+    """
+    t = _clean_token(tok)
+    out = []
+    if not t:
+        return out
+
+    # evita providers solos
+    if t in _PROVIDERS:
+        return []
+
+    # elimina sufijos estilo =X
+    if t.endswith("=X"):
+        t = t[:-2]
+
+    out.append(t)
+
+    # si tiene / o -, también produce versión concatenada
+    if "/" in t:
+        out.append(t.replace("/", ""))
+    if "-" in t:
+        out.append(t.replace("-", ""))
+
+    # si viene con . (acciones tipo BRK.B), mantenemos
+    return list(dict.fromkeys(out))
+
+def _extract_timeframe_from_texts(texts: List[str]) -> Optional[str]:
+    valid = _valid_timeframes()
+    for raw in texts:
+        t = _clean_token(raw)
+        if not t:
+            continue
+        # match directo en alias
+        if t in _TF_ALIASES:
+            tf = normalize_tf(_TF_ALIASES[t])
+            if tf in valid:
+                return tf
+        # match patrones como "15MIN", "1H", "4H"
+        m = re.search(r"(^|\b)(\d{1,2})(MIN|M|H|D|W)(\b|$)", t)
+        if m:
+            n = m.group(2)
+            u = m.group(3)
+            key = f"{n}{u}"
+            if key in _TF_ALIASES:
+                tf = normalize_tf(_TF_ALIASES[key])
+                if tf in valid:
+                    return tf
+    return None
+
+def _extract_price_candidates(texts: List[str]) -> List[float]:
+    """
+    Trata de sacar precios tipo 1.1123 o 1,1123 o 63.50
+    """
+    out = []
+    for raw in texts:
+        s = (raw or "").strip()
+        # reemplaza coma decimal por punto si parece decimal
+        s2 = s.replace(",", ".")
+        # busca números con 1+ dígitos y opcional decimal
+        for m in re.finditer(r"(?<!\d)(\d{1,5}(?:\.\d{1,6})?)(?!\d)", s2):
+            try:
+                val = float(m.group(1))
+                # filtra basura obvia
+                if 0 < val < 1_000_000:
+                    out.append(val)
+            except Exception:
+                pass
+    return out
+
+def infer_symbol_tf_from_image(img_bgr, stop_cb=None, include_tech: bool=False) -> dict:
+    """
+    OCR en header (top ~22%) para inferir symbol y timeframe.
+    Valida contra universo Firestore y confirma con FMP (si hay precio OCR).
+    """
+    def stop_now():
+        return bool(stop_cb and stop_cb())
+
+    h, w = img_bgr.shape[:2]
+    y2 = max(1, int(h * 0.22))
+    header = img_bgr[0:y2, 0:w].copy()
+
+    # OCR solo header
+    ocr = reader.readtext(header)  # [(bbox, text, conf), ...]
+    if stop_now():
+        raise RuntimeError("stopped")
+
+    raw_texts = []
+    confs = []
+    for (_bbox, txt, c) in ocr:
+        if not txt:
+            continue
+        raw_texts.append(str(txt))
+        confs.append(float(c or 0))
+
+    # tokens limpios
+    tokens = []
+    for t in raw_texts:
+        tokens.append(_clean_token(t))
+
+    universe = _universe_symbols()
+
+    # candidatos por token (con variantes)
+    candidates = []
+    for t in tokens:
+        for v in _maybe_symbol_variants(t):
+            if v in universe:
+                candidates.append(v)
+
+    # también intenta combinar divisas "EUR" + "USD" => "EURUSD"
+    # (solo si no encontró nada)
+    if not candidates:
+        triples = [t for t in tokens if re.fullmatch(r"[A-Z]{3}", t or "")]
+        for i in range(len(triples)-1):
+            pair = (triples[i] + triples[i+1]).upper()
+            if pair in universe:
+                candidates.append(pair)
+
+    # timeframe
+    tf = _extract_timeframe_from_texts(raw_texts) or None
+
+    # si hay varios candidatos, intenta desempatar con precio OCR + FMP
+    price_ocr = None
+    prices = _extract_price_candidates(raw_texts)
+    if prices:
+        # toma el más “razonable”: el mayor suele ser escala de precio; aquí tomamos el último por simplicidad
+        price_ocr = prices[-1]
+
+    best = None
+    best_score = -1.0
+    best_quote = None
+
+    # si no hay candidates, igual devolvemos debug
+    uniq = list(dict.fromkeys(candidates))
+
+    for sym in uniq:
+        if stop_now():
+            raise RuntimeError("stopped")
+
+        # score base
+        score = 1.0
+
+        # bonus si el token original contenía ":" (provider) y extraímos el símbolo
+        # (no siempre disponible; dejamos base simple)
+        # confirmación por precio con FMP (si hay precio OCR)
+        q = None
+        if price_ocr is not None:
+            try:
+                q = _FMP.quote_last(sym)  # ya existe en tu script
+            except Exception:
+                q = None
+            if q is not None and q > 0:
+                rel = abs(q - price_ocr) / max(1e-9, q)
+                # mientras más cercano, mejor
+                score += max(0.0, 2.0 - min(2.0, rel * 20.0))  # rel 0.05 => +1, etc.
+        else:
+            # si no hay precio OCR, al menos intenta quote (para adjuntar info)
+            try:
+                q = _FMP.quote_last(sym)
+            except Exception:
+                q = None
+
+        # bonus si pertenece a forex (si tienes lista forex)
+        try:
+            if sym in set(x.upper() for x in (forex or [])):
+                score += 0.3
+        except Exception:
+            pass
+
+        if score > best_score:
+            best_score = score
+            best = sym
+            best_quote = q
+
+    out = {
+        "symbol": best,
+        "timeframe": tf or None,
+        "confidence": float(min(1.0, best_score / 3.0)) if best else 0.0,
+        "quote_last": float(best_quote) if isinstance(best_quote, (int, float)) else None,
+    }
+
+    if include_tech:
+        out["tech"] = {
+            "header_texts": raw_texts,
+            "candidates": uniq,
+            "price_ocr": price_ocr,
+            "score": best_score,
+        }
+
+    return out
+
+def _atr14(df: pd.DataFrame) -> float:
+    if df is None or df.empty:
+        return 0.0
+    d = df.copy()
+    for c in ("high","low","close"):
+        if c not in d.columns:
+            return 0.0
+    h = d["high"].astype(float)
+    l = d["low"].astype(float)
+    c = d["close"].astype(float)
+    prev = c.shift(1)
+    tr = pd.concat([(h-l), (h-prev).abs(), (l-prev).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().iloc[-1]
+    return float(atr) if np.isfinite(atr) else 0.0
+
+def _sma(s: pd.Series, n: int) -> float:
+    if s is None or len(s) < n:
+        return float("nan")
+    v = s.rolling(n).mean().iloc[-1]
+    return float(v) if np.isfinite(v) else float("nan")
+
+def build_insights_from_fmp(symbol: str, tf: str, stop_cb=None) -> dict:
+    def stop_now():
+        return bool(stop_cb and stop_cb())
+
+    tf = normalize_tf(tf or "1hour")
+    now = datetime.utcnow()
+
+    # ventana de data según tf
+    if tf in {"1min","5min","15min","30min"}:
+        days = 7
+        from_utc = now - timedelta(days=days)
+        df = _FMP.historical_intraday(symbol, tf, from_utc, now)
+    elif tf in {"1hour","4hour"}:
+        days = 60
+        from_utc = now - timedelta(days=days)
+        df = _FMP.historical_intraday(symbol, tf, from_utc, now)
+    else:
+        # eod para 1day / 1week
+        from_date = now.date() - timedelta(days=365 * 2)
+        df = _FMP.historical_eod(symbol, from_date, now)
+
+    if stop_now():
+        raise RuntimeError("stopped")
+
+    if df is None or df.empty:
+        return {
+            "scenario": "unknown",
+            "targets": {},
+            "triggers": [],
+            "risks": ["No se pudo obtener histórico para generar escenarios."],
+            "summary": "No hay datos suficientes para construir escenarios.",
+        }
+
+    closes = df["close"].astype(float)
+    last = float(closes.iloc[-1])
+
+    sma20 = _sma(closes, 20)
+    sma50 = _sma(closes, 50)
+    atr = _atr14(df)
+
+    # soporte/resistencia simples (últimas 50 velas)
+    tail = df.tail(50)
+    support = float(tail["low"].astype(float).min())
+    resist  = float(tail["high"].astype(float).max())
+
+    # escenario
+    if np.isfinite(sma50) and last > sma50 and (not np.isfinite(sma20) or last > sma20):
+        scenario = "bullish"
+    elif np.isfinite(sma50) and last < sma50 and (not np.isfinite(sma20) or last < sma20):
+        scenario = "bearish"
+    else:
+        scenario = "sideways"
+
+    # targets (muy “app-like”)
+    def fmt(v: float) -> float:
+        return float(v) if np.isfinite(v) else None
+
+    if atr <= 0:
+        atr = max(1e-9, abs(resist - support) * 0.15)
+
+    targets = {
+        "short":  {"value": fmt(resist if scenario != "bearish" else support)},
+        "medium": {"value": fmt((resist + atr) if scenario != "bearish" else (support - atr))},
+        "long":   {"value": fmt((resist + 2*atr) if scenario != "bearish" else (support - 2*atr))},
+    }
+
+    triggers = []
+    risks = []
+
+    if scenario == "bullish":
+        triggers.append(f"Ruptura y cierre por encima de {resist:.4f}")
+        triggers.append("Aumento de volumen/impulso en la ruptura (si aplica)")
+        risks.append(f"Rechazo en resistencia ({resist:.4f}) y retroceso hacia {support:.4f}")
+        risks.append("Falsa ruptura (breakout fallido)")
+    elif scenario == "bearish":
+        triggers.append(f"Ruptura y cierre por debajo de {support:.4f}")
+        triggers.append("Presión vendedora sostenida (velas con cuerpo amplio)")
+        risks.append(f"Rebote técnico en soporte ({support:.4f}) hacia {resist:.4f}")
+        risks.append("Short squeeze / rebotes violentos")
+    else:
+        triggers.append(f"Rango definido entre {support:.4f} y {resist:.4f}")
+        triggers.append("Esperar ruptura confirmada para sesgo direccional")
+        risks.append("Whipsaws: entradas en medio del rango")
+        risks.append("Rupturas falsas en extremos del rango")
+
+    # “Confluencia” simple (puedes sofisticar luego)
+    # score 0..1 en base a distancia a SMA50 y cercanía a extremos
+    score = 0.5
+    if np.isfinite(sma50) and sma50 != 0:
+        score = min(1.0, max(0.0, 0.5 + (last - sma50) / (abs(sma50)*0.01)))
+    label = "Alta" if score >= 0.80 else ("Media" if score >= 0.65 else "Baja")
+
+    summary = (
+        f"Escenario: {scenario.upper()} | "
+        f"Soporte: {support:.4f} | Resistencia: {resist:.4f} | "
+        f"Objetivo corto: {targets['short']['value']:.4f}"
+    )
+
+    return {
+        "scenario": scenario,
+        "support": support,
+        "resistance": resist,
+        "targets": targets,
+        "triggers": triggers,
+        "risks": risks,
+        "summary": summary,
+        "confluencia": {"label": label, "score": float(min(1.0, max(0.0, score)))},
+    }
+
+_BOX_COLORS = [
+    (0, 0, 255),     # rojo
+    (255, 0, 255),   # magenta
+    (0, 128, 255),   # naranja
+    (255, 0, 0),     # azul
+    (0, 0, 0),       # negro
+]
+
+PATRON_CONF_MIN = float(os.getenv("PATRON_CONF_MIN", "0.65")) 
+PATRON_IOU_NMS = float(os.getenv("PATRON_IOU_NMS", "0.25")) 
+PATRON_MAX_DET = int(os.getenv("PATRON_MAX_DET", "80")) # max interno del modelo (antes de tu filtro) 
+TOPK_POR_CLASE = int(os.getenv("PATRON_TOPK_POR_CLASE", "2")) 
+MAX_TOTAL_FINAL = int(os.getenv("PATRON_MAX_TOTAL_FINAL", "12"))
+
+MIN_AREA_FRAC = float(os.getenv("PATRON_MIN_AREA_FRAC", "0.001")) # 0.1% del área imagen 
+MAX_AREA_FRAC = float(os.getenv("PATRON_MAX_AREA_FRAC", "0.20")) # 20% del área imagen
+
+# ---- Modo "en formación" (predicción visual) ----
+FORM_ENABLED      = os.getenv("PATRON_FORM_ENABLED", "1") == "1"
+FORM_WIN_FRAC     = float(os.getenv("PATRON_FORM_WIN_FRAC", "0.22"))  # 22% ancho derecho
+FORM_CONF_MIN     = float(os.getenv("PATRON_FORM_CONF_MIN", "0.35"))
+FORM_IOU_NMS      = float(os.getenv("PATRON_FORM_IOU_NMS", "0.20"))
+FORM_MAX_DET      = int(os.getenv("PATRON_FORM_MAX_DET", "60"))
+FORM_MAX_FINAL    = int(os.getenv("PATRON_FORM_MAX_FINAL", "6"))
+FORM_MIN_AREA_FRAC= float(os.getenv("PATRON_FORM_MIN_AREA_FRAC", "0.0004")) # más permisivo
+FORM_MAX_AREA_FRAC= float(os.getenv("PATRON_FORM_MAX_AREA_FRAC", "0.35"))
+FORM_EDGE_PX      = int(os.getenv("PATRON_FORM_EDGE_PX", "10"))  # cerca del borde derecho
+FORM_TOPK_POR_CLASE = int(os.getenv("PATRON_FORM_TOPK_POR_CLASE", "2"))
+
+def _iou_xyxy(a, b) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    iw = max(0.0, inter_x2 - inter_x1)
+    ih = max(0.0, inter_y2 - inter_y1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = (area_a + area_b - inter) or 1.0
+    return float(inter / denom)
+
+def _run_formacion_en_ventana_derecha(modelo_patrones, clean_img_path: str, full_w: int, full_h: int, existentes_xyxy: list, stop_now):
+    """
+    Devuelve detecciones 'en formación' en coords de imagen completa.
+    """
+    if not FORM_ENABLED:
+        return []
+
+    img = cv2.imread(clean_img_path)
+    if img is None:
+        return []
+
+    x0 = int(full_w * (1.0 - FORM_WIN_FRAC))
+    x0 = max(0, min(x0, full_w - 1))
+    roi = img[:, x0:full_w].copy()
+    roi_h, roi_w = roi.shape[:2]
+    if roi_w < 50 or roi_h < 50:
+        return []
+
+    tmp_roi_path = clean_img_path.replace("limpia_", "roi_")
+    cv2.imwrite(tmp_roi_path, roi)
+
+    if stop_now(): 
+        return []
+
+    results_roi = modelo_patrones.predict(
+        tmp_roi_path,
+        save=False,
+        conf=FORM_CONF_MIN,
+        iou=FORM_IOU_NMS,
+        max_det=FORM_MAX_DET,
+    )
+
+    roi_area = float(roi_h * roi_w) if roi_h and roi_w else 1.0
+
+    dets = []
+    for b in results_roi[0].boxes:
+        if stop_now(): 
+            return []
+
+        cls_id = int(b.cls[0])
+        conf   = float(b.conf[0])
+        rx1, ry1, rx2, ry2 = map(float, b.xyxy[0])
+
+        bw = max(0.0, rx2 - rx1)
+        bh = max(0.0, ry2 - ry1)
+        area_frac = (bw * bh) / roi_area
+
+        if area_frac < FORM_MIN_AREA_FRAC or area_frac > FORM_MAX_AREA_FRAC:
+            continue
+
+        # Queremos lo "último": cerca del borde derecho del ROI
+        if rx2 < (roi_w - FORM_EDGE_PX) and ((rx1 + rx2) * 0.5) < (roi_w * 0.65):
+            continue
+
+        name = modelo_patrones.names.get(cls_id, str(cls_id))
+
+        # pasar a coords imagen completa
+        x1 = rx1 + x0
+        x2 = rx2 + x0
+        det_xyxy = (float(x1), float(ry1), float(x2), float(ry2))
+
+        # evitar duplicados con detecciones confirmadas (solape alto)
+        dup = False
+        for ex in existentes_xyxy:
+            if _iou_xyxy(det_xyxy, ex) >= 0.45:
+                dup = True
+                break
+        if dup:
+            continue
+
+        dets.append({"name": name, "conf": conf, "cls": cls_id, "xyxy": det_xyxy, "area_frac": area_frac})
+
+    # Top-K por clase y límite final
+    by_cls = defaultdict(list)
+    for d in dets:
+        by_cls[d["cls"]].append(d)
+
+    dets2 = []
+    for cls_id, arr in by_cls.items():
+        arr.sort(key=lambda x: x["conf"], reverse=True)
+        dets2.extend(arr[:FORM_TOPK_POR_CLASE])
+
+    dets2.sort(key=lambda x: x["conf"], reverse=True)
+    return dets2[:FORM_MAX_FINAL]
+
+def analizar_con_yolo(ruta_imagen: str, stop_cb=None, include_tech: bool=False, user_id: str=None) -> tuple[str, str, dict]:
     nombre_archivo = os.path.basename(ruta_imagen)
     imagen_limpia_path = f"procesadas/limpia_{nombre_archivo}"
-    imagen_final_path = f"procesadas/patrones_{nombre_archivo}"
+    imagen_final_path  = f"procesadas/patrones_{nombre_archivo}"
 
-    # Leer imagen original
+    texto_resultado = ""  # ✅ evita NameError
+    entradas = {}
+
+    def stop_now():
+        return bool(stop_cb and stop_cb())
+
     imagen = cv2.imread(ruta_imagen)
+    if imagen is None:
+        raise ValueError("No se pudo leer la imagen")
 
-    # --- PASO 1: Detección de ruido visual ---
+    # Dimensiones/área (se usa también en filtros OCR)
+    h, w = imagen.shape[:2]
+    img_area = float(h * w) if h and w else 1.0
+
+    # -----------------------------
+    # A) Inferir symbol/timeframe antes de borrar texto
+    # -----------------------------
+    try:
+        sym_info = infer_symbol_tf_from_image(imagen, stop_cb=stop_cb, include_tech=include_tech)
+    except Exception:
+        sym_info = {"symbol": None, "timeframe": None, "confidence": 0.0, "quote_last": None}
+
+    symbol = sym_info.get("symbol")
+    tf     = sym_info.get("timeframe") or "1hour"
+
+    if symbol:
+        desc_map = _get_activos_desc()
+        desc = (desc_map.get(symbol) or {}).get("descripcion") if isinstance(desc_map.get(symbol), dict) else desc_map.get(symbol)
+        if not desc:
+            desc = symbol
+
+        entradas["asset"] = {
+            "symbol": symbol,
+            "descripcion": desc,
+            "timeframe": normalize_tf(tf),
+            "confidence": sym_info.get("confidence", 0.0),
+            "quote_last": sym_info.get("quote_last"),
+            "price": sym_info.get("quote_last"),
+        }
+        if include_tech and sym_info.get("tech"):
+            entradas["asset"]["tech"] = sym_info["tech"]
+
+        # insights FMP (lite)
+        try:
+            if stop_now(): raise RuntimeError("stopped")
+            insights = build_insights_from_fmp(symbol, tf, stop_cb=stop_cb)
+            entradas["insights"] = insights
+        except Exception:
+            pass
+
+    # -----------------------------
+    # B) Limpieza (ruido + OCR para borrar overlays)
+    # -----------------------------
     resultados_ruido = modelo_ruido.predict(ruta_imagen, save=False, conf=0.4)
-
     for box in resultados_ruido[0].boxes:
+        if stop_now(): raise RuntimeError("stopped")
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         cv2.rectangle(imagen, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
 
-    # --- PASO 2: OCR (detección de texto adicional) ---
     resultados_ocr = reader.readtext(ruta_imagen)
-    for (bbox, texto, conf) in resultados_ocr:
+    for (bbox, _texto, conf) in resultados_ocr:
+        if stop_now(): raise RuntimeError("stopped")
         if conf < 0.4:
             continue
         pts = np.array(bbox).astype(np.int32)
-        cv2.fillPoly(imagen, [pts], (255, 255, 255))  # Borrar con blanco
 
-    # Guardar imagen limpia
+        # evitar tapar zonas grandes (posible área de gráfico)
+        poly_area = abs(cv2.contourArea(pts))
+        if (poly_area / img_area) > 0.02:   # 2% del área total
+            continue
+
+        cv2.fillPoly(imagen, [pts], (255, 255, 255))
+
     cv2.imwrite(imagen_limpia_path, imagen)
 
-    # --- PASO 3: Detección de patrones sobre imagen limpia ---
-    resultados_patrones = modelo_patrones.predict(imagen_limpia_path, save=False, conf=0.4)
+    # -----------------------------
+    # C) Patrones estrictos
+    # -----------------------------
+    if stop_now(): raise RuntimeError("stopped")
 
-    # Guardar imagen con patrones detectados
-    cv2.imwrite(imagen_final_path, resultados_patrones[0].plot())
+    results = modelo_patrones.predict(
+        imagen_limpia_path,
+        save=False,
+        conf=PATRON_CONF_MIN,
+        iou=PATRON_IOU_NMS,
+        max_det=PATRON_MAX_DET,
+    )
 
-    # --- PASO 4: Formatear texto descriptivo ---
-    detalles = []
-    for box in resultados_patrones[0].boxes:
-        clase_id = int(box.cls[0])
-        conf = float(box.conf[0])
-        nombre = modelo_patrones.names[clase_id]
-        detalles.append(f"{nombre} ({conf:.2f})")
+    h, w = imagen.shape[:2]
+    img_area = float(h * w) if h and w else 1.0
 
-    texto_resultado = "🔎 Patrones detectados:\n" + "\n".join(detalles) if detalles else "❌ No se detectaron patrones."
+    dets = []
+    for b in results[0].boxes:
+        cls_id = int(b.cls[0])
+        conf   = float(b.conf[0])
+        x1, y1, x2, y2 = map(float, b.xyxy[0])
 
-    return imagen_final_path, texto_resultado
+        bw = max(0.0, x2 - x1)
+        bh = max(0.0, y2 - y1)
+        area_frac = (bw * bh) / img_area
+
+        if area_frac < MIN_AREA_FRAC or area_frac > MAX_AREA_FRAC:
+            continue
+
+        name = modelo_patrones.names.get(cls_id, str(cls_id))
+        dets.append({"name": name, "conf": conf, "cls": cls_id, "xyxy": (x1, y1, x2, y2), "area_frac": area_frac})
+
+    # Top-K por clase
+    by_cls = defaultdict(list)
+    for d in dets:
+        by_cls[d["cls"]].append(d)
+
+    dets2 = []
+    for cls_id, arr in by_cls.items():
+        arr.sort(key=lambda x: x["conf"], reverse=True)
+        dets2.extend(arr[:TOPK_POR_CLASE])
+
+    dets2.sort(key=lambda x: x["conf"], reverse=True)
+    dets2 = dets2[:MAX_TOTAL_FINAL]
+
+    out_img = cv2.imread(imagen_limpia_path)
+    if out_img is None:
+        out_img = imagen.copy()
+
+
+    for d in dets2:
+        if stop_now(): raise RuntimeError("stopped")
+        x1, y1, x2, y2 = map(int, d["xyxy"])
+        color = _BOX_COLORS[d["cls"] % len(_BOX_COLORS)]
+        cv2.rectangle(out_img, (x1, y1), (x2, y2), color, 3)
+        label = f'{d["name"]} {d["conf"]:.2f}'
+        cv2.putText(out_img, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+    cv2.imwrite(imagen_final_path, out_img)
+
+
+        # -----------------------------
+    # C2) Patrones en formación (ventana derecha)
+    # -----------------------------
+    existentes_xyxy = [d["xyxy"] for d in dets2]
+    form_dets = _run_formacion_en_ventana_derecha(
+        modelo_patrones,
+        imagen_limpia_path,
+        w, h,
+        existentes_xyxy,
+        stop_now
+    )
+
+    if form_dets:
+        entradas["patrones_en_formacion"] = [
+            {"name": d["name"], "conf": float(d["conf"]), "xyxy": list(map(float, d["xyxy"]))}
+            for d in form_dets
+        ]
+        entradas["patrones_en_formacion_label"] = [d["name"] for d in form_dets]
+
+        # dibujar con prefijo "?" para diferenciar de confirmados
+        for d in form_dets:
+            x1, y1, x2, y2 = map(int, d["xyxy"])
+            color = (0, 215, 255)  # amarillo/ácido (BGR)
+            cv2.rectangle(out_img, (x1, y1), (x2, y2), color, 2)
+            label = f'?{d["name"]} {d["conf"]:.2f}'
+            cv2.putText(out_img, label, (x1, max(24, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.60, color, 2)
+    else:
+        entradas["patrones_en_formacion"] = []
+        entradas["patrones_en_formacion_label"] = []
+
+    # -----------------------------
+    # D) Entradas “panel” (no técnico por defecto)
+    # -----------------------------
+    best_by_name = {}
+    for d in dets2:
+        n = d["name"]
+        best_by_name[n] = max(best_by_name.get(n, 0), d["conf"])
+
+    patrones_label = sorted(best_by_name.keys(), key=lambda n: best_by_name[n], reverse=True)
+    entradas["patrones_label"] = patrones_label
+    entradas["patrones"] = patrones_label
+    entradas["patrones_detectados"] = {n: True for n in patrones_label}
+
+    # Confluencia: si ya vino de insights úsala; si no, usa la simple
+    if "insights" in entradas and isinstance(entradas["insights"], dict) and "confluencia" in entradas["insights"]:
+        entradas["confluencia"] = entradas["insights"]["confluencia"]
+    else:
+        if patrones_label:
+            avg_conf = sum(best_by_name[n] for n in patrones_label) / len(patrones_label)
+            score = max(0.0, min(1.0, avg_conf))
+            label = "Alta" if (len(patrones_label) >= 3 or score >= 0.80) else ("Media" if score >= 0.65 else "Baja")
+        else:
+            score, label = 0.0, "Baja"
+        entradas["confluencia"] = {"label": label, "score": float(score)}
+
+    # Alertas / yolo_cfg SOLO para admin
+    if include_tech:
+        alertas = []
+        if len(patrones_label) >= MAX_TOTAL_FINAL:
+            alertas.append("Hay muchos patrones; se aplicó un límite estricto para evitar saturación.")
+        alertas.append(f"Filtro: conf≥{PATRON_CONF_MIN}, NMS iou≤{PATRON_IOU_NMS}, topK/clase={TOPK_POR_CLASE}")
+        entradas["alertas"] = alertas
+        entradas["yolo_cfg"] = {
+            "conf_min": PATRON_CONF_MIN,
+            "iou_nms": PATRON_IOU_NMS,
+            "topk_por_clase": TOPK_POR_CLASE,
+            "max_total_final": MAX_TOTAL_FINAL,
+            "min_area_frac": MIN_AREA_FRAC,
+            "max_area_frac": MAX_AREA_FRAC,
+        }
+
+    # Texto principal
+    if patrones_label:
+        top_txt = ", ".join([f"{n} ({best_by_name[n]:.2f})" for n in patrones_label[:6]])
+        con = entradas.get("confluencia") or {}
+        texto_resultado = (
+            f"Señal + Contexto\n"
+            f"Patrones: {top_txt}\n"
+            f"Confluencia: {con.get('label','—')} ({int(float(con.get('score',0))*100)}%)"
+        )
+    else:
+        texto_resultado = "Señal + Contexto\n❌ No se detectaron patrones con el filtro estricto."
+
+    # 👇 Agregar "en formación" (si existe)
+    form_labels = entradas.get("patrones_en_formacion_label") or []
+    if form_labels:
+        posibles = ", ".join(form_labels[:3])
+        texto_resultado += f"\nEn formación: {posibles} (no confirmado)"
+
+    return imagen_final_path, texto_resultado, entradas
 
 
 #@profile
@@ -9022,35 +9731,103 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             ruta_local = f"imagenes/{update.effective_user.id}.jpg"
             await archivo.download_to_drive(ruta_local)
 
-            if not es_grafico_de_velas(ruta_local):
+            es_ok = await asyncio.to_thread(es_grafico_de_velas, ruta_local)
+            if not es_ok:
                 await update.message.reply_text("❌ No parece ser un gráfico de velas. Intenta con otra imagen.")
                 return
 
-            await update.message.reply_text("Empezó el análisis...")
+            await update.message.reply_text("Empezó el análisis.")
 
-            ruta_salida, texto_resultado = analizar_con_yolo(ruta_local)
+            es_admin = es_administrador(user_chat_id)
 
-            with open(ruta_salida, 'rb') as foto:
+            try:
+                res = await asyncio.to_thread(
+                    analizar_con_yolo,
+                    ruta_local,
+                    include_tech=es_admin,
+                    user_id=str(user_chat_id),
+                )
+            except TypeError:
+                res = await asyncio.to_thread(analizar_con_yolo, ruta_local)
+
+            entradas = {}
+            if isinstance(res, tuple) and len(res) == 3:
+                ruta_salida, texto_resultado, entradas = res
+            elif isinstance(res, tuple) and len(res) == 2:
+                ruta_salida, texto_resultado = res
+                entradas = {}
+            else:
+                raise ValueError(f"analizar_con_yolo devolvió formato inesperado: {res}")
+
+            with open(ruta_salida, "rb") as foto:
                 await update.message.reply_photo(photo=foto)
-                await update.message.reply_text(texto_resultado)
+
+            await update.message.reply_text(texto_resultado)
+
+            # Panel tipo “Finelo-lite”
+            try:
+                asset = (entradas or {}).get("asset") or {}
+                ins   = (entradas or {}).get("insights") or {}
+                patrones = (entradas or {}).get("patrones_label") or []
+
+                sym = asset.get("symbol")
+                desc = asset.get("descripcion")
+                tf = asset.get("timeframe")
+                q = asset.get("quote_last")
+
+                conflu = (entradas or {}).get("confluencia") or ins.get("confluencia") or {}
+                con_label = conflu.get("label", "—")
+                con_score = conflu.get("score", None)
+                con_pct = f"{int(float(con_score)*100)}%" if isinstance(con_score, (int, float)) else "—"
+
+                panel = "📌 Señal + Contexto\n"
+                if sym:
+                    panel += f"📍 Activo: {desc} ({sym})\n"
+                if tf:
+                    panel += f"⏱️ TF: {tf}\n"
+                if isinstance(q, (int, float)):
+                    panel += f"💵 Precio aprox.: {q}\n"
+
+                panel += f"⚡ Confluencia: {con_label} ({con_pct})\n"
+
+                if patrones:
+                    panel += "🧩 Patrones: " + ", ".join(patrones[:8]) + ("\n" if len(patrones) <= 8 else "…\n")
+                else:
+                    panel += "🧩 Patrones: (ninguno)\n"
+
+                # Insights (triggers/risks)
+                if ins:
+                    scenario = (ins.get("scenario") or "").upper()
+                    if scenario:
+                        panel += f"📈 Escenario: {scenario}\n"
+                    trg = ins.get("triggers") or []
+                    rsk = ins.get("risks") or []
+                    if trg:
+                        panel += "⚡ Eventos:\n" + "\n".join([f"• {t}" for t in trg[:3]]) + "\n"
+                    if rsk:
+                        panel += "⚠️ Riesgos:\n" + "\n".join([f"• {r}" for r in rsk[:3]]) + "\n"
+
+                await update.message.reply_text(panel.strip())
+            except Exception:
+                pass
 
             if not es_administrador(user_chat_id):
                 success, mensaje = await descontar_transaccion(user_chat_id, 1, origen="telegram")
                 if not success:
                     await update.message.reply_text(mensaje)
+
         except Exception as e:
             await update.message.reply_text(f"Hubo un error analizando la imagen: {e}")
+
         finally:
             mark_user_state(chat_id=user_chat_id, estado="disponible")
             try:
-                if ruta_local and os.path.exists(ruta_local):
-                    os.remove(ruta_local)
-                if ruta_salida and os.path.exists(ruta_salida):
-                    os.remove(ruta_salida)
-            except Exception as cleanup_error:
-                print(f"⚠️ Error al eliminar archivos temporales: {cleanup_error}")
-        return
+                if ruta_local and os.path.exists(ruta_local): os.remove(ruta_local)
+                if ruta_salida and os.path.exists(ruta_salida): os.remove(ruta_salida)
+            except Exception:
+                pass
 
+        return
 
 
 #@profile
@@ -14363,41 +15140,35 @@ class StopRequested(Exception):
 
 @webhook_app.route('/analisis/imagen', methods=['POST'])
 async def subir_imagen_y_analizar():
-    """
-    Bloqueante (devuelve 200 con imagen_base64) y cancelable con /analisis/stop.
-    Acepta exec_id opcional en el form/json para poder cancelarlo desde la app.
-    """
     ruta_local = None
     ruta_salida = None
     acquired_lock = False
     exec_id = None
     user_id = None
+    chat_id = None
 
     try:
-        # ---- payload ----
         form = request.form or {}
         j = request.get_json(silent=True) or {}
         user_id = str(form.get("user_id") or j.get("user_id") or "").strip()
-        chat_id = str(form.get("chat_id") or j.get("chat_id") or "").strip()  # opcional/legacy
+        chat_id = str(form.get("chat_id") or j.get("chat_id") or "").strip()
+
         if not user_id:
             return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
         if "imagen" not in request.files:
             return jsonify({"status": "error", "message": "Falta archivo 'imagen'"}), 400
 
-        # ---- lock global (si aplica) ----
         if ocupado_lock.locked():
             return "Estoy ocupado", 503
         await asyncio.to_thread(ocupado_lock.acquire)
         acquired_lock = True
 
-        # ---- suscripción/permisos ----
         estado_sub = await estado_suscripcion(user_id=user_id, numero_transacciones=1, origen="app")
         if estado_sub != "activa" and not es_administrador(user_id or chat_id):
             return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
 
         await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id, estado="ocupado")
 
-        # ---- exec_id y guardado del archivo ----
         exec_id = (form.get("exec_id") or j.get("exec_id") or uuid.uuid4().hex)
         os.makedirs("imagenes", exist_ok=True)
         os.makedirs("procesadas", exist_ok=True)
@@ -14415,7 +15186,6 @@ async def subir_imagen_y_analizar():
             "updated_at": ts
         }, merge=True)
 
-        # Publica dónde corre para que /analisis/stop pueda enrutar
         await asyncio.to_thread(
             fs_marcar_worker,
             exec_id,
@@ -14425,14 +15195,13 @@ async def subir_imagen_y_analizar():
         )
 
         stop_evt = _get_stop_evt(exec_id)
-        RUNNING[exec_id] = asyncio.current_task()  # <- permite cancelación desde /analisis/stop
+        RUNNING[exec_id] = asyncio.current_task()
 
         try:
             mark_user_state(user_id=user_id, estado="esperando_grafico_ia")
         except Exception:
             pass
 
-        # ---- validación rápida ----
         es_chart = await asyncio.to_thread(es_grafico_de_velas, ruta_local)
         if not es_chart:
             await asyncio.to_thread(fs_marcar_worker, exec_id, estado="fallido")
@@ -14443,13 +15212,30 @@ async def subir_imagen_y_analizar():
             }, merge=True)
             return jsonify({"status": "error", "message": "❌ No parece ser un gráfico de velas"}), 400
 
-        # ---- análisis (en hilo) con soporte de stop_cb si existe) ----
+        include_tech = es_administrador(user_id or chat_id)
+
+        # --- análisis en hilo ---
         try:
-            ruta_salida, texto_resultado = await asyncio.to_thread(
-                analizar_con_yolo, ruta_local, stop_cb=stop_evt.is_set
+            res = await asyncio.to_thread(
+                analizar_con_yolo,
+                ruta_local,
+                stop_cb=stop_evt.is_set,
+                include_tech=include_tech,
+                user_id=user_id,
             )
         except TypeError:
-            ruta_salida, texto_resultado = await asyncio.to_thread(analizar_con_yolo, ruta_local)
+            # compat por si tu build en prod aún no trae estos args
+            res = await asyncio.to_thread(analizar_con_yolo, ruta_local)
+
+        # --- soporte retorno (2 o 3) ---
+        entradas_payload = {}
+        if isinstance(res, tuple) and len(res) == 3:
+            ruta_salida, texto_resultado, entradas_payload = res
+        elif isinstance(res, tuple) and len(res) == 2:
+            ruta_salida, texto_resultado = res
+            entradas_payload = {}
+        else:
+            raise ValueError(f"analizar_con_yolo devolvió formato inesperado: {type(res)} / {res}")
 
         if stop_evt.is_set():
             raise asyncio.CancelledError()
@@ -14463,11 +15249,9 @@ async def subir_imagen_y_analizar():
             }, merge=True)
             return jsonify({"status": "error", "message": "No se generó imagen procesada"}), 500
 
-        # ---- base64 para la app ----
         with open(ruta_salida, "rb") as f:
             img_base64 = base64.b64encode(f.read()).decode("utf-8")
 
-        # ---- cobro (si corresponde) ----
         try:
             if not es_administrador(user_id or chat_id):
                 success, mensaje = await descontar_transaccion(user_id, 1)
@@ -14476,11 +15260,17 @@ async def subir_imagen_y_analizar():
         except Exception as cobro_e:
             logger.warning(f"[IA] Error en cobro: {cobro_e}")
 
-        # ---- final OK ----
         await asyncio.to_thread(fs_marcar_worker, exec_id, estado="completed")
+
+        resumen = {
+            "message": texto_resultado,
+            "imagen_base64": img_base64,
+            "entradas": entradas_payload or {},
+        }
+
         db.collection("ejecuciones").document(exec_id).set({
             "estado": "completed",
-            "resumen": {"message": texto_resultado, "imagen_base64": img_base64},
+            "resumen": resumen,
             "updated_at": int(time.time())
         }, merge=True)
 
@@ -14488,11 +15278,11 @@ async def subir_imagen_y_analizar():
             "status": "ok",
             "exec_id": exec_id,
             "message": texto_resultado,
-            "imagen_base64": img_base64
+            "imagen_base64": img_base64,
+            "entradas": entradas_payload or {},
         }), 200
 
     except asyncio.CancelledError:
-        # Cancelado mediante /analisis/stop
         await asyncio.to_thread(fs_marcar_worker, exec_id, estado="stopped")
         db.collection("ejecuciones").document(exec_id).set({
             "estado": "stopped", "updated_at": int(time.time())
@@ -14515,7 +15305,7 @@ async def subir_imagen_y_analizar():
         RUNNING.pop(exec_id, None)
         _release_stop_evt(exec_id)
         try:
-            await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id_local, estado="disponible")
+            await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id, estado="disponible")
         except Exception:
             pass
         try:
