@@ -1109,7 +1109,10 @@ STOP_EVENTS_LOCK = threading.Lock()
 
 USER_STATE_STALE_SECONDS = int(os.getenv("USER_STATE_STALE_SECONDS", "180"))   # 3 min
 USER_STATE_SWEEP_EVERY   = int(os.getenv("USER_STATE_SWEEP_EVERY", "60"))       # cada 60s
-USER_LOCK_TTL_SECONDS    = int(os.getenv("USER_LOCK_TTL_SECONDS", "1800"))      # 30 min
+USER_LOCK_TTL_SECONDS    = int(os.getenv("USER_LOCK_TTL_SECONDS", "1800"))      # 30 min (compat)
+USER_LOCK_MIN_SECONDS    = int(os.getenv("USER_LOCK_MIN_SECONDS", "120"))       # 2 min
+USER_LOCK_MAX_SECONDS    = int(os.getenv("USER_LOCK_MAX_SECONDS", "1800"))      # 30 min
+USER_LOCK_SEC_PER_ASSET  = int(os.getenv("USER_LOCK_SEC_PER_ASSET", "50"))      # 50s por activo
 USER_STATE_BUSY_VALUES   = {
     "ocupado",
     "en_ejecucion",
@@ -1118,6 +1121,17 @@ USER_STATE_BUSY_VALUES   = {
     "esperando_grafico_ia",
     "running",
 }
+
+def compute_lock_ttl(activos_count: int) -> int:
+    """Calcula TTL dinamico: max(min, activos*seg_por_activo), cap max."""
+    try:
+        count = int(activos_count)
+    except Exception:
+        count = 1
+    if count < 1:
+        count = 1
+    ttl = max(USER_LOCK_MIN_SECONDS, count * USER_LOCK_SEC_PER_ASSET)
+    return min(USER_LOCK_MAX_SECONDS, ttl)
 
 def _load_yolo_model(model_path: str):
     if YOLO is None:
@@ -3728,6 +3742,43 @@ def release_user_lock(
         doc_ref.set(payload, merge=True)
     except Exception as e:
         logger.warning(f"[user_lock] release failed: {e}")
+
+
+def extend_user_lock(
+    *, user_id: Optional[str] = None, chat_id: Optional[str] = None,
+    lock_id: str | None = None, ttl_seconds: Optional[int] = None
+) -> bool:
+    """
+    Extiende el lease del lock distribuido si este pod es el owner.
+    """
+    uuid = resolve_user_uuid(user_id=user_id, chat_id=chat_id)
+    if not uuid:
+        return False
+
+    ttl = int(ttl_seconds or USER_LOCK_TTL_SECONDS)
+    now_unix = int(time.time())
+    lease_until = now_unix + ttl
+
+    doc_ref = _user_state_doc_by_uuid(uuid)
+    try:
+        snap = doc_ref.get()
+        data = snap.to_dict() or {}
+
+        if data.get("lock_owner") != MY_ID:
+            return False
+        if lock_id and data.get("lock_id") and data.get("lock_id") != lock_id:
+            return False
+
+        payload = {
+            "lease_until_unix": lease_until,
+            "updated_at_unix": now_unix,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        doc_ref.set(payload, merge=True)
+        return True
+    except Exception as e:
+        logger.warning(f"[user_lock] extend failed: {e}")
+        return False
 
 
 # ------------------------------------------------------------------------------------
@@ -10598,13 +10649,29 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             # Permisos del usuario (rama Telegram)
             opciones_usuario = await obtener_opciones_usuario(user_chat_id, origen="telegram")
 
+            # Lock distribuido por usuario (multi-pod)
+            lock_id = uuid.uuid4().hex
+            lock_ttl = compute_lock_ttl(1)
+            acquired = await asyncio.to_thread(
+                acquire_user_lock,
+                chat_id=user_chat_id,
+                lock_id=lock_id,
+                ttl_seconds=lock_ttl,
+            )
+            if not acquired:
+                await update.message.reply_text(
+                    "Ya tienes un análisis en ejecución. Por favor, espera a que termine."
+                )
+                return
+
             # Lanza la ejecución en background
             asyncio.create_task(
                 ejecutar_recurrente(
                     context, update, simbolo.upper(),
                     user_chat_id=user_chat_id,
                     opciones_usuario=opciones_usuario,
-                    origen="telegram"
+                    origen="telegram",
+                    lock_id=lock_id
                 )
             )
         except Exception as e:
@@ -10621,6 +10688,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
     # ───────────────────────────────
     if estado_firestore == "esperando_fechas":
         uid_chat = user_chat_id  # clave consistente para Telegram
+        lock_id = None
         try:
             await update.message.reply_text("Empezamos a obtener la información, espera un momento por favor.")
 
@@ -10655,6 +10723,21 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
 
             state["fecha_inicio"] = fecha_inicio
             state["fecha_fin"] = fecha_fin
+            # Lock distribuido por usuario (multi-pod)
+            lock_id = uuid.uuid4().hex
+            lock_ttl = USER_LOCK_MIN_SECONDS
+            acquired = await asyncio.to_thread(
+                acquire_user_lock,
+                chat_id=uid_chat,
+                lock_id=lock_id,
+                ttl_seconds=lock_ttl,
+            )
+            if not acquired:
+                await update.message.reply_text(
+                    "Ya tienes un análisis en ejecución. Por favor, espera a que termine."
+                )
+                return
+
             actualizar_estado_usuario(uid_chat, "en ejecución")
             mark_user_state(chat_id=uid_chat, estado="en ejecución")
 
@@ -10686,12 +10769,18 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 user_states[uid_chat]["fecha_fin"] = None
                 user_states[uid_chat]["estado"] = "disponible"
             mark_user_state(chat_id=uid_chat, estado="disponible")
+            if lock_id:
+                try:
+                    release_user_lock(chat_id=uid_chat, lock_id=lock_id)
+                except Exception:
+                    pass
         return
 
     # ───────────────────────────────
     # 3) Noticias por fecha + símbolo (usuario)
     # ───────────────────────────────
     if estado_firestore == "esperando_fechas_noticias_user":
+        lock_id = None
         try:
             await update.message.reply_text("Empezamos a obtener la información, espera un momento por favor.")
 
@@ -10710,6 +10799,21 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             hoy_local = datetime.now(timezone_country).date()
             if fecha_fin.date() > hoy_local:
                 raise ValueError("La fecha no puede ser mayor que hoy para noticias.")
+
+            # Lock distribuido por usuario (multi-pod)
+            lock_id = uuid.uuid4().hex
+            lock_ttl = USER_LOCK_MIN_SECONDS
+            acquired = await asyncio.to_thread(
+                acquire_user_lock,
+                chat_id=user_chat_id,
+                lock_id=lock_id,
+                ttl_seconds=lock_ttl,
+            )
+            if not acquired:
+                await update.message.reply_text(
+                    "Ya tienes un análisis en ejecución. Por favor, espera a que termine."
+                )
+                return
 
             # Inicializa en estado local
             st = user_states.setdefault(user_chat_id, {})
@@ -10777,12 +10881,18 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 user_states[user_chat_id]["fecha_fin"] = None
                 user_states[user_chat_id]["estado"] = "disponible"
             mark_user_state(chat_id=user_chat_id, estado="disponible")
+            if lock_id:
+                try:
+                    release_user_lock(chat_id=user_chat_id, lock_id=lock_id)
+                except Exception:
+                    pass
         return
 
     # ───────────────────────────────
     # 4) Noticias por fecha (admin, recorre varios símbolos)
     # ───────────────────────────────
     if estado_firestore == "esperando_fechas_noticias_admin":
+        lock_id = None
         try:
             await update.message.reply_text("Empezamos a obtener la información, espera un momento por favor.")
 
@@ -10799,6 +10909,21 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             hoy_local = datetime.now(timezone_country).date()
             if fecha_fin.date() > hoy_local:
                 raise ValueError("La fecha no puede ser mayor que hoy para noticias.")
+
+            # Lock distribuido por usuario (multi-pod)
+            lock_id = uuid.uuid4().hex
+            lock_ttl = USER_LOCK_MIN_SECONDS
+            acquired = await asyncio.to_thread(
+                acquire_user_lock,
+                chat_id=user_chat_id,
+                lock_id=lock_id,
+                ttl_seconds=lock_ttl,
+            )
+            if not acquired:
+                await update.message.reply_text(
+                    "Ya tienes un análisis en ejecución. Por favor, espera a que termine."
+                )
+                return
 
             st = user_states.setdefault(user_chat_id, {})
             st["fecha_inicio"] = fecha_inicio
@@ -10864,6 +10989,11 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 user_states[user_chat_id]["fecha_fin"] = None
                 user_states[user_chat_id]["estado"] = "disponible"
             mark_user_state(chat_id=user_chat_id, estado="disponible")
+            if lock_id:
+                try:
+                    release_user_lock(chat_id=user_chat_id, lock_id=lock_id)
+                except Exception:
+                    pass
         return
 
     # ───────────────────────────────
@@ -10935,6 +11065,7 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
     if estado_firestore == "esperando_grafico_ia":
         ruta_local = None
         ruta_salida = None
+        lock_id = None
         try:
             if not update.message.photo:
                 await update.message.reply_text("⚠️ Por favor, sube una imagen válida.")
@@ -10950,6 +11081,21 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
             es_ok = await asyncio.to_thread(es_grafico_de_velas, ruta_local)
             if not es_ok:
                 await update.message.reply_text("❌ No parece ser un gráfico de velas. Intenta con otra imagen.")
+                return
+
+            # Lock distribuido por usuario (multi-pod)
+            lock_id = uuid.uuid4().hex
+            lock_ttl = USER_LOCK_MIN_SECONDS
+            acquired = await asyncio.to_thread(
+                acquire_user_lock,
+                chat_id=user_chat_id,
+                lock_id=lock_id,
+                ttl_seconds=lock_ttl,
+            )
+            if not acquired:
+                await update.message.reply_text(
+                    "Ya tienes un análisis en ejecución. Por favor, espera a que termine."
+                )
                 return
 
             await update.message.reply_text("Empezó el análisis.")
@@ -11037,6 +11183,11 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
 
         finally:
             mark_user_state(chat_id=user_chat_id, estado="disponible")
+            if lock_id:
+                try:
+                    release_user_lock(chat_id=user_chat_id, lock_id=lock_id)
+                except Exception:
+                    pass
             try:
                 if ruta_local and os.path.exists(ruta_local): os.remove(ruta_local)
                 if ruta_salida and os.path.exists(ruta_salida): os.remove(ruta_salida)
@@ -11196,6 +11347,7 @@ async def ejecutar_recurrente(
     user_id: str | None = None,             # UUID de la app (preferido)
     origen: str = "telegram",
     exec_id: str | None = None,
+    lock_id: str | None = None,
     operatoria_cfg: dict | None = None,
     cfg: dict | None = None,
 ):
@@ -11438,6 +11590,42 @@ async def ejecutar_recurrente(
                 pass
         # liberar estados al final del finally
 
+    # --- Lock heartbeat (solo si tenemos lock distribuido) ---
+    lock_stop_evt = None
+    lock_ttl = USER_LOCK_MAX_SECONDS
+    if lock_id:
+        # Ajustar TTL dinamico segun cantidad de activos
+        try:
+            lock_ttl = compute_lock_ttl(len(activos_filtrados))
+            await asyncio.to_thread(
+                extend_user_lock,
+                user_id=user_id,
+                chat_id=user_chat_id,
+                lock_id=lock_id,
+                ttl_seconds=lock_ttl,
+            )
+        except Exception:
+            lock_ttl = USER_LOCK_MAX_SECONDS
+
+        lock_stop_evt = asyncio.Event()
+
+        async def _lock_hb():
+            interval = max(10, int(lock_ttl // 3) or 10)
+            try:
+                while not lock_stop_evt.is_set():
+                    await asyncio.sleep(interval)
+                    await asyncio.to_thread(
+                        extend_user_lock,
+                        user_id=user_id,
+                        chat_id=user_chat_id,
+                        lock_id=lock_id,
+                        ttl_seconds=lock_ttl,
+                    )
+            except Exception:
+                pass
+
+        asyncio.create_task(_lock_hb())
+
     # --- Ejecución principal ---
     try:
         if error_occurred:
@@ -11531,6 +11719,15 @@ async def ejecutar_recurrente(
                 mark_user_state(chat_id=user_chat_id, estado="disponible")
         except Exception as e:
             logger.warning(f"No se pudo marcar usuario disponible: {e}")
+
+        # Liberar lock distribuido (si aplica)
+        try:
+            if lock_stop_evt:
+                lock_stop_evt.set()
+            if lock_id:
+                release_user_lock(user_id=user_id, chat_id=user_chat_id, lock_id=lock_id)
+        except Exception:
+            pass
 
 
 #@profile
@@ -11702,8 +11899,28 @@ async def seleccionar_par(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(f"Has seleccionado el activo: {par}")
 
+    # Lock distribuido por usuario (multi-pod)
+    lock_id = uuid.uuid4().hex
+    lock_ttl = compute_lock_ttl(1)
+    acquired = await asyncio.to_thread(
+        acquire_user_lock,
+        chat_id=user_chat_id,
+        lock_id=lock_id,
+        ttl_seconds=lock_ttl,
+    )
+    if not acquired:
+        await context.bot.send_message(
+            chat_id=user_chat_id,
+            text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
+        )
+        return
+
     # Ejecutar el análisis en una tarea asíncrona
-    asyncio.create_task(ejecutar_recurrente(context, update, par, user_chat_id, opciones_usuario))
+    asyncio.create_task(
+        ejecutar_recurrente(
+            context, update, par, user_chat_id, opciones_usuario, lock_id=lock_id
+        )
+    )
 
 
 # Menú principal
@@ -16161,12 +16378,13 @@ async def ejecutar_analisis_desde_app():
 
         # --- lock distribuido por usuario (multi-pod) ---
         lock_id = uuid.uuid4().hex
+        lock_ttl = compute_lock_ttl(1)
         acquired_lock = await asyncio.to_thread(
             acquire_user_lock,
             user_id=user_id,
             chat_id=chat_id or None,
             lock_id=lock_id,
-            ttl_seconds=USER_LOCK_TTL_SECONDS,
+            ttl_seconds=lock_ttl,
         )
         if not acquired_lock:
             return jsonify({"status": "busy", "message": "Ya tienes un análisis en ejecución."}), 409
