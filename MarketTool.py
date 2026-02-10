@@ -1109,7 +1109,15 @@ STOP_EVENTS_LOCK = threading.Lock()
 
 USER_STATE_STALE_SECONDS = int(os.getenv("USER_STATE_STALE_SECONDS", "180"))   # 3 min
 USER_STATE_SWEEP_EVERY   = int(os.getenv("USER_STATE_SWEEP_EVERY", "60"))       # cada 60s
-USER_STATE_BUSY_VALUES   = {"ocupado", "en_ejecucion", "esperando_grafico_ia", "running"}
+USER_LOCK_TTL_SECONDS    = int(os.getenv("USER_LOCK_TTL_SECONDS", "1800"))      # 30 min
+USER_STATE_BUSY_VALUES   = {
+    "ocupado",
+    "en_ejecucion",
+    "en ejecucion",
+    "en ejecución",
+    "esperando_grafico_ia",
+    "running",
+}
 
 def _load_yolo_model(model_path: str):
     if YOLO is None:
@@ -3594,9 +3602,11 @@ def mark_user_state(
         print(f"[mark_user_state] No se pudo resolver UUID (user_id={user_id}, chat_id={chat_id})")
         return
 
+    now_utc = datetime.now(timezone.utc)
     payload: Dict[str, Any] = {
         "estado": estado,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": now_utc.isoformat(),
+        "updated_at_unix": int(now_utc.timestamp()),
     }
     if user_id is not None:
         payload["user_id"] = str(user_id)
@@ -3629,6 +3639,95 @@ def mark_user_state(
         st3 = user_states.setdefault(str(user_id), {})
         st3["estado"] = estado
         user_states[str(user_id)] = st3
+
+
+# ------------------------------------------------------------------------------------
+# DISTRIBUTED USER LOCK (Firestore lease) for multi-pod
+# ------------------------------------------------------------------------------------
+def acquire_user_lock(
+    *, user_id: Optional[str] = None, chat_id: Optional[str] = None,
+    lock_id: str, ttl_seconds: Optional[int] = None
+) -> bool:
+    """
+    Adquiere un lock distribuido por usuario usando Firestore (lease con TTL).
+    Devuelve True si el lock fue adquirido, False si está ocupado por otro pod.
+    """
+    uuid = resolve_user_uuid(user_id=user_id, chat_id=chat_id)
+    if not uuid:
+        return False
+
+    ttl = int(ttl_seconds or USER_LOCK_TTL_SECONDS)
+    now_unix = int(time.time())
+    lease_until = now_unix + ttl
+
+    doc_ref = _user_state_doc_by_uuid(uuid)
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def _txn_acquire(txn):
+        snap = doc_ref.get(transaction=txn)
+        data = snap.to_dict() or {}
+
+        current_owner = str(data.get("lock_owner") or "")
+        current_lease = int(data.get("lease_until_unix") or 0)
+        current_state = str(data.get("estado") or "").lower()
+
+        # Lock válido si lease no expiró
+        if current_lease > now_unix and current_state in USER_STATE_BUSY_VALUES:
+            # Si otro pod tiene lock, no adquirimos
+            if current_owner and current_owner != MY_ID:
+                return False
+
+        payload = {
+            "estado": "ocupado",
+            "lock_owner": MY_ID,
+            "lock_id": lock_id,
+            "lease_until_unix": lease_until,
+            "updated_at_unix": now_unix,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        txn.set(doc_ref, payload, merge=True)
+        return True
+
+    try:
+        return bool(_txn_acquire(transaction))
+    except Exception as e:
+        logger.warning(f"[user_lock] acquire failed: {e}")
+        return False
+
+
+def release_user_lock(
+    *, user_id: Optional[str] = None, chat_id: Optional[str] = None,
+    lock_id: str | None = None
+) -> None:
+    """
+    Libera el lock distribuido si pertenece a este pod y lock_id coincide.
+    """
+    uuid = resolve_user_uuid(user_id=user_id, chat_id=chat_id)
+    if not uuid:
+        return
+
+    doc_ref = _user_state_doc_by_uuid(uuid)
+    try:
+        snap = doc_ref.get()
+        data = snap.to_dict() or {}
+
+        if data.get("lock_owner") != MY_ID:
+            return
+        if lock_id and data.get("lock_id") and data.get("lock_id") != lock_id:
+            return
+
+        payload = {
+            "estado": "disponible",
+            "lock_owner": None,
+            "lock_id": None,
+            "lease_until_unix": None,
+            "updated_at_unix": int(time.time()),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        doc_ref.set(payload, merge=True)
+    except Exception as e:
+        logger.warning(f"[user_lock] release failed: {e}")
 
 
 # ------------------------------------------------------------------------------------
@@ -16033,6 +16132,7 @@ async def monitoreo_history():
 async def ejecutar_analisis_desde_app():
     chat_id_local = None
     acquired_lock = False
+    lock_id = None
     try:
         # --- lee el payload primero ---
         data = request.json or {}
@@ -16049,13 +16149,6 @@ async def ejecutar_analisis_desde_app():
 
         origen = (data.get("origen") or "app").lower()
 
-        # --- lock (después de validar mínimos) ---
-        if ocupado_lock.locked():
-            return "Estoy ocupado", 503
-            
-        await asyncio.to_thread(ocupado_lock.acquire)
-        acquired_lock = True
-
         # --- validar suscripción ---
         kwargs = {"user_id": user_id} if user_id else {"chat_id": chat_id}
         estado_sub = await estado_suscripcion(
@@ -16065,6 +16158,18 @@ async def ejecutar_analisis_desde_app():
         )
         if estado_sub != "activa" and not es_administrador(user_id or chat_id):
             return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
+
+        # --- lock distribuido por usuario (multi-pod) ---
+        lock_id = uuid.uuid4().hex
+        acquired_lock = await asyncio.to_thread(
+            acquire_user_lock,
+            user_id=user_id,
+            chat_id=chat_id or None,
+            lock_id=lock_id,
+            ttl_seconds=USER_LOCK_TTL_SECONDS,
+        )
+        if not acquired_lock:
+            return jsonify({"status": "busy", "message": "Ya tienes un análisis en ejecución."}), 409
 
         await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id, estado="ocupado")
 
@@ -16203,15 +16308,18 @@ async def ejecutar_analisis_desde_app():
     finally:
         try:
             await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id_local, estado="disponible")
+            if lock_id:
+                await asyncio.to_thread(
+                    release_user_lock,
+                    user_id=user_id,
+                    chat_id=chat_id_local or None,
+                    lock_id=lock_id,
+                )
             if chat_id_local:
                 clear_current_request_cfg(chat_id_local)
         except Exception:
             pass
-        if acquired_lock and ocupado_lock.locked():
-            try:
-                ocupado_lock.release()
-            except Exception:
-                pass    
+        # ocupado_lock no se usa en este endpoint (lock distribuido por usuario)
 
 @webhook_app.route('/analisis/stop', methods=['POST'])
 async def detener_analisis_desde_app():
