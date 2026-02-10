@@ -8,6 +8,7 @@ import logging
 import signal
 import functools
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List, Callable, Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 import pytz
@@ -30,10 +31,13 @@ from datetime import timedelta, date, datetime, timezone, UTC, timezone as dt_ti
 from flask import Flask, request, jsonify
 from functools import partial
 from google.cloud import firestore
-from google.cloud.firestore_v1 import FieldFilter
 from google.cloud import firestore as gcf
 from google.cloud import storage
-from icalendar import Calendar, Event
+try:
+    from icalendar import Calendar, Event  # pyright: ignore[reportMissingModuleSource]
+except Exception:
+    Calendar = None
+    Event = None
 from io import StringIO, BytesIO
 from joblib import Parallel, delayed, parallel_backend
 from numba import njit
@@ -48,10 +52,12 @@ from telegram.helpers import escape_markdown
 from textblob import TextBlob
 from textwrap import wrap
 from threading import Lock
-from ultralytics import YOLO
+try:
+    from ultralytics import YOLO  # pyright: ignore[reportMissingImports]
+except Exception:
+    YOLO = None
 from urllib.parse import urlencode
 from uvicorn.config import LOGGING_CONFIG
-from pydantic import BaseModel
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 import aiofiles
@@ -61,9 +67,17 @@ import concurrent.futures
 import csv as _csv
 import cv2
 import datetime as _dt
-import easyocr
+try:
+    import easyocr  # pyright: ignore[reportMissingImports]
+except Exception:
+    easyocr = None
 import hashlib
-import investpy
+try:
+    import investiny
+    _HAS_INVESTPY = True
+except Exception:
+    investiny = None
+    _HAS_INVESTPY = False
 import matplotlib
 import matplotlib as mpl
 import matplotlib.dates as mdates
@@ -267,49 +281,69 @@ _LAST_SYNC: Dict[tuple, float] = {}
 
 _STOP_WORDS = {"stopped", "paused", "off", "detenido", "parado"}
 
+def normalize_tf_canonical(tf: str) -> str:
+    """
+    ÚNICA normalización canónica de timeframes.
+    Entrada: cualquier variante (1m, 1min, 1minute, h1, 1hour, etc.)
+    Salida: formato estándar backend (1min, 5min, 15min, 30min, 1hour, 4hour, 1day, 1week)
+    """
+    s = (tf or "").lower().strip()
+    if not s:
+        return ""
+    
+    # Mapeo completo de todas las variantes posibles
+    mapping = {
+        # 1 minuto
+        '1m': '1min', '1min': '1min', '1mins': '1min', '1minute': '1min', '1minutes': '1min', '1': '1min',
+        # 5 minutos
+        '5m': '5min', '5min': '5min', '5mins': '5min', '5minute': '5min', '5minutes': '5min',
+        # 15 minutos
+        '15m': '15min', '15min': '15min', '15mins': '15min', '15minute': '15min', '15minutes': '15min',
+        # 30 minutos
+        '30m': '30min', '30min': '30min', '30mins': '30min', '30minute': '30min', '30minutes': '30min',
+        # 1 hora
+        '1h': '1hour', '1hour': '1hour', 'h1': '1hour', '1hr': '1hour',
+        # 4 horas
+        '4h': '4hour', '4hour': '4hour', 'h4': '4hour', '4hr': '4hour',
+        # 1 día
+        '1d': '1day', '1day': '1day', 'd1': '1day',
+        # 1 semana
+        '1w': '1week', '1week': '1week', 'w1': '1week',
+    }
+    
+    return mapping.get(s, s)
+
+
 def _norm_tf_allowed(tf: str) -> str:
     """
-    Forma CANÓNICA para allowed_timeframes:
-    1min/1m/1hour/1h/1day/1d/1week/1w -> 1m,1h,1d,1w, etc.
-    (lo que estás guardando en allowed_timeframes)
+    Forma para allowed_timeframes (corta): 1m, 5m, 15m, etc.
+    DEPRECADO: Usar normalize_tf_canonical() y convertir al final si es necesario.
     """
-    s = (tf or "").lower()
-    if s in ("1m", "1min"):      return "1m"
-    if s in ("5m", "5min"):      return "5m"
-    if s in ("15m", "15min"):    return "15m"
-    if s in ("30m", "30min"):    return "30m"
-    if s in ("1h", "1hour", "h1"):   return "1h"
-    if s in ("4h", "4hour", "h4"):   return "4h"
-    if s in ("1d", "1day", "d1"):    return "1d"
-    if s in ("1w", "1week", "w1"):   return "1w"
-    return s
+    canonical = normalize_tf_canonical(tf)
+    short_map = {
+        '1min': '1m', '5min': '5m', '15min': '15m', '30min': '30m',
+        '1hour': '1h', '4hour': '4h', '1day': '1d', '1week': '1w'
+    }
+    return short_map.get(canonical, canonical)
 
 
 def _norm_tf_backend(tf: str) -> str:
     """
-    Normaliza TF hacia lo que escribe el front en tf_states (1min, 1day, 1week, etc.)
+    Normaliza TF hacia formato backend.
+    DEPRECADO: Usar normalize_tf_canonical() directamente.
     """
-    s = (tf or "").lower()
-    if s in ("1m", "1min", "1"):    return "1min"
-    if s in ("5m", "5min"):         return "5min"
-    if s in ("15m", "15min"):       return "15min"
-    if s in ("30m", "30min"):       return "30min"
-    if s in ("1h", "1hour"):        return "1hour"
-    if s in ("4h", "4hour"):        return "4hour"
-    if s in ("1d", "1day", "d1"):   return "1day"
-    if s in ("1w", "1week", "w1"):  return "1week"
-    return s
+    return normalize_tf_canonical(tf)
 
 
 TF_TTL_MINUTES = {
-    "1m":  5,
-    "5m":  10,
-    "15m": 30,
-    "30m": 60,
-    "1h":  180,
-    "4h":  360,
-    "1d":  1440,
-    "1w":  10080,
+    "1m":  10,    # antes 5 → duplicado para evitar false positives
+    "5m":  20,    # antes 10
+    "15m": 45,    # antes 30
+    "30m": 90,    # antes 60
+    "1h":  240,   # antes 180
+    "4h":  480,   # antes 360
+    "1d":  2880,  # antes 1440 (2 días)
+    "1w":  15120, # antes 10080 (>1 semana)
 }
 
 
@@ -324,10 +358,10 @@ def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
       4) Si no hay info específica → miramos allowed_timeframes
       5) Opcional: TTL por last_ts/updated_at (en ms)
     """
-    # Normalizaciones básicas
+    # Normalizaciones básicas usando función canónica
     symbol = (symbol or "").upper()
-    tf_backend = _norm_tf_backend(tf)   # p.ej "1" / "1m" -> "1min"
-    tf_allowed = _norm_tf_allowed(tf)   # p.ej "1" / "1min" -> "1m"
+    tf_canonical = normalize_tf_canonical(tf)  # unificado
+    tf_allowed = _norm_tf_allowed(tf)   # formato corto para comparación
 
     # Cargamos el documento de monitoreo
     doc_id = f"{exec_id}__{symbol}"
@@ -345,15 +379,11 @@ def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
     # 2) Obtenemos el estado particular del TF
     tf_states = doc.get("tf_states") or {}
 
-    # Prioridad:
-    #   a) tf_states["1min"]
-    #   b) tf_states["1m"]
-    #   c) doc["1min"]  (campo raíz)
-    #   d) doc["1m"]    (campo raíz)
+    # Prioridad: buscar en tf_states y doc usando formato canónico
     st = (
-        tf_states.get(tf_backend)
-        or tf_states.get(tf)
-        or doc.get(tf_backend)
+        tf_states.get(tf_canonical)
+        or tf_states.get(tf)  # fallback por si viene en otro formato
+        or doc.get(tf_canonical)
         or doc.get(tf)
         or {}
     )
@@ -395,9 +425,11 @@ def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
     last_ms = _to_ms(last)
     if last_ms is not None:
         now_ms = int(time.time() * 1000)
-        tf_key = tf_backend  # "1min", "5min", etc.
-        ttl_minutes = TF_TTL_MINUTES.get(tf_key, 60)
+        # Usar formato canónico para buscar TTL
+        tf_short = _norm_tf_allowed(tf_canonical)
+        ttl_minutes = TF_TTL_MINUTES.get(tf_short, 60)
         if now_ms - last_ms > ttl_minutes * 60_000:
+            logger.debug(f"[_tf_is_enabled] TF {tf} expired: {now_ms - last_ms}ms > {ttl_minutes}min TTL")
             return False
 
     return True
@@ -961,6 +993,7 @@ _ALLOW_TARGET = re.compile(r"^10\.8\.0\.(\d{1,3}):8(1|2|3)\d{2}$")  # rangos 81x
 
 # Registro de ejecuciones en curso: exec_id -> asyncio.Task
 RUNNING: Dict[str, asyncio.Task] = {}
+RUNNING_LOCK = asyncio.Lock()  # Protección contra race conditions
 
 STOP_EVENTS: dict[str, threading.Event] = {}
 STOP_EVENTS_LOCK = threading.Lock()
@@ -969,8 +1002,18 @@ USER_STATE_STALE_SECONDS = int(os.getenv("USER_STATE_STALE_SECONDS", "180"))   #
 USER_STATE_SWEEP_EVERY   = int(os.getenv("USER_STATE_SWEEP_EVERY", "60"))       # cada 60s
 USER_STATE_BUSY_VALUES   = {"ocupado", "en_ejecucion", "esperando_grafico_ia", "running"}
 
-modelo_patrones = YOLO("patrones.pt")
-modelo_ruido = YOLO("ruido.pt")
+def _load_yolo_model(model_path: str):
+    if YOLO is None:
+        logger.warning("Ultralytics YOLO no esta instalado; modelo %s deshabilitado.", model_path)
+        return None
+    try:
+        return YOLO(model_path)
+    except Exception as e:
+        logger.warning("No se pudo cargar YOLO %s: %s", model_path, e)
+        return None
+
+modelo_patrones = _load_yolo_model("patrones.pt")
+modelo_ruido = _load_yolo_model("ruido.pt")
 
 # Lock global para simular carga
 ocupado_lock = threading.Lock()
@@ -1168,6 +1211,9 @@ def get_easyocr_reader(prefer_gpu: bool = True):
     Inicializa EasyOCR una sola vez con cache de modelos, usa GPU si está disponible,
     y hace fallback a CPU si falla.
     """
+    if easyocr is None:
+        logger.warning("EasyOCR no esta instalado; OCR deshabilitado.")
+        return None
     global _reader
     if _reader is not None:
         return _reader
@@ -3006,6 +3052,9 @@ def analizar_con_yolo(ruta_imagen: str, stop_cb=None, include_tech: bool=False, 
     texto_resultado = ""  # ✅ evita NameError
     entradas = {}
 
+    if modelo_patrones is None or modelo_ruido is None:
+        raise RuntimeError("Modelos YOLO no disponibles en este entorno")
+
     def stop_now():
         return bool(stop_cb and stop_cb())
 
@@ -3037,7 +3086,7 @@ def analizar_con_yolo(ruta_imagen: str, stop_cb=None, include_tech: bool=False, 
         entradas["asset"] = {
             "symbol": symbol,
             "descripcion": desc,
-            "timeframe": normalize_tf(tf),
+            "timeframe": normalize_tf_canonical(tf),
             "confidence": sym_info.get("confidence", 0.0),
             "quote_last": sym_info.get("quote_last"),
             "price": sym_info.get("quote_last"),
@@ -3050,17 +3099,28 @@ def analizar_con_yolo(ruta_imagen: str, stop_cb=None, include_tech: bool=False, 
             if stop_now(): raise RuntimeError("stopped")
             insights = build_insights_from_fmp(symbol, tf, stop_cb=stop_cb)
             entradas["insights"] = insights
-        except Exception:
-            pass
+        except RuntimeError as e:
+            if "stopped" in str(e).lower():
+                raise
+            logger.warning(f"[analizar_con_yolo] insights FMP fallido para {symbol}/{tf}: {e}", exc_info=False)
+        except Exception as e:
+            logger.warning(f"[analizar_con_yolo] insights FMP fallido para {symbol}/{tf}: {e}", exc_info=True)
 
     # -----------------------------
     # B) Limpieza (ruido + OCR para borrar overlays)
     # -----------------------------
-    resultados_ruido = modelo_ruido.predict(ruta_imagen, save=False, conf=0.4)
-    for box in resultados_ruido[0].boxes:
-        if stop_now(): raise RuntimeError("stopped")
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        cv2.rectangle(imagen, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
+    if modelo_ruido is not None:
+        resultados_ruido = modelo_ruido.predict(ruta_imagen, save=False, conf=0.4)
+        for box in resultados_ruido[0].boxes:
+            if stop_now():
+                raise RuntimeError("stopped")
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cv2.rectangle(imagen, (x1, y1), (x2, y2), (255, 255, 255), thickness=-1)
+    else:
+        logger.debug("[analizar_con_yolo] modelo_ruido no disponible; se omite limpieza de ruido.")
+
+    if reader is None:
+        raise RuntimeError("EasyOCR no disponible en este entorno")
 
     resultados_ocr = reader.readtext(ruta_imagen)
     for (bbox, _texto, conf) in resultados_ocr:
@@ -4114,26 +4174,52 @@ def _fmp_econ_fetch(from_date: str, to_date: str, *, timeout: int) -> pd.DataFra
 
 
 def _investing_econ_fetch() -> pd.DataFrame:
-    """Optional investpy calendar (GMT base)."""
+    """Optional investiny calendar (GMT base)."""
     if not globals().get("_HAS_INVESTPY", False):
         return pd.DataFrame()
     try:
-        cal = investpy.economic_calendar(time_zone="GMT")
-        cal = cal[cal["importance"].isin(["high","medium","low"])].copy()
-        cal["date"] = pd.to_datetime(cal["date"], format="%d/%m/%Y", errors="coerce")
-        time_str = cal["time"].where(cal["time"].str.match(r"^\d{2}:\d{2}$", na=False), "00:00")
-        cal["date"] = pd.to_datetime(cal["date"].dt.strftime("%Y-%m-%d") + " " + time_str, utc=True)
-        cal = cal.rename(columns={"importance":"impact", "forecast":"estimate"})
+        # investiny.economic_calendar() retorna un dict con eventos
+        from datetime import datetime, timedelta
+        # Obtener eventos de la próxima semana
+        events = investiny.economic_calendar(
+            from_date=(datetime.now() - timedelta(days=1)).strftime("%d/%m/%Y"),
+            to_date=(datetime.now() + timedelta(days=7)).strftime("%d/%m/%Y")
+        )
+        
+        if not events:
+            return pd.DataFrame()
+        
+        cal = pd.DataFrame(events)
+        
+        # Mapear columnas de investiny a nuestro formato
+        # investiny usa: date, time, zone, currency, importance, event, actual, forecast, previous
+        if "importance" in cal.columns:
+            cal = cal[cal["importance"].isin(["high","medium","low"])].copy()
+        
+        if "date" in cal.columns and "time" in cal.columns:
+            cal["date"] = pd.to_datetime(cal["date"] + " " + cal["time"].fillna("00:00"), 
+                                         format="%d/%m/%Y %H:%M", errors="coerce")
+            cal["date"] = cal["date"].dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="infer")
+        
+        # Renombrar columnas
+        rename_map = {"importance": "impact", "forecast": "estimate"}
+        cal = cal.rename(columns=rename_map)
+        
         keep = ["date","currency","event","actual","estimate","previous","impact"]
         for c in keep:
             if c not in cal.columns:
                 cal[c] = pd.NA
+        
         for c in ["actual","estimate","previous"]:
-            cal[c] = pd.to_numeric(cal[c], errors="coerce")
-        cal["impact"] = cal["impact"].astype(str).str.capitalize()
+            if c in cal.columns:
+                cal[c] = pd.to_numeric(cal[c], errors="coerce")
+        
+        if "impact" in cal.columns:
+            cal["impact"] = cal["impact"].astype(str).str.capitalize()
+        
         return cal[keep].sort_values("date", ascending=True).reset_index(drop=True)
     except Exception as e:
-        logger.info("[Investing] Error economic calendar: %s", e)
+        logger.info("[Investiny] Error economic calendar: %s", e)
         return pd.DataFrame()
 
 
@@ -4602,6 +4688,10 @@ def generar_link_google_calendar(event, date, currency, ponderacion):
 async def enviar_eventos_y_archivo_calendar(df, context, user_chat_id):
     # --- Normalización defensiva del DF ---
     if df is None or getattr(df, "empty", True):
+        return
+
+    if Calendar is None or Event is None:
+        logger.warning("icalendar no esta instalado; se omite envio de calendario.")
         return
 
     df = df.copy()  # evitar chained assignments
@@ -10127,6 +10217,7 @@ async def recibir_usuario_especifico(update: Update, context: ContextTypes.DEFAU
         return
     
     # Guardar ID del usuario en Firestore directamente
+    user_id = _user_id_from_chat(user_chat_id)
     user_ref = _user_state_doc(user_id=user_id, chat_id=user_chat_id)
     user_ref.set({"destinatario_manual": message_text}, merge=True)  # 👈 Se guarda aquí manualmente
 
@@ -14829,12 +14920,34 @@ async def monitoreo_resume():
     GET /monitoreo/resume?symbol=BTCUSD&timeframe=1min&exec_id=xxxx
     Respuesta: { status, symbol, timeframe, exec_id, last_ts (ms), count, source }
     """
+    limit = 600
+    from_ts = None
+    to_ts = None
+    persist = False
+    fill_gaps = False
+    force_api = False
+    max_minutes_per_call = 10_000
     try:
         symbol = str((request.args.get("symbol") or "")).strip().upper()
         timeframe = _norm_tf(request.args.get("timeframe"))
         exec_id = str((request.args.get("exec_id") or "")).strip()
         if not symbol or not timeframe or not exec_id:
             return jsonify({"status":"error","message":"symbol, timeframe y exec_id son obligatorios"}), 400
+
+        def _arg_bool(v) -> bool:
+            return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+        limit = request.args.get("limit", 600)
+        from_ts = request.args.get("from_ts", None)
+        to_ts = request.args.get("to_ts", None)
+        persist = _arg_bool(request.args.get("persist", False))
+
+        fill_gaps = _arg_bool(request.args.get("fill_gaps", False))
+        force_api = _arg_bool(request.args.get("force_api", False))
+        try:
+            max_minutes_per_call = int(request.args.get("max_minutes_per_call") or 10_000)
+        except Exception:
+            max_minutes_per_call = 10_000
 
         st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
         series_ms = _series_to_ms(st.get("series", []))

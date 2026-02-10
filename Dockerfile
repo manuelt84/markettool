@@ -8,14 +8,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Instala primero PyTorch (mejor cache) y luego el resto
+# Instala dependencias Python (mejor cache)
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir \
+# ✅ Importante: actualizar pip + setuptools + wheel primero
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Instalar PyTorch separado (con índice especial)
+RUN python -m pip install --no-cache-dir \
     torch==2.2.2+cu121 torchvision==0.17.2+cu121 torchaudio==2.2.2 \
-    --extra-index-url https://download.pytorch.org/whl/cu121 \
- && pip install --no-cache-dir -r requirements.txt
+    --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Instalar el resto de dependencias
+RUN python -m pip install --no-cache-dir -r requirements.txt
 
 # Código
 COPY . .
