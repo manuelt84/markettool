@@ -585,20 +585,65 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
 def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     """
     Carga históricos del caché.
-    ✅ OPTIMIZADO: Usa LazyHistoricosLoader para cargar bajo demanda + LRU cache.
-    Fallback a archivos CSV/JSON si existen.
+    ✅ OPTIMIZADO: Intenta en orden:
+       1. LazyHistoricosLoader (LRU + TTL en memoria)
+       2. Firestore Metadata (TTL compartido entre pods) ← NEW: Multi-pod coordination
+       3. GCS (permanente, compartido)
+       4. Archivos locales CSV/JSON (legacy)
+    
+    En multi-pod: El TTL se comparte via Firestore metadata, evitando que múltiples
+    pods hagan FMP calls simultáneamente para el mismo símbolo.
     """
     import json
     
-    # Primero intenta lazy loader
+    # Opción 1: Lazy loader (rápido, en caché)
     try:
         df = _LAZY_HIST_LOADER.get(symbol, tf)
         if not df.empty:
+            logger.debug(f"[load_cached] Hit LazyLoader: {symbol}/{tf}")
             return df
     except Exception as e:
         logger.debug(f"[LazyLoader] Failed to load {symbol}/{tf}: {e}")
     
-    # Fallback a archivos tradicionales (CSV/JSON)
+    # Opción 2: Firestore Metadata (TTL compartido entre pods) ← NEW
+    # Si otro pod actualizó recientemente, evitamos llamar a FMP nuevamente
+    try:
+        metadata = get_historicos_metadata(symbol, tf)
+        if metadata is not None and not is_metadata_stale(metadata):
+            # TTL válido: datos en GCS están frescos
+            logger.debug(f"[load_cached] Firestore metadata valid (ttl not expired): {symbol}/{tf}")
+            
+            # Cargar de GCS sabiendo que está actualizado
+            try:
+                df = load_from_gcs(symbol, tf)
+                if df is not None and not df.empty:
+                    logger.debug(f"[load_cached] Hit GCS (via Firestore TTL): {symbol}/{tf}")
+                    # Cachear localmente para próximas llamadas
+                    try:
+                        _LAZY_HIST_LOADER.put(symbol, tf, df)
+                    except Exception:
+                        pass
+                    return df
+            except Exception as gcs_err:
+                logger.debug(f"[GCS] Load failed even though Firestore valid: {gcs_err}")
+    except Exception as e:
+        logger.debug(f"[Firestore] Metadata check failed (not fatal): {e}")
+    
+    # Opción 3: GCS (permanente, 300-500ms) - si no hay metadata
+    try:
+        df = load_from_gcs(symbol, tf)
+        if df is not None and not df.empty:
+            logger.debug(f"[load_cached] Hit GCS: {symbol}/{tf}")
+            # Cachear localmente para próximas llamadas
+            try:
+                _LAZY_HIST_LOADER.put(symbol, tf, df)
+            except Exception:
+                pass
+            return df
+    except Exception as e:
+        logger.debug(f"[GCS] Load failed for {symbol}/{tf}, trying local: {e}")
+    
+    # Opción 4: Archivos locales (CSV/JSON legacy)
     primary = _hist_path(symbol, tf)
     alt = _hist_path_json(symbol, tf) if primary.endswith(".csv") else _hist_path_csv(symbol, tf)
     
@@ -688,10 +733,33 @@ def save_cached_history(symbol: str, tf: str, out: pd.DataFrame, *, storage_dir:
         local_json = os.path.join(tempfile.gettempdir(), nombre)
 
         payload = out.tail(1000).to_dict(orient="records")
+        
+        # ===== GUARDAR EN GCS (permanente) + FIRESTORE METADATA =====
+        try:
+            gcs_success = save_to_gcs(symbol, tf, out)
+            if gcs_success:
+                logger.debug(f"[save_cached_history] Saved to GCS for {symbol}/{tf}")
+                
+                # Guardar metadata en Firestore para sincronizar TTL entre pods
+                try:
+                    safe_sym = _safe_symbol_for_filename(symbol)
+                    safe_tf = normalize_tf(tf)
+                    gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
+                    set_historicos_metadata(
+                        symbol, tf, gcs_path, 
+                        len(payload), 
+                        ttl_seconds=APP_CONFIG.cache_ttl_historicos
+                    )
+                except Exception as meta_err:
+                    logger.debug(f"[save_cached_history] Firestore metadata save failed (not fatal): {meta_err}")
+        except Exception as e:
+            logger.debug(f"[save_cached_history] GCS save failed: {e}")
+        
+        # ===== GUARDAR LOCALMENTE (backup) =====
         with open(local_json, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
 
-        logger.debug("[save_cached_history] guardado %s filas=%d", local_json, len(payload))
+        logger.debug("[save_cached_history] guardado %s filas=%d (local backup)", local_json, len(payload))
 
     except Exception as e:
         # MUY importante mantener este mensaje, porque tus logs lo buscan por texto
@@ -4075,6 +4143,24 @@ class LazyHistoricosLoader:
             logger.error(f"[LazyLoader] Error loading {symbol}: {e}")
             return pd.DataFrame()
     
+    def put(self, symbol: str, temporalidad: str, df: pd.DataFrame) -> None:
+        """
+        Guarda un DataFrame en el caché (manualmente).
+        Útil para actualizar caché después de cargar de GCS o FMP.
+        """
+        cache_key = f"{symbol.upper()}"
+        with self._lock:
+            # Eviction si es necesario
+            if len(self._cache) >= self.maxsize:
+                oldest_key = min(self._cache_times, key=self._cache_times.get)
+                del self._cache[oldest_key]
+                del self._cache_times[oldest_key]
+                logger.debug(f"[LazyLoader] Evicted {oldest_key} from cache")
+            
+            self._cache[cache_key] = df.copy()
+            self._cache_times[cache_key] = time.time()
+            logger.debug(f"[LazyLoader] Cached {symbol} ({len(df)} rows)")
+    
     def clear_cache(self):
         """Limpia el caché completo."""
         with self._lock:
@@ -4089,6 +4175,278 @@ _LAZY_HIST_LOADER = LazyHistoricosLoader(
     maxsize=APP_CONFIG.cache_max_size_historicos,
     ttl_seconds=APP_CONFIG.cache_ttl_historicos
 )
+
+
+# ======================================================================
+# GCS STORAGE LAYER para Históricos Permanentes
+# ======================================================================
+
+_GCS_CLIENT = None
+_GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool")
+_GCS_ENABLED = os.environ.get("GCS_ENABLED", "true").lower() == "true"
+
+def _get_gcs_bucket():
+    """Inicializa lazy el cliente de GCS."""
+    global _GCS_CLIENT
+    if not _GCS_ENABLED:
+        return None
+    
+    try:
+        if _GCS_CLIENT is None:
+            _GCS_CLIENT = storage.Client()
+        return _GCS_CLIENT.bucket(_GCS_BUCKET_NAME)
+    except Exception as e:
+        logger.warning(f"[GCS] Client initialization failed: {e}. GCS disabled.")
+        return None
+
+
+def load_from_gcs(symbol: str, tf: str) -> Optional[pd.DataFrame]:
+    """
+    Carga históricos desde Google Cloud Storage.
+    
+    Returns:
+        pd.DataFrame si el archivo existe en GCS, None en caso contrario.
+    """
+    try:
+        bucket = _get_gcs_bucket()
+        if bucket is None:
+            return None
+        
+        # Normalizar nombre del archivo
+        safe_sym = _safe_symbol_for_filename(symbol)
+        safe_tf = normalize_tf(tf)
+        gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
+        
+        blob = bucket.blob(gcs_path)
+        if not blob.exists():
+            return None
+        
+        # Descargar y parsear
+        json_data = blob.download_as_text(encoding="utf-8")
+        data = json.loads(json_data)
+        
+        # Soportar formato {"data": [...]} o directamente [...]
+        if isinstance(data, dict) and "data" in data:
+            data = data["data"]
+        
+        df = pd.DataFrame(data)
+        
+        # Normalizar columna de tiempo
+        if "time" in df.columns:
+            df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+            df = df.set_index("time").sort_index()
+        elif "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+            df = df.set_index("date").sort_index()
+        
+        # Asegurar UTC timezone
+        if df.index.tz is None and hasattr(df.index, "tz_localize"):
+            df.index = df.index.tz_localize(pytz.UTC)
+        
+        # Normalizar columnas OHLCV
+        df = _ensure_cols(df)
+        
+        logger.debug(f"[GCS] Loaded {symbol}/{tf} from gs://{_GCS_BUCKET_NAME}/{gcs_path} ({len(df)} rows)")
+        return df
+    
+    except Exception as e:
+        logger.debug(f"[GCS] Failed to load {symbol}/{tf}: {e}")
+        return None
+
+
+def save_to_gcs(symbol: str, tf: str, df: pd.DataFrame) -> bool:
+    """
+    Guarda históricos en Google Cloud Storage de forma permanente.
+    
+    Returns:
+        True si se guardó exitosamente, False si falló o GCS deshabilitado.
+    """
+    try:
+        if df is None or df.empty:
+            return False
+        
+        bucket = _get_gcs_bucket()
+        if bucket is None:
+            return False
+        
+        # Preparar datos
+        safe_sym = _safe_symbol_for_filename(symbol)
+        safe_tf = normalize_tf(tf)
+        gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
+        
+        # Normalizar índice a UTC si es necesario
+        out = df.copy()
+        if hasattr(out.index, "tz_localize") and out.index.tz is None:
+            out.index = out.index.tz_localize(pytz.UTC)
+        elif hasattr(out.index, "tz_convert"):
+            out.index = out.index.tz_convert(pytz.UTC)
+        
+        # Crear columna 'time' ISO8601
+        idx_utc = pd.DatetimeIndex(pd.to_datetime(out.index, utc=True, errors="coerce"))
+        out["time"] = idx_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        # Asegurar columnas OHLCV
+        for c in ("open", "high", "low", "close", "volume"):
+            if c not in out.columns:
+                out[c] = np.nan
+        
+        # Mantener solo últimas 1000 filas para no exceder límites
+        payload = out[["time", "open", "high", "low", "close", "volume"]].tail(1000).to_dict(orient="records")
+        
+        # Subir a GCS
+        blob = bucket.blob(gcs_path)
+        blob.upload_from_string(
+            json.dumps(payload, ensure_ascii=False),
+            content_type="application/json"
+        )
+        
+        logger.debug(f"[GCS] Saved {symbol}/{tf} to gs://{_GCS_BUCKET_NAME}/{gcs_path} ({len(payload)} rows)")
+        return True
+    
+    except Exception as e:
+        logger.warning(f"[GCS] Failed to save {symbol}/{tf}: {e}")
+        return False
+
+
+# ======================================================================
+# FIRESTORE METADATA LAYER (Multi-pod coordination)
+# ======================================================================
+# Previene duplicate FMP calls en multi-pod deployments mediante TTL compartido
+
+_FIRESTORE_CLIENT = None
+_FIRESTORE_ENABLED = os.environ.get("FIRESTORE_ENABLED", "true").lower() == "true"
+
+def _get_firestore_client() -> Optional[firestore.Client]:
+    """Initializes Firestore client lazily."""
+    global _FIRESTORE_CLIENT
+    if not _FIRESTORE_ENABLED:
+        return None
+    
+    try:
+        if _FIRESTORE_CLIENT is None:
+            # google.cloud.firestore uses Client(); firebase_admin uses client()
+            if hasattr(firestore, "Client"):
+                _FIRESTORE_CLIENT = firestore.Client()
+            elif hasattr(firestore, "client"):
+                _FIRESTORE_CLIENT = firestore.client()
+            else:
+                raise AttributeError("No Firestore client constructor found")
+        return _FIRESTORE_CLIENT
+    except Exception as e:
+        logger.warning(f"[Firestore] Metadata client initialization failed: {e}. Operating without shared TTL.")
+        return None
+
+
+def get_historicos_metadata(symbol: str, tf: str) -> Optional[Dict[str, Any]]:
+    """
+    Obtiene metadata de históricos desde Firestore (para TTL compartido entre pods).
+    
+    Args:
+        symbol: Trading symbol (e.g., "EURUSD")
+        tf: Timeframe (e.g., "1day")
+    
+    Returns:
+        Dict con metadata si existe: {last_update_utc, ttl_seconds, is_stale, ...}
+        None si no existe o Firestore deshabilitado
+    """
+    try:
+        db = _get_firestore_client()
+        if db is None:
+            return None
+        
+        doc_id = f"{symbol.upper()}_{normalize_tf(tf)}"
+        doc = db.collection("historicos_metadata").document(doc_id).get()
+        
+        if doc.exists:
+            return doc.to_dict()
+        return None
+    
+    except Exception as e:
+        logger.debug(f"[Firestore] Failed to get metadata for {symbol}/{tf}: {e}")
+        return None
+
+
+def set_historicos_metadata(symbol: str, tf: str, gcs_path: str, rows_count: int, ttl_seconds: int = 1800) -> bool:
+    """
+    Guarda metadata de históricos en Firestore (compartido entre pods).
+    
+    Llamado automáticamente después de save_to_gcs().
+    
+    Args:
+        symbol: Trading symbol
+        tf: Timeframe
+        gcs_path: Path en GCS donde está el archivo
+        rows_count: Cantidad de filas disponibles
+        ttl_seconds: TTL en segundos (default 30min, compartido entre todos los pods)
+    
+    Returns:
+        True si se guardó exitosamente, False si falló
+    """
+    try:
+        db = _get_firestore_client()
+        if db is None:
+            return False
+        
+        doc_id = f"{symbol.upper()}_{normalize_tf(tf)}"
+        now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        
+        metadata = {
+            "symbol": symbol.upper(),
+            "timeframe": normalize_tf(tf),
+            "gcs_path": gcs_path,
+            "last_update_utc": now_utc,
+            "rows_available": rows_count,
+            "ttl_seconds": ttl_seconds,
+            "is_stale": False,
+            "updated_by_pod": os.environ.get("POD_NAME", "unknown")
+        }
+        
+        db.collection("historicos_metadata").document(doc_id).set(metadata, merge=True)
+        logger.debug(f"[Firestore] Set metadata for {symbol}/{tf}: ttl={ttl_seconds}s")
+        return True
+    
+    except Exception as e:
+        logger.debug(f"[Firestore] Failed to set metadata for {symbol}/{tf}: {e}")
+        return False
+
+
+def is_metadata_stale(metadata: Dict[str, Any]) -> bool:
+    """
+    Verifica si la metadata (y por tanto el histórico) necesita actualización.
+    
+    Args:
+        metadata: Dict retornado por get_historicos_metadata()
+    
+    Returns:
+        True si TTL expiró, False si aún es válido
+    """
+    if not metadata:
+        return True
+    
+    try:
+        last_update = metadata.get("last_update_utc")
+        ttl_seconds = metadata.get("ttl_seconds", 1800)
+        
+        if last_update is None:
+            return True
+        
+        # last_update puede ser Timestamp de Firestore o datetime
+        if hasattr(last_update, "timestamp"):
+            last_update = datetime.fromtimestamp(last_update.timestamp(), tz=timezone.utc)
+        elif isinstance(last_update, datetime):
+            if last_update.tzinfo is None:
+                last_update = last_update.replace(tzinfo=timezone.utc)
+        else:
+            return True
+        
+        age_seconds = (datetime.utcnow().replace(tzinfo=timezone.utc) - last_update).total_seconds()
+        is_stale = age_seconds > ttl_seconds
+        
+        return is_stale
+    
+    except Exception as e:
+        logger.debug(f"[Firestore] Error checking staleness: {e}")
+        return True
 
 
 # CARPETA_HISTORICOS debe estar definido en tu módulo
