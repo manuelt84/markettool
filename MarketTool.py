@@ -78,6 +78,18 @@ try:
 except Exception:
     investiny = None
     _HAS_INVESTPY = False
+try:
+    from bs4 import BeautifulSoup
+    _HAS_BEAUTIFULSOUP = True
+except Exception:
+    BeautifulSoup = None
+    _HAS_BEAUTIFULSOUP = False
+try:
+    from playwright.sync_api import sync_playwright
+    _HAS_PLAYWRIGHT = True
+except Exception:
+    sync_playwright = None
+    _HAS_PLAYWRIGHT = False
 import matplotlib
 import matplotlib as mpl
 import matplotlib.dates as mdates
@@ -4223,6 +4235,214 @@ def _investing_econ_fetch() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _investing_com_econ_fetch(*, timeout: int = 15) -> pd.DataFrame:
+    """
+    Fetch economic calendar from investing.com via web scraping.
+    Faster than FMP, with real-time data. Returns UTC timestamps.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        logger.warning("[Investing.com] BeautifulSoup4 not installed, skipping.")
+        return pd.DataFrame()
+    
+    # Try requests + BeautifulSoup first (faster)
+    url = "https://www.investing.com/economic-calendar/"
+    
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        t0 = time.time()
+        logger.info("[Investing.com] GET %s (timeout=%s)", url, timeout)
+        
+        resp = HTTP_SESSION.get(url, headers=headers, timeout=timeout)
+        logger.info("[Investing.com] status=%s en %.3fs", resp.status_code, time.time()-t0)
+        
+        if resp.status_code != 200:
+            logger.warning("[Investing.com] HTTP %s", resp.status_code)
+            return pd.DataFrame()
+        
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        
+        # Investing.com calendar data is typically in <table> or JSON embedded in page
+        # Looking for event rows in the calendar
+        events = []
+        
+        # Try to find calendar table
+        table = soup.find('table', {'class': lambda x: x and 'w-full' in x if x else False})
+        
+        if table:
+            rows = table.find_all('tr')[1:]  # Skip header
+            for row in rows:
+                try:
+                    cols = row.find_all('td')
+                    if len(cols) < 6:
+                        continue
+                    
+                    # Extract event data
+                    time_str = cols[0].get_text(strip=True)
+                    currency = cols[1].get_text(strip=True)
+                    event_name = cols[2].get_text(strip=True)
+                    impact = cols[3].get_text(strip=True).lower()
+                    
+                    # Parse actual/forecast/previous if available
+                    actual_str = cols[4].get_text(strip=True) if len(cols) > 4 else ""
+                    forecast_str = cols[5].get_text(strip=True) if len(cols) > 5 else ""
+                    previous_str = cols[6].get_text(strip=True) if len(cols) > 6 else ""
+                    
+                    # Skip if impact not high/medium/low
+                    if impact not in ['high', 'medium', 'low']:
+                        continue
+                    
+                    events.append({
+                        'date': time_str,
+                        'currency': currency,
+                        'event': event_name,
+                        'actual': actual_str if actual_str and actual_str != '-' else pd.NA,
+                        'estimate': forecast_str if forecast_str and forecast_str != '-' else pd.NA,
+                        'previous': previous_str if previous_str and previous_str != '-' else pd.NA,
+                        'impact': impact.capitalize()
+                    })
+                except Exception as e:
+                    logger.debug("[Investing.com] Row parse error: %s", e)
+                    continue
+        
+        # Alternative: Try to extract from JSON embedded in page
+        if not events:
+            script_tags = soup.find_all('script')
+            for script in script_tags:
+                if script.string and 'economic' in script.string.lower():
+                    try:
+                        # Look for JSON data
+                        content = script.string
+                        if '{' in content and 'date' in content:
+                            # Try to extract JSON-like data
+                            start = content.find('{')
+                            if start != -1:
+                                # This is a simplified extraction
+                                # A more robust approach would use regex or JSON parsing
+                                pass
+                    except Exception:
+                        pass
+        
+        if not events:
+            logger.info("[Investing.com] No events found in HTML, trying Playwright fallback...")
+            return _investing_com_econ_fetch_playwright()
+        
+        df = pd.DataFrame(events)
+        
+        # Parse dates - try multiple formats
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=False)
+        
+        # If parsing failed, use Playwright
+        if df["date"].isna().all():
+            logger.info("[Investing.com] Date parsing failed, trying Playwright fallback...")
+            return _investing_com_econ_fetch_playwright()
+        
+        # Localize to UTC
+        df["date"] = df["date"].dt.tz_localize("UTC", ambiguous="infer", nonexistent="shift_forward")
+        df = df.dropna(subset=["date"])
+        
+        # Convert numeric columns
+        for c in ["actual", "estimate", "previous"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        
+        logger.info("[Investing.com] Fetched %d events via requests+BS4", len(df))
+        return df[["date", "currency", "event", "actual", "estimate", "previous", "impact"]].sort_values("date").reset_index(drop=True)
+        
+    except Exception as e:
+        logger.warning("[Investing.com] Requests+BS4 failed: %s. Trying Playwright...", e)
+        return _investing_com_econ_fetch_playwright()
+
+
+def _investing_com_econ_fetch_playwright() -> pd.DataFrame:
+    """
+    Fallback: Use Playwright to render investing.com calendar.
+    More robust for dynamic content but slower.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.warning("[Investing.com-Playwright] Playwright not installed")
+        return pd.DataFrame()
+    
+    try:
+        events = []
+        url = "https://www.investing.com/economic-calendar/"
+        
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle")
+            
+            # Wait for calendar to load
+            page.wait_for_selector("table", timeout=10000)
+            
+            # Get table content
+            html = page.content()
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Extract events (same logic as requests version)
+            table = soup.find('table')
+            if table:
+                rows = table.find_all('tr')[1:]
+                for row in rows:
+                    try:
+                        cols = row.find_all('td')
+                        if len(cols) < 6:
+                            continue
+                        
+                        time_str = cols[0].get_text(strip=True)
+                        currency = cols[1].get_text(strip=True)
+                        event_name = cols[2].get_text(strip=True)
+                        impact_str = cols[3].get_text(strip=True).lower()
+                        
+                        if impact_str not in ['high', 'medium', 'low']:
+                            continue
+                        
+                        actual_str = cols[4].get_text(strip=True) if len(cols) > 4 else ""
+                        forecast_str = cols[5].get_text(strip=True) if len(cols) > 5 else ""
+                        previous_str = cols[6].get_text(strip=True) if len(cols) > 6 else ""
+                        
+                        events.append({
+                            'date': time_str,
+                            'currency': currency,
+                            'event': event_name,
+                            'actual': actual_str if actual_str != '-' else pd.NA,
+                            'estimate': forecast_str if forecast_str != '-' else pd.NA,
+                            'previous': previous_str if previous_str != '-' else pd.NA,
+                            'impact': impact_str.capitalize()
+                        })
+                    except Exception as e:
+                        logger.debug("[Investing.com-Playwright] Row error: %s", e)
+                        continue
+            
+            browser.close()
+        
+        if not events:
+            logger.info("[Investing.com-Playwright] No events extracted")
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(events)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=False)
+        df["date"] = df["date"].dt.tz_localize("UTC", ambiguous="infer", nonexistent="shift_forward")
+        df = df.dropna(subset=["date"])
+        
+        for c in ["actual", "estimate", "previous"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        
+        logger.info("[Investing.com-Playwright] Fetched %d events", len(df))
+        return df[["date", "currency", "event", "actual", "estimate", "previous", "impact"]].sort_values("date").reset_index(drop=True)
+        
+    except Exception as e:
+        logger.warning("[Investing.com-Playwright] Error: %s", e)
+        return pd.DataFrame()
+
+
 def _to_local_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -4290,10 +4510,23 @@ def obtener_eventos_economicos(*, plan: str | None = None, desde_inicio: bool = 
         d = _fmp_econ_fetch(start, end, timeout=APP_CONFIG.http_timeout)
         if not d.empty: parts.append(d)
 
-    # optional investing layer
-    inv = _investing_econ_fetch()
-    if not inv.empty:
-        parts.append(inv)
+    # Try investing.com web scraping first (faster + real-time)
+    try:
+        inv_com = _investing_com_econ_fetch(timeout=APP_CONFIG.http_timeout)
+        if not inv_com.empty:
+            logger.info("[Eventos] Got %d events from investing.com scraping", len(inv_com))
+            parts.append(inv_com)
+    except Exception as e:
+        logger.warning("[Eventos] investing.com scraping failed: %s", e)
+
+    # Fallback to investiny
+    try:
+        inv = _investing_econ_fetch()
+        if not inv.empty:
+            logger.info("[Eventos] Got %d events from investiny", len(inv))
+            parts.append(inv)
+    except Exception as e:
+        logger.warning("[Eventos] investiny failed: %s", e)
 
     if not parts:
         return pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])

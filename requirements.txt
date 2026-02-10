@@ -2,6 +2,8 @@ ultralytics==8.0.196
 opencv-python
 matplotlib==3.8.4
 requests>=2.31.0
+beautifulsoup4>=4.12.0
+playwright>=1.40.0
 pandas==2.2.2
 numpy==1.26.4
 statsmodels==0.14.4
