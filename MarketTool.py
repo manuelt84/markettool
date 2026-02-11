@@ -2,6 +2,7 @@
 import os
 import sys
 import math
+import random
 import time
 import json
 import logging
@@ -4143,7 +4144,7 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
 
     while reintento < max_reintentos:
         try:
-            response = requests.get(url, timeout_request_global)
+            response = HTTP_SESSION.get(url, timeout_request_global)
             if response.status_code == 200:
                 nuevas_noticias = response.json()
                 if isinstance(nuevas_noticias, list) and len(nuevas_noticias) > 0:
@@ -4218,7 +4219,7 @@ def obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=50, max_rei
 
     while reintento < max_reintentos:
         try:
-            response = requests.get(url, timeout_request_global)
+            response = HTTP_SESSION.get(url, timeout_request_global)
             if response.status_code == 200:
                 nuevas_noticias = response.json()
                 if isinstance(nuevas_noticias, list) and len(nuevas_noticias) > 0:
@@ -4261,11 +4262,13 @@ def calcular_impacto_noticias(df_noticias):
     if df_noticias.empty:
         return 0
 
-    impacto_total = 0
-    for _, noticia in df_noticias.iterrows():
-        texto = noticia.get('title', '') + ' ' + noticia.get('summary', '')
-        sentimiento = analizar_sentimiento(texto)  # Función que analiza sentimiento del texto
-        impacto_total += sentimiento  # Acumular sentimiento como impacto
+    # OPTIMIZACIÓN: Vectorizar con apply() en lugar de iterrows() para mejor rendimiento
+    def _sentimiento_row(row):
+        texto = row.get('title', '') + ' ' + row.get('summary', '')
+        return analizar_sentimiento(texto)
+    
+    sentimientos = df_noticias.apply(_sentimiento_row, axis=1)
+    impacto_total = sentimientos.sum()
 
     # Normalizar impacto
     impacto_normalizado = impacto_total / len(df_noticias) if len(df_noticias) > 0 else 0
@@ -4280,6 +4283,7 @@ async def get_noticias_cached(symbol: str, fecha_inicio=None, fecha_fin=None, li
     ✅ Cache hit: <100ms
     ✅ Cache miss: ~5s (FMP API)
     ✅ GCS backup: Compartido entre pods
+    ✅ OPTIMIZACION: Timeout de 30s para evitar operaciones congeladas
     """
     # Función auxiliar para llamar obtener_noticias de forma async
     async def _fetch(symbol_inner):
@@ -4291,15 +4295,23 @@ async def get_noticias_cached(symbol: str, fecha_inicio=None, fecha_fin=None, li
             limite
         )
     
-    # Usar caché compartido
-    return await _NEWS_CACHE.get_or_fetch(symbol, _fetch)
+    # Usar caché compartido con timeout
+    try:
+        return await asyncio.wait_for(_NEWS_CACHE.get_or_fetch(symbol, _fetch), timeout=30.0)
+    except asyncio.TimeoutError:
+        logger.error(f"[get_noticias_cached] Timeout para {symbol}")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"[get_noticias_cached] Error: {e}")
+        return pd.DataFrame()
 
 
-def invalidate_noticias_cache(symbol: str):
-    """Invalida caché de noticias para un símbolo (fuerza refresh)."""
-    if symbol in _NEWS_CACHE._local_cache:
-        del _NEWS_CACHE._local_cache[symbol]
-        logger.info(f"[NewsCache] Invalidated: {symbol}")
+def invalidate_noticias_cache(symbol: str | Iterable[str]):
+    """Invalida caché de noticias para uno o varios símbolos (fuerza refresh)."""
+    if isinstance(symbol, (list, tuple, set)):
+        _NEWS_CACHE.invalidate_many(symbol)
+        return
+    _NEWS_CACHE.invalidate(symbol)
 
 
 # ======================================================================
@@ -5129,6 +5141,8 @@ class IndicatorsCache:
         """
         Espera a que otro pod termine de calcular y libere el lock.
         
+        OPTIMIZACION: Exponential backoff con jitter para reducir retry storms
+        
         Args:
             symbol: Trading symbol
             tf: Timeframe
@@ -5143,7 +5157,8 @@ class IndicatorsCache:
         logger.info(f"[IndicatorsCache] Waiting for other pod to finish: {symbol}/{tf}")
         
         start_time = time.time()
-        check_interval = 2  # Check cada 2 segundos
+        check_interval = 0.5  # Comienza con 0.5s
+        max_interval = 10.0   # Máximo 10s entre checks
         
         while (time.time() - start_time) < max_wait_sec:
             try:
@@ -5162,7 +5177,13 @@ class IndicatorsCache:
                             logger.info(f"[IndicatorsCache] Other pod finished, using result: {symbol}/{tf}")
                             return True
                 
-                # Esperar antes de próximo check
+                # Exponential backoff: esperar antes de próximo check
+                time.sleep(check_interval)
+                check_interval = min(max_interval, check_interval * 1.5)  # Crecer hasta max
+                
+                # Agregar pequeño jitter para evitar thundering herd
+                jitter = random.uniform(0, check_interval * 0.1)
+                time.sleep(jitter)
                 time.sleep(check_interval)
             
             except Exception as e:
@@ -5970,14 +5991,26 @@ class SharedNewsCache:
     ✅ GCS como fuente de verdad compartida entre pods
     ✅ Caché local TTL de 5 minutos
     ✅ Auto-actualización en GCS
+    ✅ OPTIMIZACION: Lazy client initialization para evitar startup overhead
     """
     
     def __init__(self, gcs_bucket: str = ""):
         self.gcs_enabled = os.environ.get("GCS_ENABLED", "false").lower() == "true"
-        self.gcs_bucket = gcs_bucket or os.environ.get("GCS_BUCKET_NAME", "")
+        self.gcs_bucket_name = gcs_bucket or os.environ.get("GCS_BUCKET_NAME", "")
         self._local_cache: Dict[str, tuple] = {}  # {symbol: (timestamp, df)}
         self._ttl_seconds = int(os.environ.get("NEWS_CACHE_TTL_SECONDS", "300"))  # 5 min
         self._lock = asyncio.Lock()
+        self._gcs_bucket = None  # Lazy-loaded
+    
+    @property
+    def gcs_bucket(self):
+        """Lazy initialization del bucket de GCS."""
+        if self._gcs_bucket is None and self.gcs_enabled and self.gcs_bucket_name:
+            try:
+                self._gcs_bucket = storage.Client().bucket(self.gcs_bucket_name)
+            except Exception as e:
+                logger.warning(f"[SharedNewsCache] GCS client init failed: {e}")
+        return self._gcs_bucket
     
     async def get_or_fetch(self, symbol: str, fetch_fn) -> pd.DataFrame:
         """Obtiene noticias con estrategia multi-nivel de caché."""
@@ -5988,14 +6021,14 @@ class SharedNewsCache:
             if symbol in self._local_cache:
                 cached_at, df = self._local_cache[symbol]
                 if (now - cached_at) < self._ttl_seconds:
-                    logger.debug(f"[SharedNewsCache] Hit (local): {symbol}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[SharedNewsCache] Hit (local): {symbol}")
                     return df
             
             # 2. Check GCS (compartido entre pods)
             if self.gcs_enabled and self.gcs_bucket:
                 try:
-                    bucket = storage.Client().bucket(self.gcs_bucket)
-                    blob = bucket.blob(f"forex_news/{symbol}_noticias.json")
+                    blob = self.gcs_bucket.blob(f"forex_news/{symbol}_noticias.json")
                     
                     # Verificar que exista
                     if blob.exists():
@@ -6011,7 +6044,8 @@ class SharedNewsCache:
                                 
                                 # Cachear localmente
                                 self._local_cache[symbol] = (now, df)
-                                logger.info(f"[SharedNewsCache] Hit (GCS): {symbol} (age: {age_seconds:.0f}s)")
+                                if logger.isEnabledFor(logging.INFO):
+                                    logger.info(f"[SharedNewsCache] Hit (GCS): {symbol} (age: {age_seconds:.0f}s)")
                                 return df
                             except Exception as e:
                                 logger.warning(f"[SharedNewsCache] Error parsing GCS data: {e}")
@@ -6019,20 +6053,21 @@ class SharedNewsCache:
                     logger.warning(f"[SharedNewsCache] Error reading GCS: {e}")
             
             # 3. Fetch desde API (fallback)
-            logger.info(f"[SharedNewsCache] Fetching from API: {symbol}")
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(f"[SharedNewsCache] Fetching from API: {symbol}")
             df = await fetch_fn(symbol)
             
             if df is not None and not df.empty:
                 # Guardar en GCS para otros pods
                 if self.gcs_enabled and self.gcs_bucket:
                     try:
-                        bucket = storage.Client().bucket(self.gcs_bucket)
-                        blob = bucket.blob(f"forex_news/{symbol}_noticias.json")
+                        blob = self.gcs_bucket.blob(f"forex_news/{symbol}_noticias.json")
                         blob.upload_from_string(
                             df.to_json(orient='records', date_format='iso'),
                             content_type='application/json'
                         )
-                        logger.info(f"[SharedNewsCache] Saved to GCS: {symbol}")
+                        if logger.isEnabledFor(logging.INFO):
+                            logger.info(f"[SharedNewsCache] Saved to GCS: {symbol}")
                     except Exception as e:
                         logger.error(f"[SharedNewsCache] Error saving to GCS: {e}")
                 
@@ -6040,6 +6075,18 @@ class SharedNewsCache:
                 self._local_cache[symbol] = (now, df)
             
             return df if df is not None else pd.DataFrame()
+
+    def invalidate(self, symbol: str):
+        """Invalida caché local para un símbolo."""
+        if symbol in self._local_cache:
+            del self._local_cache[symbol]
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(f"[SharedNewsCache] Invalidated: {symbol}")
+
+    def invalidate_many(self, symbols: Iterable[str]):
+        """Invalida caché local para múltiples símbolos."""
+        for sym in symbols:
+            self.invalidate(sym)
 
 
 # Instancias globales del framework de coordinación
@@ -6209,16 +6256,25 @@ def _split_by_local_day(df: pd.DataFrame) -> dict:
             df["date_country"] = df["date"]
         else:
             return {}
-    buckets = {}
-    for _, row in df.iterrows():
-        try:
-            key = _local_day_key(row["date_country"])
-        except Exception:
-            continue
-        buckets.setdefault(key, []).append(row)
-    for k in list(buckets.keys()):
-        buckets[k] = pd.DataFrame(buckets[k])
-    return buckets
+    
+    # OPTIMIZACIÓN: Usar groupby() en lugar de iterrows() para mejor rendimiento
+    try:
+        # Aplicar _local_day_key de forma vectorizada
+        df = df.copy()
+        df['_day_key'] = df['date_country'].apply(lambda x: _local_day_key(x) if pd.notna(x) else None)
+        
+        # Filtrar filas sin key válida
+        df = df[df['_day_key'].notna()]
+        
+        # Agrupar por día
+        buckets = {}
+        for day_key, group in df.groupby('_day_key'):
+            buckets[day_key] = group.drop('_day_key', axis=1)
+        
+        return buckets
+    except Exception as e:
+        logger.warning(f"[_split_by_local_day] Error: {e}")
+        return {}
 
 
 def cargar_eventos_completos() -> list[dict]:
@@ -6604,11 +6660,13 @@ class SharedEconomicEventsCache:
         if cache_key in self._cache:
             cached_at, df = self._cache[cache_key]
             if (now - cached_at) < self._ttl_seconds:
-                logger.debug(f"[EconomicEventsCache] HIT: {cache_key}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[EconomicEventsCache] HIT: {cache_key}")
                 return df
         
         # Fetch y cachear
-        logger.info(f"[EconomicEventsCache] FETCH: {cache_key}")
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(f"[EconomicEventsCache] FETCH: {cache_key}")
         df = await (fetch_fn() if iscoroutinefunction(fetch_fn) else asyncio.to_thread(fetch_fn))
         
         if df is not None and not df.empty:
@@ -6620,11 +6678,54 @@ class SharedEconomicEventsCache:
         """Invalida caché para forzar refresh."""
         if cache_key in self._cache:
             del self._cache[cache_key]
-            logger.info(f"[EconomicEventsCache] INVALIDATED: {cache_key}")
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(f"[EconomicEventsCache] INVALIDATED: {cache_key}")
+
+    def invalidate_many(self, cache_keys: Iterable[str]):
+        """Invalida caché para múltiples claves."""
+        for key in cache_keys:
+            self.invalidate(key)
 
 
 # Instancia global
 _ECONOMIC_EVENTS_CACHE = SharedEconomicEventsCache()
+
+
+class UserConfigCache:
+    """
+    Caché de configuración de usuario con TTL de 10 minutos.
+    
+    OPTIMIZACION: Reduce lecturas de Firestore por config cambios lentos.
+    """
+    def __init__(self):
+        self._cache: Dict[str, tuple] = {}  # {user_id: (timestamp, config_dict)}
+        self._ttl_seconds = int(os.environ.get("CONFIG_CACHE_TTL_SECONDS", "600"))  # 10 min
+    
+    def get_or_load(self, user_id: str, loader_fn) -> dict:
+        """Obtiene config del cache o carga desde Firestore."""
+        now = time.time()
+        
+        if user_id in self._cache:
+            cached_at, cfg = self._cache[user_id]
+            if (now - cached_at) < self._ttl_seconds:
+                logger.debug(f"[UserConfigCache] HIT: {user_id}")
+                return cfg
+        
+        # Cargar desde Firestore
+        logger.debug(f"[UserConfigCache] LOAD: {user_id}")
+        cfg = loader_fn(user_id) or {}
+        self._cache[user_id] = (now, cfg)
+        return cfg
+    
+    def invalidate(self, user_id: str):
+        """Invalida cache para un usuario."""
+        if user_id in self._cache:
+            del self._cache[user_id]
+            logger.info(f"[UserConfigCache] INVALIDATED: {user_id}")
+
+
+# Instancia global
+_USER_CONFIG_CACHE = UserConfigCache()
 
 
 def obtener_eventos_economicos(*, plan: str | None = None, desde_inicio: bool = False) -> pd.DataFrame:
@@ -6699,6 +6800,7 @@ async def get_eventos_economicos_cached(*, plan: str | None = None, desde_inicio
     ✅ Reduce 3x FMP requests a 1 en 3 pods
     ✅ Cache hit: <100ms
     ✅ Cache miss: ~5-10s (FMP + web scraping)
+    ✅ OPTIMIZACION: Timeout de 30s para evitar operaciones congeladas
     """
     # Generar cache_key basada en parámetros
     key = f"econ_plan={plan or APP_CONFIG.fmp_plan}_desde={desde_inicio}"
@@ -6707,14 +6809,26 @@ async def get_eventos_economicos_cached(*, plan: str | None = None, desde_inicio
     def _fetch():
         return obtener_eventos_economicos(plan=plan, desde_inicio=desde_inicio)
     
-    # Usar caché compartido
-    return await _ECONOMIC_EVENTS_CACHE.get_or_fetch(key, _fetch)
+    # Usar caché compartido con timeout
+    try:
+        return await asyncio.wait_for(_ECONOMIC_EVENTS_CACHE.get_or_fetch(key, _fetch), timeout=30.0)
+    except asyncio.TimeoutError:
+        logger.error(f"[get_eventos_economicos_cached] Timeout")
+        return pd.DataFrame()
+    except Exception as e:
+        logger.error(f"[get_eventos_economicos_cached] Error: {e}")
+        return pd.DataFrame()
 
 
 def invalidate_economic_events_cache(plan: str | None = None, desde_inicio: bool = False):
     """Invalida caché de eventos para forzar refresh."""
     key = f"econ_plan={plan or APP_CONFIG.fmp_plan}_desde={desde_inicio}"
     _ECONOMIC_EVENTS_CACHE.invalidate(key)
+
+
+def invalidate_economic_events_cache_many(keys: Iterable[str]):
+    """Invalida caché de eventos para múltiples keys."""
+    _ECONOMIC_EVENTS_CACHE.invalidate_many(keys)
 
 
 def obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin) -> pd.DataFrame:
@@ -7149,7 +7263,7 @@ async def enviar_eventos_y_archivo_calendar(df, context, user_chat_id):
     cal.add('prodid', '-//Mi Sistema de Trading//ES')
     cal.add('version', '2.0')
 
-    for _, row in df.iterrows():
+    for row in df.to_dict("records"):
         # lee con .get() y defaults seguros
         ev   = row.get('event', '')
         cur  = row.get('currency', '')
@@ -8095,9 +8209,9 @@ def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, tem
                 if not dfw.empty:
                     meta["blackout"] = True
                     # guarda máximo 5 para UI/log
-                    for _, r in dfw.sort_values("date").head(5).iterrows():
+                    for r in dfw.sort_values("date").head(5).to_dict("records"):
                         meta["blackout_events"].append({
-                            "date": r["date"].isoformat() if pd.notna(r["date"]) else None,
+                            "date": r.get("date").isoformat() if pd.notna(r.get("date")) else None,
                             "currency": str(r.get("currency") or ""),
                             "event": str(r.get("event") or ""),
                             "impact": str(r.get("impact") or ""),
@@ -8146,14 +8260,14 @@ def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, tem
         df["bucket"] = df["date"]
 
     scores = []
-    for _, ev in df.iterrows():
-        dt = ev.get("date")
+    for ev in df.itertuples(index=False):
+        dt = getattr(ev, "date", None)
         if pd.isna(dt):
             continue
 
-        actual = ev.get("actual")
-        est = ev.get("estimate")
-        prev = ev.get("previous")
+        actual = getattr(ev, "actual", None)
+        est = getattr(ev, "estimate", None)
+        prev = getattr(ev, "previous", None)
         if pd.isna(actual):
             continue
 
@@ -8170,36 +8284,38 @@ def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, tem
             continue
 
         # aplica polaridad
-        pol = _polarity(ev.get("event"))
+        event_name = getattr(ev, "event", None)
+        pol = _polarity(event_name)
         dir_surprise = float(raw) * float(pol)
 
         # sensibilidad por categoría
-        ck = _category_key(ev.get("event"))
+        ck = _category_key(event_name)
         sens = _sens_for_cat(ck, dir_surprise)
 
         core = math.tanh(dir_surprise * surprise_scale)  # [-1,1]
         score = core * sens
 
         # pesos
-        w = float(ev.get("impact_w", 1.0)) * float(ev.get("recency_boost", 1.0)) * float(ev.get("decay", 1.0))
+        w = float(getattr(ev, "impact_w", 1.0)) * float(getattr(ev, "recency_boost", 1.0)) * float(getattr(ev, "decay", 1.0))
         score *= w
 
         # FX quote flip
-        if bool(fund.get("flip_secondary_currency", True)) and quote_ccy and str(ev.get("currency") or "").upper() == quote_ccy:
+        currency = str(getattr(ev, "currency", "") or "")
+        if bool(fund.get("flip_secondary_currency", True)) and quote_ccy and currency.upper() == quote_ccy:
             score *= -1.0
 
         score = _cap(score)
 
         scores.append({
-            "bucket": ev.get("bucket"),
+            "bucket": getattr(ev, "bucket", None),
             "date": dt,
-            "currency": str(ev.get("currency") or ""),
-            "impact": str(ev.get("impact") or ""),
-            "event": str(ev.get("event") or ""),
+            "currency": currency,
+            "impact": str(getattr(ev, "impact", "") or ""),
+            "event": str(event_name or ""),
             "score": float(score),
             "core": float(core),
             "w": float(w),
-            "age_min": float(ev.get("age_min", 0.0)),
+            "age_min": float(getattr(ev, "age_min", 0.0)),
         })
 
     if not scores:
@@ -12427,14 +12543,14 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 await update.message.reply_text("No se encontraron noticias publicadas en la fecha ingresada.")
                 return
 
-            for _, noticia in noticias_del_dia.iterrows():
+            for noticia in noticias_del_dia.to_dict("records"):
                 title = noticia.get('title', '')
                 sitio = noticia.get('site', 'No especificado')
                 text = noticia.get('text', 'Sin Descripción') or 'Sin Descripción'
                 symbol = noticia.get('symbol', symbol)
-                fecha = noticia['publishedDate']
+                fecha = noticia.get('publishedDate')
                 try:
-                    fecha_str = fecha.strftime('%Y-%m-%d %H:%M:%S')
+                    fecha_str = fecha.strftime('%Y-%m-%d %H:%M:%S') if fecha else ""
                 except Exception:
                     fecha_str = str(fecha)
                 importancia = analizar_importancia(f"{title} {text}")
@@ -12533,14 +12649,14 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                     continue
 
                 hubo_algo = True
-                for _, noticia in noticias_del_dia.iterrows():
+                for noticia in noticias_del_dia.to_dict("records"):
                     title = noticia.get('title', '')
                     sitio = noticia.get('site', 'No especificado')
                     text = noticia.get('text', 'Sin Descripción') or 'Sin Descripción'
                     sym  = noticia.get('symbol', symbol)
-                    fecha = noticia['publishedDate']
+                    fecha = noticia.get('publishedDate')
                     try:
-                        fecha_str = fecha.strftime('%Y-%m-%d %H:%M:%S')
+                        fecha_str = fecha.strftime('%Y-%m-%d %H:%M:%S') if fecha else ""
                     except Exception:
                         fecha_str = str(fecha)
                     importancia = analizar_importancia(f"{title} {text}")
@@ -13380,18 +13496,15 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     query = update.callback_query
 
-    # Obtener los datos de activos con descripción desde Firestore
+    # Obtener los datos de activos/categorías desde Firestore (batch read)
     doc_ref_activos = db.collection("config").document("activos_con_descripcion")
-    doc_activos = doc_ref_activos.get()
+    doc_ref_categorias = db.collection("config").document("categorias")
+    doc_activos, doc_categorias = list(db.get_all([doc_ref_activos, doc_ref_categorias]))
 
     if doc_activos.exists:
         activos_con_descripcion = doc_activos.to_dict().get("data", {})
     else:
         activos_con_descripcion = {}
-
-    # Obtener los datos de categorías desde Firestore
-    doc_ref_categorias = db.collection("config").document("categorias")
-    doc_categorias = doc_ref_categorias.get()
 
     if doc_categorias.exists:
         categorias = doc_categorias.to_dict().get("data", {})
@@ -14401,7 +14514,7 @@ async def obtener_noticias_generales(update, context):
 
         while reintento < max_reintentos:
             try:
-                response = requests.get(url, timeout=10)
+                response = HTTP_SESSION.get(url, timeout=10)
                 if response.status_code == 200:
                     if not response.text.strip():
                         logging.info("La respuesta de la API está vacía.")
@@ -14427,12 +14540,13 @@ async def obtener_noticias_generales(update, context):
                 df["publishedDate"] = pd.to_datetime(df["publishedDate"], utc=True, errors="coerce")
                 df = df.dropna(subset=["publishedDate"])
 
-                for _, n in df.iterrows():
+                for n in df.to_dict("records"):
                     title = n.get("title", "")
                     sitio = n.get("site", "Desconocido")
                     text = n.get("text", "Sin Descripción")
                     symbol = n.get("symbol", "No Aplica")
-                    fecha = n["publishedDate"].strftime("%Y-%m-%d %H:%M:%S")
+                    fecha_val = n.get("publishedDate")
+                    fecha = fecha_val.strftime("%Y-%m-%d %H:%M:%S") if fecha_val else ""
                     importancia = analizar_importancia(f"{title} {text}")
                     url = n.get("url", "")
                     link_traductor = f"https://translate.google.com/translate?sl=auto&tl=es&u={url}"
@@ -15095,7 +15209,7 @@ async def validar_pago_blockchain(hash_transaccion, monto_esperado, max_reintent
     while reintento < max_reintentos:
         try:
             # Realizar la solicitud GET a la API
-            response = requests.get(url, timeout_request_global)
+            response = HTTP_SESSION.get(url, timeout_request_global)
 
             # Verificar si la respuesta es exitosa
             if response.status_code == 200:
@@ -16464,7 +16578,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
         # 1) estable/realtime (forex)
         url1 = f"https://financialmodelingprep.com/stable/quote?symbol={symbol}&apikey={API_KEY}"
         logging.info(f"[Quote-Fallback-v4] URL: {url1}")
-        r = requests.get(url1, timeout=8)
+        r = HTTP_SESSION.get(url1, timeout=8)
         if r.ok:
             arr = r.json() or []
             if isinstance(arr, list) and arr:
@@ -16473,7 +16587,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
         # 2) fallback v3
         url2 = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={API_KEY}"
         logging.info(f"[Quote-Fallback-v3] URL: {url2}")
-        r = requests.get(url2, timeout=8)
+        r = HTTP_SESSION.get(url2, timeout=8)
         if r.ok:
             arr = r.json() or []
             if isinstance(arr, list) and arr:
@@ -16491,7 +16605,7 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
         iv = _fmp_interval(tf)
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}?apikey={API_KEY}"
         logging.info(f"[Historical-Fetch] URL: {url}")
-        r = requests.get(url, timeout=5)
+        r = HTTP_SESSION.get(url, timeout=5)
         if not r.ok:
             return []
         arr = r.json() or []
@@ -16832,7 +16946,7 @@ def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> l
             "to":   _ms_to_fmp_local(to_ms)
         }
         logging.info(f"[Historical-Range] URL: {url} params: from={params['from']} to={params['to']}")
-        r = requests.get(url, params=params, timeout=5)
+        r = HTTP_SESSION.get(url, params=params, timeout=5)
         if not r.ok:
             logging.info(f"[Historical-Range] HTTP {r.status_code}: {r.text[:200]}")
             return []
@@ -16850,7 +16964,7 @@ def _fmp_hist_with_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> list
     logging.info(f"[Historical-Range-Alt] URL: {url}")
     params = {"apikey": API_KEY, "from": _ms_to_fmp_local(from_ms), "to": _ms_to_fmp_local(to_ms)}
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = HTTP_SESSION.get(url, params=params, timeout=20)
         if not r.ok:
             return []
         return _normalize_fmp_bars(r.json())  # ya devuelve ascendente
@@ -17112,22 +17226,23 @@ def _detect_new_results(symbol: str, df: pd.DataFrame) -> List[dict]:
     Devuelve filas donde 'actual' apareció/cambió respecto de lo último visto.
     """
     new_rows = []
-    for _, row in df.iterrows():
-        k = (symbol, _event_row_key(row))
-        actual = _numeric_or_nan(row.get("actual"))
+    for row in df.itertuples(index=False):
+        row_dict = row._asdict()
+        k = (symbol, _event_row_key(row_dict))
+        actual = _numeric_or_nan(row_dict.get("actual"))
         if math.isnan(actual):
             continue
         prev = _LAST_ACTUAL.get(k, math.nan)
         if math.isnan(prev) or not math.isclose(prev, actual, rel_tol=0, abs_tol=1e-12):
             _LAST_ACTUAL[k] = actual
             new_rows.append({
-                "date": row["date"].isoformat(),
-                "currency": row.get("currency"),
-                "event": row.get("event"),
-                "impact": row.get("impact"),
+                "date": row_dict.get("date").isoformat() if pd.notna(row_dict.get("date")) else None,
+                "currency": row_dict.get("currency"),
+                "event": row_dict.get("event"),
+                "impact": row_dict.get("impact"),
                 "actual": actual,
-                "estimate": _numeric_or_nan(row.get("estimate")),
-                "previous": _numeric_or_nan(row.get("previous")),
+                "estimate": _numeric_or_nan(row_dict.get("estimate")),
+                "previous": _numeric_or_nan(row_dict.get("previous")),
             })
     return new_rows
 
@@ -17468,17 +17583,18 @@ async def monitoreo_eventos():
         df = _filter_by_symbol_currencies(df, symbol)
 
         # snapshot compacto
-        events = []
-        for _, row in df.iterrows():
-            events.append({
-                "date": (row["date"].isoformat() if pd.notna(row["date"]) else None),
-                "currency": row.get("currency"),
-                "event": row.get("event"),
-                "impact": row.get("impact"),
-                "actual": (float(row.get("actual")) if pd.notna(row.get("actual")) else None),
-                "estimate": (float(row.get("estimate")) if pd.notna(row.get("estimate")) else None),
-                "previous": (float(row.get("previous")) if pd.notna(row.get("previous")) else None),
-            })
+        events = [
+            {
+                "date": (row.date.isoformat() if pd.notna(row.date) else None),
+                "currency": getattr(row, "currency", None),
+                "event": getattr(row, "event", None),
+                "impact": getattr(row, "impact", None),
+                "actual": (float(row.actual) if pd.notna(getattr(row, "actual", None)) else None),
+                "estimate": (float(row.estimate) if pd.notna(getattr(row, "estimate", None)) else None),
+                "previous": (float(row.previous) if pd.notna(getattr(row, "previous", None)) else None),
+            }
+            for row in df.itertuples(index=False)
+        ]
 
         h = _hash_payload(events)
         key = (exec_id, symbol)
@@ -17490,22 +17606,23 @@ async def monitoreo_eventos():
         # señales por fila (cuando actual existe)
         signals = []
         agg = 0.0
-        for _, row in df.iterrows():
-            if pd.notna(row.get("actual")):
+        for row in df.itertuples(index=False):
+            actual = getattr(row, "actual", None)
+            if pd.notna(actual):
                 sig = evaluar_evento_para_symbol(symbol, {
-                    "date": row["date"],
-                    "currency": row.get("currency"),
-                    "event": row.get("event"),
-                    "impact": row.get("impact"),
-                    "actual": row.get("actual"),
-                    "estimate": row.get("estimate"),
-                    "previous": row.get("previous"),
+                    "date": row.date,
+                    "currency": getattr(row, "currency", None),
+                    "event": getattr(row, "event", None),
+                    "impact": getattr(row, "impact", None),
+                    "actual": actual,
+                    "estimate": getattr(row, "estimate", None),
+                    "previous": getattr(row, "previous", None),
                 })
                 sig_out = {
-                    "date": (row["date"].isoformat() if pd.notna(row["date"]) else None),
-                    "currency": row.get("currency"),
-                    "event": row.get("event"),
-                    "impact": row.get("impact"),
+                    "date": (row.date.isoformat() if pd.notna(row.date) else None),
+                    "currency": getattr(row, "currency", None),
+                    "event": getattr(row, "event", None),
+                    "impact": getattr(row, "impact", None),
                     "score": sig["score"],
                     "direction": sig["direction"],
                     "reason": sig["reason"],
@@ -18348,13 +18465,19 @@ async def ejecutar_analisis_desde_app():
         })()
         dummy_context = type("DummyContext", (), {"bot": application.bot})()
 
-        # 7) cargar CFG + TZ desde user_ids/user_config.current
-        user_ref = db.collection('user_ids').document(user_id)
-        cfg_ref  = user_ref.collection('user_config').document('current')
-        doc_user, doc_cfg = list(db.get_all([user_ref, cfg_ref]))
-
-        cfg = (doc_cfg.to_dict() or {})
-        tz_name = (doc_user.to_dict() or {}).get('timezone') or 'UTC'
+        # 7) cargar CFG + TZ desde user_ids/user_config.current (con caché TTL)
+        # OPTIMIZACION: Config loader con 10min TTL para reducir Firestore reads
+        def _load_user_config(uid):
+            user_ref = db.collection('user_ids').document(uid)
+            cfg_ref  = user_ref.collection('user_config').document('current')
+            doc_user, doc_cfg = list(db.get_all([user_ref, cfg_ref]))
+            tz_name = (doc_user.to_dict() or {}).get('timezone') or 'UTC'
+            cfg = (doc_cfg.to_dict() or {})
+            return {"config": cfg, "timezone": tz_name}
+        
+        cached_data = _USER_CONFIG_CACHE.get_or_load(user_id, _load_user_config)
+        cfg = cached_data.get("config", {})
+        tz_name = cached_data.get("timezone", "UTC")
 
         global timezone_country, timezone_name
         timezone_name = tz_name
