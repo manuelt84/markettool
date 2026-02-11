@@ -11851,17 +11851,18 @@ async def ejecutar_analisis_con_hilos(
 
     loop = asyncio.get_running_loop()
 
-    # --- Análisis principal ---
-    analisis_tasks = []
-    meta = []  # (symbol, temporalidad) alineado con analisis_tasks
-    
     # Preparar cfg para evaluar (inyectar whitelist si vino en overrides)
     cfg_for_process = dict(cfg or {})
     if white_cfg:
         cfg_for_process["whitelist"] = white_cfg
 
-    for symbol in activos_filtrados:
-        for temporalidad in temps:
+    # --- Semaphore para limitar concurrencia (evita overhead de context switching con 250+ tasks) ---
+    # Con caché, 8 tasks simultáneamente es optimal (evita contención + aprovecha cache hit)
+    sem = asyncio.Semaphore(8)
+    
+    async def bounded_analysis(symbol, temporalidad):
+        """Envuelve procesar_simbolo_temporalidad con límite de concurrencia."""
+        async with sem:
             fn = partial(
                 procesar_simbolo_temporalidad,
                 symbol, temporalidad, df_eventos, user_chat_id, context,
@@ -11869,8 +11870,16 @@ async def ejecutar_analisis_con_hilos(
                 calc_windows=calc_map,
                 cfg=cfg_for_process
             )
-            fut = loop.run_in_executor(None, fn)
-            analisis_tasks.append(fut)
+            return await loop.run_in_executor(None, fn)
+
+    # --- Análisis principal ---
+    analisis_tasks = []
+    meta = []  # (symbol, temporalidad) alineado con analisis_tasks
+
+    for symbol in activos_filtrados:
+        for temporalidad in temps:
+            task = bounded_analysis(symbol, temporalidad)
+            analisis_tasks.append(task)
             meta.append((symbol, temporalidad))
 
     analisis_results = await asyncio.gather(*analisis_tasks, return_exceptions=True)
