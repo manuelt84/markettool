@@ -109,6 +109,10 @@ import uuid
 import uvicorn
 import warnings
 import threading
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 
 # ======================================================================
@@ -129,6 +133,15 @@ class AppConfig:
     cache_ttl_config: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_CONFIG", "600")))
     cache_ttl_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_HISTORICOS", "1800")))
     cache_max_size_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_MAX_SIZE_HISTORICOS", "100")))
+    cache_warmup_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_ENABLED", "true").lower() == "true")
+    cache_warmup_blocking_startup: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_BLOCKING_STARTUP", "true").lower() == "true")
+    cache_warmup_interval_minutes: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_INTERVAL_MINUTES", "240")))
+    cache_warmup_max_ram_percent: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_MAX_RAM_PERCENT", "80")))
+    cache_warmup_concurrency: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "4")))
+    cache_warmup_news_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_NEWS_ENABLED", "true").lower() == "true")
+    cache_warmup_events_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_EVENTS_ENABLED", "true").lower() == "true")
+    cache_warmup_news_limit: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_NEWS_LIMIT", "2")))
+    cache_warmup_leader_only: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_LEADER_ONLY", "false").lower() == "true")
 
 
 
@@ -2451,6 +2464,89 @@ def _valid_timeframes() -> set:
     except Exception:
         return {"1min","5min","15min","30min","1hour","4hour","1day","1week"}
 
+def _memory_usage_percent() -> Optional[float]:
+    """Returns memory usage percent or None if not available."""
+    if psutil is None:
+        return None
+    try:
+        return float(psutil.virtual_memory().percent)
+    except Exception:
+        return None
+
+async def warmup_cache_all_assets(reason: str = "scheduled"):
+    """
+    Warm caches for historicos, indicators, news, and events.
+    This is intended for all-assets runs to avoid repeated GCS access.
+    """
+    if not APP_CONFIG.cache_warmup_enabled:
+        return
+    if APP_CONFIG.cache_warmup_leader_only and not _POD_COORDINATOR.should_run_scheduled_task("warmup_cache"):
+        return
+
+    _ensure_globals_loaded()
+    symbols = sorted(_universe_symbols())
+    tfs = sorted(_valid_timeframes())
+    if not symbols or not tfs:
+        logger.info("[Warmup] No symbols/timeframes available")
+        return
+
+    start = time.time()
+    logger.info(
+        "[Warmup] Starting (%s). symbols=%d, tfs=%d, concurrency=%d",
+        reason,
+        len(symbols),
+        len(tfs),
+        APP_CONFIG.cache_warmup_concurrency,
+    )
+
+    sem = asyncio.Semaphore(max(1, APP_CONFIG.cache_warmup_concurrency))
+
+    async def _warm_symbol_tf(symbol: str, tf: str):
+        async with sem:
+            await asyncio.to_thread(load_cached_history, symbol, tf)
+            await asyncio.to_thread(_INDICATORS_CACHE.load, symbol, tf)
+
+    limit_reached = False
+    warmed_symbols = 0
+    for symbol in symbols:
+        mem_pct = _memory_usage_percent()
+        if mem_pct is not None and mem_pct >= APP_CONFIG.cache_warmup_max_ram_percent:
+            logger.warning(
+                "[Warmup] Memory usage %.1f%% >= %d%%. Stopping warmup.",
+                mem_pct,
+                APP_CONFIG.cache_warmup_max_ram_percent,
+            )
+            logger.info("[Warmup] Limit reached. Cached %d/%d symbols.", warmed_symbols, len(symbols))
+            limit_reached = True
+            break
+
+        tasks = []
+        for tf in tfs:
+            tasks.append(asyncio.create_task(_warm_symbol_tf(symbol, tf)))
+            if len(tasks) >= APP_CONFIG.cache_warmup_concurrency:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if APP_CONFIG.cache_warmup_news_enabled:
+            try:
+                await get_noticias_cached(symbol, limite=APP_CONFIG.cache_warmup_news_limit)
+            except Exception:
+                pass
+
+        warmed_symbols += 1
+
+    if APP_CONFIG.cache_warmup_events_enabled:
+        try:
+            await get_eventos_economicos_cached()
+        except Exception:
+            pass
+
+    if limit_reached:
+        logger.info("[Warmup] Finished early due to memory limit.")
+    logger.info("[Warmup] Finished in %.2fs", time.time() - start)
+
 # --------------------------
 # Normalización OCR
 # --------------------------
@@ -4144,7 +4240,7 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
 
     while reintento < max_reintentos:
         try:
-            response = HTTP_SESSION.get(url, timeout_request_global)
+            response = HTTP_SESSION.get(url, timeout=timeout_request_global)
             if response.status_code == 200:
                 nuevas_noticias = response.json()
                 if isinstance(nuevas_noticias, list) and len(nuevas_noticias) > 0:
@@ -4219,7 +4315,7 @@ def obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=50, max_rei
 
     while reintento < max_reintentos:
         try:
-            response = HTTP_SESSION.get(url, timeout_request_global)
+            response = HTTP_SESSION.get(url, timeout=timeout_request_global)
             if response.status_code == 200:
                 nuevas_noticias = response.json()
                 if isinstance(nuevas_noticias, list) and len(nuevas_noticias) > 0:
@@ -15209,7 +15305,7 @@ async def validar_pago_blockchain(hash_transaccion, monto_esperado, max_reintent
     while reintento < max_reintentos:
         try:
             # Realizar la solicitud GET a la API
-            response = HTTP_SESSION.get(url, timeout_request_global)
+            response = HTTP_SESSION.get(url, timeout=timeout_request_global)
 
             # Verificar si la respuesta es exitosa
             if response.status_code == 200:
@@ -15306,6 +15402,14 @@ def programar_actualizacion_menus(application: Application):
     scheduler.add_job(
         actualizar,
         IntervalTrigger(minutes=10),  # Se ejecutará cada 10 minutos
+    )
+
+    def _warmup_job():
+        asyncio.run_coroutine_threadsafe(warmup_cache_all_assets("scheduled"), loop)
+
+    scheduler.add_job(
+        _warmup_job,
+        IntervalTrigger(minutes=APP_CONFIG.cache_warmup_interval_minutes),
     )
 
     scheduler.start()
@@ -15912,6 +16016,10 @@ async def initialize_bot():
         # Iniciar heartbeat si es líder
         loop = asyncio.get_event_loop()
         await _POD_COORDINATOR.start_heartbeat(loop)
+
+        # Warmup cache (blocking) for all-assets workflows
+        if APP_CONFIG.cache_warmup_enabled and APP_CONFIG.cache_warmup_blocking_startup:
+            await warmup_cache_all_assets("startup")
 
         # Programar el guardado diario (todas las tareas arrancan, pero solo líder ejecuta)
         asyncio.create_task(guardar_noticias_forex_diarias())
