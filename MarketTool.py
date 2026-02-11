@@ -5370,6 +5370,219 @@ class IndicatorsCache:
 _INDICATORS_CACHE = IndicatorsCache()
 
 
+# ============================================================================
+# POD LEADER COORDINATOR - Multi-Pod Coordination for Scheduled Tasks
+# ============================================================================
+
+class PodLeaderCoordinator:
+    """
+    Coordina procesos periódicos en entorno multi-pod.
+    
+    ✅ Solo el pod LÍDER ejecuta tareas programadas (ej: actualizar menús Telegram)
+    ✅ Evita solicitudes duplicadas a APIs externas
+    ✅ Failover automático si el líder cae
+    ✅ Heartbeat cada 60 segundos
+    ✅ TTL de 3 minutos (si líder no envía heartbeat, es reemplazado)
+    
+    Firestore Document: system/scheduler_leader
+    {
+        "pod_id": "markettool-7d8f9-abc12",
+        "heartbeat_utc": "2026-02-11T15:30:00Z",
+        "elected_at_utc": "2026-02-11T15:00:00Z",
+        "ttl_seconds": 180
+    }
+    """
+    
+    def __init__(self):
+        import socket
+        self.pod_id = socket.gethostname()
+        self.firestore_enabled = os.environ.get("FIRESTORE_ENABLED", "false").lower() == "true"
+        self.db = firestore.Client() if self.firestore_enabled else None
+        self.leader_doc_path = "system/scheduler_leader"
+        self.ttl_seconds = int(os.environ.get("LEADER_TTL_SECONDS", "180"))  # 3 min
+        self.heartbeat_interval = int(os.environ.get("LEADER_HEARTBEAT_SECONDS", "60"))  # 1 min
+        self.is_leader = False
+        self.heartbeat_task = None
+        self.last_check = 0
+        self.check_cooldown = 30  # Re-check leadership cada 30 seg si no es líder
+        
+        logger.info(f"[PodCoordinator] Initialized pod_id={self.pod_id}, firestore_enabled={self.firestore_enabled}")
+    
+    def _is_firestore_available(self) -> bool:
+        """Check if Firestore is enabled and available."""
+        return self.firestore_enabled and self.db is not None
+    
+    async def try_become_leader(self) -> bool:
+        """
+        Intenta convertirse en líder del cluster.
+        
+        Returns:
+            bool: True si este pod es el líder, False de lo contrario
+        """
+        if not self._is_firestore_available():
+            # Sin Firestore, cada pod es su propio líder (fallback a comportamiento original)
+            logger.warning("[PodCoordinator] Firestore disabled. Pod operates independently.")
+            self.is_leader = True
+            return True
+        
+        try:
+            doc_ref = self.db.document(self.leader_doc_path)
+            doc = doc_ref.get()
+            now_utc = datetime.now(timezone.utc)
+            
+            if not doc.exists:
+                # No hay líder, tomar el control
+                doc_ref.set({
+                    "pod_id": self.pod_id,
+                    "heartbeat_utc": now_utc.isoformat(),
+                    "elected_at_utc": now_utc.isoformat(),
+                    "ttl_seconds": self.ttl_seconds
+                })
+                self.is_leader = True
+                logger.info(f"[PodCoordinator] ✅ Elected as LEADER (no previous leader)")
+                return True
+            
+            # Verificar si el líder actual está vivo
+            data = doc.to_dict()
+            current_leader = data.get("pod_id")
+            last_heartbeat_str = data.get("heartbeat_utc")
+            
+            if not last_heartbeat_str:
+                # Documento corrupto, tomar control
+                doc_ref.set({
+                    "pod_id": self.pod_id,
+                    "heartbeat_utc": now_utc.isoformat(),
+                    "elected_at_utc": now_utc.isoformat(),
+                    "ttl_seconds": self.ttl_seconds
+                })
+                self.is_leader = True
+                logger.info(f"[PodCoordinator] ✅ Elected as LEADER (corrupted document)")
+                return True
+            
+            # Parse heartbeat timestamp
+            last_heartbeat = datetime.fromisoformat(last_heartbeat_str.replace('Z', '+00:00'))
+            elapsed = (now_utc - last_heartbeat).total_seconds()
+            
+            if current_leader == self.pod_id:
+                # Ya soy el líder, actualizar heartbeat
+                doc_ref.update({
+                    "heartbeat_utc": now_utc.isoformat()
+                })
+                self.is_leader = True
+                logger.debug(f"[PodCoordinator] ✅ Still LEADER (heartbeat updated)")
+                return True
+            
+            # Otro pod es líder
+            if elapsed > self.ttl_seconds:
+                # Líder anterior murió (no envió heartbeat), tomar control
+                doc_ref.set({
+                    "pod_id": self.pod_id,
+                    "heartbeat_utc": now_utc.isoformat(),
+                    "elected_at_utc": now_utc.isoformat(),
+                    "ttl_seconds": self.ttl_seconds,
+                    "previous_leader": current_leader,
+                    "takeover_reason": f"Leader timeout after {elapsed:.0f}s"
+                })
+                self.is_leader = True
+                logger.warning(f"[PodCoordinator] ⚠️ TAKEOVER: Previous leader '{current_leader}' timeout ({elapsed:.0f}s > {self.ttl_seconds}s)")
+                return True
+            else:
+                # Líder está vivo
+                if time.time() - self.last_check > self.check_cooldown:
+                    logger.info(f"[PodCoordinator] ❌ NOT leader. Current leader: '{current_leader}' (last heartbeat {elapsed:.0f}s ago)")
+                    self.last_check = time.time()
+                self.is_leader = False
+                return False
+        
+        except Exception as e:
+            logger.error(f"[PodCoordinator] Error in leader election: {e}")
+            # En caso de error, no ejecutar tareas (fail-safe)
+            self.is_leader = False
+            return False
+    
+    async def start_heartbeat(self, loop=None):
+        """
+        Inicia el heartbeat periódico si este pod es líder.
+        
+        Args:
+            loop: asyncio event loop (opcional)
+        """
+        if not self._is_firestore_available():
+            return
+        
+        async def heartbeat_worker():
+            while True:
+                try:
+                    await asyncio.sleep(self.heartbeat_interval)
+                    
+                    if self.is_leader:
+                        # Actualizar heartbeat en Firestore
+                        doc_ref = self.db.document(self.leader_doc_path)
+                        now_utc = datetime.now(timezone.utc)
+                        doc_ref.update({
+                            "heartbeat_utc": now_utc.isoformat()
+                        })
+                        logger.debug(f"[PodCoordinator] 💓 Heartbeat sent")
+                    else:
+                        # No soy líder, intentar convertirme si el líder murió
+                        await self.try_become_leader()
+                
+                except Exception as e:
+                    logger.error(f"[PodCoordinator] Heartbeat error: {e}")
+        
+        # Iniciar tarea de heartbeat
+        if loop:
+            self.heartbeat_task = loop.create_task(heartbeat_worker())
+        else:
+            self.heartbeat_task = asyncio.create_task(heartbeat_worker())
+        
+        logger.info(f"[PodCoordinator] Heartbeat started (interval={self.heartbeat_interval}s)")
+    
+    def should_run_scheduled_task(self, task_name: str) -> bool:
+        """
+        Verifica si este pod debe ejecutar una tarea programada.
+        
+        Args:
+            task_name: Nombre de la tarea (ej: "actualizar_menus")
+        
+        Returns:
+            bool: True si debe ejecutar, False de lo contrario
+        """
+        if not self._is_firestore_available():
+            # Sin Firestore, cada pod ejecuta sus propias tareas (fallback)
+            return True
+        
+        if self.is_leader:
+            logger.debug(f"[PodCoordinator] ✅ Executing '{task_name}' (I am leader)")
+            return True
+        else:
+            logger.debug(f"[PodCoordinator] ⏭️ Skipping '{task_name}' (not leader)")
+            return False
+    
+    async def release_leadership(self):
+        """
+        Libera el liderazgo (útil en shutdown graceful).
+        """
+        if not self._is_firestore_available() or not self.is_leader:
+            return
+        
+        try:
+            doc_ref = self.db.document(self.leader_doc_path)
+            doc_ref.delete()
+            logger.info(f"[PodCoordinator] Leadership released by pod {self.pod_id}")
+            self.is_leader = False
+        except Exception as e:
+            logger.error(f"[PodCoordinator] Error releasing leadership: {e}")
+        
+        # Cancelar heartbeat task
+        if self.heartbeat_task:
+            self.heartbeat_task.cancel()
+
+
+# Instancia global del coordinador de pods
+_POD_COORDINATOR = PodLeaderCoordinator()
+
+
 # CARPETA_HISTORICOS debe estar definido en tu módulo
 # cache_historicos es global
 
@@ -14391,6 +14604,10 @@ def programar_actualizacion_menus(application: Application):
 
     #@profile
     def actualizar():
+        # ✅ Multi-pod coordination: Solo el líder ejecuta
+        if not _POD_COORDINATOR.should_run_scheduled_task("actualizar_menus"):
+            return
+        
         asyncio.run_coroutine_threadsafe(actualizar_menus(application), loop)
 
     scheduler.add_job(
@@ -14724,10 +14941,122 @@ webhook_app = Flask(__name__)
 # Convierte la aplicación Flask a ASGI
 asgi_app = WsgiToAsgi(webhook_app)
 
+
+# ============================================================================
+# API Endpoints - Multi-Pod Coordination Status
+# ============================================================================
+
+@webhook_app.route("/api/pod/status", methods=["GET"])
+def get_pod_status():
+    """
+    Retorna el estado del pod actual (líder o follower).
+    
+    GET /api/pod/status
+    
+    Response:
+    {
+        "pod_id": "markettool-7d8f9-abc12",
+        "is_leader": true,
+        "firestore_enabled": true,
+        "ttl_seconds": 180,
+        "heartbeat_interval": 60
+    }
+    """
+    return jsonify({
+        "pod_id": _POD_COORDINATOR.pod_id,
+        "is_leader": _POD_COORDINATOR.is_leader,
+        "firestore_enabled": _POD_COORDINATOR.firestore_enabled,
+        "ttl_seconds": _POD_COORDINATOR.ttl_seconds,
+        "heartbeat_interval": _POD_COORDINATOR.heartbeat_interval
+    })
+
+
+@webhook_app.route("/api/pod/leader", methods=["GET"])
+def get_cluster_leader():
+    """
+    Retorna información del pod líder actual del cluster.
+    
+    GET /api/pod/leader
+    
+    Response:
+    {
+        "current_leader": "markettool-7d8f9-abc12",
+        "heartbeat_utc": "2026-02-11T15:30:00Z",
+        "elected_at_utc": "2026-02-11T15:00:00Z",
+        "seconds_since_heartbeat": 15,
+        "is_alive": true
+    }
+    """
+    if not _POD_COORDINATOR._is_firestore_available():
+        return jsonify({
+            "error": "Firestore not enabled",
+            "message": "Multi-pod coordination requires FIRESTORE_ENABLED=true"
+        }), 503
+    
+    try:
+        doc_ref = _POD_COORDINATOR.db.document(_POD_COORDINATOR.leader_doc_path)
+        doc = doc_ref.get()
+        
+        if not doc.exists:
+            return jsonify({
+                "current_leader": None,
+                "message": "No leader elected yet"
+            }), 404
+        
+        data = doc.to_dict()
+        last_heartbeat_str = data.get("heartbeat_utc")
+        last_heartbeat = datetime.fromisoformat(last_heartbeat_str.replace('Z', '+00:00'))
+        now_utc = datetime.now(timezone.utc)
+        elapsed = (now_utc - last_heartbeat).total_seconds()
+        
+        return jsonify({
+            "current_leader": data.get("pod_id"),
+            "heartbeat_utc": last_heartbeat_str,
+            "elected_at_utc": data.get("elected_at_utc"),
+            "seconds_since_heartbeat": round(elapsed, 1),
+            "is_alive": elapsed < _POD_COORDINATOR.ttl_seconds,
+            "ttl_seconds": data.get("ttl_seconds", _POD_COORDINATOR.ttl_seconds)
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@webhook_app.route("/api/pod/release-leadership", methods=["POST"])
+def release_leadership():
+    """
+    Fuerza la liberación del liderazgo del pod actual.
+    
+    POST /api/pod/release-leadership
+    
+    ⚠️ Usar con cuidado: Otro pod tomará el liderazgo inmediatamente.
+    """
+    if not _POD_COORDINATOR.is_leader:
+        return jsonify({
+            "error": "Not leader",
+            "message": f"This pod ({_POD_COORDINATOR.pod_id}) is not the current leader"
+        }), 403
+    
+    try:
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(_POD_COORDINATOR.release_leadership())
+        loop.close()
+        
+        return jsonify({
+            "success": True,
+            "message": f"Leadership released by pod {_POD_COORDINATOR.pod_id}",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat()
+        })
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 #@profile
 async def guardar_noticias_forex_diarias():
     """
     Ejecuta `guardar_noticias_forex` una vez al día, a medianoche.
+    ✅ Multi-pod coordination: Solo el líder ejecuta esta tarea.
     """
     while True:
         ahora = datetime.now()
@@ -14737,13 +15066,19 @@ async def guardar_noticias_forex_diarias():
         logger.info(f"Esperando {tiempo_para_guardar} segundos para guardar noticias Forex...")
 
         await asyncio.sleep(tiempo_para_guardar)
-        await guardar_noticias_forex()
+        
+        # ✅ Multi-pod coordination: Solo el líder ejecuta
+        if _POD_COORDINATOR.should_run_scheduled_task("guardar_noticias_forex"):
+            await guardar_noticias_forex()
+        else:
+            logger.debug("[MultiPod] Skipping guardar_noticias_forex (not leader)")
 
 
 #@profile
 async def guardar_datos_historicos_diarios():
     """
     Ejecuta `guardar_datos_historicos` una vez al día, a medianoche.
+    ✅ Multi-pod coordination: Solo el líder ejecuta esta tarea.
     """
     while True:
         ahora = datetime.now()
@@ -14753,7 +15088,12 @@ async def guardar_datos_historicos_diarios():
         logger.info(f"Esperando {tiempo_para_guardar} segundos para guardar datos históricos...")
 
         await asyncio.sleep(tiempo_para_guardar)
-        await guardar_datos_historicos()
+        
+        # ✅ Multi-pod coordination: Solo el líder ejecuta
+        if _POD_COORDINATOR.should_run_scheduled_task("guardar_datos_historicos"):
+            await guardar_datos_historicos()
+        else:
+            logger.debug("[MultiPod] Skipping guardar_datos_historicos (not leader)")
 
 
 # Cargar datos iniciales
@@ -14788,13 +15128,22 @@ async def initialize_bot():
             cargar_datos_historicos_inicial(),
         )
 
-        # Programar el guardado diario
+        # ✅ Multi-pod coordination: Inicializar leader election
+        logger.info("[MultiPod] Initializing pod coordinator...")
+        await _POD_COORDINATOR.try_become_leader()
+        
+        # Iniciar heartbeat si es líder
+        loop = asyncio.get_event_loop()
+        await _POD_COORDINATOR.start_heartbeat(loop)
+
+        # Programar el guardado diario (todas las tareas arrancan, pero solo líder ejecuta)
         asyncio.create_task(guardar_noticias_forex_diarias())
         asyncio.create_task(guardar_datos_historicos_diarios())
 
-        # Ejecutar la primera actualización de menús en segundo plano
-        asyncio.create_task(actualizar_menus(application))
-
+        # Ejecutar la primera actualización de menús en segundo plano (solo líder)
+        if _POD_COORDINATOR.should_run_scheduled_task("actualizar_menus_inicial"):
+            asyncio.create_task(actualizar_menus(application))
+        
         logger.info("Actualizar menus de usuarios telegram...")
         programar_actualizacion_menus(application)
 
