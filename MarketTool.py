@@ -39,7 +39,10 @@ except Exception:
     Calendar = None
     Event = None
 from io import StringIO, BytesIO
-from joblib import Parallel, delayed, parallel_backend
+# ✅ FIX: joblib.Parallel removed to fix ResourceTracker errors in Docker/Python 3.12
+# Previous usage was redundant (Parallel with range(1) = no parallelization)
+# For future parallel needs: use ThreadPoolExecutor or asyncio instead
+# from joblib import Parallel, delayed, parallel_backend
 from numba import njit
 from pandas.tseries.offsets import CustomBusinessDay
 from scipy.signal import argrelextrema
@@ -8573,7 +8576,6 @@ def ajustar_window_dinamico_optimizado(
     min_factor: int = 2,
     max_factor: int = 5,
     min_levels: int = 2,
-    n_jobs: int = -1,
 ):
     # Obtener la ventana inicial
     if calc_windows is not None:
@@ -8601,10 +8603,19 @@ def ajustar_window_dinamico_optimizado(
     window_ajustado = window
     min_factor_temporal = 1
 
-    # Determinar si usar paralelización según el tamaño de los datos
-    use_parallel = len(df) > 500 and n_jobs != 1
-    backend_options = {'n_jobs': n_jobs}
-
+    # ✅ FIX: No usar Parallel para una sola tarea (causa ResourceTracker errors)
+    # La paralelización solo es útil si hay múltiples tareas independientes
+    # Aquí solo hay 1 tarea por símbolo/temporalidad, ejecutar directamente es más eficiente
+    # 
+    # 📝 NOTA: Si en el futuro necesitas paralelizar múltiples ventanas o símbolos:
+    #    - Paraleliza al nivel superior (múltiples símbolos/temporalidades)
+    #    - Usa ThreadPoolExecutor en vez de multiprocessing (más seguro en Docker)
+    #    - Ejemplo:
+    #      from concurrent.futures import ThreadPoolExecutor
+    #      with ThreadPoolExecutor(max_workers=4) as executor:
+    #          futures = [executor.submit(calcular_para_ventana, w) for w in ventanas]
+    #          resultados = [f.result() for f in futures]
+    
     while not niveles_suficientes:
         if min_factor_temporal > max_factor:
             logger.info(
@@ -8617,27 +8628,14 @@ def ajustar_window_dinamico_optimizado(
             logger.info(f"Ventana ajustada alcanzó el límite máximo permitido ({max_window}) para {symbol} en {temporalidad}.")
             break
 
-        # Función para calcular soportes y resistencias
-        #@profile
-        def calcular_soportes_resistencias():
-            return calcular_soportes_resistencias_para_window(
-                window_ajustado, df, precio_actual, min_levels, symbol, temporalidad
-            )
-
-        # Usar paralelización o ejecución directa
-        if use_parallel:
-            with parallel_backend('loky', **backend_options):
-                resultados = Parallel()(
-                    delayed(calcular_soportes_resistencias)()
-                    for _ in range(1)
-                )
-        else:
-            resultados = [calcular_soportes_resistencias()]
-
+        # ✅ Ejecutar cálculo directamente (sin overhead de multiprocessing)
+        soportes, resistencias = calcular_soportes_resistencias_para_window(
+            window_ajustado, df, precio_actual, min_levels, symbol, temporalidad
+        )
+        
         # Procesar resultados
-        for soportes, resistencias in resultados:
-            soportes_dinamicos.update(soportes)
-            resistencias_dinamicas.update(resistencias)
+        soportes_dinamicos.update(soportes)
+        resistencias_dinamicas.update(resistencias)
 
         # Verificar si se alcanzaron niveles suficientes
         if len(soportes_dinamicos) >= min_levels and len(resistencias_dinamicas) >= min_levels:
@@ -9441,7 +9439,6 @@ def calcular_entradas(
             min_factor=2,
             max_factor=8,
             min_levels=2,
-            n_jobs=-1,
         )
 
         soportes_dinamicos = _clean_levels(soportes_dinamicos)
