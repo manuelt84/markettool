@@ -1004,6 +1004,7 @@ matplotlib.use('Agg')
 pd.set_option('future.no_silent_downcasting', True)
 
 warnings.filterwarnings("ignore", message="Maximum Likelihood optimization failed to converge")
+warnings.filterwarnings("ignore", category=UserWarning, message="Detected filter using positional arguments")
 
 #from pathlib import Path
 #from dotenv import load_dotenv
@@ -8111,86 +8112,135 @@ def evaluar_si_autorizado_operar(
     prob_fundamental: float,
     rrr_promedio: float,
     alertas: list,
-    tecnica_meta: dict = None
+    tecnica_meta: dict = None,
+    whitelist_cfg: dict = None
 ) -> dict:
     """
     ✅ FASE 3: Whitelisting - Determina si las condiciones son "suficientemente buenas" para operar.
     
-    Basado en estándares profesionales:
-    - Confluencia score >= 0.60 (60% confianza técnica)
-    - Probabilidad >= 55% (por encima de random)
-    - RRR >= 1.5 (riesgo-recompensa profesional)
-    - Sin alertas críticas (RSI extremo, cerca de valor, etc)
+    Mejoras (Trader & Math Expert):
+    - Cálculo de Expectativa Matemática (E) como factor decisivo.
+    - Curvas de puntuación continuas en lugar de escalones binarios.
+    - Penalización exponencial por alertas críticas.
+    - Flexibilidad en RRR si la probabilidad compensa (High Winrate setups).
+    - Configurable desde frontend (whitelist_cfg).
     
     Returns:
         {
             "autorizado": bool,
             "score_final": float,
             "razon_rechazo": str o None,
-            "recomendacion": str
+            "recomendacion": str,
+            "expectativa": float
         }
     """
     score_final = 0.0
     razones_rechazo = []
+    warnings_list = []
     
-    # 1. Confluencia técnica (máx 25% del score)
-    if confluencia_score is not None and confluencia_score >= 0.60:
-        score_final += 25
-    elif confluencia_score is not None and confluencia_score >= 0.50:
-        score_final += 15
-        razones_rechazo.append("Confluencia técnica baja (50-60%)")
+    # Configuración (defaults conservadores)
+    cfg = whitelist_cfg or {}
+    MIN_SCORE = float(cfg.get("min_score", 60.0))
+    MIN_EXPECTANCY = float(cfg.get("min_expectancy", 0.0))  # 0.0 es breakeven
+    MIN_TOLERANCE_E = float(cfg.get("tolerance_negative_e", -0.1))
+    
+    # --- A. Cálculo de Expectativa Matemática ---
+    # Asumimos prob_tecnica como winrate estimado. Si es None, usamos 50% conservador.
+    p_win = (prob_tecnica if prob_tecnica is not None else 50.0) / 100.0
+    rrr = rrr_promedio if rrr_promedio is not None else 1.0
+    
+    # Kelly simple / Expectancy: (Win% * Reward) - (Loss% * Risk)
+    # Risk siempre 1R. Reward lo tomamos del RRR.
+    expectancy = (p_win * rrr) - (1.0 - p_win)
+    
+    # --- B. Scoring por Componentes (0-100+) ---
+    
+    # 1. Confluencia técnica (0-25 pts)
+    # Mapeo suave: 0.5 -> 0pts, 0.8+ -> 25pts (Full confidence)
+    if confluencia_score is not None:
+        raw_conf = min(1.0, max(0.0, confluencia_score))
+        if raw_conf < 0.5:
+            razones_rechazo.append(f"Confluencia técnica insuficiente ({raw_conf:.2f})")
+        
+        # Curva cuadrática para premiar la alta calidad más agresivamente
+        # (x - 0.5) / 0.3 => normalizado 0..1 entre 0.5 y 0.8
+        factor = min(1.0, max(0.0, (raw_conf - 0.5) / 0.3))
+        score_final += 25.0 * factor
     else:
-        razones_rechazo.append("Confluencia técnica insuficiente (<50%)")
-    
-    # 2. Probabilidad técnica (máx 25%)
-    if prob_tecnica is not None and prob_tecnica >= 55:
-        score_final += min(25, (prob_tecnica - 50) * 5)  # Escala lineal de 55->0% a 75->100%
-    else:
-        razones_rechazo.append("Probabilidad técnica baja (<55%)")
-    
-    # 3. Probabilidad fundamental (máx 25%)
-    if prob_fundamental is not None and prob_fundamental >= 55:
-        score_final += min(25, (prob_fundamental - 50) * 5)
-    
-    # 4. Risk-Reward Ratio (máx 25%)
-    if rrr_promedio is not None and rrr_promedio >= 1.5:
-        score_final += 25
-    elif rrr_promedio is not None and rrr_promedio >= 1.2:
-        score_final += 15
-        razones_rechazo.append(f"RRR bajo ({rrr_promedio:.2f} < 1.5)")
-    else:
-        razones_rechazo.append(f"RRR insuficiente ({rrr_promedio})")
-    
-    # 5. Alertas críticas (penalización)
+         warnings_list.append("Sin datos de confluencia")
+
+    # 2. Probabilidad técnica (0-25 pts)
+    # Mapeo: 50% -> 0pts, 65% -> 25pts.
+    # Un modelo >60% ya es excelente. >55% es bueno.
+    if prob_tecnica is not None:
+        if prob_tecnica < 50.0:
+            warnings_list.append(f"Prob. Técnica < 50% ({prob_tecnica:.1f}%)")
+        
+        # 50->0, 60->20, 62.5->25.
+        p_score = min(25.0, max(0.0, (prob_tecnica - 50.0) * 2.0))
+        score_final += p_score
+
+    # 3. Probabilidad fundamental (0-25 pts)
+    # Similar a técnica
+    if prob_fundamental is not None:
+        f_score = min(25.0, max(0.0, (prob_fundamental - 50.0) * 2.0))
+        score_final += f_score
+
+    # 4. Risk-Reward Ratio & Expectancy (0-25 pts + Bonus)
+    if rrr_promedio is not None:
+        # Puntuación base por RRR: 1.0->0, 2.0->25.
+        rrr_score = min(25.0, max(0.0, (rrr_promedio - 1.0) * 25.0))
+        score_final += rrr_score
+
+        # REGLA DE ORO: No operar esperanza negativa
+        if expectancy < MIN_TOLERANCE_E: # Tolerancia leve por error de estimación
+             razones_rechazo.append(f"Expectativa matemática negativa (E={expectancy:.2f})")
+        elif expectancy < MIN_EXPECTANCY:
+             warnings_list.append(f"Expectativa marginal (E={expectancy:.2f})")
+        
+        # Si RRR es bajo (<1.2) pero la Esperanza es muy buena (>0.4), PERMITIR (Scalping)
+        if rrr_promedio < 1.2 and expectancy < 0.2:
+            razones_rechazo.append(f"RRR bajo ({rrr_promedio:.2f}) sin suficiente Winrate compensatorio")
+
+    # 5. Penalizaciones por Alertas
     alertas_criticas = 0
     if alertas:
-        alertas_criticas = sum(1 for a in alertas if "OVERBOUGHT" in str(a) or "OVERSOLD" in str(a) or "cerca de" in str(a).lower())
+        # Penaliza RSI en extremos o divergencias graves
+        alertas_criticas = sum(1 for a in alertas if "OVERBOUGHT" in str(a) or "OVERSOLD" in str(a) or "CRITICAL" in str(a))
     
-    if alertas_criticas > 2:
-        score_final *= 0.7  # Penalizar 30% si hay muchas alertas
-        razones_rechazo.append(f"Demasiadas alertas críticas ({alertas_criticas})")
+    if alertas_criticas > 0:
+        penalty = 0.85 ** alertas_criticas # -15% compuesto por alerta
+        score_final *= penalty
+        if alertas_criticas > 2:
+            razones_rechazo.append(f"Múltiples alertas críticas ({alertas_criticas})")
+
+    # --- C. Decisión Final ---
     
-    # Determinar autorización
-    autorizado = score_final >= 60 and len(razones_rechazo) == 0
+    # Umbral de aprobación configurable
+    autorizado = score_final >= MIN_SCORE and len(razones_rechazo) == 0
     
-    razon_rechazo = " | ".join(razones_rechazo) if razones_rechazo else None
+    # Fallback log
+    razon_str = " | ".join(map(str, razones_rechazo)) if razones_rechazo else None
+    warn_str = " | ".join(map(str, warnings_list)) if warnings_list else ""
     
-    # Recomendación
     if autorizado:
-        recomendacion = "✅ OPERABLE: Condiciones buenas para el trade"
-    elif score_final >= 50:
-        recomendacion = "⚠️ MARGINAL: Condiciones aceptables pero con riesgos"
+        recomendacion = f"✅ ENTRAMOS: Score {score_final:.1f} | E={expectancy:.2f}"
+    elif score_final >= (MIN_SCORE - 10):
+        recomendacion = f"⚠️ OBSERVACIÓN: Score {score_final:.1f} (Marginal)"
     else:
-        recomendacion = "❌ RECHAZADO: Esperar mejores condiciones"
-    
-    logger.info(f"[Whitelist] {symbol}-{tf} {tipo_operacion}: Score={score_final:.1f} Autorizado={autorizado}")
-    if razon_rechazo:
-        logger.warning(f"  Razones rechazo: {razon_rechazo}")
-    
+        recomendacion = f"❌ DESCARTADO: Score {score_final:.1f}"
+
+    logger.info(f"[Whitelist] {symbol}-{tf} {tipo_operacion}: Score={score_final:.1f} E={expectancy:.2f} Auth={autorizado}")
+    if razon_str: 
+        logger.warning(f"  [RECHAZO] {razon_str}")
+    if warn_str:
+        logger.info(f"  [WARN] {warn_str}")
+
     return {
         "autorizado": autorizado,
         "score_final": float(score_final),
-        "razon_rechazo": razon_rechazo,
+        "expectativa": float(expectancy),
+        "razon_rechazo": razon_str,
         "recomendacion": recomendacion
     }
 
@@ -11630,14 +11680,25 @@ def procesar_simbolo_temporalidad(
             prob_fundamental=entradas.get('probabilidad_fundamental', 50),
             rrr_promedio=entradas.get('entradas', [{}])[0].get('rrr', 1.0) if entradas.get('entradas') else 1.0,
             alertas=entradas.get('alertas', []),
-            tecnica_meta=entradas.get('tecnica_meta')
+            tecnica_meta=entradas.get('tecnica_meta'),
+            whitelist_cfg=(cfg or {}).get("whitelist")
         )
         es_autorizado_operar = whitelist_result.get('autorizado', False)
         score_whitelist = whitelist_result.get('score_final', 0)
+        expectativa_val = whitelist_result.get('expectativa', 0.0)
+        motivo_rechazo = whitelist_result.get('motivo_rechazo', "")
     except Exception as e:
         logger.warning(f"[Whitelist] Error evaluando autorización para {symbol}-{tf}: {e}")
         es_autorizado_operar = True  # Fallback: no bloquear si hay error
         score_whitelist = 0
+        expectativa_val = 0.0
+        motivo_rechazo = "Error evaluación"
+
+    # Injectar datos top-level en entradas para el front (JSON enriquecido)
+    entradas['score'] = score_whitelist
+    entradas['expectativa'] = expectativa_val
+    entradas['rechazo'] = motivo_rechazo
+    entradas['autorizado'] = es_autorizado_operar
 
     # Devolver resultados
     resultado = {
@@ -11646,8 +11707,10 @@ def procesar_simbolo_temporalidad(
         "Oportunidad": entradas.get('flag_oportunidad'),
         "Patrones Detectados": entradas.get('patrones_detectados'),
         "Tipo de Operacion": entradas.get('tipo_operacion'),
-        "Autorizado Operar (Whitelist)": es_autorizado_operar,  # ✅ PHASE 3
-        "Score Whitelist": score_whitelist,  # ✅ PHASE 3
+        "Autorizado Whitelist": es_autorizado_operar,  # ✅ PHASE 3
+        "Score Final": score_whitelist,                # ✅ PHASE 3 (Score Final para ranking)
+        "Expectativa": expectativa_val,                # ✅ PHASE 3
+        "Motivo Rechazo": motivo_rechazo,              # ✅ PHASE 3
         "Ultimo Valor": entradas.get('ultimo_valor'),
         "Soporte Nivel 2": entradas.get('soporte_nivel_2'),
         "Soporte Nivel 1": entradas.get('soporte_nivel_1'),
@@ -11760,6 +11823,7 @@ async def ejecutar_analisis_con_hilos(
     fmp_map   = cfg_overrides.get('fmpWindows')
     calc_map  = cfg_overrides.get('calcWindows')
     temps     = cfg_overrides.get('tfs') or temporalidades
+    white_cfg = cfg_overrides.get('whitelist')
 
     valid = {'1min','5min','15min','30min','1hour','4hour','1day','1week'}
     temps = [t for t in temps if t in valid]
@@ -11769,6 +11833,11 @@ async def ejecutar_analisis_con_hilos(
     # --- Análisis principal ---
     analisis_tasks = []
     meta = []  # (symbol, temporalidad) alineado con analisis_tasks
+    
+    # Preparar cfg para evaluar (inyectar whitelist si vino en overrides)
+    cfg_for_process = dict(cfg or {})
+    if white_cfg:
+        cfg_for_process["whitelist"] = white_cfg
 
     for symbol in activos_filtrados:
         for temporalidad in temps:
@@ -11777,7 +11846,7 @@ async def ejecutar_analisis_con_hilos(
                 symbol, temporalidad, df_eventos, user_chat_id, context,
                 fmp_windows=fmp_map,
                 calc_windows=calc_map,
-                cfg=cfg
+                cfg=cfg_for_process
             )
             fut = loop.run_in_executor(None, fn)
             analisis_tasks.append(fut)
@@ -13847,6 +13916,7 @@ async def ejecutar_recurrente(
                 "tfs":         (operatoria_cfg or {}).get("tfs"),
                 "fmpWindows":  (operatoria_cfg or {}).get("fmpWindows"),
                 "calcWindows": (operatoria_cfg or {}).get("calcWindows"),
+                "whitelist":   (operatoria_cfg or {}).get("whitelist"),
             },
             cfg=cfg,
         )

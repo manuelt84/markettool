@@ -91,11 +91,15 @@
 #### 2️⃣ Agregado: Sistema de Whitelisting
 - **Ubicación:** Líneas 8105-8178
 - **Función:** `evaluar_si_autorizado_operar()`
-- **Criterios:**
-  - Confluencia score >= 60% (25 pts)
-  - Probabilidad >= 55% (25 pts)
-  - RRR >= 1.5 (25 pts)
-  - Sin alertas críticas (25 pts)
+- **Criterios (MEJORADO - Expert Math/Trader):**
+  - **Expectativa Matemática (E):** Se calcula E = (ProbWin x RRR) - (ProbLoss x 1).
+    - Trades con E negativa se rechazan automáticamente.
+  - **Scoring Continuo (0-100):**
+    - Confluencia técnica (0-25 pts): Curva cuadrática.
+    - Probabilidad técnica (0-25 pts): Escala sensible (50%->0, 62.5% -> 25).
+    - RRR (0-25 pts): Escala lineal suave, premiando RRR > 2.0.
+  - **Penalizaciones:**
+    - Alertas críticas (RSI extremo, divergencias) reducen score en 15% compuesto.
   - Score final mínimo: 60/100
 - **Output:**
   - `autorizado`: bool
