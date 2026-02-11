@@ -10824,6 +10824,7 @@ def calcular_entradas(
                     )
                     stop_loss, take_profit = np.nan, np.nan
             else:
+                precio_entrada = None
                 take_profit = None
                 stop_loss = None
 
