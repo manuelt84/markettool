@@ -4659,6 +4659,717 @@ def is_metadata_stale(metadata: Dict[str, Any]) -> bool:
         return True
 
 
+# ======================================================================
+# INDICATORS CACHE SYSTEM (Reduce 30min -> 2-3min)
+# Multi-pod optimized: Stateless pods, GCS as source of truth
+# ======================================================================
+
+_INDICATORS_CACHE_ENABLED = os.environ.get("INDICATORS_CACHE_ENABLED", "true").lower() == "true"
+_INDICATORS_CACHE_TTL_HOURS = int(os.environ.get("INDICATORS_CACHE_TTL_HOURS", "4"))
+_INDICATORS_FORCE_RECALC = os.environ.get("INDICATORS_FORCE_RECALC", "false").lower() == "true"
+_INDICATORS_MEMORY_CACHE_SIZE = int(os.environ.get("INDICATORS_MEMORY_CACHE_SIZE", "5"))  # LRU pequeño
+_INDICATORS_LOCK_TIMEOUT_SEC = int(os.environ.get("INDICATORS_LOCK_TIMEOUT_SEC", "180"))  # 3 min
+
+
+def hash_dataframe(df: pd.DataFrame) -> str:
+    """
+    Genera hash SHA256 de un DataFrame para detectar cambios.
+    Hash solo de: index + close prices (suficiente para detectar updates).
+    
+    Args:
+        df: DataFrame con datos OHLCV
+    
+    Returns:
+        Hash de 16 caracteres (suficiente para colisiones)
+    """
+    try:
+        # Ordenar por index para consistencia
+        df_sorted = df.sort_index()
+        
+        # Serializar: timestamps + close prices (más eficiente que todo el DF)
+        timestamps = df_sorted.index.astype(str).tolist()[:100]  # Primeros 100
+        closes = df_sorted['close'].round(6).tolist()[-100:]     # Últimos 100
+        
+        data_str = f"{len(df)}_{timestamps}_{closes}"
+        
+        return hashlib.sha256(data_str.encode()).hexdigest()[:16]
+    except Exception as e:
+        logger.warning(f"[IndicatorsCache] Error hashing DataFrame: {e}")
+        # Fallback: hash basado en shape
+        return hashlib.sha256(f"{df.shape}_{time.time()}".encode()).hexdigest()[:16]
+
+
+def merge_indicators_incremental(cached: dict, new: dict, split_index: int, window_context: int) -> dict:
+    """
+    Combina indicadores cacheados + nuevos calculados incrementalmente.
+    
+    Args:
+        cached: Indicadores antiguos (completos)
+        new: Indicadores recién calculados (últimas velas + context)
+        split_index: Índice donde empiezan los datos realmente nuevos
+        window_context: Tamaño de ventana usado para context
+    
+    Returns:
+        Indicadores combinados
+    """
+    merged = {}
+    
+    # Indicadores que son listas de valores (por fila)
+    for key in new.keys():
+        if key not in cached:
+            # Indicador nuevo que no existía en cache
+            merged[key] = new[key]
+            continue
+        
+        cached_val = cached[key]
+        new_val = new[key]
+        
+        # Si son listas, hacer merge incremental
+        if isinstance(cached_val, list) and isinstance(new_val, list):
+            # Mantener cache antiguo hasta split_index
+            old_part = cached_val[:split_index]
+            
+            # Los nuevos valores ya incluyen window_context antes de split_index
+            # Solo tomamos los valores desde split_index en adelante
+            new_part = new_val[window_context:] if len(new_val) > window_context else new_val
+            
+            merged[key] = old_part + new_part
+        else:
+            # Para valores únicos o no-lista, usar el nuevo
+            merged[key] = new_val
+    
+    return merged
+
+
+class IndicatorsCache:
+    """
+    Sistema de caché inteligente para indicadores técnicos - MULTI-POD OPTIMIZED.
+    
+    Arquitectura stateless:
+    - GCS: única fuente de verdad (compartido entre todos los pods)
+    - Firestore: metadata + distributed lock (coordinación entre pods)
+    - Memory cache: LRU(5) solo para hit rate dentro de sesión (bajo consumo RAM)
+    - Lock distribuido: previene cálculos duplicados entre pods
+    
+    Features:
+    - Pods completamente stateless (bajo consumo de RAM)
+    - Coordinación automática entre pods via Firestore
+    - Activos dinámicos soportados (FMP on-demand)
+    - Cálculo incremental (solo velas nuevas + window context)
+    - Validación por hash (detecta cambios en datos)
+    
+    Performance esperado:
+    - Cold start (sin caché): mismo tiempo que antes (~30 min para 50 activos)
+    - Warm hit (GCS): 100-300ms por activo (sin cálculo)
+    - Incremental (nuevas velas): 2-3 min (solo recalcula últimas velas)
+    - Multi-pod: pod que llegue primero calcula, resto espera y usa resultado
+    """
+    
+    def __init__(self, bucket_name: str = None):
+        self.bucket_name = bucket_name or _GCS_BUCKET_NAME
+        self._bucket = None
+        self._db = None
+        self._lock = threading.Lock()
+        self._pod_id = socket.gethostname()  # Identificador único del pod
+        
+        # Memory cache LRU PEQUEÑO (solo 5 items para hit rate en sesión)
+        from collections import OrderedDict
+        self._memory_cache = OrderedDict()  # LRU: {key: (data, timestamp)}
+        self._memory_cache_max = _INDICATORS_MEMORY_CACHE_SIZE
+        self._memory_cache_ttl_sec = 300  # 5 min en memoria
+        
+        self._enabled = _INDICATORS_CACHE_ENABLED
+        
+        logger.info(f"[IndicatorsCache] Initialized (pod={self._pod_id}, enabled={self._enabled}, ttl={_INDICATORS_CACHE_TTL_HOURS}h, mem_lru={self._memory_cache_max})")
+    
+    @property
+    def bucket(self):
+        if self._bucket is None and self._enabled:
+            try:
+                self._bucket = storage.Client().bucket(self.bucket_name)
+            except Exception as e:
+                logger.warning(f"[IndicatorsCache] GCS not available: {e}")
+        return self._bucket
+    
+    @property
+    def db(self):
+        if self._db is None and self._enabled:
+            self._db = _get_firestore_client()
+        return self._db
+    
+    def _gcs_path(self, symbol: str, tf: str) -> str:
+        """Genera path en GCS para indicadores."""
+        return f"indicators/{symbol.upper()}__{normalize_tf(tf)}.json"
+    
+    def _metadata_doc_id(self, symbol: str, tf: str) -> str:
+        """Genera doc ID para Firestore metadata."""
+        return f"{symbol.upper()}__{normalize_tf(tf)}"
+    
+    def _memory_get(self, symbol: str, tf: str) -> Optional[dict]:
+        """Get from LRU memory cache (stateless, muy pequeño)."""
+        cache_key = f"{symbol}_{tf}"
+        if cache_key in self._memory_cache:
+            data, timestamp = self._memory_cache[cache_key]
+            age = time.time() - timestamp
+            
+            if age < self._memory_cache_ttl_sec:
+                # Move to end (LRU: most recent)
+                self._memory_cache.move_to_end(cache_key)
+                logger.debug(f"[IndicatorsCache] Memory hit: {symbol}/{tf} (age={age:.0f}s)")
+                return data
+            else:
+                # Expired: remove
+                del self._memory_cache[cache_key]
+        
+        return None
+    
+    def _memory_put(self, symbol: str, tf: str, data: dict):
+        """Put in LRU memory cache (auto-evict oldest if full)."""
+        cache_key = f"{symbol}_{tf}"
+        
+        # Remove if exists (to re-add at end)
+        if cache_key in self._memory_cache:
+            del self._memory_cache[cache_key]
+        
+        # Add at end (most recent)
+        self._memory_cache[cache_key] = (data, time.time())
+        
+        # Evict oldest if over limit (FIFO/LRU)
+        while len(self._memory_cache) > self._memory_cache_max:
+            oldest_key = next(iter(self._memory_cache))  # First item (oldest)
+            del self._memory_cache[oldest_key]
+            logger.debug(f"[IndicatorsCache] Evicted from memory: {oldest_key}")
+    
+    def load(self, symbol: str, tf: str) -> Optional[dict]:
+        """
+        Carga indicadores cacheados desde GCS (multi-pod aware).
+        
+        Flow:
+        1. Check memory cache (LRU pequeño, <100ms)
+        2. Check GCS (source of truth, 100-300ms)
+        3. Validate TTL
+        
+        Returns:
+            dict con estructura:
+            {
+                "metadata": {...},
+                "indicators": {...}
+            }
+            None si no existe o está inválido
+        """
+        if not self._enabled:
+            return None
+        
+        # 1. Check memory cache first (muy rápido)
+        mem_data = self._memory_get(symbol, tf)
+        if mem_data is not None:
+            return mem_data
+        
+        # 2. Load from GCS (source of truth para multi-pod)
+        try:
+            if self.bucket is None:
+                return None
+            
+            gcs_path = self._gcs_path(symbol, tf)
+            blob = self.bucket.blob(gcs_path)
+            
+            if not blob.exists():
+                logger.debug(f"[IndicatorsCache] Miss (not found in GCS): {symbol}/{tf}")
+                return None
+            
+            # Cargar desde GCS
+            data = json.loads(blob.download_as_text())
+            
+            # Validar estructura
+            if "metadata" not in data or "indicators" not in data:
+                logger.warning(f"[IndicatorsCache] Invalid structure: {symbol}/{tf}")
+                return None
+            
+            # Validar TTL
+            metadata = data["metadata"]
+            last_update = datetime.fromisoformat(metadata["last_update_utc"].replace('Z', '+00:00'))
+            age_hours = (datetime.utcnow().replace(tzinfo=timezone.utc) - last_update).total_seconds() / 3600
+            
+            if age_hours > _INDICATORS_CACHE_TTL_HOURS:
+                logger.info(f"[IndicatorsCache] Stale (age={age_hours:.1f}h): {symbol}/{tf}")
+                return None
+            
+            # Cache en memoria LRU
+            self._memory_put(symbol, tf, data)
+            
+            logger.info(f"[IndicatorsCache] GCS hit: {symbol}/{tf} (age={age_hours:.1f}h, rows={metadata.get('rows_count')}, pod={self._pod_id})")
+            return data
+        
+        except Exception as e:
+            logger.debug(f"[IndicatorsCache] Load error {symbol}/{tf}: {e}")
+            return None
+    
+    def save(self, symbol: str, tf: str, indicators: dict, df_historicos: pd.DataFrame, calc_duration_ms: float = 0):
+        """
+        Guarda indicadores en GCS + metadata en Firestore.
+        
+        Args:
+            symbol: Trading symbol
+            tf: Timeframe
+            indicators: Dict con indicadores calculados
+            df_historicos: DataFrame original (para hash y validación)
+            calc_duration_ms: Tiempo de cálculo en ms (para métricas)
+        """
+        if not self._enabled:
+            return
+        
+        try:
+            with self._lock:
+                if self.bucket is None or self.db is None:
+                    logger.warning("[IndicatorsCache] GCS/Firestore not available for save")
+                    return
+                
+                now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+                data_hash = hash_dataframe(df_historicos)
+                
+                # Preparar payload
+                payload = {
+                    "metadata": {
+                        "symbol": symbol.upper(),
+                        "timeframe": normalize_tf(tf),
+                        "last_update_utc": now_utc.isoformat(),
+                        "data_hash": data_hash,
+                        "rows_count": len(df_historicos),
+                        "calc_duration_ms": calc_duration_ms,
+                        "indicators_list": list(indicators.keys())
+                    },
+                    "indicators": indicators
+                }
+                
+                # Guardar en GCS
+                gcs_path = self._gcs_path(symbol, tf)
+                blob = self.bucket.blob(gcs_path)
+                blob.upload_from_string(
+                    json.dumps(payload, default=str),  # default=str para tipos no-json
+                    content_type="application/json"
+                )
+                
+                # Metadata en Firestore
+                doc_id = self._metadata_doc_id(symbol, tf)
+                self.db.collection("indicators_metadata").document(doc_id).set({
+                    "symbol": symbol.upper(),
+                    "timeframe": normalize_tf(tf),
+                    "gcs_path": f"gs://{self.bucket_name}/{gcs_path}",
+                    "last_update_utc": now_utc,
+                    "data_hash": data_hash,
+                    "rows_count": len(df_historicos),
+                    "indicators_list": list(indicators.keys()),
+                    "calc_duration_ms": calc_duration_ms,
+                    "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
+                    "is_valid": True
+                }, merge=True)
+                
+                # Cache en memoria LRU
+                self._memory_put(symbol, tf, payload)
+                
+                logger.info(f"[IndicatorsCache] Saved: {symbol}/{tf} ({len(df_historicos)} rows, {calc_duration_ms:.0f}ms, pod={self._pod_id})")
+        
+        except Exception as e:
+            logger.error(f"[IndicatorsCache] Save error {symbol}/{tf}: {e}")
+    
+    def invalidate(self, symbol: str, tf: str):
+        """
+        Invalida caché para forzar recálculo (multi-pod aware).
+        Marca como inválido en Firestore para que TODOS los pods lo sepan.
+        """
+        try:
+            # Eliminar de memoria local
+            cache_key = f"{symbol}_{tf}"
+            if cache_key in self._memory_cache:
+                del self._memory_cache[cache_key]
+            
+            # Marcar como inválido en Firestore (no eliminar, para auditoría)
+            if self.db:
+                doc_id = self._metadata_doc_id(symbol, tf)
+                self.db.collection("indicators_metadata").document(doc_id).update({
+                    "is_valid": False,
+                    "invalidated_at": datetime.utcnow().replace(tzinfo=timezone.utc)
+                })
+            
+            logger.info(f"[IndicatorsCache] Invalidated: {symbol}/{tf} (pod={self._pod_id})")
+        except Exception as e:
+            logger.warning(f"[IndicatorsCache] Invalidate error {symbol}/{tf}: {e}")
+    
+    def _acquire_lock(self, symbol: str, tf: str, timeout_sec: int = None) -> bool:
+        """
+        Intenta adquirir lock distribuido en Firestore (multi-pod coordination).
+        
+        Args:
+            symbol: Trading symbol
+            tf: Timeframe
+            timeout_sec: Timeout en segundos (default: 180s = 3 min)
+        
+        Returns:
+            True si se adquirió el lock, False si otro pod ya está calculando
+        """
+        if self.db is None:
+            return True  # Si no hay Firestore, proceder sin lock
+        
+        timeout_sec = timeout_sec or _INDICATORS_LOCK_TIMEOUT_SEC
+        
+        try:
+            doc_id = self._metadata_doc_id(symbol, tf)
+            doc_ref = self.db.collection("indicators_metadata").document(doc_id)
+            
+            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+            
+            # Leer estado actual
+            doc = doc_ref.get()
+            
+            if doc.exists:
+                data = doc.to_dict()
+                lock_pod = data.get("calculating_by_pod")
+                lock_time = data.get("calculating_since")
+                
+                if lock_pod and lock_time:
+                    # Hay un lock activo
+                    if isinstance(lock_time, str):
+                        lock_time = datetime.fromisoformat(lock_time.replace('Z', '+00:00'))
+                    elif hasattr(lock_time, "timestamp"):
+                        lock_time = datetime.fromtimestamp(lock_time.timestamp(), tz=timezone.utc)
+                    
+                    age_sec = (now_utc - lock_time).total_seconds()
+                    
+                    if age_sec < timeout_sec:
+                        # Lock válido: otro pod está calculando
+                        if lock_pod != self._pod_id:
+                            logger.info(f"[IndicatorsCache] Lock held by {lock_pod}: {symbol}/{tf} (age={age_sec:.0f}s)")
+                            return False
+                        # else: mismo pod, re-adquirir lock
+            
+            # Adquirir lock
+            doc_ref.set({
+                "calculating_by_pod": self._pod_id,
+                "calculating_since": now_utc,
+                "lock_acquired_at": now_utc
+            }, merge=True)
+            
+            logger.debug(f"[IndicatorsCache] Lock acquired: {symbol}/{tf} (pod={self._pod_id})")
+            return True
+        
+        except Exception as e:
+            logger.warning(f"[IndicatorsCache] Lock acquisition error {symbol}/{tf}: {e}")
+            return True  # En caso de error, proceder sin lock
+    
+    def _release_lock(self, symbol: str, tf: str):
+        """
+        Libera lock distribuido en Firestore.
+        """
+        if self.db is None:
+            return
+        
+        try:
+            doc_id = self._metadata_doc_id(symbol, tf)
+            doc_ref = self.db.collection("indicators_metadata").document(doc_id)
+            
+            # Solo liberar si el lock es de este pod
+            doc = doc_ref.get()
+            if doc.exists:
+                data = doc.to_dict()
+                if data.get("calculating_by_pod") == self._pod_id:
+                    doc_ref.update({
+                        "calculating_by_pod": firestore.DELETE_FIELD,
+                        "calculating_since": firestore.DELETE_FIELD,
+                        "lock_released_at": datetime.utcnow().replace(tzinfo=timezone.utc)
+                    })
+                    logger.debug(f"[IndicatorsCache] Lock released: {symbol}/{tf} (pod={self._pod_id})")
+        
+        except Exception as e:
+            logger.warning(f"[IndicatorsCache] Lock release error {symbol}/{tf}: {e}")
+    
+    def _wait_for_lock_release(self, symbol: str, tf: str, max_wait_sec: int = 200) -> bool:
+        """
+        Espera a que otro pod termine de calcular y libere el lock.
+        
+        Args:
+            symbol: Trading symbol
+            tf: Timeframe
+            max_wait_sec: Tiempo máximo de espera
+        
+        Returns:
+            True si el cálculo está listo, False si timeout
+        """
+        if self.db is None:
+            return False
+        
+        logger.info(f"[IndicatorsCache] Waiting for other pod to finish: {symbol}/{tf}")
+        
+        start_time = time.time()
+        check_interval = 2  # Check cada 2 segundos
+        
+        while (time.time() - start_time) < max_wait_sec:
+            try:
+                # Check si el lock se liberó
+                doc_id = self._metadata_doc_id(symbol, tf)
+                doc = self.db.collection("indicators_metadata").document(doc_id).get()
+                
+                if doc.exists:
+                    data = doc.to_dict()
+                    lock_pod = data.get("calculating_by_pod")
+                    
+                    if not lock_pod:
+                        # Lock liberado: intentar cargar resultado
+                        cached = self.load(symbol, tf)
+                        if cached is not None:
+                            logger.info(f"[IndicatorsCache] Other pod finished, using result: {symbol}/{tf}")
+                            return True
+                
+                # Esperar antes de próximo check
+                time.sleep(check_interval)
+            
+            except Exception as e:
+                logger.warning(f"[IndicatorsCache] Wait error {symbol}/{tf}: {e}")
+                break
+        
+        logger.warning(f"[IndicatorsCache] Wait timeout: {symbol}/{tf} (waited {max_wait_sec}s)")
+        return False
+    
+    def get_or_calculate(
+        self,
+        symbol: str,
+        tf: str,
+        df_historicos: pd.DataFrame,
+        calc_func: Callable[[pd.DataFrame, str], pd.DataFrame]
+    ) -> Tuple[pd.DataFrame, dict]:
+        """
+        Obtiene indicadores del caché o los calcula si es necesario.
+        MULTI-POD OPTIMIZED: usa lock distribuido para evitar cálculos duplicados.
+        
+        Flow:
+        1. Intentar cargar desde caché (memoria LRU → GCS)
+        2. Si no existe: intentar adquirir lock distribuido
+        3. Si lock adquirido: calcular y guardar
+        4. Si lock NO adquirido: esperar a que otro pod termine
+        5. Siempre liberar lock al final
+        
+        Args:
+            symbol: Trading symbol
+            tf: Timeframe
+            df_historicos: DataFrame con datos OHLCV
+            calc_func: Función de cálculo (ej: calcular_indicadores_impl)
+        
+        Returns:
+            Tuple (df_con_indicadores, stats)
+            stats: dict con métricas (cache_hit, incremental, calc_time, etc.)
+        """
+        if not self._enabled or _INDICATORS_FORCE_RECALC:
+            # Modo sin caché o forzar recálculo
+            start_time = time.time()
+            df_result = calc_func(df_historicos.copy(), tf)
+            calc_time_ms = (time.time() - start_time) * 1000
+            
+            return df_result, {
+                "cache_hit": False,
+                "incremental": False,
+                "calc_time_ms": calc_time_ms,
+                "source": "full_calc_no_cache",
+                "pod_id": self._pod_id
+            }
+        
+        # 1. Intentar cargar caché
+        cached = self.load(symbol, tf)
+        
+        if cached is None:
+            # No hay caché: necesita cálculo
+            
+            # 2. Intentar adquirir lock distribuido (multi-pod coordination)
+            lock_acquired = self._acquire_lock(symbol, tf)
+            
+            if not lock_acquired:
+                # Otro pod está calculando: esperar resultado
+                logger.info(f"[IndicatorsCache] Another pod calculating: {symbol}/{tf} (pod={self._pod_id})")
+                
+                if self._wait_for_lock_release(symbol, tf, max_wait_sec=200):
+                    # Otro pod terminó: cargar resultado
+                    cached = self.load(symbol, tf)
+                    if cached is not None:
+                        df_result = self._apply_indicators_to_df(df_historicos.copy(), cached["indicators"])
+                        return df_result, {
+                            "cache_hit": True,
+                            "incremental": False,
+                            "calc_time_ms": 0,
+                            "source": "waited_for_other_pod",
+                            "pod_id": self._pod_id
+                        }
+                
+                # Timeout o error esperando: calcular nosotros
+                logger.warning(f"[IndicatorsCache] Wait failed, calculating anyway: {symbol}/{tf}")
+                lock_acquired = True  # Forzar cálculo
+            
+            if lock_acquired:
+                # Tenemos el lock: calcular
+                try:
+                    logger.info(f"[IndicatorsCache] Cold start: {symbol}/{tf} (pod={self._pod_id})")
+                    start_time = time.time()
+                    df_result = calc_func(df_historicos.copy(), tf)
+                    calc_time_ms = (time.time() - start_time) * 1000
+                    
+                    # Extraer indicadores del DataFrame y guardar
+                    indicators = self._extract_indicators_from_df(df_result)
+                    self.save(symbol, tf, indicators, df_historicos, calc_time_ms)
+                    
+                    return df_result, {
+                        "cache_hit": False,
+                        "incremental": False,
+                        "calc_time_ms": calc_time_ms,
+                        "source": "full_calc_cold_start",
+                        "pod_id": self._pod_id
+                    }
+                finally:
+                    # SIEMPRE liberar lock
+                    self._release_lock(symbol, tf)
+        
+        # 3. Tenemos caché: validar si datos históricos cambiaron
+        cached_hash = cached["metadata"]["data_hash"]
+        current_hash = hash_dataframe(df_historicos)
+        cached_rows = cached["metadata"]["rows_count"]
+        current_rows = len(df_historicos)
+        
+        if cached_hash == current_hash and cached_rows == current_rows:
+            # Hit perfecto: datos idénticos
+            logger.info(f"[IndicatorsCache] Perfect hit: {symbol}/{tf} ({current_rows} rows, pod={self._pod_id})")
+            df_result = self._apply_indicators_to_df(df_historicos.copy(), cached["indicators"])
+            
+            return df_result, {
+                "cache_hit": True,
+                "incremental": False,
+                "calc_time_ms": 0,
+                "source": "cache_perfect_match",
+                "cached_age_hours": (datetime.utcnow().replace(tzinfo=timezone.utc) - 
+                                     datetime.fromisoformat(cached["metadata"]["last_update_utc"].replace('Z', '+00:00'))).total_seconds() / 3600,
+                "pod_id": self._pod_id
+            }
+        
+        # 4. Cálculo incremental: solo nuevas velas
+        if current_rows > cached_rows:
+            # Adquirir lock para cálculo incremental
+            lock_acquired = self._acquire_lock(symbol, tf)
+            
+            if not lock_acquired:
+                # Otro pod haciendo incremental: esperar
+                if self._wait_for_lock_release(symbol, tf, max_wait_sec=120):
+                    cached = self.load(symbol, tf)
+                    if cached is not None:
+                        df_result = self._apply_indicators_to_df(df_historicos.copy(), cached["indicators"])
+                        return df_result, {
+                            "cache_hit": True,
+                            "incremental": True,
+                            "calc_time_ms": 0,
+                            "source": "waited_for_other_pod_incremental",
+                            "pod_id": self._pod_id
+                        }
+            
+            try:
+                new_bars = current_rows - cached_rows
+                window = definir_window(tf)
+                
+                # Context necesario para indicadores (ej: RSI necesita window previo)
+                context_start = max(0, cached_rows - window)
+                df_to_calc = df_historicos.iloc[context_start:].copy()
+                
+                logger.info(f"[IndicatorsCache] Incremental: {symbol}/{tf} (+{new_bars} bars, context={window}, pod={self._pod_id})")
+                
+                start_time = time.time()
+                df_partial = calc_func(df_to_calc, tf)
+                calc_time_ms = (time.time() - start_time) * 1000
+                
+                # Extraer indicadores del segmento calculado
+                indicators_partial = self._extract_indicators_from_df(df_partial)
+                
+                # Merge: mantener cache antiguo + nuevos valores
+                indicators_merged = merge_indicators_incremental(
+                    cached["indicators"],
+                    indicators_partial,
+                    cached_rows,
+                    window
+                )
+                
+                # Aplicar al DataFrame completo
+                df_result = self._apply_indicators_to_df(df_historicos.copy(), indicators_merged)
+                
+                # Guardar actualizado
+                self.save(symbol, tf, indicators_merged, df_historicos, calc_time_ms)
+                
+                return df_result, {
+                    "cache_hit": True,
+                    "incremental": True,
+                    "calc_time_ms": calc_time_ms,
+                    "source": "incremental_update",
+                    "new_bars": new_bars,
+                    "cached_rows": cached_rows,
+                    "total_rows": current_rows,
+                    "pod_id": self._pod_id
+                }
+            finally:
+                if lock_acquired:
+                    self._release_lock(symbol, tf)
+        
+        else:
+            # Los datos se redujeron o cambiaron estructura: recalcular todo
+            lock_acquired = self._acquire_lock(symbol, tf)
+            
+            try:
+                logger.warning(f"[IndicatorsCache] Data mismatch: {symbol}/{tf} (cached={cached_rows}, current={current_rows}, pod={self._pod_id})")
+                start_time = time.time()
+                df_result = calc_func(df_historicos.copy(), tf)
+                calc_time_ms = (time.time() - start_time) * 1000
+                
+                indicators = self._extract_indicators_from_df(df_result)
+                self.save(symbol, tf, indicators, df_historicos, calc_time_ms)
+                
+                return df_result, {
+                    "cache_hit": False,
+                    "incremental": False,
+                    "calc_time_ms": calc_time_ms,
+                    "source": "full_calc_data_mismatch",
+                    "pod_id": self._pod_id
+                }
+            finally:
+                if lock_acquired:
+                    self._release_lock(symbol, tf)
+    
+    def _extract_indicators_from_df(self, df: pd.DataFrame) -> dict:
+        """Extrae indicadores de un DataFrame a dict serializable."""
+        indicators = {}
+        
+        # Columnas de indicadores (excluir OHLCV originales)
+        base_cols = {'open', 'high', 'low', 'close', 'volume', 'time'}
+        indicator_cols = [col for col in df.columns if col not in base_cols]
+        
+        for col in indicator_cols:
+            try:
+                values = df[col].tolist()
+                # Convertir tipos especiales a serializables
+                values = [None if pd.isna(v) else v for v in values]
+                indicators[col] = values
+            except Exception as e:
+                logger.warning(f"[IndicatorsCache] Error extracting column {col}: {e}")
+        
+        return indicators
+    
+    def _apply_indicators_to_df(self, df: pd.DataFrame, indicators: dict) -> pd.DataFrame:
+        """Aplica indicadores desde dict a DataFrame."""
+        for col, values in indicators.items():
+            try:
+                if len(values) == len(df):
+                    df[col] = values
+                else:
+                    logger.warning(f"[IndicatorsCache] Length mismatch for {col}: {len(values)} vs {len(df)}")
+            except Exception as e:
+                logger.warning(f"[IndicatorsCache] Error applying column {col}: {e}")
+        
+        return df
+
+
+# Instancia global del caché
+_INDICATORS_CACHE = IndicatorsCache()
+
+
 # CARPETA_HISTORICOS debe estar definido en tu módulo
 # cache_historicos es global
 
@@ -5836,7 +6547,18 @@ def obtener_datos_con_hilos(
 
 # Función para calcular indicadores
 #@profile
-def calcular_indicadores(df, temporalidad):
+def calcular_indicadores_impl(df, temporalidad):
+    """
+    Implementación original de cálculo de indicadores.
+    Esta función NO debe llamarse directamente; usar calcular_indicadores() que incluye caché.
+    
+    Args:
+        df: DataFrame con datos OHLCV
+        temporalidad: Timeframe (1min, 5min, etc.)
+    
+    Returns:
+        DataFrame con indicadores calculados
+    """
     window = min(definir_window(temporalidad), len(df))
 
     # Media Móvil Simple (SMA)
@@ -5927,6 +6649,57 @@ def calcular_indicadores(df, temporalidad):
     df.bfill(inplace=True)
 
     return df
+
+
+def calcular_indicadores(df, temporalidad, symbol=None):
+    """
+    Calcula indicadores técnicos con caché inteligente.
+    
+    Si symbol es None, calcula sin caché (modo compatibilidad/legacy).
+    Si symbol está presente, usa sistema de caché incremental con GCS.
+    
+    Args:
+        df: DataFrame con datos OHLCV
+        temporalidad: Timeframe (1min, 5min, 1hour, 1day, etc.)
+        symbol: Trading symbol (ej: "EURUSD"). Si None, no usa caché.
+    
+    Returns:
+        DataFrame con indicadores calculados
+        
+    Performance:
+        - Sin caché (symbol=None): mismo tiempo que antes
+        - Con caché (cold start): mismo tiempo + overhead de save (~100ms)
+        - Con caché (hit): <100ms (solo carga desde GCS)
+        - Con caché (incremental): proporcional a nuevas velas (~5-10% del tiempo total)
+    """
+    if symbol is None or not _INDICATORS_CACHE_ENABLED:
+        # Modo legacy: sin caché
+        return calcular_indicadores_impl(df, temporalidad)
+    
+    # Modo con caché
+    df_result, stats = _INDICATORS_CACHE.get_or_calculate(
+        symbol=symbol,
+        tf=temporalidad,
+        df_historicos=df,
+        calc_func=calcular_indicadores_impl
+    )
+    
+    # Log stats para métricas
+    if stats.get("cache_hit"):
+        if stats.get("incremental"):
+            logger.info(
+                f"[Indicators] {symbol}/{temporalidad}: Incremental (+{stats.get('new_bars', 0)} bars, {stats['calc_time_ms']:.0f}ms, pod={stats.get('pod_id', '?')})"
+            )
+        else:
+            logger.info(
+                f"[Indicators] {symbol}/{temporalidad}: Cache hit (age={stats.get('cached_age_hours', 0):.1f}h, 0ms, source={stats.get('source', '?')}, pod={stats.get('pod_id', '?')})"
+            )
+    else:
+        logger.info(
+            f"[Indicators] {symbol}/{temporalidad}: Full calc ({stats['calc_time_ms']:.0f}ms, source={stats['source']}, pod={stats.get('pod_id', '?')})"
+        )
+    
+    return df_result
 
 def limitar_probabilidad(probabilidad_exito):
     return max(1, min(probabilidad_exito, 100))
@@ -9484,7 +10257,7 @@ def procesar_simbolo_temporalidad(
 
     # ------------------- Indicadores -------------------
     try:
-        df_indicadores = calcular_indicadores(df_combinado, tf)
+        df_indicadores = calcular_indicadores(df_combinado, tf, symbol=symbol)
         if df_indicadores is None or df_indicadores.empty:
             logger.info(f"No hay indicadores para {symbol} en {tf}.")
             return None
@@ -16907,6 +17680,143 @@ def health_check():
 #@profile
 def index():
     return "El bot está funcionando", 200
+
+
+# ======================================================================
+# INDICATORS CACHE API ENDPOINTS
+# ======================================================================
+
+@webhook_app.route('/api/cache/invalidate', methods=['POST'])
+def api_cache_invalidate():
+    """
+    Invalida caché de indicadores para un activo/temporalidad.
+    
+    Body JSON:
+        {
+            "symbol": "EURUSD",
+            "timeframe": "1day"
+        }
+    
+    Returns:
+        {"status": "ok", "message": "Cache invalidated"}
+    """
+    try:
+        data = request.get_json()
+        symbol = data.get('symbol')
+        timeframe = data.get('timeframe')
+        
+        if not symbol or not timeframe:
+            return jsonify({"error": "Missing symbol or timeframe"}), 400
+        
+        _INDICATORS_CACHE.invalidate(symbol, timeframe)
+        
+        return jsonify({
+            "status": "ok",
+            "message": f"Cache invalidated for {symbol}/{timeframe}"
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"[API] Cache invalidate error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@webhook_app.route('/api/cache/stats', methods=['GET'])
+def api_cache_stats():
+    """
+    Obtiene estadísticas del caché de indicadores.
+    
+    Returns:
+        {
+            "enabled": true,
+            "memory_cache_size": 42,
+            "ttl_hours": 4,
+            "cached_symbols": ["EURUSD__1day", "GBPUSD__4hour", ...]
+        }
+    """
+    try:
+        cached_keys = list(_INDICATORS_CACHE._memory_cache.keys())
+        
+        return jsonify({
+            "enabled": _INDICATORS_CACHE_ENABLED,
+            "memory_cache_size": len(cached_keys),
+            "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
+            "force_recalc": _INDICATORS_FORCE_RECALC,
+            "cached_symbols": cached_keys
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"[API] Cache stats error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@webhook_app.route('/api/cache/clear', methods=['POST'])
+def api_cache_clear():
+    """
+    Limpia todo el caché de memoria (NO elimina de GCS).
+    
+    Returns:
+        {"status": "ok", "cleared_items": 42}
+    """
+    try:
+        count = len(_INDICATORS_CACHE._memory_cache)
+        _INDICATORS_CACHE._memory_cache.clear()
+        _INDICATORS_CACHE._memory_cache_ttl.clear()
+        
+        return jsonify({
+            "status": "ok",
+            "cleared_items": count,
+            "message": "Memory cache cleared (GCS data preserved)"
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"[API] Cache clear error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@webhook_app.route('/api/cache/metadata', methods=['GET'])
+def api_cache_metadata():
+    """
+    Obtiene metadata de indicadores desde Firestore.
+    
+    Query params:
+        ?symbol=EURUSD&timeframe=1day
+    
+    Returns:
+        Metadata del caché si existe, o null
+    """
+    try:
+        symbol = request.args.get('symbol')
+        timeframe = request.args.get('timeframe')
+        
+        if not symbol or not timeframe:
+            return jsonify({"error": "Missing symbol or timeframe parameters"}), 400
+        
+        # Obtener metadata desde Firestore
+        if _INDICATORS_CACHE.db:
+            doc_id = _INDICATORS_CACHE._metadata_doc_id(symbol, timeframe)
+            doc = _INDICATORS_CACHE.db.collection("indicators_metadata").document(doc_id).get()
+            
+            if doc.exists:
+                metadata = doc.to_dict()
+                # Convertir timestamps a ISO strings
+                if 'last_update_utc' in metadata:
+                    metadata['last_update_utc'] = metadata['last_update_utc'].isoformat()
+                
+                return jsonify({
+                    "exists": True,
+                    "metadata": metadata
+                }), 200
+            else:
+                return jsonify({
+                    "exists": False,
+                    "message": f"No metadata found for {symbol}/{timeframe}"
+                }), 404
+        else:
+            return jsonify({"error": "Firestore not available"}), 503
+    
+    except Exception as e:
+        logger.error(f"[API] Cache metadata error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 # Ruta de prueba
