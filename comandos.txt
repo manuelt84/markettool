@@ -71,6 +71,40 @@ gcloud container node-pools update new-pool --cluster=trading-cluster --zone=sou
 openssl.exe req -x509 -nodes -days 365 -newkey rsa:2048 -keyout certs/cert.key -out certs/cert.crt -config C:\projects\markettool\san.cnf
 
 
+#=== GCS STORAGE (Bucket para históricos) ===
+# PASO 1: Re-autenticar si es necesario
+gcloud auth login
+
+# PASO 2: Dar permisos EDITOR a la service account (rol completo - incluye Storage + Firestore)
+gcloud projects add-iam-policy-binding trading-449607 --member="serviceAccount:firestore@trading-449607.iam.gserviceaccount.com" --role="roles/editor"
+
+# Alternativa desde consola web (más fácil):
+# https://console.cloud.google.com/iam-admin/iam?project=trading-449607
+# Buscar: firestore@trading-449607.iam.gserviceaccount.com
+# Editar → Agregar rol: Editor (roles/editor)
+
+# Crear bucket si no existe
+gsutil mb -p trading-449607 -c STANDARD -l southamerica-west1 gs://markettool/
+
+# Verificar service account actual
+python check_sa.py
+
+# Poblar bucket con históricos (ejecutar una vez)
+python populate_gcs.py
+
+# Verificar bucket y contenido
+gsutil ls -p trading-449607
+gsutil ls gs://markettool/
+gsutil ls gs://markettool/historicos/
+
+# Ver archivos específicos
+gsutil ls -lh gs://markettool/historicos/
+gsutil cat gs://markettool/historicos/EURUSD__1day.json
+
+# URL consola web
+# https://console.cloud.google.com/storage/browser/markettool/historicos?project=trading-449607
+
+
 #Comandos ejecutados repetidamente
 docker build -t markettool .
 docker run --env-file .env markettool  ##Ejecutar Local

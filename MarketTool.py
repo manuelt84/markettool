@@ -772,6 +772,7 @@ class HistoryConfig:
     bars: Optional[int] = None
     append_realtime: bool = True
     allow_refresh: bool = True
+    fmp_window: Optional[int] = None   # Nueva propiedad para override de ventana inicial
 
 
 # --------------------------- Historical merge helpers ---------------------------
@@ -893,7 +894,8 @@ class HistoryManager:
 
         now = utc_now()
         if cache_df.empty:
-            win = DEFAULT_FMP_WINDOWS.get(tf, 1000)
+            # PRIORIDAD: Si cfg trae fmp_window, úsala. Si no, usa el DEFAULT.
+            win = cfg.fmp_window if (cfg.fmp_window and cfg.fmp_window > 0) else DEFAULT_FMP_WINDOWS.get(tf, 1000)
             from_dt = now - self._timedelta_for(tf, win)
         else:
             last = cache_df.index[-1]
@@ -936,13 +938,16 @@ _HIST = HistoryManager(client=_FMP)
 def obtener_datos_historicos(symbol: str, temporalidad: str,
                              bars: Optional[int] = None,
                              append_realtime: bool = True,
-                             allow_refresh: bool = True) -> pd.DataFrame:
-    cfg = HistoryConfig(bars=bars, append_realtime=append_realtime, allow_refresh=allow_refresh)
+                             allow_refresh: bool = True,
+                             fmp_window: Optional[int] = None) -> pd.DataFrame:
+    cfg = HistoryConfig(bars=bars, append_realtime=append_realtime, allow_refresh=allow_refresh, fmp_window=fmp_window)
     return _HIST.get(symbol, temporalidad, cfg=cfg)
 
 def obtener_datos_historicos_fmp(symbol: str, temporalidad: str, *,
                                  bars: int | None = None, **kwargs):
-    return obtener_datos_historicos(symbol, temporalidad, bars=bars, append_realtime=True, allow_refresh=True)
+    # kwargs puede traer fmp_window
+    window = kwargs.get("fmp_window") or kwargs.get("window")
+    return obtener_datos_historicos(symbol, temporalidad, bars=bars, append_realtime=True, allow_refresh=True, fmp_window=window)
 
 
 #mpl.rcParams['figure.max_open_warning'] = 200
@@ -3483,6 +3488,31 @@ def obtener_datos_firestore():
 
 
 #@profile
+def _ensure_globals_loaded():
+    """
+    Lazy loader: carga activos, forex, categorias, etc. si están vacíos.
+    Llamado bajo demanda antes de operaciones que necesiten estas listas.
+    """
+    global activos, forex, relacionados_usd, categorias, temporalidades, zonas_horarias
+    
+    # Solo carga si las listas/diccionarios están vacíos
+    if not activos or not forex or not categorias:
+        try:
+            logger.info("[Lazy Load] Cargando datos base de Firestore...")
+            activos, forex, relacionados_usd = obtener_datos_firestore()
+            categorias, temporalidades, zonas_horarias = obtener_configuracion()
+            logger.info(f"[Lazy Load] Cargados: {len(activos)} activos, {len(forex)} forex, {len(categorias)} categorías")
+        except Exception as e:
+            logger.error(f"[Lazy Load] Error cargando datos: {e}")
+            # Mantener valores por defecto vacíos
+            if not activos: activos = []
+            if not forex: forex = []
+            if not relacionados_usd: relacionados_usd = []
+            if not categorias: categorias = {}
+            if not temporalidades: temporalidades = []
+            if not zonas_horarias: zonas_horarias = []
+
+
 def obtener_configuracion():
     """
     Obtiene los datos de Firestore para las categorías, temporalidades y zonas horarias.
@@ -4332,7 +4362,7 @@ _LAZY_HIST_LOADER = LazyHistoricosLoader(
 # ======================================================================
 
 _GCS_CLIENT = None
-_GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool")
+_GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
 _GCS_ENABLED = os.environ.get("GCS_ENABLED", "true").lower() == "true"
 
 def _get_gcs_bucket():
@@ -11371,6 +11401,9 @@ async def ejecutar_recurrente(
     # --- Resolver chat_id si falta y hay user_id
     if not user_chat_id and user_id:
         user_chat_id = await asyncio.to_thread(_find_chat_id_for_user_sync, db, user_id)
+
+    # --- Asegurar que las listas globales estén cargadas (lazy loading)
+    await asyncio.to_thread(_ensure_globals_loaded)
 
     # --- Filtrado de activos por moneda
     global activos
