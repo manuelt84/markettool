@@ -7416,14 +7416,6 @@ async def enviar_eventos_y_archivo_calendar(df, context, user_chat_id):
 
 
 #@profile
-def _is_finite_number(x) -> bool:
-    try:
-        return isinstance(x, (int, float, np.floating)) and math.isfinite(float(x))
-    except Exception:
-        return False
-
-
-#@profile
 def _coerce_float(x):
     """Devuelve float(x) si es finito; si no, None."""
     try:
@@ -7438,28 +7430,6 @@ def _coerce_float(x):
         return v if math.isfinite(v) else None
     except Exception:
         return None
-
-#@profile
-def _lookup_rt_tick(cache_rt: dict, symbol: str):
-    """Busca el último close en varias variantes de clave."""
-    if symbol in cache_rt:
-        return cache_rt[symbol]
-    up = symbol.upper()
-    lo = symbol.lower()
-    if up in cache_rt:
-        return cache_rt[up]
-    if lo in cache_rt:
-        return cache_rt[lo]
-    # soportar prefijos tipo "OANDA:EURUSD"
-    if ":" in symbol:
-        tail = symbol.split(":", 1)[1]
-        if tail in cache_rt:
-            return cache_rt[tail]
-        if tail.upper() in cache_rt:
-            return cache_rt[tail.upper()]
-        if tail.lower() in cache_rt:
-            return cache_rt[tail.lower()]
-    return None
 
 # Implementación de hilos para optimizar las solicitudes de datos
 #@profile
@@ -11961,19 +11931,6 @@ def _csv_params_from_cfg(cfg: dict):
 def _use_dayfirst(cfg: dict | None) -> bool:
     fmt = ((cfg or {}).get("locale") or {}).get("date_format")
     return fmt == "DD/MM/YYYY"
-
-# si quieres formatear el texto de salida también:
-def _strftime_from_cfg(cfg: dict | None) -> tuple[str, str, str]:
-    loc = (cfg or {}).get("locale") or {}
-    date_map = {
-        "DD/MM/YYYY": "%d/%m/%Y",
-        "MM/DD/YYYY": "%m/%d/%Y",
-        "YYYY-MM-DD": "%Y-%m-%d",
-    }
-    time_map = {"24h": "%H:%M", "12h": "%I:%M %p"}
-    date_fmt = date_map.get(loc.get("date_format"), "%Y-%m-%d")
-    time_fmt = time_map.get(loc.get("time_format"), "%H:%M")
-    return date_fmt, time_fmt, f"{date_fmt} {time_fmt}"
 
 def _prepare_df_for_csv(df_in: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """Copia el DF y aplica formatos de fecha/hora y numéricos según cfg, sin destruir columnas no-fecha."""
@@ -17436,90 +17393,10 @@ def _densify_minutes(series: list[dict], tf: str, max_fill:int = 10, max_gap_min
 
     return out
 
-def _overlay_historical_for_closed(series: list[dict], hist: list[dict], tf: str) -> list[dict]:
-    """
-    Reemplaza (o crea) los buckets ya CERRADOS usando barras de historical (que suelen traer v>0).
-    Mantiene la vela del bucket en curso tal como estaba (tick).
-    """
-    if not series: return series
-    tfms = _tfms(tf)
-    cur_bucket = _current_bucket_start(tfms)
-    # index por bucket
-    s_map = {c["t"]: dict(c) for c in series}
-    for b in (hist or []):
-        t = _bucket_start(int(b["t"]), tfms)
-        if t >= cur_bucket:
-            continue  # no sobreescribas el bucket vigente
-        cand = {"t": t, "o": float(b["o"]), "h": float(b["h"]), "l": float(b["l"]), "c": float(b["c"]), "v": float(b.get("v",0))}
-        if t in s_map:
-            s_map[t] = _prefer(s_map[t], cand)
-        else:
-            s_map[t] = cand
-    out = list(s_map.values())
-    out.sort(key=lambda x: x["t"])
-    return out
-
-def _closed_signature(series: list[dict], tf: str) -> tuple:
-    """
-    Firma barata de 'buckets cerrados' para detectar cambios reales tras overlay/backfill.
-    Devuelve (count_closed, last_closed_ts, checksum_int)
-    """
-    if not series:
-        return (0, None, 0)
-    tfms = _tf_ms(tf)
-    cur_bucket = _current_closed_bucket_start(tf)
-    count = 0
-    last_t = None
-    checksum = 0
-    for c in series:
-        t = int(c["t"])
-        if t >= cur_bucket:
-            break
-        count += 1
-        last_t = t
-        # checksum liviano y determinista
-        # redondeo para evitar ruido por floats
-        o = int(round(float(c.get("o", 0))*1e5))
-        h = int(round(float(c.get("h", 0))*1e5))
-        l = int(round(float(c.get("l", 0))*1e5))
-        v = int(round(float(c.get("v", 0))*1e2))
-        checksum = (checksum * 1315423911 + t + o + h + l + v) & 0xFFFFFFFF
-    return (count, last_t, checksum)
-
-
-def _ms_to_iso(ms: int) -> str:
-    return datetime.utcfromtimestamp(ms/1000.0).strftime("%Y-%m-%d %H:%M:%S")
-
-
 def _current_closed_bucket_start(tf: str) -> int:
     tfms = _tf_ms(tf)
     now_bucket = (_now_ms() // tfms) * tfms
     return now_bucket  # este es el inicio del bucket en curso; 'cerrados' son < now_bucket
-
-
-def _backfill_range_once(series: list[dict], symbol: str, tf: str, from_ms: int, to_ms: int) -> int:
-    """
-    Backfill de una sola llamada con rango exacto [from_ms, to_ms].
-    - No depende de que 'series' ya tenga datos (puede sembrar).
-    - No toca el bucket en curso (filtra por seguridad).
-    """
-    if to_ms <= from_ms:
-        return 0
-
-    rng = _fetch_historical_range(symbol, tf, from_ms, to_ms)
-    if not rng:
-        return 0
-
-    # Blindaje opcional: evita afectar el bucket vigente
-    cur_open = _current_closed_bucket_start(tf)  # inicio del bucket en curso
-    rng = [b for b in rng if int(b["t"]) < cur_open]
-    if not rng:
-        return 0
-
-    added = merge_bars_series(series, rng, tf)
-    if added:
-        series[:] = _snap_and_dedupe_to_minutes(series, tf)
-    return added
 
 def _ms_to_iso_utc(ts_ms: int) -> str:
     # "YYYY-MM-DD HH:MM:SS" en UTC (formato que acepta FMP en historical-chart)
@@ -17545,45 +17422,6 @@ def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> l
     except Exception as e:
         logging.warning(f"[Historical-Range] Error: {e}")
         return []
-
-
-def _fmp_hist_with_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> list[dict]:
-    if not API_KEY: 
-        return []
-    iv = _fmp_interval(tf)
-    url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}"
-    logging.info(f"[Historical-Range-Alt] URL: {url}")
-    params = {"apikey": API_KEY, "from": _ms_to_fmp_local(from_ms), "to": _ms_to_fmp_local(to_ms)}
-    try:
-        r = HTTP_SESSION.get(url, params=params, timeout=20)
-        if not r.ok:
-            return []
-        return _normalize_fmp_bars(r.json())  # ya devuelve ascendente
-    except Exception:
-        return []
-
-
-def _detect_closed_gaps(series: list[dict], tf: str) -> list[tuple[int, int]]:
-    """
-    Lista los huecos entre buckets YA CERRADOS: [(from_ms, to_ms)].
-    La serie debe venir snap/dedup y ordenada.
-    """
-    if not series:
-        return []
-    tfms = _tf_ms(tf)
-    cur_bucket = _current_bucket_start(tfms)
-    gaps = []
-    for i in range(1, len(series)):
-        a = series[i-1]["t"]
-        b = series[i]["t"]
-        if b >= cur_bucket:
-            break  # no miramos gaps que toquen el bucket en curso
-        delta = (b - a) // tfms
-        if delta > 1:
-            from_ms = a + tfms
-            to_ms   = b
-            gaps.append((from_ms, to_ms))
-    return gaps
 
 
 def _backfill_internal_gaps(
