@@ -7680,9 +7680,16 @@ def calcular_indicadores(df, temporalidad, symbol=None):
         - Con caché (hit): <100ms (solo carga desde GCS)
         - Con caché (incremental): proporcional a nuevas velas (~5-10% del tiempo total)
     """
+    REQUIRED_INDICATORS = {"macd", "signal", "rsi", "%K", "%D", "close", "high", "low", "ATR"}
+    
     if symbol is None or not _INDICATORS_CACHE_ENABLED:
         # Modo legacy: sin caché
-        return calcular_indicadores_impl(df, temporalidad)
+        df_result = calcular_indicadores_impl(df, temporalidad)
+        # Validar que se calcularon todos los indicadores
+        missing = REQUIRED_INDICATORS - set(df_result.columns)
+        if missing:
+            raise ValueError(f"[calcular_indicadores] Faltan columnas requeridas después de calcular_impl: {missing}. El cálculo fue incompleto.")
+        return df_result
     
     # Modo con caché
     df_result, stats = _INDICATORS_CACHE.get_or_calculate(
@@ -7691,6 +7698,24 @@ def calcular_indicadores(df, temporalidad, symbol=None):
         df_historicos=df,
         calc_func=calcular_indicadores_impl
     )
+    
+    # ✅ VALIDACIÓN CRÍTICA: Asegurar que el caché devolvió un DataFrame completo
+    missing_indicators = REQUIRED_INDICATORS - set(df_result.columns)
+    if missing_indicators:
+        logger.error(
+            f"[calcular_indicadores] CACHE CORRUPTED: {symbol}/{temporalidad} missing indicators: {missing_indicators}. "
+            f"Cache source: {stats.get('source')}. Force recalc on next run."
+        )
+        # Marcar caché como corrupto para invalidar en siguiente llamada
+        try:
+            _INDICATORS_CACHE.invalidate(symbol, temporalidad)
+        except Exception as e:
+            logger.warning(f"[calcular_indicadores] Could not invalidate cache: {e}")
+        # Lanzar excepción para que el caller reintente
+        raise ValueError(
+            f"DataFrame del caché incompleto: faltan {missing_indicators}. "
+            f"Caché invalidado. Intenta de nuevo en la próxima ejecución."
+        )
     
     # Log stats para métricas
     if stats.get("cache_hit"):
@@ -7765,7 +7790,7 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
     required_cols = ["macd", "signal", "rsi", "%K", "%D", "close", "high", "low", "ATR"]
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
-        logger.warning(f"[ajustar_probabilidad_tecnica] Columnas faltantes: {missing_cols}. Retornando prob default (50.0)")
+        logger.error(f"⚠️ [ajustar_probabilidad_tecnica] Indicadores FALTANTES: {missing_cols}. Retornando prob default (50.0). Revisa integridad de calcular_indicadores.")
         return 50.0
 
     ultima_fila = df.iloc[-1]
@@ -8694,6 +8719,11 @@ def calcular_probabilidad_general(probabilidad_tecnica: float,
 #@profile
 def verificar_zona_no_trading(df, window):
     # Condiciones para identificar una zona de no trading
+    # Validar que ATR exista en el DataFrame
+    if 'ATR' not in df.columns:
+        logger.error("⚠️ [verificar_zona_no_trading] Columna 'ATR' no encontrada. Indicadores incompletos. Retornando False (conservador).")
+        return False
+    
     if df['ATR'].iloc[-1] < df['ATR'].rolling(window=window).mean().iloc[-1] * 0.8:
         return True  # Baja volatilidad, podría ser una zona de no trading
     return False
@@ -11638,6 +11668,10 @@ def procesar_simbolo_temporalidad(
         if df_indicadores is None or df_indicadores.empty:
             logger.info(f"No hay indicadores para {symbol} en {tf}.")
             return None
+    except ValueError as ve:
+        # Validación de integridad del caché
+        logger.error(f"[INTEGRIDAD] calcular_indicadores falló para {symbol}-{tf}: {ve}. Cache invalidado.")
+        return None
     except Exception as e:
         logger.info(f"calcular_indicadores falló para {symbol}-{tf}: {e}")
         return None
@@ -18818,8 +18852,16 @@ async def ejecutar_analisis_desde_app():
             numero_transacciones=1,
             origen=origen,
         )
-        if estado_sub != "activa" and not es_administrador(user_id or chat_id):
-            return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
+        # Diferenciar entre suscripción inactiva y transacciones insuficientes
+        if not es_administrador(user_id or chat_id):
+            if estado_sub == "transacciones_insuficientes":
+                return jsonify({
+                    "status": "error", 
+                    "code": "INSUFFICIENT_TRANSACTIONS",
+                    "message": "No cuenta con la cuota de transacciones requerida. Por favor, adquiere un paquete."
+                }), 402
+            elif estado_sub != "activa":
+                return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
 
         # --- lock distribuido por usuario (multi-pod) ---
         lock_id = uuid.uuid4().hex
@@ -19093,8 +19135,15 @@ async def subir_imagen_y_analizar():
         acquired_lock = True
 
         estado_sub = await estado_suscripcion(user_id=user_id, numero_transacciones=1, origen="app")
-        if estado_sub != "activa" and not es_administrador(user_id or chat_id):
-            return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
+        if not es_administrador(user_id or chat_id):
+            if estado_sub == "transacciones_insuficientes":
+                return jsonify({
+                    "status": "error",
+                    "code": "INSUFFICIENT_TRANSACTIONS",
+                    "message": "No cuenta con la cuota de transacciones requerida. Por favor, adquiere un paquete."
+                }), 402
+            elif estado_sub != "activa":
+                return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
 
         await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id, estado="ocupado")
 
