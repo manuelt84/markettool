@@ -3718,12 +3718,14 @@ def mark_user_state(
         st3["estado"] = estado
         user_states[str(user_id)] = st3
     
-    # ✅ NUEVO: Invalidar caché distribuido para que otros pods lo actualicen
-    asyncio.create_task(_USER_STATE_CACHE.invalidate(uuid)) if uuid else None
-    if chat_id:
-        asyncio.create_task(_USER_STATE_CACHE.invalidate(str(chat_id))) if chat_id else None
-    if user_id:
-        asyncio.create_task(_USER_STATE_CACHE.invalidate(str(user_id))) if user_id else None
+    # ✅ NUEVO: Invalidar caché distribuido (sync) para que otros pods lo actualicen
+    # ⚠️ SYNC invalidate porque se llama desde asyncio.to_thread()
+    if uuid and uuid in _USER_STATE_CACHE._cache:
+        del _USER_STATE_CACHE._cache[uuid]
+    if chat_id and str(chat_id) in _USER_STATE_CACHE._cache:
+        del _USER_STATE_CACHE._cache[str(chat_id)]
+    if user_id and str(user_id) in _USER_STATE_CACHE._cache:
+        del _USER_STATE_CACHE._cache[str(user_id)]
 
 
 # ------------------------------------------------------------------------------------
@@ -4280,12 +4282,13 @@ async def get_noticias_cached(symbol: str, fecha_inicio=None, fecha_fin=None, li
     ✅ GCS backup: Compartido entre pods
     """
     # Función auxiliar para llamar obtener_noticias de forma async
-    def _fetch(symbol_inner):
-        return obtener_noticias(
+    async def _fetch(symbol_inner):
+        return await asyncio.to_thread(
+            obtener_noticias,
             symbol_inner,
             fecha_inicio or (datetime.now() - timedelta(days=7)),
             fecha_fin or datetime.now(),
-            limite=limite
+            limite
         )
     
     # Usar caché compartido
@@ -7918,21 +7921,16 @@ def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, tem
         "notes": [],
     }
 
-    # ---- Noticias (igual que antes pero con factor configurable) ✅ Con caché multi-pod ---
+    # ---- Noticias (igual que antes pero con factor configurable) ---
+    # ✅ Con caché multi-pod (fallback a síncrono para compatibilidad)
     try:
         if fund.get("obtener_noticias", True):
             global cache_noticias
             if "cache_noticias" not in globals() or cache_noticias is None:
                 cache_noticias = {}
             
-            # ✅ Usar caché compartido si es posible (async context), fallback a síncrono
-            try:
-                # Intenta ejecutar en thread para obtener del caché
-                df_noticias = asyncio.run(get_noticias_cached(symbol, fecha_inicio, fecha_fin))
-            except Exception as e_cache:
-                logger.warning(f"[NewsCache] Fallback to sync: {e_cache}")
-                df_noticias = cache_noticias.get(symbol) or obtener_noticias(symbol, fecha_inicio, fecha_fin)
-            
+            # ✅ Primero intenta caché local, luego fetch
+            df_noticias = cache_noticias.get(symbol) or obtener_noticias(symbol, fecha_inicio, fecha_fin)
             cache_noticias[symbol] = df_noticias
         else:
             df_noticias = None
