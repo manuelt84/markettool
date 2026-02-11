@@ -9915,7 +9915,7 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soport
         porcentaje_riesgo: float = 0.02,
         max_leverage: float = 25.0,
         metodo: str = "distance"
-    ) -> tuple[float, str]:
+    ) -> tuple[float, float, str]:
         """
         Calcula apalancamiento usando dos métodos: distance-based y risk-based.
         Retorna el MENOR de los dos (más conservador).
@@ -9928,10 +9928,10 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soport
             metodo: "distance" (tu método) o "risk" (recomendado)
         
         Returns:
-            (apalancamiento_final, mensage_log)
+            (apalancamiento_final, apalancamiento_teorico, mensage_log)
         """
         if not (precio_actual > 0 and nivel_stop > 0):
-            return 0, "Precios inválidos"
+            return 0, 0, "Precios inválidos"
         
         # Método 1: Distance-based (tu fórmula original)
         distancia_relativa = abs(precio_actual - nivel_stop) / precio_actual
@@ -9956,55 +9956,67 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soport
         if leverage_calcalc > max_leverage:
             msg = f"⚠️ Leverage limitado: {leverage_calcalc:.1f}x → {leverage_final:.1f}x (soporte cercano)"
         
-        return float(leverage_final), msg
+        return float(leverage_final), float(leverage_calcalc), msg
     
     # Apalancamiento para compra
     if soporte_nivel_1 and precio_actual > soporte_nivel_1:
-        apalancamiento_compra_nivel_1, msg_1 = calcular_apalancamiento_seguro(
+        apalancamiento_compra_nivel_1, apalancamiento_compra_nivel_1_teorico, msg_1 = calcular_apalancamiento_seguro(
             precio_actual, soporte_nivel_1, MAX_RISK_PER_TRADE, MAX_LEVERAGE
         )
         apalancamiento_compra_nivel_1 = int(apalancamiento_compra_nivel_1)
+        apalancamiento_compra_nivel_1_teorico = int(apalancamiento_compra_nivel_1_teorico)
         if msg_1:
             logger.info(f"[Niveles S1] {msg_1}")
     else:
         apalancamiento_compra_nivel_1 = 0
+        apalancamiento_compra_nivel_1_teorico = 0
     
     if soporte_nivel_2 and precio_actual > soporte_nivel_2:
-        apalancamiento_compra_nivel_2, msg_2 = calcular_apalancamiento_seguro(
+        apalancamiento_compra_nivel_2, apalancamiento_compra_nivel_2_teorico, msg_2 = calcular_apalancamiento_seguro(
             precio_actual, soporte_nivel_2, MAX_RISK_PER_TRADE, MAX_LEVERAGE
         )
         apalancamiento_compra_nivel_2 = int(apalancamiento_compra_nivel_2)
+        apalancamiento_compra_nivel_2_teorico = int(apalancamiento_compra_nivel_2_teorico)
         if msg_2:
             logger.info(f"[Niveles S2] {msg_2}")
     else:
         apalancamiento_compra_nivel_2 = 0
+        apalancamiento_compra_nivel_2_teorico = 0
     
     # Apalancamiento para venta (proceso inverso)
     if resistencia_nivel_1 and precio_actual < resistencia_nivel_1:
-        apalancamiento_venta_nivel_1, msg_3 = calcular_apalancamiento_seguro(
+        apalancamiento_venta_nivel_1, apalancamiento_venta_nivel_1_teorico, msg_3 = calcular_apalancamiento_seguro(
             precio_actual, resistencia_nivel_1, MAX_RISK_PER_TRADE, MAX_LEVERAGE
         )
         apalancamiento_venta_nivel_1 = int(apalancamiento_venta_nivel_1)
+        apalancamiento_venta_nivel_1_teorico = int(apalancamiento_venta_nivel_1_teorico)
         if msg_3:
             logger.info(f"[Niveles R1] {msg_3}")
     else:
         apalancamiento_venta_nivel_1 = 0
+        apalancamiento_venta_nivel_1_teorico = 0
     
     if resistencia_nivel_2 and precio_actual < resistencia_nivel_2:
-        apalancamiento_venta_nivel_2, msg_4 = calcular_apalancamiento_seguro(
+        apalancamiento_venta_nivel_2, apalancamiento_venta_nivel_2_teorico, msg_4 = calcular_apalancamiento_seguro(
             precio_actual, resistencia_nivel_2, MAX_RISK_PER_TRADE, MAX_LEVERAGE
         )
         apalancamiento_venta_nivel_2 = int(apalancamiento_venta_nivel_2)
+        apalancamiento_venta_nivel_2_teorico = int(apalancamiento_venta_nivel_2_teorico)
         if msg_4:
             logger.info(f"[Niveles R2] {msg_4}")
     else:
         apalancamiento_venta_nivel_2 = 0
+        apalancamiento_venta_nivel_2_teorico = 0
     
     multiplicador = {
         "apalancamiento_compra_nivel_1": apalancamiento_compra_nivel_1,
         "apalancamiento_compra_nivel_2": apalancamiento_compra_nivel_2,
         "apalancamiento_venta_nivel_1": apalancamiento_venta_nivel_1,
-        "apalancamiento_venta_nivel_2": apalancamiento_venta_nivel_2
+        "apalancamiento_venta_nivel_2": apalancamiento_venta_nivel_2,
+        "apalancamiento_compra_nivel_1_teorico": apalancamiento_compra_nivel_1_teorico,
+        "apalancamiento_compra_nivel_2_teorico": apalancamiento_compra_nivel_2_teorico,
+        "apalancamiento_venta_nivel_1_teorico": apalancamiento_venta_nivel_1_teorico,
+        "apalancamiento_venta_nivel_2_teorico": apalancamiento_venta_nivel_2_teorico
     }
 
     # Usar filtrar_por_distancia para identificar niveles importantes
@@ -10864,6 +10876,10 @@ def calcular_entradas(
             "apalancamiento_compra_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_2"),
             "apalancamiento_venta_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_1"),
             "apalancamiento_venta_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_2"),
+            "apalancamiento_compra_nivel_1_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_1_teorico"),
+            "apalancamiento_compra_nivel_2_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_2_teorico"),
+            "apalancamiento_venta_nivel_1_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_1_teorico"),
+            "apalancamiento_venta_nivel_2_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_2_teorico"),
             "precio_entrada": precio_entrada,
             "take_profit": take_profit,
             "stop_loss": stop_loss,
