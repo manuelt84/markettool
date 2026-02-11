@@ -7611,6 +7611,83 @@ def calcular_indicadores_impl(df, temporalidad):
     return df
 
 
+# ======================== FASE 3: VALIDACIÓN DE DATOS OHLCV ========================
+
+#@profile
+def validar_ohlcv_calidad(df: pd.DataFrame, symbol: str, tf: str, strict: bool = False) -> tuple[bool, list[str]]:
+    """
+    ✅ FASE 3: Valida la calidad de datos OHLCV antes de procesamiento.
+    
+    Chequea:
+    - Candles invertidas (High < Open/Close o Low > Open/Close)
+    - Volumen cero (sin movimiento)
+    - Gaps sospechosos > 5%
+    - Datos faltantes (NaN)
+    - Índices duplicados
+    
+    Args:
+        df: DataFrame con OHLCV
+        symbol: Símbolo del instrumento
+        tf: Timeframe
+        strict: Si True, rechaza cualquier anomalía; si False, solo avisa
+    
+    Returns:
+        (es_válido, lista_de_problemas)
+    """
+    problemas = []
+    
+    if df.empty:
+        return False, ["DataFrame vacío"]
+    
+    if len(df) < 2:
+        return False, ["Menos de 2 candles de datos"]
+    
+    # Validar estructura
+    required_cols = ['open', 'high', 'low', 'close', 'volume']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        return False, [f"Columnas faltantes: {missing}"]
+    
+    # Validar candles invertidas
+    candles_invertidas = ((df['high'] < df[['open', 'close']].max(axis=1)) | 
+                          (df['low'] > df[['open', 'close']].min(axis=1))).sum()
+    if candles_invertidas > 0:
+        problemas.append(f"⚠️ {candles_invertidas} candles invertidas (High < Open/Close o Low > Open/Close)")
+    
+    # Validar volumen cero
+    vol_cero = (df['volume'] == 0).sum()
+    if vol_cero > len(df) * 0.1:  # Si >10% tienen volumen 0
+        problemas.append(f"⚠️ {vol_cero} candles con volumen cero ({vol_cero/len(df)*100:.1f}%)")
+    
+    # Validar gaps sospechosos (>5%)
+    df_copy = df.copy()
+    df_copy['gap'] = df_copy['close'].shift(1).fillna(df_copy['open'])
+    df_copy['gap_pct'] = abs(df_copy['open'] - df_copy['gap']) / df_copy['gap'] * 100
+    gaps_sospechosos = (df_copy['gap_pct'] > 5).sum()
+    if gaps_sospechosos > 0:
+        problemas.append(f"⚠️ {gaps_sospechosos} gaps >5% detectados (posible dato erróneo or market gap)")
+    
+    # Validar NaN en OHLC
+    nan_count = df[['open', 'high', 'low', 'close']].isna().sum().sum()
+    if nan_count > 0:
+        problemas.append(f"⚠️ {nan_count} valores NaN en OHLC")
+    
+    # Validar índices duplicados
+    if df.index.duplicated().any():
+        problemas.append(f"⚠️ Índices duplicados detectados ({df.index.duplicated().sum()} duplicados)")
+    
+    # Logger
+    if problemas:
+        logger.warning(f"[VALIDACIÓN OHLCV] {symbol}-{tf}: {len(problemas)} problemas detectados")
+        for p in problemas:
+            logger.warning(f"  {p}")
+    
+    # Si strict=True, rechazar si hay problemas; si False, solo avisar
+    es_valido = len(problemas) == 0 if strict else True
+    
+    return es_valido, problemas
+
+
 def calcular_indicadores(df, temporalidad, symbol=None):
     """
     Calcula indicadores técnicos con caché inteligente.
@@ -7714,7 +7791,7 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
         return 50.0
     
     # ✅ Verificar que los indicadores requeridos existan
-    required_cols = ["macd", "signal", "rsi", "stoch_k", "close", "high", "low", "ATR"]
+    required_cols = ["macd", "signal", "rsi", "%K", "%D", "close", "high", "low", "ATR"]
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
         logger.warning(f"[ajustar_probabilidad_tecnica] Columnas faltantes: {missing_cols}. Retornando prob default (50.0)")
@@ -7809,7 +7886,9 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
         if senal_macd and senal_rsi and senal_estocastico:
             probabilidad_tecnica += mag["triple_signal_bonus"]  # “+10”
 
-    # Limitar al rango [0,100]
+    # Limitar al rango [1,75] - máximo 75% refleja realidad
+    # Incluso con múltiples señales, raramente supera 75%
+    probabilidad_tecnica = min(probabilidad_tecnica, 75.0)
     return limitar_probabilidad(probabilidad_tecnica)
 
 
@@ -8018,6 +8097,101 @@ def evaluar_confluencia_trade(
         "align_fundamental": align_fund,
         "pair_bias": float(pair_bias) if isinstance(pair_bias, (int, float)) and math.isfinite(pair_bias) else None,
         "warnings": warnings,
+    }
+
+# ======================== FASE 3: SISTEMA DE WHITELISTING ========================
+
+#@profile
+def evaluar_si_autorizado_operar(
+    symbol: str,
+    tf: str,
+    tipo_operacion: str,
+    confluencia_score: float,
+    prob_tecnica: float,
+    prob_fundamental: float,
+    rrr_promedio: float,
+    alertas: list,
+    tecnica_meta: dict = None
+) -> dict:
+    """
+    ✅ FASE 3: Whitelisting - Determina si las condiciones son "suficientemente buenas" para operar.
+    
+    Basado en estándares profesionales:
+    - Confluencia score >= 0.60 (60% confianza técnica)
+    - Probabilidad >= 55% (por encima de random)
+    - RRR >= 1.5 (riesgo-recompensa profesional)
+    - Sin alertas críticas (RSI extremo, cerca de valor, etc)
+    
+    Returns:
+        {
+            "autorizado": bool,
+            "score_final": float,
+            "razon_rechazo": str o None,
+            "recomendacion": str
+        }
+    """
+    score_final = 0.0
+    razones_rechazo = []
+    
+    # 1. Confluencia técnica (máx 25% del score)
+    if confluencia_score is not None and confluencia_score >= 0.60:
+        score_final += 25
+    elif confluencia_score is not None and confluencia_score >= 0.50:
+        score_final += 15
+        razones_rechazo.append("Confluencia técnica baja (50-60%)")
+    else:
+        razones_rechazo.append("Confluencia técnica insuficiente (<50%)")
+    
+    # 2. Probabilidad técnica (máx 25%)
+    if prob_tecnica is not None and prob_tecnica >= 55:
+        score_final += min(25, (prob_tecnica - 50) * 5)  # Escala lineal de 55->0% a 75->100%
+    else:
+        razones_rechazo.append("Probabilidad técnica baja (<55%)")
+    
+    # 3. Probabilidad fundamental (máx 25%)
+    if prob_fundamental is not None and prob_fundamental >= 55:
+        score_final += min(25, (prob_fundamental - 50) * 5)
+    
+    # 4. Risk-Reward Ratio (máx 25%)
+    if rrr_promedio is not None and rrr_promedio >= 1.5:
+        score_final += 25
+    elif rrr_promedio is not None and rrr_promedio >= 1.2:
+        score_final += 15
+        razones_rechazo.append(f"RRR bajo ({rrr_promedio:.2f} < 1.5)")
+    else:
+        razones_rechazo.append(f"RRR insuficiente ({rrr_promedio})")
+    
+    # 5. Alertas críticas (penalización)
+    alertas_criticas = 0
+    if alertas:
+        alertas_criticas = sum(1 for a in alertas if "OVERBOUGHT" in str(a) or "OVERSOLD" in str(a) or "cerca de" in str(a).lower())
+    
+    if alertas_criticas > 2:
+        score_final *= 0.7  # Penalizar 30% si hay muchas alertas
+        razones_rechazo.append(f"Demasiadas alertas críticas ({alertas_criticas})")
+    
+    # Determinar autorización
+    autorizado = score_final >= 60 and len(razones_rechazo) == 0
+    
+    razon_rechazo = " | ".join(razones_rechazo) if razones_rechazo else None
+    
+    # Recomendación
+    if autorizado:
+        recomendacion = "✅ OPERABLE: Condiciones buenas para el trade"
+    elif score_final >= 50:
+        recomendacion = "⚠️ MARGINAL: Condiciones aceptables pero con riesgos"
+    else:
+        recomendacion = "❌ RECHAZADO: Esperar mejores condiciones"
+    
+    logger.info(f"[Whitelist] {symbol}-{tf} {tipo_operacion}: Score={score_final:.1f} Autorizado={autorizado}")
+    if razon_rechazo:
+        logger.warning(f"  Razones rechazo: {razon_rechazo}")
+    
+    return {
+        "autorizado": autorizado,
+        "score_final": float(score_final),
+        "razon_rechazo": razon_rechazo,
+        "recomendacion": recomendacion
     }
 
 def limpiar_valores(val):
@@ -9666,37 +9840,113 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soport
           resistencia_nivel_1 = resistencias_cercanas[0]
           resistencia_nivel_2 = resistencias_cercanas[1]
 
-    # Validar Soporte Nivel 1 < Precio Actual < Resistencia Nivel 1
-    if soporte_nivel_1 >= precio_actual or precio_actual >= resistencia_nivel_1:
-       soporte_nivel_2, soporte_nivel_1 = np.nan, np.nan
-       resistencia_nivel_1, resistencia_nivel_2 = np.nan, np.nan
+    # ✅ CORREGIDO: Validar que los niveles están bien ordenados y existan
+    # NO anular si el precio está fuera (es válido en breakouts)
+    # Solo anular si los datos no existen o están inválidos
+    if not (pd.notna(soporte_nivel_1) and pd.notna(resistencia_nivel_1)):
+        soporte_nivel_2, soporte_nivel_1 = np.nan, np.nan
+        resistencia_nivel_1, resistencia_nivel_2 = np.nan, np.nan
+    elif pd.notna(soporte_nivel_1) and pd.notna(resistencia_nivel_1):
+        # Validar que están en orden: S1 < R1
+        if soporte_nivel_1 >= resistencia_nivel_1:
+            soporte_nivel_2, soporte_nivel_1 = np.nan, np.nan
+            resistencia_nivel_1, resistencia_nivel_2 = np.nan, np.nan
 
-    # Definir el porcentaje residual (ejemplo: conservar 5% del precio actual)
-    porcentaje_residual = 0.10  # 10.5%
-
+    # ========== SISTEMA DE APALANCAMIENTO MEJORADO ==========
+    # ✅ FASE 1: Risk-Based Leverage (con límite de seguridad)
+    # Máximo apalancamiento permitido (estándar profesional de seguridad)
+    MAX_LEVERAGE = 25.0
+    MAX_RISK_PER_TRADE = 0.02  # 2% del capital por operación
+    
+    #@profile
+    def calcular_apalancamiento_seguro(
+        precio_actual: float,
+        nivel_stop: float,
+        porcentaje_riesgo: float = 0.02,
+        max_leverage: float = 25.0,
+        metodo: str = "distance"
+    ) -> tuple[float, str]:
+        """
+        Calcula apalancamiento usando dos métodos: distance-based y risk-based.
+        Retorna el MENOR de los dos (más conservador).
+        
+        Args:
+            precio_actual: Precio de entrada
+            nivel_stop: Precio del stop loss
+            porcentaje_riesgo: Máximo riesgo por operación (0.02 = 2%)
+            max_leverage: Límite máximo de apalancamiento
+            metodo: "distance" (tu método) o "risk" (recomendado)
+        
+        Returns:
+            (apalancamiento_final, mensage_log)
+        """
+        if not (precio_actual > 0 and nivel_stop > 0):
+            return 0, "Precios inválidos"
+        
+        # Método 1: Distance-based (tu fórmula original)
+        distancia_relativa = abs(precio_actual - nivel_stop) / precio_actual
+        if distancia_relativa > 0:
+            leverage_distance = (1 - 0.10) / distancia_relativa
+        else:
+            leverage_distance = 0
+        
+        # Método 2: Risk-based (recomendado - más seguro)
+        # apalancamiento = riesgo_máximo / distancia_en_precio
+        riesgo_maximo = porcentaje_riesgo
+        leverage_risk = riesgo_maximo / distancia_relativa if distancia_relativa > 0 else 0
+        
+        # TOMAR EL MENOR de ambos (más conservador)
+        leverage_calcalc = min(leverage_distance, leverage_risk)
+        
+        # Aplicar límite máximo de seguridad
+        leverage_final = min(leverage_calcalc, max_leverage)
+        
+        # Log si estamos cerca del límite
+        msg = ""
+        if leverage_calcalc > max_leverage:
+            msg = f"⚠️ Leverage limitado: {leverage_calcalc:.1f}x → {leverage_final:.1f}x (soporte cercano)"
+        
+        return float(leverage_final), msg
+    
     # Apalancamiento para compra
     if soporte_nivel_1 and precio_actual > soporte_nivel_1:
-        perdida_relativa_nivel_1 = (precio_actual - soporte_nivel_1) / precio_actual
-        apalancamiento_compra_nivel_1 = int((1 - porcentaje_residual) / perdida_relativa_nivel_1) if perdida_relativa_nivel_1 > 0 else 0
+        apalancamiento_compra_nivel_1, msg_1 = calcular_apalancamiento_seguro(
+            precio_actual, soporte_nivel_1, MAX_RISK_PER_TRADE, MAX_LEVERAGE
+        )
+        apalancamiento_compra_nivel_1 = int(apalancamiento_compra_nivel_1)
+        if msg_1:
+            logger.info(f"[Niveles S1] {msg_1}")
     else:
         apalancamiento_compra_nivel_1 = 0
     
     if soporte_nivel_2 and precio_actual > soporte_nivel_2:
-        perdida_relativa_nivel_2 = (precio_actual - soporte_nivel_2) / precio_actual
-        apalancamiento_compra_nivel_2 = int((1 - porcentaje_residual) / perdida_relativa_nivel_2) if perdida_relativa_nivel_2 > 0 else 0
+        apalancamiento_compra_nivel_2, msg_2 = calcular_apalancamiento_seguro(
+            precio_actual, soporte_nivel_2, MAX_RISK_PER_TRADE, MAX_LEVERAGE
+        )
+        apalancamiento_compra_nivel_2 = int(apalancamiento_compra_nivel_2)
+        if msg_2:
+            logger.info(f"[Niveles S2] {msg_2}")
     else:
         apalancamiento_compra_nivel_2 = 0
     
     # Apalancamiento para venta (proceso inverso)
     if resistencia_nivel_1 and precio_actual < resistencia_nivel_1:
-        perdida_relativa_venta_nivel_1 = (resistencia_nivel_1 - precio_actual) / precio_actual
-        apalancamiento_venta_nivel_1 = int((1 - porcentaje_residual) / perdida_relativa_venta_nivel_1) if perdida_relativa_venta_nivel_1 > 0 else 0
+        apalancamiento_venta_nivel_1, msg_3 = calcular_apalancamiento_seguro(
+            precio_actual, resistencia_nivel_1, MAX_RISK_PER_TRADE, MAX_LEVERAGE
+        )
+        apalancamiento_venta_nivel_1 = int(apalancamiento_venta_nivel_1)
+        if msg_3:
+            logger.info(f"[Niveles R1] {msg_3}")
     else:
         apalancamiento_venta_nivel_1 = 0
     
     if resistencia_nivel_2 and precio_actual < resistencia_nivel_2:
-        perdida_relativa_venta_nivel_2 = (resistencia_nivel_2 - precio_actual) / precio_actual
-        apalancamiento_venta_nivel_2 = int((1 - porcentaje_residual) / perdida_relativa_venta_nivel_2) if perdida_relativa_venta_nivel_2 > 0 else 0
+        apalancamiento_venta_nivel_2, msg_4 = calcular_apalancamiento_seguro(
+            precio_actual, resistencia_nivel_2, MAX_RISK_PER_TRADE, MAX_LEVERAGE
+        )
+        apalancamiento_venta_nivel_2 = int(apalancamiento_venta_nivel_2)
+        if msg_4:
+            logger.info(f"[Niveles R2] {msg_4}")
     else:
         apalancamiento_venta_nivel_2 = 0
     
@@ -9782,8 +10032,124 @@ def calc_tp_sl_venta_asym(entry: float, atr: float, tp_mult: float, sl_mult: flo
         return None, None
     return tp, sl
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers para múltiples entradas con rango dinámico, niveles confirmados y RRR
+# ======================== FASE 2: FUNCIONES DE GESTIÓN DE RIESGO Y COSTOS ========================
+
+#@profile
+def calcular_tamaño_posicion(
+    account_balance: float,
+    entry_price: float,
+    stop_loss: float,
+    max_risk_percent: float = 0.02,
+    side: str = "long"
+) -> Optional[float]:
+    """
+    ✅ FASE 2: Calcula tamaño de posición basado en gestión de riesgo profesional.
+    
+    Fórmula: position_size = (account_balance × max_risk_percent) / (entry - stop_loss)
+    
+    Args:
+        account_balance: Saldo de cuenta en moneda base
+        entry_price: Precio de entrada
+        stop_loss: Nivel de stop loss
+        max_risk_percent: Máximo riesgo por operación (default 2% = 0.02)
+        side: "long" o "short"
+    
+    Returns:
+        Tamaño de posición normalizado (0-1), o None si inválido
+    """
+    if not (_finite(account_balance) and _finite(entry_price) and _finite(stop_loss)):
+        return None
+    if account_balance <= 0 or entry_price <= 0:
+        return None
+    if side == "long" and stop_loss >= entry_price:
+        return None
+    if side == "short" and stop_loss <= entry_price:
+        return None
+    
+    max_risk_amount = account_balance * max_risk_percent
+    
+    if side == "long":
+        risk_per_unit = entry_price - stop_loss
+    else:
+        risk_per_unit = stop_loss - entry_price
+    
+    if risk_per_unit <= 0:
+        return None
+    
+    position_size = max_risk_amount / risk_per_unit
+    return float(position_size)
+
+
+#@profile
+def ajustar_tp_sl_por_costos(
+    entry: float,
+    tp: float,
+    sl: float,
+    instrument_type: str = "forex",
+    side: str = "long",
+    volume: float = 1.0
+) -> tuple[float, float]:
+    """
+    ✅ FASE 2: Ajusta TP y SL restando costos de transacción (spread, comisión, slippage).
+    
+    Costos típicos:
+    - Forex: 1-2 pips spread + 1 pip comisión = 3 pips total
+    - Cripto: 0.1-0.5% comisión (usamos 0.3%)
+    - Acciones: $0.01-$0.10 por acción comisión
+    - Futuros: $20-100 por round-trip
+    
+    Returns:
+        (tp_ajustado, sl_ajustado) - más conservadores que los originales
+    """
+    
+    if not (_finite(entry) and _finite(tp) and _finite(sl)):
+        return tp, sl
+    
+    if instrument_type.lower() == "forex":
+        # Forex: restar 3 pips por spread/comisión (1.5 entrada + 1.5 salida)
+        pip_value = 0.0001 if "JPY" not in str(entry).upper() else 0.01
+        spread_cost = 3 * pip_value
+        
+        if side == "long":
+            tp_neto = tp - spread_cost  # Reducir ganancia por costos
+            sl_ajustado = sl + spread_cost  # Aumentar pérdida por costos
+        else:
+            tp_neto = tp + spread_cost
+            sl_ajustado = sl - spread_cost
+        
+        return float(tp_neto), float(sl_ajustado)
+        
+    elif instrument_type.lower() == "crypto":
+        # Cripto: restar 0.3% por comisión (0.1% entrada + 0.2% salida)
+        comision_percent = 0.003
+        
+        if side == "long":
+            tp_neto = tp * (1 - comision_percent)  # TP reducido por comisión
+            sl_ajustado = sl * (1 + comision_percent)  # SL aumentado por comisión
+        else:
+            tp_neto = tp * (1 + comision_percent)
+            sl_ajustado = sl * (1 - comision_percent)
+        
+        return float(tp_neto), float(sl_ajustado)
+        
+    elif instrument_type.lower() == "stock":
+        # Acciones: restar comisión fija ~$10 por lado
+        comision = 20  # $20 round-trip asumido
+        cost_per_share = comision / volume if volume > 0 else 0
+        
+        if side == "long":
+            tp_neto = tp - cost_per_share
+            sl_ajustado = sl + cost_per_share
+        else:
+            tp_neto = tp + cost_per_share
+            sl_ajustado = sl - cost_per_share
+        
+        return float(tp_neto), float(sl_ajustado)
+    
+    else:
+        # Instrumento no reconocido: sin ajuste
+        return float(tp), float(sl)
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 #@profile
@@ -9821,7 +10187,7 @@ def _add_entry(
     precio_actual: float,
     niveles: dict,
     rango_dinamico: Iterable[Optional[float]] = (None, None),
-    min_rrr: float = 1.2
+    min_rrr: float = 1.5  # ✅ PHASE 2: Cambiado de 1.2 a 1.5 (estándar profesional)
 ):
     """Calcula TP/SL, RRR y agrega la entrada si pasa validaciones."""
     if not (_finite(entry) and _finite(atr) and atr > 0):
@@ -9914,7 +10280,7 @@ def generar_entradas_multiples(
     breakout_offset_atr=0.2,
     scale_offset_atr=0.5,
     boll_offset_atr=0.1,
-    min_rrr=1.2,
+    min_rrr=1.5,  # ✅ PHASE 2: Cambiado de 1.2 a 1.5 (estándar profesional)
     # --- nuevos parámetros opcionales ---
     enable_breakout_retest=True,
     retest_offset_atr=0.2,          # distancia típica del pullback tras la ruptura
@@ -11222,6 +11588,15 @@ def procesar_simbolo_temporalidad(
         return None
 
     # ------------------- Indicadores -------------------
+    # ✅ FASE 3: Validar calidad OHLCV antes de procesar
+    try:
+        es_valido, problemas = validar_ohlcv_calidad(df_combinado, symbol, tf, strict=False)
+        if not es_valido:
+            logger.warning(f"[VALIDACIÓN] {symbol}-{tf}: Datos OHLCV no válidos. Problemas: {problemas}")
+            # En modo no-strict, continuamos pero registramos la advertencia
+    except Exception as e:
+        logger.warning(f"[VALIDACIÓN] Error validando OHLCV para {symbol}-{tf}: {e}")
+    
     try:
         df_indicadores = calcular_indicadores(df_combinado, tf, symbol=symbol)
         if df_indicadores is None or df_indicadores.empty:
@@ -11244,6 +11619,26 @@ def procesar_simbolo_temporalidad(
         logger.info(f"calcular_entradas falló para {symbol}-{tf}: {e}")
         return None
 
+    # ✅ FASE 3: WHITELISTING - Evaluar si autorizado operar
+    try:
+        whitelist_result = evaluar_si_autorizado_operar(
+            symbol=symbol,
+            tf=tf,
+            tipo_operacion=entradas.get('tipo_operacion', 'Neutral'),
+            confluencia_score=entradas.get('confluencia', {}).get('score', 0.5) if isinstance(entradas.get('confluencia'), dict) else 0.5,
+            prob_tecnica=entradas.get('probabilidad_tecnica', 50),
+            prob_fundamental=entradas.get('probabilidad_fundamental', 50),
+            rrr_promedio=entradas.get('entradas', [{}])[0].get('rrr', 1.0) if entradas.get('entradas') else 1.0,
+            alertas=entradas.get('alertas', []),
+            tecnica_meta=entradas.get('tecnica_meta')
+        )
+        es_autorizado_operar = whitelist_result.get('autorizado', False)
+        score_whitelist = whitelist_result.get('score_final', 0)
+    except Exception as e:
+        logger.warning(f"[Whitelist] Error evaluando autorización para {symbol}-{tf}: {e}")
+        es_autorizado_operar = True  # Fallback: no bloquear si hay error
+        score_whitelist = 0
+
     # Devolver resultados
     resultado = {
         "Activo": symbol,
@@ -11251,6 +11646,8 @@ def procesar_simbolo_temporalidad(
         "Oportunidad": entradas.get('flag_oportunidad'),
         "Patrones Detectados": entradas.get('patrones_detectados'),
         "Tipo de Operacion": entradas.get('tipo_operacion'),
+        "Autorizado Operar (Whitelist)": es_autorizado_operar,  # ✅ PHASE 3
+        "Score Whitelist": score_whitelist,  # ✅ PHASE 3
         "Ultimo Valor": entradas.get('ultimo_valor'),
         "Soporte Nivel 2": entradas.get('soporte_nivel_2'),
         "Soporte Nivel 1": entradas.get('soporte_nivel_1'),
