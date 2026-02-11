@@ -471,7 +471,7 @@ class FMPClient:
         assert interval in {"1min","5min","15min","30min","1hour","4hour"}
         fmt = "%Y-%m-%d %H:%M:%S"
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{interval}/{symbol}"
-        logging.info(f"MTORO5 {url}")
+        logging.info(f"[FMP] Historical Intraday {url}")
         r = self._get(url, {"from": from_utc.strftime(fmt), "to": to_utc.strftime(fmt)})
         if r.status_code != 200: return pd.DataFrame()
         data = r.json() or []
@@ -511,7 +511,7 @@ class FMPClient:
     @safe_op(default=pd.DataFrame(), log=logging.getLogger("MarketTool.FMP"))
     def historical_eod(self, symbol: str, from_date: datetime, to_date: datetime) -> pd.DataFrame:
         url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
-        logging.info(f"MTORO6 {url}")
+        logging.info(f"[FMP] Historical Daily {url}")
         r = self._get(url, {"from": from_date.strftime("%Y-%m-%d"), "to": to_date.strftime("%Y-%m-%d")})
         if r.status_code != 200: return pd.DataFrame()
         payload = r.json() or {}; hist = payload.get("historical") or []
@@ -540,7 +540,7 @@ class FMPClient:
     @safe_op(default=None, log=logging.getLogger("MarketTool.FMP"))
     def quote_last(self, symbol: str) -> Optional[float]:
         url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}"
-        logging.info(f"MTORO7 {url}")
+        logging.info(f"[FMP] Quote {url}")
         r = self._get(url, {})
         if r.status_code != 200: return None
         arr = r.json() or []
@@ -713,6 +713,36 @@ def save_cached_history(symbol: str, tf: str, out: pd.DataFrame, *, storage_dir:
         if not mask.all():
             out = out.loc[mask].copy()
             idx_utc = idx_utc[mask]
+
+        # --- FIX: Evitar guardar datos intradía en archivos diarios (1day) ---
+        # Si detectamos que para '1day' tenemos datos muy frecuentes, remuestreamos.
+        if normalize_tf(tf) == "1day" and len(out) > 5:
+            # Calculamos la diferencia mediana en los últimos registros
+            diffs = pd.Series(idx_utc[-20:]).diff().dropna()
+            if not diffs.empty:
+                med = diffs.median()
+                # Si la mediana es menor a 4 horas, asumo que es intradía erróneo
+                if med < timedelta(hours=4):
+                    logger.warning(f"[save_cached_history] CORRUPT DATA DETECTED: {symbol}/1day contains intraday data (median diff {med}). Resampling to 1D...")
+                    
+                    # Asegurar tipos numéricos
+                    for c in ("open", "high", "low", "close", "volume"):
+                        if c in out.columns:
+                            out[c] = pd.to_numeric(out[c], errors="coerce")
+                    
+                    # Remuestrear a 1D
+                    # Usamos .agg con diccionario para OHLCV
+                    out = out.resample("1D").agg({
+                        "open": "first",
+                        "high": "max",
+                        "low": "min",
+                        "close": "last",
+                        "volume": "sum"
+                    }).dropna(subset=["close"])
+                    
+                    # Recalcular idx_utc post-resample
+                    idx_utc = pd.DatetimeIndex(pd.to_datetime(out.index, utc=True))
+        # ---------------------------------------------------------------------
 
         # 'time' como string ISO (sin .dt)
         out = out.copy()
@@ -4080,13 +4110,13 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
     # Determinar el endpoint adecuado según la categoría del símbolo
     if symbol in categorias["Cripto"]:
         endpoint = "https://financialmodelingprep.com/api/v4/crypto_news"
-        logging.info(f"MTORO9 {endpoint}")
+        logging.info(f"[News] Endpoint: {endpoint}")
     elif any(symbol in categorias[categoria] for categoria in ["Principales", "Cruces", "Exóticos", "OilAndGas", "Agricultura", "Indices"]):
         endpoint = "https://financialmodelingprep.com/api/v4/forex_news"
-        logging.info(f"MTORO10 {endpoint}")
+        logging.info(f"[News] Endpoint: {endpoint}")
     else:
         endpoint = "https://financialmodelingprep.com/api/v3/stock_news"
-        logging.info(f"MTORO11 {endpoint}")
+        logging.info(f"[News] Endpoint: {endpoint}")
 
 
     # Llamar a la API para obtener nuevas noticias
@@ -4168,7 +4198,7 @@ def obtener_noticias_simbolo(symbol, fecha_inicio, fecha_fin, limite=50, max_rei
     else:
         url = f"{endpoint}?symbol={symbol}&from={fecha_inicio.strftime('%Y-%m-%d')}&to={fecha_fin.strftime('%Y-%m-%d')}&limit={limite}&apikey={API_KEY}"
 
-    logging.info(f"MTORO stock URL: {url}")
+    logging.info(f"[News] Stock URL: {url}")
 
     reintento = 0
     tiempo_espera = tiempo_espera_inicial
@@ -6813,7 +6843,6 @@ PRIORIDAD_PATRONES = {
     "Pinzas de Suelo": 1,
 }
 
-#MTORO Antiguo (detecta mas patrones porque no tiene confirmación)
 #@profile
 def detectar_patrones_velas(df, window):
     patrones_detectados = {}
@@ -14629,7 +14658,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
     try:
         # 1) estable/realtime (forex)
         url1 = f"https://financialmodelingprep.com/stable/quote?symbol={symbol}&apikey={API_KEY}"
-        logging.info(f"MTORO1 URL: {url1}")
+        logging.info(f"[Quote-Fallback-v4] URL: {url1}")
         r = requests.get(url1, timeout=8)
         if r.ok:
             arr = r.json() or []
@@ -14638,7 +14667,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
                 if p: return float(p)
         # 2) fallback v3
         url2 = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={API_KEY}"
-        logging.info(f"MTORO2 URL: {url2}")
+        logging.info(f"[Quote-Fallback-v3] URL: {url2}")
         r = requests.get(url2, timeout=8)
         if r.ok:
             arr = r.json() or []
@@ -14656,7 +14685,7 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
     try:
         iv = _fmp_interval(tf)
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}?apikey={API_KEY}"
-        logging.info(f"MTORO3 URL: {url}")
+        logging.info(f"[Historical-Fetch] URL: {url}")
         r = requests.get(url, timeout=5)
         if not r.ok:
             return []
@@ -14997,14 +15026,14 @@ def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> l
             "from": _ms_to_fmp_local(from_ms),
             "to":   _ms_to_fmp_local(to_ms)
         }
-        logging.info(f"MTORO10 url: {url} params: from={params['from']} to={params['to']}")
+        logging.info(f"[Historical-Range] URL: {url} params: from={params['from']} to={params['to']}")
         r = requests.get(url, params=params, timeout=5)
         if not r.ok:
-            logging.info(f"MTORO10 HTTP {r.status_code}: {r.text[:200]}")
+            logging.info(f"[Historical-Range] HTTP {r.status_code}: {r.text[:200]}")
             return []
         return _normalize_fmp_bars(r.json())
     except Exception as e:
-        logging.warning(f"MTORO10 error: {e}")
+        logging.warning(f"[Historical-Range] Error: {e}")
         return []
 
 
@@ -15013,7 +15042,7 @@ def _fmp_hist_with_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> list
         return []
     iv = _fmp_interval(tf)
     url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}"
-    logging.info(f"MTORO _fmp_hist_with_range URL: {url}")
+    logging.info(f"[Historical-Range-Alt] URL: {url}")
     params = {"apikey": API_KEY, "from": _ms_to_fmp_local(from_ms), "to": _ms_to_fmp_local(to_ms)}
     try:
         r = requests.get(url, params=params, timeout=20)
