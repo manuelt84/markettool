@@ -3720,12 +3720,12 @@ def mark_user_state(
     
     # ✅ NUEVO: Invalidar caché distribuido (sync) para que otros pods lo actualicen
     # ⚠️ SYNC invalidate porque se llama desde asyncio.to_thread()
-    if uuid and uuid in _USER_STATE_CACHE._cache:
-        del _USER_STATE_CACHE._cache[uuid]
-    if chat_id and str(chat_id) in _USER_STATE_CACHE._cache:
-        del _USER_STATE_CACHE._cache[str(chat_id)]
-    if user_id and str(user_id) in _USER_STATE_CACHE._cache:
-        del _USER_STATE_CACHE._cache[str(user_id)]
+    if uuid and uuid in _USER_STATE_CACHE._local_cache:
+        del _USER_STATE_CACHE._local_cache[uuid]
+    if chat_id and str(chat_id) in _USER_STATE_CACHE._local_cache:
+        del _USER_STATE_CACHE._local_cache[str(chat_id)]
+    if user_id and str(user_id) in _USER_STATE_CACHE._local_cache:
+        del _USER_STATE_CACHE._local_cache[str(user_id)]
 
 
 # ------------------------------------------------------------------------------------
@@ -7502,6 +7502,13 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
     if len(df) < 2:
         logger.info("No hay suficientes datos para calcular la probabilidad técnica.")
         return 50.0
+    
+    # ✅ Verificar que los indicadores requeridos existan
+    required_cols = ["macd", "signal", "rsi", "stoch_k", "close", "high", "low", "ATR"]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        logger.warning(f"[ajustar_probabilidad_tecnica] Columnas faltantes: {missing_cols}. Retornando prob default (50.0)")
+        return 50.0
 
     ultima_fila = df.iloc[-1]
     penultima_fila = df.iloc[-2]
@@ -8766,7 +8773,7 @@ def predecir_arima(df, temporalidad, symbol, steps=5):
 
     # Verificar que haya suficientes datos
     if len(df) < 30:
-        logger.info(f"Datos insuficientes para ARIMA. activo: {df['Activo']}, temporalidad {temporalidad}")
+        logger.info(f"Datos insuficientes para ARIMA. symbol: {symbol}, temporalidad: {temporalidad}")
         return None
 
     # Eliminar valores NaN
