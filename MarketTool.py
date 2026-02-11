@@ -12724,6 +12724,23 @@ async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen
 
 
 # =========================
+# Monitoreo: cobro por llamada
+# =========================
+async def _charge_monitoreo_per_call(user_id: str, origen: str = "app") -> Tuple[bool, str]:
+    """
+    Cobra 1 transacción por cada llamada a endpoints de monitoreo.
+    - Se cobra por cada consulta de activo_temporalidad
+    - Admins bypass automáticamente
+    - Usado en: /monitoreo/eventos, /monitoreo/incremental, /monitoreo/history
+    """
+    if not user_id:
+        return False, "user_id es obligatorio"
+    if es_administrador(user_id):
+        return True, "admin"
+    return await descontar_transaccion(user_id, 1, origen=origen)
+
+
+# =========================
 # ✉️ Noticias generales (Firestore + descuento)
 # =========================
 #@profile
@@ -15526,7 +15543,7 @@ def _server_err(e):
     return jsonify({"status":"error","message":"internal error"}), 500
 
 @webhook_app.route("/monitoreo/eventos", methods=["POST"])
-def monitoreo_eventos():
+async def monitoreo_eventos():
     """
     POST /monitoreo/eventos
     Body:
@@ -15565,6 +15582,11 @@ def monitoreo_eventos():
 
         if not user_id or not exec_id or not symbol:
             return jsonify({"status":"error","message":"user_id, exec_id y symbol son obligatorios"}), 400
+
+        # Cobro por llamada
+        ok, msg = await _charge_monitoreo_per_call(user_id, origen="app")
+        if not ok:
+            return jsonify({"status":"error","message": msg}), 402
 
         logger.info(f"Llamando _fetch_events_for({symbol}, hb={hours_back}, mf={minutes_fwd})")
         df = _fetch_events_for(symbol, hours_back=hours_back, minutes_fwd=minutes_fwd)
@@ -15695,6 +15717,11 @@ async def monitoreo_incremental():
             return jsonify({"status": "error", "message": "exec_id es obligatorio"}), 400
         if not symbol or not timeframe:
             return jsonify({"status": "error", "message": "symbol y timeframe son obligatorios"}), 400
+
+        # Cobro por llamada (cada consulta activo_temporalidad)
+        ok, msg = await _charge_monitoreo_per_call(user_id, origen="app")
+        if not ok:
+            return jsonify({"status":"error","message": msg}), 402
 
         logging.info(
             "INC START user=%s exec=%s body=%s",
@@ -16177,6 +16204,11 @@ async def monitoreo_history():
                     "candles": [],
                 }
             ), 200
+
+        # Cobro por llamada (cada consulta activo_temporalidad)
+        ok, msg = await _charge_monitoreo_per_call(user_id, origen="app")
+        if not ok:
+            return jsonify({"status":"error","message": msg}), 402
 
         try:
             limit = int(limit)
