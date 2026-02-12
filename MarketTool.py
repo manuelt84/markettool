@@ -9182,6 +9182,24 @@ def detectar_patrones_confirmados_velas(df: pd.DataFrame, window: int = 10):
 # Función para predicción con ARIMA
 #@profile
 def predecir_arima(df, temporalidad, symbol, steps=5):
+    # Cachear predicciones ARIMA por símbolo/TF para evitar recalcular
+    cache_key = f"{symbol}_{temporalidad}_{len(df)}"
+    if hasattr(predecir_arima, '_cache'):
+        cached = predecir_arima._cache.get(cache_key)
+        if cached is not None:
+            return cached
+    else:
+        predecir_arima._cache = {}
+    
+    # Evitar ARIMA para TFs muy bajas (costoso y poco útil)
+    if temporalidad in ['1min', '5min', '15min']:
+        # Retornar predicción simple basada en media móvil
+        if len(df) >= 20:
+            ma_pred = df['close'].rolling(20).mean().iloc[-1]
+            result = [ma_pred] * steps if not pd.isna(ma_pred) else None
+            predecir_arima._cache[cache_key] = result
+            return result
+        return None
 
     # Mapeo actualizado de temporalidades
     mapeo_temporalidades = {
@@ -9275,15 +9293,28 @@ def predecir_arima(df, temporalidad, symbol, steps=5):
         # Predecir los próximos 'steps' valores
         forecast = model_fit.forecast(steps=steps)
 
-        return forecast.tolist()
+        result = forecast.tolist()
+        
+        # Cachear resultado exitoso
+        predecir_arima._cache[cache_key] = result
+        
+        # Limpiar cache si crece mucho (mantener últimos 100)
+        if len(predecir_arima._cache) > 100:
+            keys_to_remove = list(predecir_arima._cache.keys())[:50]
+            for k in keys_to_remove:
+                predecir_arima._cache.pop(k, None)
+        
+        return result
     except Exception as e:
         logger.info(f"Error al ajustar ARIMA: {e}")
-        return None
+        result = None
+        predecir_arima._cache[cache_key] = result
+        return result
 
 # Función para simulación de Monte Carlo
 #@profile
-def simulacion_monte_carlo(df, temporalidad, num_simulaciones=100, num_dias=5, seed=None):
-    # Validar temporalidad
+def simulacion_monte_carlo(df, temporalidad, num_simulaciones=50, num_dias=5, seed=None):
+    # Validar temporalidad (reducido de 100 a 50 simulaciones para acelerar)
     temporalidades_no_validas = ['1min', '5min', '15min', '30min', '1hour', '4hour']
     if temporalidad in temporalidades_no_validas:
         return 50, 50  # Valores neutros para evitar problemas
@@ -9543,6 +9574,65 @@ def _clean_levels(L):
         if _finite(vv):
             out.append(vv)
     return out
+
+# ========== OPTIMIZACIONES: Cache de niveles y paralelización ==========
+
+# Cache global para niveles de soporte/resistencia (evita recalcular)
+# Estructura: {"symbol|tf|precio_hash|df_len": {"soportes": [...], "resistencias": [...], "timestamp": ...}}
+_niveles_cache = {}
+_niveles_cache_ttl = 300  # 5 minutos de vigencia
+
+def _get_niveles_cache_key(symbol: str, tf: str, precio_actual: float, df_len: int) -> str:
+    """Genera clave de cache para niveles basada en símbolo, TF, precio y tamaño del DF."""
+    precio_hash = int(precio_actual * 100)  # Discretizar precio para permitir pequeñas variaciones
+    return f"{symbol}|{tf}|{precio_hash}|{df_len}"
+
+def _get_cached_niveles(cache_key: str):
+    """Obtiene niveles del cache si son recientes."""
+    if cache_key in _niveles_cache:
+        entry = _niveles_cache[cache_key]
+        age = (datetime.utcnow() - entry['timestamp']).total_seconds()
+        if age < _niveles_cache_ttl:
+            return entry['soportes'], entry['resistencias']
+    return None, None
+
+def _cache_niveles(cache_key: str, soportes: list, resistencias: list):
+    """Almacena niveles en cache."""
+    _niveles_cache[cache_key] = {
+        'soportes': soportes,
+        'resistencias': resistencias,
+        'timestamp': datetime.utcnow()
+    }
+    # Limpiar entradas antiguas si el cache crece mucho
+    if len(_niveles_cache) > 200:
+        now = datetime.utcnow()
+        keys_to_remove = [
+            k for k, v in _niveles_cache.items()
+            if (now - v['timestamp']).total_seconds() > _niveles_cache_ttl
+        ]
+        for k in keys_to_remove:
+            _niveles_cache.pop(k, None)
+
+async def _calcular_predicciones_paralelo(df, tf, symbol, window):
+    """Ejecuta predicciones ARIMA, Media Móvil y Monte Carlo en paralelo."""
+    loop = asyncio.get_event_loop()
+    
+    # Ejecutar en threads separados para no bloquear el event loop
+    arima_task = loop.run_in_executor(None, predecir_arima, df, tf, symbol)
+    mm_task = loop.run_in_executor(None, predecir_media_movil, df, window)
+    mc_task = loop.run_in_executor(
+        None, 
+        lambda: simulacion_monte_carlo(df, tf, num_simulaciones=50, num_dias=5, seed=42)
+    )
+    
+    # Esperar a que todas terminen
+    predicciones_arima, predicciones_media_movil, (prob_alza, prob_baja) = await asyncio.gather(
+        arima_task, mm_task, mc_task
+    )
+    
+    return predicciones_arima, predicciones_media_movil, prob_alza, prob_baja
+
+# ========================================================================
 
 #@profile
 def ajustar_window_dinamico_optimizado(
@@ -10592,41 +10682,114 @@ def calcular_entradas(
 
         tf = _tf_backend(temporalidad)
         window = min(definir_window(tf, overrides=calc_windows), len(df))
+        precio_actual = df["close"].iloc[-1]
 
-        # --- Patrones ---
-        patrones_detectados = {}
-        resultados = detectar_patrones_confirmados_velas(df, window)
-        for _, _, nombre in resultados:
-            patrones_detectados[nombre] = True
-        # print(f"Paso exitosamente la detección de patrones: {patrones_detectados}")
+        # --- PARALELIZACIÓN DE OPERACIONES COSTOSAS ---
+        # Ejecutar en paralelo: patrones, rango, técnica, fundamental
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            # Lanzar tareas en paralelo 
+            future_patrones = executor.submit(detectar_patrones_confirmados_velas, df, window)
+            future_rango = executor.submit(
+                lambda: detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
+            )
+            future_tecnica = executor.submit(analisis_tecnico_detallado, df, tf, window, cfg)
+            
+            fecha_inicio = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+            fecha_fin = datetime.now().strftime("%Y-%m-%d")
+            future_fundamental = executor.submit(
+                ajustar_probabilidad_fundamental,
+                50, df_eventos, symbol, tf, fecha_inicio, fecha_fin, cfg, True  # return_meta=True
+            )
+            
+            # Recoger resultados
+            try:
+                resultados = future_patrones.result()
+                patrones_detectados = {}
+                for _, _, nombre in resultados:
+                    patrones_detectados[nombre] = True
+            except Exception as e:
+                logger.info(f"Error detectando patrones para {symbol}-{tf}: {e}")
+                patrones_detectados = {}
+            
+            try:
+                en_rango = future_rango.result()
+            except Exception:
+                en_rango = {
+                    "es_rango_repetitivo": False,
+                    "estructura_tendencia": "indefinida",
+                    "rebotes": [],
+                    "rango_dinamico": [None, None],
+                }
+            
+            try:
+                tecnica_meta = future_tecnica.result()
+            except Exception as e:
+                logger.info(f"Error en análisis técnico para {symbol}-{tf}: {e}")
+                tecnica_meta = None
+            
+            try:
+                prob_funda_out = future_fundamental.result()
+                if isinstance(prob_funda_out, tuple):
+                    prob_funda, fundamental_meta = prob_funda_out
+                else:
+                    prob_funda, fundamental_meta = prob_funda_out, None
+                probabilidad_fundamental = round(prob_funda if prob_funda is not None else 50, 2)
+            except Exception as e:
+                logger.info(f"Error en análisis fundamental para {symbol}-{tf}: {e}")
+                probabilidad_fundamental = 50.0
+                fundamental_meta = None
 
-        # --- Predicciones/MC ---
-        predicciones_arima = predecir_arima(df, tf, symbol)
-        predicciones_media_movil = predecir_media_movil(df, window)
-
-        probabilidad_alza, probabilidad_baja = simulacion_monte_carlo(
-            df, tf, num_simulaciones=100, num_dias=5, seed=42
-        )
+        # --- Predicciones/MC (PARALELIZADAS para mejor rendimiento) ---
+        try:
+            # Ejecutar predicciones en paralelo usando asyncio
+            # Detectar si ya hay un loop corriendo (ej: en Flask con asyncio) 
+            try:
+                loop = asyncio.get_running_loop()
+                # Si hay loop, usar run_in_executor directamente (no podemos usar asyncio.run)
+                raise RuntimeError("Loop already running, use sequential")
+            except RuntimeError:
+                # No hay loop corriendo, crear uno temporal
+                predicciones_arima, predicciones_media_movil, probabilidad_alza, probabilidad_baja = \
+                    asyncio.run(_calcular_predicciones_paralelo(df, tf, symbol, window))
+        except Exception as e:
+            logger.info(f"Paralelización no disponible para {symbol}-{tf}: {e}. Usando secuencial.")
+            # Fallback a ejecución secuencial
+            predicciones_arima = predecir_arima(df, tf, symbol)
+            predicciones_media_movil = predecir_media_movil(df, window)
+            probabilidad_alza, probabilidad_baja = simulacion_monte_carlo(
+                df, tf, num_simulaciones=50, num_dias=5, seed=42
+            )
+        
         probabilidad_alza = probabilidad_alza if probabilidad_alza is not None else 50
         probabilidad_baja = probabilidad_baja if probabilidad_baja is not None else 50
 
-        precio_actual = df["close"].iloc[-1]
-
-        # --- Soportes/Resistencias dinámicos ---
-        df, soportes_dinamicos, resistencias_dinamicas = ajustar_window_dinamico_optimizado(
-            df,
-            symbol,
-            tf,
-            precio_actual,
-            calc_windows=calc_windows,
-            max_incremento=5,
-            min_factor=2,
-            max_factor=8,
-            min_levels=2,
-        )
-
-        soportes_dinamicos = _clean_levels(soportes_dinamicos)
-        resistencias_dinamicas = _clean_levels(resistencias_dinamicas)
+        # --- Soportes/Resistencias dinámicos (CON CACHE) ---
+        cache_key = _get_niveles_cache_key(symbol, tf, precio_actual, len(df))
+        soportes_cached, resistencias_cached = _get_cached_niveles(cache_key)
+        
+        if soportes_cached is not None and resistencias_cached is not None:
+            # Usar niveles del cache
+            soportes_dinamicos = soportes_cached
+            resistencias_dinamicas = resistencias_cached
+        else:
+            # Calcular niveles (costoso)
+            df, soportes_dinamicos, resistencias_dinamicas = ajustar_window_dinamico_optimizado(
+                df,
+                symbol,
+                tf,
+                precio_actual,
+                calc_windows=calc_windows,
+                max_incremento=5,
+                min_factor=2,
+                max_factor=8,
+                min_levels=2,
+            )
+            
+            soportes_dinamicos = _clean_levels(soportes_dinamicos)
+            resistencias_dinamicas = _clean_levels(resistencias_dinamicas)
+            
+            # Almacenar en cache
+            _cache_niveles(cache_key, soportes_dinamicos, resistencias_dinamicas)
 
         if symbol not in soportes_resistencias_cache:
             soportes_resistencias_cache[symbol] = {}
@@ -10652,35 +10815,10 @@ def calcular_entradas(
             max_niveles=2,
         )
 
-        try:
-            en_rango = detectar_rango_zigzag(
-                df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3
-            )
-        except Exception:
-            en_rango = {
-                "es_rango_repetitivo": False,
-                "estructura_tendencia": "indefinida",
-                "rebotes": [],
-                "rango_dinamico": [None, None],
-            }
-
         ATR = _tofloat(df["ATR"].iloc[-1]) if "ATR" in df.columns else None
 
-        # --- Prob. técnica y fundamental (usan cfg) ---
+        # --- Prob. técnica (ya calculamos tecnica_meta y fundamental_meta en paralelo) ---
         probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df, tf, window, cfg), 2)
-        tecnica_meta = analisis_tecnico_detallado(df, tf, window, cfg)
-
-        fecha_inicio = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-        fecha_fin = datetime.now().strftime("%Y-%m-%d")
-
-        prob_funda_out = ajustar_probabilidad_fundamental(
-            50, df_eventos, symbol, tf, fecha_inicio=fecha_inicio, fecha_fin=fecha_fin, cfg=cfg, return_meta=True
-        )
-        if isinstance(prob_funda_out, tuple):
-            prob_funda, fundamental_meta = prob_funda_out
-        else:
-            prob_funda, fundamental_meta = prob_funda_out, None
-        probabilidad_fundamental = round(prob_funda if prob_funda is not None else 50, 2)
 
         # --- Prob. general (con pesos desde cfg.general) ---
         probabilidad_general = calcular_probabilidad_general(
@@ -11958,9 +12096,13 @@ async def ejecutar_analisis_con_hilos(
     if white_cfg:
         cfg_for_process["whitelist"] = white_cfg
 
-    # --- Semaphore para limitar concurrencia (evita overhead de context switching con 250+ tasks) ---
-    # Con caché, 8 tasks simultáneamente es optimal (evita contención + aprovecha cache hit)
-    sem = asyncio.Semaphore(8)
+    # --- ThreadPoolExecutor dedicado con más workers para alto rendimiento ---
+    # Con cache y optimizaciones, aumentar a 16-20 workers aprovecha mejor recursos
+    max_workers = min(20, (len(activos_filtrados) * len(temps)) // 2)
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    
+    # --- Semaphore para limitar concurrencia (balance entre throughput y recursos) ---
+    sem = asyncio.Semaphore(16)  # Aumentado de 8 a 16 para mejor paralelización
     
     async def bounded_analysis(symbol, temporalidad):
         """Envuelve procesar_simbolo_temporalidad con límite de concurrencia."""
@@ -11972,7 +12114,7 @@ async def ejecutar_analisis_con_hilos(
                 calc_windows=calc_map,
                 cfg=cfg_for_process
             )
-            return await loop.run_in_executor(None, fn)
+            return await loop.run_in_executor(executor, fn)
 
     # --- Análisis principal ---
     analisis_tasks = []
