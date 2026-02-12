@@ -11624,6 +11624,108 @@ def calcular_ponderacion(row: dict, cfg: dict | None = None) -> float:
 
     return float(ponderacion)
 
+
+#@profile
+def calcular_ponderacion_vectorizado(df: pd.DataFrame, cfg: dict | None = None) -> pd.Series:
+    """Versión vectorizada de calcular_ponderacion para acelerar procesamiento masivo."""
+    p = _norm_ponder_cfg(cfg)
+    if not p.get("enable", True):
+        return pd.Series(0.0, index=df.index)
+    
+    # Inicializar array de ponderaciones
+    ponderacion = np.zeros(len(df), dtype=float)
+    
+    # --- Probabilidad general (vectorizado) ---
+    if 'Probabilidad General (%)' in df.columns:
+        pg = df['Probabilidad General (%)'].fillna(0)
+        ponderacion += np.where(pg > p["prob_high"], p["prob_high_delta"], 0)
+        ponderacion += np.where(pg < p["prob_low"], p["prob_low_delta"], 0)
+        ponderacion += np.where((pg >= p["neutral_min"]) & (pg <= p["neutral_max"]), p["neutral_delta"], 0)
+    
+    # --- Concordancia Tec + Fund (vectorizado) ---
+    if 'Probabilidad Tecnica (%)' in df.columns and 'Probabilidad Fundamental (%)' in df.columns:
+        pt = df['Probabilidad Tecnica (%)'].fillna(50)
+        pf = df['Probabilidad Fundamental (%)'].fillna(50)
+        ponderacion += np.where((pt > 60) & (pf > 60), p["concordancia_bull_delta"], 0)
+        ponderacion += np.where((pt < 40) & (pf < 40), p["concordancia_bear_delta"], 0)
+    
+    # --- Niveles (vectorizado con manejo de división por cero) ---
+    cols_niveles = {'Ultimo Valor', 'Soporte Nivel 1', 'Resistencia Nivel 1', 'Soporte Nivel 2', 'Resistencia Nivel 2'}
+    if cols_niveles.issubset(df.columns):
+        precio = df['Ultimo Valor'].fillna(0)
+        s1 = df['Soporte Nivel 1'].fillna(0)
+        r1 = df['Resistencia Nivel 1'].fillna(0)
+        s2 = df['Soporte Nivel 2'].fillna(0)
+        r2 = df['Resistencia Nivel 2'].fillna(0)
+        
+        # Distancias con protección división por cero
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dist_s1 = np.where(s1 != 0, np.abs(precio - s1) / s1, np.inf)
+            dist_r1 = np.where(r1 != 0, np.abs(r1 - precio) / r1, np.inf)
+            
+            ponderacion += np.where(dist_s1 < 0.01, p["near_s1_delta"], 0)
+            ponderacion += np.where(dist_r1 < 0.01, p["near_r1_delta"], 0)
+            
+            # Ventanas 1%
+            ponderacion += np.where(precio <= s1 * 1.01, np.maximum(0, p["near_s1_delta"]), 0)
+            ponderacion += np.where(precio >= r1 * 0.99, np.minimum(0, p["near_r1_delta"]), 0)
+            ponderacion += np.where(precio <= s2 * 1.01, p["near_s2_delta"], 0)
+            ponderacion += np.where(precio >= r2 * 0.99, p["near_r2_delta"], 0)
+    
+    # --- MACD (vectorizado) ---
+    if 'Cruce MACD' in df.columns:
+        macd = df['Cruce MACD'].fillna('')
+        ponderacion += np.where(macd == 'Cruce Alcista', p["macd_cruce_alcista_delta"], 0)
+        ponderacion += np.where(macd == 'Cruce Bajista', p["macd_cruce_bajista_delta"], 0)
+    
+    # --- Bollinger (vectorizado) ---
+    if all(c in df.columns for c in ['bollinger_upper', 'bollinger_lower', 'Ultimo Valor']):
+        bup = df['bollinger_upper'].fillna(np.inf)
+        blo = df['bollinger_lower'].fillna(-np.inf)
+        precio = df['Ultimo Valor'].fillna(0)
+        ponderacion += np.where(precio < blo, p["bollinger_bajo_delta"], 0)
+        ponderacion += np.where(precio > bup, p["bollinger_alto_delta"], 0)
+    
+    # --- Tendencia (vectorizado) ---
+    if 'Tendencia Predicha' in df.columns:
+        tend = df['Tendencia Predicha'].fillna('Neutral')
+        ponderacion += np.where(tend == 'Alcista', p["tendencia_alcista_delta"], 0)
+        ponderacion += np.where(tend == 'Bajista', p["tendencia_bajista_delta"], 0)
+    
+    # --- Señales (requiere lista global, vectorizado si existe) ---
+    if 'Tipo de Operacion' in df.columns:
+        try:
+            signal = df['Tipo de Operacion'].fillna('Neutral')
+            compra_mask = signal.isin(señales_compra)
+            venta_mask = signal.isin(señales_venta)
+            ponderacion += np.where(compra_mask, p["senal_compra_delta"], 0)
+            ponderacion += np.where(venta_mask, p["senal_venta_delta"], 0)
+        except NameError:
+            pass
+    
+    # --- Ponderación incremental (vectorizado) ---
+    if 'Ponderacion Incremental' in df.columns:
+        pi = df['Ponderacion Incremental'].fillna(0)
+        th = p["ponder_inc_threshold"]
+        if th is not None:
+            ponderacion += np.where(pi >= th, p["ponder_inc_pos_delta"], 0)
+            ponderacion += np.where(pi <= -th, p["ponder_inc_neg_delta"], 0)
+    
+    # --- Multiplicador por temporalidad (vectorizado) ---
+    if 'Temporalidad' in df.columns:
+        tf_lower = df['Temporalidad'].astype(str).str.lower()
+        mult = np.ones(len(df))
+        mult = np.where(tf_lower.str.contains('1min|5min|1m|5m', regex=True, na=False), p["mult_1m_5m"], mult)
+        mult = np.where(tf_lower.str.contains('15min|30min|15m|30m', regex=True, na=False), p["mult_15m_30m"], mult)
+        mult = np.where(tf_lower.str.contains('1hour|4hour|1h|4h', regex=True, na=False), p["mult_1h_4h"], mult)
+        mult = np.where(tf_lower.str.contains('1day|1week|1d|1w', regex=True, na=False), p["mult_1d_1w"], mult)
+        ponderacion *= mult
+    
+    # --- Clamp final (vectorizado) ---
+    ponderacion = np.clip(ponderacion, p["clamp_min"], p["clamp_max"])
+    
+    return pd.Series(ponderacion, index=df.index, dtype=float)
+
 #@profile
 def procesar_simbolo_temporalidad(
     symbol: str,
@@ -12388,15 +12490,12 @@ async def procesar_resultado(
             },
         )
 
-    # Ponderaciones (esto es lo que toma tiempo)
+    # Ponderaciones (usa versión vectorizada para acelerar)
     df_resultados = df_resultados.copy()
     df_resultados = calcular_ponderacion_incremental_por_divisa(df_resultados, cfg)
 
     df_resultados = df_resultados.copy()
-    df_resultados["Ponderacion"] = (
-        df_resultados.apply(lambda row: calcular_ponderacion(row, cfg), axis=1)
-        .astype(float)
-    )
+    df_resultados["Ponderacion"] = calcular_ponderacion_vectorizado(df_resultados, cfg)
 
     # Limpia columnas internas si existen
     if not df_resultados.empty:
