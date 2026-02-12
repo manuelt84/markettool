@@ -136,21 +136,29 @@ function Snapshot-LocalCacheFromKube {
     $archiveLocal = Join-Path $SnapshotLocalDirArg "markettool-cache-$TimestampArg.tgz"
 
     Write-Host "[2/6] Creando archivo de cache dentro del pod..."
-    $dirs = @()
+    $dirPaths = @()
     $dirCandidates = @("historicos", "forex_news", "indicators", "indicadores", "indicators_cache")
     foreach ($d in $dirCandidates) {
         $exists = kubectl exec -n $NamespaceArg $pod -c $ContainerArg -- sh -lc "test -d /app/$d && echo YES || echo NO"
-        if (($exists | Out-String).Trim() -eq "YES") { $dirs += $d }
+        if (($exists | Out-String).Trim() -eq "YES") { $dirPaths += "/app/$d" }
     }
 
-    if (-not $dirs -or $dirs.Count -eq 0) {
+    $histDir = kubectl exec -n $NamespaceArg $pod -c $ContainerArg -- sh -lc "printenv HIST_DIR 2>/dev/null || true"
+    $histDir = ($histDir | Out-String).Trim()
+    if ($histDir) {
+        $histPath = if ($histDir.StartsWith("/")) { $histDir } else { "/app/$histDir" }
+        $existsHist = kubectl exec -n $NamespaceArg $pod -c $ContainerArg -- sh -lc "test -d $histPath && echo YES || echo NO"
+        if (($existsHist | Out-String).Trim() -eq "YES") { $dirPaths += $histPath }
+    }
+
+    if (-not $dirPaths -or $dirPaths.Count -eq 0) {
         Write-Warning "No hay carpetas de cache locales detectadas en el pod (/app/historicos, /app/forex_news, /app/indicators...)."
         return ""
     }
 
-    $dirsArg = $dirs -join " "
-    Write-Host "Carpetas detectadas en pod: $($dirs -join ', ')"
-    kubectl exec -n $NamespaceArg $pod -c $ContainerArg -- sh -lc "cd /app && tar -czf $archiveInPod $dirsArg && ls -lh $archiveInPod" | Out-Host
+    $dirPathsArg = $dirPaths -join " "
+    Write-Host "Carpetas detectadas en pod: $($dirPaths -join ', ')"
+    kubectl exec -n $NamespaceArg $pod -c $ContainerArg -- sh -lc "tar -czf $archiveInPod $dirPathsArg && ls -lh $archiveInPod" | Out-Host
 
     Write-Host "[3/6] Verificando si el archivo existe en el pod..."
     $exists = kubectl exec -n $NamespaceArg $pod -c $ContainerArg -- sh -lc "test -f $archiveInPod && echo YES || echo NO"
@@ -183,21 +191,29 @@ function Snapshot-LocalCacheFromDocker {
     $archiveLocal = Join-Path $SnapshotLocalDirArg "markettool-cache-$TimestampArg.tgz"
 
     Write-Host "[2/6] Creando archivo de cache dentro del contenedor..."
-    $dirs = @()
+    $dirPaths = @()
     $dirCandidates = @("historicos", "forex_news", "indicators", "indicadores", "indicators_cache")
     foreach ($d in $dirCandidates) {
         $exists = docker exec $container sh -lc "test -d /app/$d && echo YES || echo NO"
-        if (($exists | Out-String).Trim() -eq "YES") { $dirs += $d }
+        if (($exists | Out-String).Trim() -eq "YES") { $dirPaths += "/app/$d" }
     }
 
-    if (-not $dirs -or $dirs.Count -eq 0) {
+    $histDir = docker exec $container sh -lc "printenv HIST_DIR 2>/dev/null || true"
+    $histDir = ($histDir | Out-String).Trim()
+    if ($histDir) {
+        $histPath = if ($histDir.StartsWith("/")) { $histDir } else { "/app/$histDir" }
+        $existsHist = docker exec $container sh -lc "test -d $histPath && echo YES || echo NO"
+        if (($existsHist | Out-String).Trim() -eq "YES") { $dirPaths += $histPath }
+    }
+
+    if (-not $dirPaths -or $dirPaths.Count -eq 0) {
         Write-Warning "No hay carpetas de cache locales detectadas en el contenedor (/app/historicos, /app/forex_news, /app/indicators...)."
         return ""
     }
 
-    $dirsArg = $dirs -join " "
-    Write-Host "Carpetas detectadas en contenedor: $($dirs -join ', ')"
-    docker exec $container sh -lc "cd /app && tar -czf $archiveInContainer $dirsArg && ls -lh $archiveInContainer" | Out-Host
+    $dirPathsArg = $dirPaths -join " "
+    Write-Host "Carpetas detectadas en contenedor: $($dirPaths -join ', ')"
+    docker exec $container sh -lc "tar -czf $archiveInContainer $dirPathsArg && ls -lh $archiveInContainer" | Out-Host
 
     Write-Host "[3/6] Verificando si el archivo existe en el contenedor..."
     $exists = docker exec $container sh -lc "test -f $archiveInContainer && echo YES || echo NO"
