@@ -182,6 +182,12 @@ _LOGGER_FORMAT = "%(levelname)s:%(asctime)s:%(name)s:%(message)s"
 logging.basicConfig(level=getattr(logging, APP_CONFIG.log_level.upper(), logging.INFO),
                     format=_LOGGER_FORMAT)
 logger = logging.getLogger("MarketTool")
+logger.info(
+    "[startup] HIST_DIR=%s cwd=%s hist_abs=%s",
+    APP_CONFIG.hist_dir,
+    os.getcwd(),
+    os.path.abspath(APP_CONFIG.hist_dir),
+)
 
 # HTTP Session with retries
 def _build_session(retries: int, backoff: float) -> requests.Session:
@@ -592,6 +598,34 @@ def _hist_path(symbol: str, tf: str) -> str:
         return _hist_path_json(symbol, tf)
     return _hist_path_csv(symbol, tf)
 
+def _save_local_history_df(symbol: str, tf: str, df: pd.DataFrame) -> None:
+    """Best-effort local save for historicos (similar to indicators cache)."""
+    try:
+        if df is None or getattr(df, "empty", True):
+            return
+
+        out = df.copy()
+        idx_utc = pd.DatetimeIndex(pd.to_datetime(out.index, utc=True, errors="coerce"))
+        mask = ~idx_utc.isna()
+        if not mask.all():
+            out = out.loc[mask].copy()
+            idx_utc = idx_utc[mask]
+
+        out["time"] = idx_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        for c in ("open", "high", "low", "close", "volume"):
+            if c not in out.columns:
+                out[c] = np.nan
+
+        payload = out[["time", "open", "high", "low", "close", "volume"]].tail(1000).to_dict(orient="records")
+
+        os.makedirs(APP_CONFIG.hist_dir, exist_ok=True)
+        local_hist = _hist_path_json(symbol, tf)
+        with open(local_hist, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        logger.debug("[hist_local] Saved %s rows=%d", local_hist, len(payload))
+    except Exception as e:
+        logger.debug("[hist_local] Save failed %s/%s: %s", symbol, tf, e)
+
 def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in ["open","high","low","close","volume"]:
@@ -636,6 +670,7 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
                 df = load_from_gcs(symbol, tf)
                 if df is not None and not df.empty:
                     logger.debug(f"[load_cached] Hit GCS (via Firestore TTL): {symbol}/{tf}")
+                    _save_local_history_df(symbol, tf, df)
                     # Cachear localmente para próximas llamadas
                     try:
                         _LAZY_HIST_LOADER.put(symbol, tf, df)
@@ -652,6 +687,7 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
         df = load_from_gcs(symbol, tf)
         if df is not None and not df.empty:
             logger.debug(f"[load_cached] Hit GCS: {symbol}/{tf}")
+            _save_local_history_df(symbol, tf, df)
             # Cachear localmente para próximas llamadas
             try:
                 _LAZY_HIST_LOADER.put(symbol, tf, df)
@@ -804,6 +840,7 @@ def save_cached_history(symbol: str, tf: str, out: pd.DataFrame, *, storage_dir:
             logger.debug(f"[save_cached_history] GCS save failed: {e}")
         
         # ===== GUARDAR LOCALMENTE (backup) =====
+        _save_local_history_df(symbol, tf, out)
         with open(local_json, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
 
@@ -4435,7 +4472,7 @@ class LazyHistoricosLoader:
         Obtiene históricos del símbolo. Si no está en caché, carga del archivo.
         Con TTL: Si pasó el TTL, recarga del disco.
         """
-        cache_key = f"{symbol.upper()}"
+        cache_key = f"{symbol.upper()}__{normalize_tf(temporalidad)}"
         
         with self._lock:
             now = time.time()
@@ -4451,7 +4488,7 @@ class LazyHistoricosLoader:
                     del self._cache_times[cache_key]
             
             # Cargar del disco
-            df = self._load_from_disk(symbol)
+            df = self._load_from_disk(symbol, temporalidad)
             
             # Guardar en caché (con eviction si necesario)
             if len(self._cache) >= self.maxsize:
@@ -4466,14 +4503,25 @@ class LazyHistoricosLoader:
             
             return df
     
-    def _load_from_disk(self, symbol: str) -> pd.DataFrame:
-        """Carga un símbolo desde archivo JSON."""
+    def _load_from_disk(self, symbol: str, temporalidad: str) -> pd.DataFrame:
+        """Carga un símbolo desde archivo JSON (timeframe-aware)."""
         try:
-            filename = f"{symbol.upper()}.json"
-            filepath = os.path.join(self.hist_dir, filename)
-            
-            if not os.path.exists(filepath):
-                logger.warning(f"[LazyLoader] File not found: {filepath}")
+            safe_sym = _safe_symbol_for_filename(symbol).upper()
+            safe_tf = normalize_tf(temporalidad)
+            candidates = [
+                os.path.join(self.hist_dir, f"{safe_sym}__{safe_tf}.json"),
+                os.path.join(self.hist_dir, f"{safe_sym}_{safe_tf}.json"),
+                os.path.join(self.hist_dir, f"{symbol.upper()}.json"),
+            ]
+
+            filepath = None
+            for cand in candidates:
+                if os.path.exists(cand):
+                    filepath = cand
+                    break
+
+            if not filepath:
+                logger.warning("[LazyLoader] File not found: %s (%s/%s)", self.hist_dir, symbol, safe_tf)
                 return pd.DataFrame()
             
             # Soporta JSON estándar, NDJSON, y {"data": [...]}
@@ -6397,12 +6445,13 @@ async def cargar_datos_historicos_inicial():
     count = 0
     
     try:
-        if not os.path.exists(CARPETA_HISTORICOS):
-            logger.warning("[Startup] Historical folder not found: %s", CARPETA_HISTORICOS)
+        hist_dir = APP_CONFIG.hist_dir if hasattr(APP_CONFIG, "hist_dir") else CARPETA_HISTORICOS
+        if not os.path.exists(hist_dir):
+            logger.warning("[Startup] Historical folder not found: %s", hist_dir)
             cache_historicos = {}
             return
-        
-        for archivo in os.listdir(CARPETA_HISTORICOS):
+
+        for archivo in os.listdir(hist_dir):
             # Soporta .json y opcionalmente .jsonl (NDJSON)
             if not (archivo.endswith(".json") or archivo.endswith(".jsonl")):
                 continue
@@ -6415,12 +6464,16 @@ async def cargar_datos_historicos_inicial():
                 elif base.endswith(".json"):
                     base = base[:-5]
                 
-                partes = base.split("_")
-                if len(partes) != 2:
+                if "__" in base:
+                    symbol, temporalidad = base.split("__", 1)
+                elif "_" in base:
+                    symbol, temporalidad = base.rsplit("_", 1)
+                else:
                     logger.debug("[Startup] Unexpected filename format: %s (skipping)", archivo)
                     continue
-                
-                symbol, temporalidad = partes[0], partes[1]
+
+                if temporalidad == "enriched":
+                    continue
                 
                 # Solo indexar que existe, no cargar aún
                 indexed.setdefault(symbol, {})[temporalidad] = True
