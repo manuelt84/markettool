@@ -28,4 +28,15 @@ COPY . .
 EXPOSE 8080
 ENV PORT=8080
 
+# Optimizaciones Python para alto rendimiento
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONOPTIMIZE=1
+ENV PYTHONDONTWRITEBYTECODE=1
+# Optimización de GC para workloads con alta concurrencia
+ENV MALLOC_TRIM_THRESHOLD_=100000
+ENV MALLOC_MMAP_THRESHOLD_=100000
+# Cache de modelos PyTorch/EasyOCR
+ENV TORCH_HOME=/app/models/torch
+ENV EASY_OCR_MODEL_DIR=/app/models/easyocr
+
 CMD ["python", "MarketTool.py", "--host", "0.0.0.0", "--port", "8080"]

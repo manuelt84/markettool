@@ -196,7 +196,8 @@ def _build_session(retries: int, backoff: float) -> requests.Session:
         allowed_methods=frozenset(["GET","POST","PUT","DELETE","HEAD","OPTIONS"]),
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=20)
+    # pool_maxsize aumentado para soportar 32 workers * 4 pods = 128 análisis concurrentes
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=50, pool_connections=50)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
@@ -1019,7 +1020,8 @@ except Exception:
 
 timezone_country = pytz.UTC
 user_states = {}
-timeout_request_global = 2 # Tiempo máximo de espera en segundos
+# Timeout aumentado para APIs externas (FMP, Investing) bajo alta concurrencia
+timeout_request_global = 10  # Tiempo máximo de espera en segundos
 max_workers_global = min(32, (os.cpu_count() or 1) * 2) #puede tener 64
 cache_noticias = {}
 subscriptions = {}
@@ -12097,12 +12099,14 @@ async def ejecutar_analisis_con_hilos(
         cfg_for_process["whitelist"] = white_cfg
 
     # --- ThreadPoolExecutor dedicado con más workers para alto rendimiento ---
-    # Con cache y optimizaciones, aumentar a 16-20 workers aprovecha mejor recursos
-    max_workers = min(20, (len(activos_filtrados) * len(temps)) // 2)
+    # Optimizado para hardware multi-core (i9/i7) con 16-32GB RAM
+    # Permite procesamiento paralelo completo de todos los pares activo-timeframe
+    max_workers = min(32, len(activos_filtrados) * len(temps))
     executor = ThreadPoolExecutor(max_workers=max_workers)
     
     # --- Semaphore para limitar concurrencia (balance entre throughput y recursos) ---
-    sem = asyncio.Semaphore(16)  # Aumentado de 8 a 16 para mejor paralelización
+    # Aumentado a 24 para maximizar uso de CPU/RAM disponible
+    sem = asyncio.Semaphore(24)
     
     async def bounded_analysis(symbol, temporalidad):
         """Envuelve procesar_simbolo_temporalidad con límite de concurrencia."""
