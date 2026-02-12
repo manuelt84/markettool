@@ -19703,6 +19703,27 @@ async def ejecutar_analisis_desde_app():
                     user_id=user_id, origen="app",
                     exec_id=exec_id, operatoria_cfg=op_cfg, cfg=cfg
                 )
+
+                # No sobreescribir estados terminales (p. ej. saldo_insuficiente -> fallido)
+                try:
+                    _snap = await asyncio.to_thread(db.collection("ejecuciones").document(exec_id).get)
+                    _curr = _snap.to_dict() if _snap and _snap.exists else {}
+                    _estado_curr = str((_curr or {}).get("estado") or "").lower()
+                    _resumen_curr = (_curr or {}).get("resumen") or {}
+                    _error_curr = str(
+                        (_resumen_curr or {}).get("error")
+                        or (_curr or {}).get("error")
+                        or (_curr or {}).get("message")
+                        or ""
+                    ).strip()
+
+                    if _estado_curr in {"fallido", "failed", "stopped", "detenido", "cancelado", "canceled"} or _error_curr:
+                        tracker_status = "cancelled" if _estado_curr in {"stopped", "detenido", "cancelado", "canceled"} else "failed"
+                        await _EXECUTION_TRACKER.complete(exec_id, tracker_status)
+                        return urls_local
+                except Exception:
+                    pass
+
                 # fin normal
                 await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "completado", {"urls": urls_local})
                 await _EXECUTION_TRACKER.complete(exec_id, "completed")
