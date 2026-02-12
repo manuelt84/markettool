@@ -8,7 +8,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-indicators/
 .eggs/
 
 # ===================================
@@ -67,6 +66,7 @@ Thumbs.db
 # ===================================
 backup/
 historicos/
+indicators/
 
 # ===================================
 # FIRESTORE / JSON CONFIGS (opcional)
