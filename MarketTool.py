@@ -942,9 +942,8 @@ class HistoryManager:
 
         now = utc_now()
         if cache_df.empty:
-            # PRIORIDAD: Si cfg trae fmp_window, úsala. Si no, usa el DEFAULT.
-            win = cfg.fmp_window if (cfg.fmp_window and cfg.fmp_window > 0) else DEFAULT_FMP_WINDOWS.get(tf, 1000)
-            from_dt = now - self._timedelta_for(tf, win)
+            # Cold-start: sin cache local/remota -> pedir toda la historia disponible en FMP.
+            from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
         else:
             last = cache_df.index[-1]
             base_tf = self._base_interval_for(tf)
@@ -970,13 +969,14 @@ class HistoryManager:
                 logger.warning("Descarga fallida %s %s: %s", symbol, tf, e)
                 new_df = pd.DataFrame()
 
-        out = merge_histories(cache_df, new_df)
+        out_full = merge_histories(cache_df, new_df)
+        out = out_full
         if cfg.bars and isinstance(cfg.bars, int) and cfg.bars > 0 and len(out) > cfg.bars:
             out = out.tail(cfg.bars)
         if cfg.append_realtime and not out.empty:
             out = self._append_realtime_last_bar(symbol, tf, out)
-        if not out.empty:
-            save_cached_history(symbol, tf, out)
+        if not out_full.empty:
+            save_cached_history(symbol, tf, out_full)
         return out
 
 # Public API (overrides legacy)
@@ -5058,7 +5058,15 @@ class IndicatorsCache:
             logger.debug(f"[IndicatorsCache] Load error {symbol}/{tf}: {e}")
             return None
     
-    def save(self, symbol: str, tf: str, indicators: dict, df_historicos: pd.DataFrame, calc_duration_ms: float = 0):
+    def save(
+        self,
+        symbol: str,
+        tf: str,
+        indicators: dict,
+        df_historicos: pd.DataFrame,
+        calc_duration_ms: float = 0,
+        analysis_audit: dict | None = None,
+    ):
         """
         Guarda indicadores en GCS + metadata en Firestore.
         
@@ -5081,6 +5089,16 @@ class IndicatorsCache:
                 now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
                 data_hash = hash_dataframe(df_historicos)
                 
+                # Preparar metadata de auditoría de análisis (bootstrap/incremental)
+                audit = analysis_audit if isinstance(analysis_audit, dict) else {}
+                payload_audit = {
+                    "last_mode": audit.get("last_mode"),
+                    "last_bootstrap_at": audit.get("last_bootstrap_at"),
+                    "last_incremental_at": audit.get("last_incremental_at"),
+                    "last_incremental_bars": audit.get("last_incremental_bars"),
+                    "last_data_mismatch_at": audit.get("last_data_mismatch_at"),
+                }
+
                 # Preparar payload
                 payload = {
                     "metadata": {
@@ -5090,7 +5108,8 @@ class IndicatorsCache:
                         "data_hash": data_hash,
                         "rows_count": len(df_historicos),
                         "calc_duration_ms": calc_duration_ms,
-                        "indicators_list": list(indicators.keys())
+                        "indicators_list": list(indicators.keys()),
+                        "analysis_audit": payload_audit,
                     },
                     "indicators": indicators
                 }
@@ -5115,7 +5134,14 @@ class IndicatorsCache:
                     "indicators_list": list(indicators.keys()),
                     "calc_duration_ms": calc_duration_ms,
                     "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
-                    "is_valid": True
+                    "is_valid": True,
+                    "analysis_audit": {
+                        "last_mode": audit.get("last_mode"),
+                        "last_bootstrap_at": (now_utc if audit.get("last_mode") == "bootstrap" else audit.get("last_bootstrap_at")),
+                        "last_incremental_at": (now_utc if audit.get("last_mode") == "incremental" else audit.get("last_incremental_at")),
+                        "last_incremental_bars": audit.get("last_incremental_bars"),
+                        "last_data_mismatch_at": (now_utc if audit.get("last_mode") == "data_mismatch" else audit.get("last_data_mismatch_at")),
+                    }
                 }, merge=True)
                 
                 # Cache en memoria LRU
@@ -5374,7 +5400,17 @@ class IndicatorsCache:
                     
                     # Extraer indicadores del DataFrame y guardar
                     indicators = self._extract_indicators_from_df(df_result)
-                    self.save(symbol, tf, indicators, df_historicos, calc_time_ms)
+                    self.save(
+                        symbol,
+                        tf,
+                        indicators,
+                        df_historicos,
+                        calc_time_ms,
+                        analysis_audit={
+                            "last_mode": "bootstrap",
+                            "last_bootstrap_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                        },
+                    )
                     
                     return df_result, {
                         "cache_hit": False,
@@ -5456,7 +5492,18 @@ class IndicatorsCache:
                 df_result = self._apply_indicators_to_df(df_historicos.copy(), indicators_merged)
                 
                 # Guardar actualizado
-                self.save(symbol, tf, indicators_merged, df_historicos, calc_time_ms)
+                self.save(
+                    symbol,
+                    tf,
+                    indicators_merged,
+                    df_historicos,
+                    calc_time_ms,
+                    analysis_audit={
+                        "last_mode": "incremental",
+                        "last_incremental_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                        "last_incremental_bars": int(new_bars),
+                    },
+                )
                 
                 return df_result, {
                     "cache_hit": True,
@@ -5483,7 +5530,17 @@ class IndicatorsCache:
                 calc_time_ms = (time.time() - start_time) * 1000
                 
                 indicators = self._extract_indicators_from_df(df_result)
-                self.save(symbol, tf, indicators, df_historicos, calc_time_ms)
+                self.save(
+                    symbol,
+                    tf,
+                    indicators,
+                    df_historicos,
+                    calc_time_ms,
+                    analysis_audit={
+                        "last_mode": "data_mismatch",
+                        "last_data_mismatch_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                    },
+                )
                 
                 return df_result, {
                     "cache_hit": False,
@@ -7452,19 +7509,47 @@ def obtener_datos_con_hilos(
         # 2) resolver bars desde cfg; si no hay → None
         bars = get_bars_for_tf(cfg, tf)
 
+        # Fuerza full-history en análisis (override manual, no recomendado para uso normal).
+        force_full_history = str(os.getenv("ANALYSIS_USE_FULL_HISTORY", "false")).strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+
+        # Mantener serie histórica completa en análisis para que el cache de indicadores
+        # pueda trabajar en modo incremental (solo nuevas velas + contexto) en futuras corridas.
+        # Si se desactiva, vuelve al comportamiento legacy con recorte por bars.
+        persist_full_series = str(os.getenv("ANALYSIS_PERSIST_FULL_SERIES", "true")).strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+
+        # 2.1) cold-start por activo/TF: si no hay historia cacheada, traer TODO desde FMP
+        try:
+            cached_df = load_cached_history(symbol, tf)
+            cold_start = cached_df is None or getattr(cached_df, "empty", True)
+        except Exception:
+            cold_start = True
+
+        bars_effective = None if (persist_full_series or force_full_history or cold_start) else bars
+
         # 3) histórico (acepta bars=None; si tu fetch ya respeta bars, igual hacemos tail defensivo)
-        df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars)
+        df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars_effective)
         if df_historico is None or df_historico.empty:
             logger.info("Datos históricos no disponibles para %s en %s", symbol, tf)
             return pd.DataFrame()
 
         df_out = df_historico.sort_index()
 
-        # 4) recorte final si bars es numérico
-        if isinstance(bars, int) and bars > 0 and len(df_out) > bars:
+        # 4) recorte final si bars es numérico (solo si NO estamos preservando serie completa)
+        if (not persist_full_series) and (not force_full_history) and (not cold_start) and isinstance(bars, int) and bars > 0 and len(df_out) > bars:
             before = len(df_out)
             df_out = df_out.tail(bars)
             logging.info("[HIST][TAIL] recortado de %d a %d por bars=%d", before, len(df_out), bars)
+
+        if cold_start:
+            logging.info("[HIST][BOOTSTRAP_FULL] %s-%s primera carga completa desde FMP/cache", symbol, tf)
+        elif persist_full_series:
+            logging.info("[HIST][INCREMENTAL_FULL_SERIES] %s-%s actualizando solo velas nuevas sobre serie persistida", symbol, tf)
+        elif force_full_history:
+            logging.info("[HIST][FULL_OVERRIDE] %s-%s usando historia completa por override", symbol, tf)
 
         logging.info(
             "[HIST][RETURN] %s-%s len=%d last_ts=%s last_close=%s",
