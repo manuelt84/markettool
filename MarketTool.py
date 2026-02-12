@@ -12884,6 +12884,14 @@ async def procesar_resultado(
             "top_timeframe_by_asset": top_timeframe_by_asset_temp,
         }
 
+        try:
+            logger.info(
+                f"[ui_resumen preview] top_timeframe={top_timeframe_temp} "
+                f"top_timeframe_by_asset={top_timeframe_by_asset_temp}"
+            )
+        except Exception:
+            pass
+
         # Publicar inmediatamente antes de calcular ponderaciones
         fs_actualizar_ejecucion(
             exec_id,
@@ -12991,6 +12999,15 @@ async def procesar_resultado(
             "priority_assets": priority_assets,  # ✅ Activos prioritarios para monitoreo
             "ready_for_monitoring": [],  # Se actualizará a medida que se suban
         }
+
+        try:
+            logger.info(
+                f"[ui_resumen final] top_timeframe={top_timeframe_final} "
+                f"top_timeframe_by_asset={top_timeframe_by_asset_final} "
+                f"priority_assets={priority_assets}"
+            )
+        except Exception:
+            pass
 
         # ✅ Publicar INMEDIATAMENTE con ponderaciones para navegación del front
         fs_actualizar_ejecucion(
