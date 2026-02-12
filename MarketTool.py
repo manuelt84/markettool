@@ -14432,6 +14432,21 @@ async def ejecutar_recurrente(
             estado_code = estado["reason"]
 
     if estado_code == "transacciones_insuficientes" and not es_administrador(user_id or user_chat_id):
+        error_occurred = True
+        if exec_id:
+            try:
+                await asyncio.to_thread(
+                    fs_finalizar_ejecucion,
+                    exec_id,
+                    "fallido",
+                    {
+                        "error": "saldo_insuficiente",
+                        "code": "INSUFFICIENT_TRANSACTIONS",
+                        "message": "No cuenta con la cuota de transacciones requerida. Por favor, adquiere un paquete.",
+                    },
+                )
+            except Exception:
+                pass
         if send_to_tg:
             try:
                 await context.bot.send_message(
@@ -19635,11 +19650,30 @@ async def ejecutar_analisis_desde_app():
 
         origen = (data.get("origen") or "app").lower()
 
+        # Estimar transacciones requeridas reales (activo x temporalidades)
+        n_transacciones_req = 1
+        try:
+            raw_cfg = None
+            if isinstance(data.get("setup"), dict):
+                raw_cfg = data["setup"]
+            elif isinstance(data.get("operatoria"), dict):
+                op = data["operatoria"]
+                raw_cfg = op.get("config", op)
+            op_cfg_est = normalize_operatoria_payload(raw_cfg) if raw_cfg else None
+            tfs_est = (op_cfg_est or {}).get("tfs") or temporalidades
+
+            await asyncio.to_thread(_ensure_globals_loaded)
+            activos_filtrados_est = await asyncio.to_thread(filtrar_activos_por_moneda, activos, activo)
+            n_transacciones_req = max(1, len(list(activos_filtrados_est or [])) * len(list(tfs_est or [])))
+        except Exception as _e:
+            logger.debug(f"[analisis/ejecutar] No se pudo estimar n_transacciones, fallback=1: {_e}")
+            n_transacciones_req = 1
+
         # --- validar suscripción ---
         kwargs = {"user_id": user_id} if user_id else {"chat_id": chat_id}
         estado_sub = await estado_suscripcion(
             **kwargs,
-            numero_transacciones=1,
+            numero_transacciones=n_transacciones_req,
             origen=origen,
         )
         # Diferenciar entre suscripción inactiva y transacciones insuficientes
