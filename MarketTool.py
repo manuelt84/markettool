@@ -12364,6 +12364,58 @@ async def procesar_resultado(
         (df_resultados_ordenado.get('Zona No Trading') == False)
     ].copy()
 
+    # --- Resumen ligero para UI (disponible antes de subir artefactos pesados) ---
+    if can_archive:
+        cols_ui = [
+            "Activo",
+            "Temporalidad",
+            "Tipo de Operacion",
+            "Ponderacion",
+            "Precio de Entrada",
+            "Take Profit",
+            "Stop Loss",
+            "Autorizado Whitelist",
+            "Motivo Rechazo",
+        ]
+        cols_ui = [c for c in cols_ui if c in df_resultados_ordenado.columns]
+
+        ordenados_top = (
+            df_resultados_ordenado[cols_ui]
+            .head(30)
+            .replace([np.inf, -np.inf], np.nan)
+            .where(pd.notnull(df_resultados_ordenado[cols_ui]), None)
+            .to_dict("records")
+            if cols_ui else []
+        )
+
+        opp_top = (
+            df_filtrado[cols_ui]
+            .head(30)
+            .replace([np.inf, -np.inf], np.nan)
+            .where(pd.notnull(df_filtrado[cols_ui]), None)
+            .to_dict("records")
+            if cols_ui else []
+        )
+
+        ui_resumen = {
+            "ordenados_top": sanitize_for_json(ordenados_top),
+            "oportunidades_top": sanitize_for_json(opp_top),
+            "counts": {
+                "ordenados": int(len(df_resultados_ordenado)),
+                "oportunidades": int(len(df_filtrado)),
+            },
+        }
+
+        fs_actualizar_ejecucion(
+            exec_id,
+            ui_resumen=ui_resumen,
+            upload_state={
+                "status": "publishing",
+                "phase": "starting",
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            },
+        )
+
     # --- JSON oportunidades ---
     if can_archive:
         opp_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
@@ -12376,6 +12428,16 @@ async def procesar_resultado(
         ))
 
     await _collect_urls(json_tasks, "JSON")
+
+    if can_archive:
+        fs_actualizar_ejecucion(
+            exec_id,
+            upload_state={
+                "status": "partial_ready",
+                "phase": "core_ready",
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            },
+        )
 
     df_resultadosToImage = pd.DataFrame(df_filtrado)
 
@@ -12615,6 +12677,16 @@ async def procesar_resultado(
 
             # ⚠️ Nota: el descuento de transacciones lo moviste a *antes* de ejecutar_analisis_con_hilos.
             # Aquí NO descontamos nada para evitar doble cargo.
+
+    if can_archive:
+        fs_actualizar_ejecucion(
+            exec_id,
+            upload_state={
+                "status": "completed",
+                "phase": "done",
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            },
+        )
 
     urls_generadas = _solo_strings_urls(urls_generadas)
     logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
