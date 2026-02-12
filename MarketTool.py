@@ -12159,6 +12159,35 @@ async def procesar_resultado(
     # Limitar concurrencia de uploads para evitar saturar CPU/GCS
     upload_sem = asyncio.Semaphore(6)
 
+    # Función para priorizar temporalidades bajas (traders intradía)
+    def _tf_priority(tf_str: str) -> int:
+        """Convierte temporalidad a minutos para ordenar (menor = más prioritario)"""
+        try:
+            s = str(tf_str or '').strip().lower()
+            if not s: return 99999
+            
+            # Mapeo directo de temporalidades comunes
+            tf_map = {
+                '1min': 1, '5min': 5, '15min': 15, '30min': 30,
+                '1h': 60, '2h': 120, '4h': 240, '6h': 360, '8h': 480, '12h': 720,
+                '1d': 1440, '1w': 10080, '1m': 43200
+            }
+            if s in tf_map:
+                return tf_map[s]
+            
+            # Parseo genérico si no está en el mapa
+            if 'min' in s:
+                return int(s.replace('min', ''))
+            if 'h' in s:
+                return int(s.replace('h', '')) * 60
+            if 'd' in s:
+                return int(s.replace('d', '')) * 1440
+            if 'w' in s:
+                return int(s.replace('w', '')) * 10080
+            return 99999
+        except:
+            return 99999
+
     async def _upload_enriched(res: dict):
         if not isinstance(res, dict):
             return None
@@ -12297,8 +12326,69 @@ async def procesar_resultado(
     if "Niveles Confirmados Reduced (Nivel)" in df_resultados.columns:
         df_resultados["Niveles Confirmados Reduced (Nivel)"] = df_resultados["Niveles Confirmados Reduced (Nivel)"].apply(_fmt_niveles_cell)
 
+    # --- PUBLICAR UI_RESUMEN TEMPRANO (sin ponderaciones completas) ---
+    # Esto permite que el front navegue inmediatamente mientras se calculan ponderaciones
+    if can_archive:
+        # Crear versión preliminar ordenada alfabéticamente (sin ponderaciones todavía)
+        df_prelim = df_resultados.sort_values(by="Activo")
+        
+        cols_ui = [
+            "Activo",
+            "Temporalidad",
+            "Tipo de Operacion",
+            "Precio de Entrada",
+            "Take Profit",
+            "Stop Loss",
+            "Autorizado Whitelist",
+            "Motivo Rechazo",
+        ]
+        cols_ui = [c for c in cols_ui if c in df_prelim.columns]
 
-    # Ponderaciones
+        ordenados_prelim = (
+            df_prelim[cols_ui]
+            .head(30)
+            .replace([np.inf, -np.inf], np.nan)
+            .where(pd.notnull(df_prelim[cols_ui]), None)
+            .to_dict("records")
+            if cols_ui else []
+        )
+
+        # Oportunidades preliminares (sin ponderación, solo por zona válida)
+        df_opp_prelim = df_prelim[
+            (df_prelim.get('Oportunidad') == True) &
+            (df_prelim.get('Zona No Trading') == False)
+        ].copy()
+
+        opp_prelim = (
+            df_opp_prelim[cols_ui]
+            .head(30)
+            .replace([np.inf, -np.inf], np.nan)
+            .where(pd.notnull(df_opp_prelim[cols_ui]), None)
+            .to_dict("records")
+            if cols_ui else []
+        )
+
+        ui_resumen_temp = {
+            "ordenados_top": sanitize_for_json(ordenados_prelim),
+            "oportunidades_top": sanitize_for_json(opp_prelim),
+            "counts": {
+                "ordenados": int(len(df_prelim)),
+                "oportunidades": int(len(df_opp_prelim)),
+            },
+        }
+
+        # Publicar inmediatamente antes de calcular ponderaciones
+        fs_actualizar_ejecucion(
+            exec_id,
+            ui_resumen=ui_resumen_temp,
+            upload_state={
+                "status": "calculating",
+                "phase": "early_preview",
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            },
+        )
+
+    # Ponderaciones (esto es lo que toma tiempo)
     df_resultados = df_resultados.copy()
     df_resultados = calcular_ponderacion_incremental_por_divisa(df_resultados, cfg)
 
@@ -12321,9 +12411,15 @@ async def procesar_resultado(
         by="Ponderacion", ascending=False
     )
 
-    # 7) Subir enriquecidos por símbolo/TF (paralelizado)
+    # 7) Subir enriquecidos por símbolo/TF (paralelizado, priorizando temporalidades bajas)
     if can_archive:
-        upload_tasks = [_upload_enriched(res) for res in resultados]
+        # Ordenar resultados por temporalidad (1min primero, 1w último)
+        resultados_sorted = sorted(
+            resultados,
+            key=lambda r: _tf_priority(r.get("Temporalidad") if isinstance(r, dict) else None)
+        )
+        
+        upload_tasks = [_upload_enriched(res) for res in resultados_sorted]
         upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
         urls_enriched = []
         for result in upload_results:
@@ -12364,7 +12460,7 @@ async def procesar_resultado(
         (df_resultados_ordenado.get('Zona No Trading') == False)
     ].copy()
 
-    # --- Resumen ligero para UI (disponible antes de subir artefactos pesados) ---
+    # --- Actualizar resumen UI con ponderaciones finales (antes de subir JSONs) ---
     if can_archive:
         cols_ui = [
             "Activo",
@@ -12397,7 +12493,7 @@ async def procesar_resultado(
             if cols_ui else []
         )
 
-        ui_resumen = {
+        ui_resumen_final = {
             "ordenados_top": sanitize_for_json(ordenados_top),
             "oportunidades_top": sanitize_for_json(opp_top),
             "counts": {
@@ -12406,9 +12502,10 @@ async def procesar_resultado(
             },
         }
 
+        # Publicar con ponderaciones completas, antes de uploads pesados
         fs_actualizar_ejecucion(
             exec_id,
-            ui_resumen=ui_resumen,
+            ui_resumen=ui_resumen_final,
             upload_state={
                 "status": "publishing",
                 "phase": "starting",
