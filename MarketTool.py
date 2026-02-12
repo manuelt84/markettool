@@ -12652,57 +12652,36 @@ async def procesar_resultado(
         by="Ponderacion", ascending=False
     )
 
-    # 7) Subir enriquecidos por símbolo/TF (paralelizado, priorizando temporalidades bajas)
-    if can_archive:
-        # Ordenar resultados por temporalidad (1min primero, 1w último)
-        resultados_sorted = sorted(
-            resultados,
-            key=lambda r: _tf_priority(r.get("Temporalidad") if isinstance(r, dict) else None)
-        )
-        
-        upload_tasks = [_upload_enriched(res) for res in resultados_sorted]
-        upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
-        urls_enriched = []
-        for result in upload_results:
-            if isinstance(result, Exception):
-                logger.info(f"No se pudo subir JSON enriquecido: {result}")
-            elif result:
-                urls_enriched.append(result)
-        if urls_enriched:
-            urls_generadas.extend(urls_enriched)
-
-    # 8) (Solo app) Subir **ordenado** saneado
-    json_tasks = []
-    if can_archive:
-        df_ord = (
-            df_resultados_ordenado
-            .replace([np.inf, -np.inf], np.nan)
-            .where(pd.notnull(df_resultados_ordenado), None)
-            .copy()
-        )
-        # sanea celdas anidadas si las hubiera
-        for col in df_ord.columns:
-            if df_ord[col].apply(lambda v: isinstance(v, (dict, list, tuple, set, pd.Series))).any():
-                df_ord[col] = df_ord[col].apply(sanitize_for_json)
-
-        ordered_records = sanitize_for_json(df_ord.to_dict("records"))
-
-        json_tasks.append(asyncio.create_task(
-            _upload_json_registrar(
-                nombre_base=f"{moneda_filtro.upper()}_resultados_ordenados",
-                data=ordered_records,
-                metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado"},
-            )
-        ))
-
-    # Oportunidades base (solo zona válida)
+    # Oportunidades base (solo zona válida) - DEFINIR ANTES DE USAR
     df_filtrado = df_resultados_ordenado[
         (df_resultados_ordenado.get('Oportunidad') == True) &
         (df_resultados_ordenado.get('Zona No Trading') == False)
     ].copy()
 
-    # --- Actualizar resumen UI con ponderaciones finales (antes de subir JSONs) ---
+    # --- IDENTIFICAR ACTIVOS PRIORITARIOS PARA MONITOREO ---
+    # Top 2 Long + Top 2 Short (más ponderados de cada tipo)
+    priority_assets = []
+    if not df_filtrado.empty:
+        # Identificar operaciones long (compra)
+        df_long = df_filtrado[
+            df_filtrado.get('Tipo de Operacion', '').astype(str).str.lower().str.contains('compra|buy|long', case=False, na=False)
+        ].sort_values('Ponderacion', ascending=False).head(2)
+        
+        # Identificar operaciones short (venta)
+        df_short = df_filtrado[
+            df_filtrado.get('Tipo de Operacion', '').astype(str).str.lower().str.contains('venta|sell|short', case=False, na=False)
+        ].sort_values('Ponderacion', ascending=False).head(2)
+        
+        # Combinar y extraer símbolos únicos
+        df_priority = pd.concat([df_long, df_short], ignore_index=True)
+        if not df_priority.empty:
+            priority_assets = df_priority['Activo'].unique().tolist()
+            logger.info(f"✅ Activos prioritarios para monitoreo (top 2 long + top 2 short): {priority_assets}")
+
+    # --- ACTUALIZAR UI_RESUMEN CON PONDERACIONES FINALES ANTES DE SUBIR ---
+    # ✅ Esto permite navegación inmediata con el activo top seleccionado
     if can_archive:
+
         cols_ui = [
             "Activo",
             "Temporalidad",
@@ -12741,20 +12720,128 @@ async def procesar_resultado(
                 "ordenados": int(len(df_resultados_ordenado)),
                 "oportunidades": int(len(df_filtrado)),
             },
+            "priority_assets": priority_assets,  # ✅ Activos prioritarios para monitoreo
+            "ready_for_monitoring": [],  # Se actualizará a medida que se suban
         }
 
-        # Publicar con ponderaciones completas, antes de uploads pesados
+        # ✅ Publicar INMEDIATAMENTE con ponderaciones para navegación del front
         fs_actualizar_ejecucion(
             exec_id,
             ui_resumen=ui_resumen_final,
             upload_state={
                 "status": "publishing",
-                "phase": "starting",
+                "phase": "ponderaciones_completas",
                 "updated_at": datetime.utcnow().isoformat() + "Z",
             },
         )
+        logger.info(f"✅ UI Resumen actualizado con ponderaciones - Usuario puede navegar ahora")
 
-    # --- JSON oportunidades ---
+    # 7) Subir enriquecidos PRIORIZANDO activos para monitoreo
+    if can_archive:
+        # Separar resultados en prioritarios y resto
+        resultados_priority = []
+        resultados_rest = []
+        
+        for res in resultados:
+            if isinstance(res, dict):
+                sym = res.get("Activo")
+                if sym in priority_assets:
+                    resultados_priority.append(res)
+                else:
+                    resultados_rest.append(res)
+        
+        # Ordenar prioritarios por TF (1min primero)
+        resultados_priority_sorted = sorted(
+            resultados_priority,
+            key=lambda r: _tf_priority(r.get("Temporalidad"))
+        )
+        
+        # Ordenar resto por TF
+        resultados_rest_sorted = sorted(
+            resultados_rest,
+            key=lambda r: _tf_priority(r.get("Temporalidad"))
+        )
+        
+        ready_for_monitoring = []
+        
+        # ✅ FASE 1: Subir activos prioritarios primero
+        if resultados_priority_sorted:
+            logger.info(f"📤 Subiendo {len(resultados_priority_sorted)} archivos de activos prioritarios...")
+            priority_tasks = [_upload_enriched(res) for res in resultados_priority_sorted]
+            priority_results = await asyncio.gather(*priority_tasks, return_exceptions=True)
+            
+            # Procesar resultados y actualizar ready_for_monitoring
+            for i, result in enumerate(priority_results):
+                if isinstance(result, Exception):
+                    logger.info(f"No se pudo subir JSON prioritario: {result}")
+                elif result:
+                    urls_generadas.append(result)
+                    # Añadir símbolo a ready si no está ya
+                    sym = resultados_priority_sorted[i].get("Activo")
+                    if sym and sym not in ready_for_monitoring:
+                        ready_for_monitoring.append(sym)
+            
+            # Actualizar ui_resumen con activos listos para monitoreo
+            if ready_for_monitoring:
+                fs_actualizar_ejecucion(
+                    exec_id,
+                    ui_resumen={"ready_for_monitoring": ready_for_monitoring},
+                    upload_state={
+                        "status": "publishing",
+                        "phase": "priority_ready",
+                        "updated_at": datetime.utcnow().isoformat() + "Z",
+                    },
+                )
+                logger.info(f"✅ Activos prioritarios listos para monitoreo: {ready_for_monitoring}")
+        
+        # ✅ FASE 2: Subir resto de activos en background
+        if resultados_rest_sorted:
+            logger.info(f"📤 Subiendo {len(resultados_rest_sorted)} archivos restantes...")
+            rest_tasks = [_upload_enriched(res) for res in resultados_rest_sorted]
+            rest_results = await asyncio.gather(*rest_tasks, return_exceptions=True)
+            
+            for i, result in enumerate(rest_results):
+                if isinstance(result, Exception):
+                    logger.info(f"No se pudo subir JSON enriquecido: {result}")
+                elif result:
+                    urls_generadas.append(result)
+                    # Añadir símbolo a ready
+                    sym = resultados_rest_sorted[i].get("Activo")
+                    if sym and sym not in ready_for_monitoring:
+                        ready_for_monitoring.append(sym)
+            
+            # Actualizar con lista completa
+            if ready_for_monitoring:
+                fs_actualizar_ejecucion(
+                    exec_id,
+                    ui_resumen={"ready_for_monitoring": ready_for_monitoring},
+                )
+
+    # 8) (Solo app) Subir **ordenado** saneado
+    json_tasks = []
+    if can_archive:
+        df_ord = (
+            df_resultados_ordenado
+            .replace([np.inf, -np.inf], np.nan)
+            .where(pd.notnull(df_resultados_ordenado), None)
+            .copy()
+        )
+        # sanea celdas anidadas si las hubiera
+        for col in df_ord.columns:
+            if df_ord[col].apply(lambda v: isinstance(v, (dict, list, tuple, set, pd.Series))).any():
+                df_ord[col] = df_ord[col].apply(sanitize_for_json)
+
+        ordered_records = sanitize_for_json(df_ord.to_dict("records"))
+
+        json_tasks.append(asyncio.create_task(
+            _upload_json_registrar(
+                nombre_base=f"{moneda_filtro.upper()}_resultados_ordenados",
+                data=ordered_records,
+                metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado"},
+            )
+        ))
+
+    # 9) (Solo app) Subir oportunidades
     if can_archive:
         opp_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
         json_tasks.append(asyncio.create_task(
