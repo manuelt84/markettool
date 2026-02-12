@@ -40,6 +40,14 @@ spec:
           value: "trading-firestore.json"
         - name: GUNICORN_CMD_ARGS
           value: "--workers=1 --threads=1"  # Evita que más de una solicitud se procese a la vez
+        - name: CACHE_WARMUP_LEADER_ONLY
+          value: "true"
+        - name: CACHE_WARMUP_BLOCKING_STARTUP
+          value: "false"
+        - name: CACHE_WARMUP_ENABLED
+          value: "true"
+        - name: CACHE_WARMUP_CONCURRENCY
+          value: "2"
         volumeMounts:
         - name: gcp-key-volume
           mountPath: "/var/secrets/google"

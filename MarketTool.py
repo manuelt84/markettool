@@ -17453,7 +17453,15 @@ def _maybe_refresh_from_gcs(exec_id: str, symbol: str, timeframe: str, st: dict,
             changed = (st.get("gcs_generation") != blob.generation) or \
                       (st.get("gcs_updated", 0) < (blob.updated.timestamp() if blob.updated else 0))
             too_old = (time.time() - st.get("ts_loaded", 0)) > max_age_s
-            if not (changed or too_old):
+            stale_by_policy = _is_series_stale_by_policy(st, timeframe)
+            if stale_by_policy:
+                logging.info(
+                    "GCS refresh by staleness policy: %s %s (bars_policy=%s)",
+                    symbol,
+                    timeframe,
+                    _MONITOR_STALE_BARS_POLICY.get(timeframe),
+                )
+            if not (changed or too_old or stale_by_policy):
                 return
             js = _download_json_from_gcs(path)
             if isinstance(js, dict) and "series" in js and "candles" in js["series"]:
@@ -17758,10 +17766,69 @@ def _ensure_stream_initialized(exec_id: str, symbol: str, tf: str, st: dict):
     _gcs_write_json(stream_path, series)  # << stream guarda SOLO la lista
 
 
+def _parse_monitor_stale_bars_policy() -> dict[str, int]:
+    """
+    Política de staleness por TF (en cantidad de velas de atraso).
+    Env opcional:
+      MONITOR_STALE_BARS_POLICY="1min:12,5min:8,15min:6,30min:4,1hour:3,4hour:2,1day:2,1week:1"
+    """
+    policy = {
+        "1min": 12,
+        "5min": 8,
+        "15min": 6,
+        "30min": 4,
+        "1hour": 3,
+        "4hour": 2,
+        "1day": 2,
+        "1week": 1,
+    }
+
+    raw = str(os.getenv("MONITOR_STALE_BARS_POLICY", "")).strip()
+    if not raw:
+        return policy
+
+    try:
+        for token in raw.split(","):
+            token = token.strip()
+            if not token or ":" not in token:
+                continue
+            k, v = token.split(":", 1)
+            tf = _norm_tf(k.strip())
+            bars = int(v.strip())
+            if tf and bars > 0:
+                policy[tf] = bars
+    except Exception:
+        pass
+    return policy
+
+
+_MONITOR_STALE_BARS_POLICY = _parse_monitor_stale_bars_policy()
+
+
+def _is_series_stale_by_policy(st: dict, timeframe: str) -> bool:
+    try:
+        series = st.get("series") if isinstance(st, dict) else None
+        if not isinstance(series, list) or not series:
+            return True
+
+        last = series[-1] if isinstance(series[-1], dict) else None
+        last_t = int(last.get("t", 0)) if last else 0
+        if last_t <= 0:
+            return True
+
+        tfms = _tf_ms(timeframe)
+        stale_bars = int(_MONITOR_STALE_BARS_POLICY.get(timeframe, 2))
+        now_ms = int(time.time() * 1000)
+        return (now_ms - last_t) > (stale_bars * tfms)
+    except Exception:
+        return False
+
+
 def _tf_ms(tf: str) -> int:
     return {
         "1min": 60_000, "5min": 5*60_000, "15min": 15*60_000,
-        "30min": 30*60_000, "1hour": 60*60_000, "4hour": 4*60*60_000
+        "30min": 30*60_000, "1hour": 60*60_000, "4hour": 4*60*60_000,
+        "1day": 24*60*60_000, "1week": 7*24*60*60_000,
     }.get(tf, 60_000)
 
 def _bucket_ts(ts_ms: int, tf_ms: int) -> int:
