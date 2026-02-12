@@ -4902,6 +4902,7 @@ class IndicatorsCache:
     Arquitectura stateless:
     - GCS: única fuente de verdad (compartido entre todos los pods)
     - Firestore: metadata + distributed lock (coordinación entre pods)
+    - Disco local del pod: backup/warm-start rápido (best-effort)
     - Memory cache: LRU(5) solo para hit rate dentro de sesión (bajo consumo RAM)
     - Lock distribuido: previene cálculos duplicados entre pods
     
@@ -4931,10 +4932,11 @@ class IndicatorsCache:
         self._memory_cache = OrderedDict()  # LRU: {key: (data, timestamp)}
         self._memory_cache_max = _INDICATORS_MEMORY_CACHE_SIZE
         self._memory_cache_ttl_sec = 300  # 5 min en memoria
+        self._local_dir = os.environ.get("INDICATORS_DIR", "indicators")
         
         self._enabled = _INDICATORS_CACHE_ENABLED
         
-        logger.info(f"[IndicatorsCache] Initialized (pod={self._pod_id}, enabled={self._enabled}, ttl={_INDICATORS_CACHE_TTL_HOURS}h, mem_lru={self._memory_cache_max})")
+        logger.info(f"[IndicatorsCache] Initialized (pod={self._pod_id}, enabled={self._enabled}, ttl={_INDICATORS_CACHE_TTL_HOURS}h, mem_lru={self._memory_cache_max}, local_dir={self._local_dir})")
     
     @property
     def bucket(self):
@@ -4958,6 +4960,53 @@ class IndicatorsCache:
     def _metadata_doc_id(self, symbol: str, tf: str) -> str:
         """Genera doc ID para Firestore metadata."""
         return f"{symbol.upper()}__{normalize_tf(tf)}"
+
+    def _local_path(self, symbol: str, tf: str) -> str:
+        """Path local dentro del pod para cache de indicadores."""
+        safe_symbol = str(symbol).upper().replace("/", "_")
+        safe_tf = normalize_tf(tf).replace("/", "_")
+        return os.path.join(self._local_dir, f"{safe_symbol}__{safe_tf}.json")
+
+    def _load_local(self, symbol: str, tf: str) -> Optional[dict]:
+        """Carga desde disco local del pod (best-effort)."""
+        try:
+            local_path = self._local_path(symbol, tf)
+            if not os.path.exists(local_path):
+                return None
+
+            with open(local_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if "metadata" not in data or "indicators" not in data:
+                logger.warning(f"[IndicatorsCache] Local invalid structure: {symbol}/{tf}")
+                return None
+
+            metadata = data["metadata"]
+            last_update_raw = metadata.get("last_update_utc")
+            if not last_update_raw:
+                return None
+
+            last_update = datetime.fromisoformat(str(last_update_raw).replace('Z', '+00:00'))
+            age_hours = (datetime.utcnow().replace(tzinfo=timezone.utc) - last_update).total_seconds() / 3600
+            if age_hours > _INDICATORS_CACHE_TTL_HOURS:
+                logger.info(f"[IndicatorsCache] Local stale (age={age_hours:.1f}h): {symbol}/{tf}")
+                return None
+
+            logger.debug(f"[IndicatorsCache] Local hit: {symbol}/{tf} (age={age_hours:.1f}h)")
+            return data
+        except Exception as e:
+            logger.debug(f"[IndicatorsCache] Local load error {symbol}/{tf}: {e}")
+            return None
+
+    def _save_local(self, symbol: str, tf: str, payload: dict):
+        """Guarda en disco local del pod (best-effort)."""
+        try:
+            os.makedirs(self._local_dir, exist_ok=True)
+            local_path = self._local_path(symbol, tf)
+            with open(local_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, default=str)
+        except Exception as e:
+            logger.debug(f"[IndicatorsCache] Local save error {symbol}/{tf}: {e}")
     
     def _memory_get(self, symbol: str, tf: str) -> Optional[dict]:
         """Get from LRU memory cache (stateless, muy pequeño)."""
@@ -5000,8 +5049,9 @@ class IndicatorsCache:
         
         Flow:
         1. Check memory cache (LRU pequeño, <100ms)
-        2. Check GCS (source of truth, 100-300ms)
-        3. Validate TTL
+        2. Check local pod cache (fast warm-start)
+        3. Check GCS (source of truth compartido, 100-300ms)
+        4. Validate TTL
         
         Returns:
             dict con estructura:
@@ -5018,8 +5068,14 @@ class IndicatorsCache:
         mem_data = self._memory_get(symbol, tf)
         if mem_data is not None:
             return mem_data
+
+        # 2. Check local pod cache
+        local_data = self._load_local(symbol, tf)
+        if local_data is not None:
+            self._memory_put(symbol, tf, local_data)
+            return local_data
         
-        # 2. Load from GCS (source of truth para multi-pod)
+        # 3. Load from GCS (source of truth para multi-pod)
         try:
             if self.bucket is None:
                 return None
@@ -5050,6 +5106,7 @@ class IndicatorsCache:
             
             # Cache en memoria LRU
             self._memory_put(symbol, tf, data)
+            self._save_local(symbol, tf, data)
             
             logger.info(f"[IndicatorsCache] GCS hit: {symbol}/{tf} (age={age_hours:.1f}h, rows={metadata.get('rows_count')}, pod={self._pod_id})")
             return data
@@ -5082,10 +5139,6 @@ class IndicatorsCache:
         
         try:
             with self._lock:
-                if self.bucket is None or self.db is None:
-                    logger.warning("[IndicatorsCache] GCS/Firestore not available for save")
-                    return
-                
                 now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
                 data_hash = hash_dataframe(df_historicos)
                 
@@ -5113,36 +5166,41 @@ class IndicatorsCache:
                     },
                     "indicators": indicators
                 }
+
+                # Guardar local en pod (best-effort, independiente de GCS/Firestore)
+                self._save_local(symbol, tf, payload)
                 
-                # Guardar en GCS
-                gcs_path = self._gcs_path(symbol, tf)
-                blob = self.bucket.blob(gcs_path)
-                blob.upload_from_string(
-                    json.dumps(payload, default=str),  # default=str para tipos no-json
-                    content_type="application/json"
-                )
-                
-                # Metadata en Firestore
-                doc_id = self._metadata_doc_id(symbol, tf)
-                self.db.collection("indicators_metadata").document(doc_id).set({
-                    "symbol": symbol.upper(),
-                    "timeframe": normalize_tf(tf),
-                    "gcs_path": f"gs://{self.bucket_name}/{gcs_path}",
-                    "last_update_utc": now_utc,
-                    "data_hash": data_hash,
-                    "rows_count": len(df_historicos),
-                    "indicators_list": list(indicators.keys()),
-                    "calc_duration_ms": calc_duration_ms,
-                    "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
-                    "is_valid": True,
-                    "analysis_audit": {
-                        "last_mode": audit.get("last_mode"),
-                        "last_bootstrap_at": (now_utc if audit.get("last_mode") == "bootstrap" else audit.get("last_bootstrap_at")),
-                        "last_incremental_at": (now_utc if audit.get("last_mode") == "incremental" else audit.get("last_incremental_at")),
-                        "last_incremental_bars": audit.get("last_incremental_bars"),
-                        "last_data_mismatch_at": (now_utc if audit.get("last_mode") == "data_mismatch" else audit.get("last_data_mismatch_at")),
-                    }
-                }, merge=True)
+                # Guardar en GCS + metadata Firestore (si disponible)
+                if self.bucket is None or self.db is None:
+                    logger.warning("[IndicatorsCache] GCS/Firestore not available, local cache saved only")
+                else:
+                    gcs_path = self._gcs_path(symbol, tf)
+                    blob = self.bucket.blob(gcs_path)
+                    blob.upload_from_string(
+                        json.dumps(payload, default=str),
+                        content_type="application/json"
+                    )
+
+                    doc_id = self._metadata_doc_id(symbol, tf)
+                    self.db.collection("indicators_metadata").document(doc_id).set({
+                        "symbol": symbol.upper(),
+                        "timeframe": normalize_tf(tf),
+                        "gcs_path": f"gs://{self.bucket_name}/{gcs_path}",
+                        "last_update_utc": now_utc,
+                        "data_hash": data_hash,
+                        "rows_count": len(df_historicos),
+                        "indicators_list": list(indicators.keys()),
+                        "calc_duration_ms": calc_duration_ms,
+                        "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
+                        "is_valid": True,
+                        "analysis_audit": {
+                            "last_mode": audit.get("last_mode"),
+                            "last_bootstrap_at": (now_utc if audit.get("last_mode") == "bootstrap" else audit.get("last_bootstrap_at")),
+                            "last_incremental_at": (now_utc if audit.get("last_mode") == "incremental" else audit.get("last_incremental_at")),
+                            "last_incremental_bars": audit.get("last_incremental_bars"),
+                            "last_data_mismatch_at": (now_utc if audit.get("last_mode") == "data_mismatch" else audit.get("last_data_mismatch_at")),
+                        }
+                    }, merge=True)
                 
                 # Cache en memoria LRU
                 self._memory_put(symbol, tf, payload)
