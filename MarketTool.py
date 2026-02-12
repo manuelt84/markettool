@@ -12645,6 +12645,26 @@ async def procesar_resultado(
         except:
             return 99999
 
+    def _pick_top_timeframe(rows: list[dict]) -> str:
+        counts: dict[str, int] = {}
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            tf = r.get("Temporalidad")
+            if tf is None:
+                continue
+            s = str(tf).strip()
+            if not s:
+                continue
+            counts[s] = counts.get(s, 0) + 1
+        if not counts:
+            return ""
+        top_tf = sorted(
+            counts.items(),
+            key=lambda kv: (-kv[1], _tf_priority(kv[0]), str(kv[0]))
+        )[0][0]
+        return str(top_tf)
+
     async def _upload_enriched(res: dict):
         if not isinstance(res, dict):
             return None
@@ -12810,6 +12830,8 @@ async def procesar_resultado(
             if cols_ui else []
         )
 
+        top_timeframe_temp = _pick_top_timeframe(ordenados_prelim)
+
         # Oportunidades preliminares (sin ponderación, solo por zona válida)
         df_opp_prelim = df_prelim[
             (df_prelim.get('Oportunidad') == True) &
@@ -12832,6 +12854,7 @@ async def procesar_resultado(
                 "ordenados": int(len(df_prelim)),
                 "oportunidades": int(len(df_opp_prelim)),
             },
+            "top_timeframe": top_timeframe_temp,
         }
 
         # Publicar inmediatamente antes de calcular ponderaciones
@@ -12917,6 +12940,8 @@ async def procesar_resultado(
             if cols_ui else []
         )
 
+        top_timeframe_final = _pick_top_timeframe(ordenados_top)
+
         opp_top = (
             df_filtrado[cols_ui]
             .head(30)
@@ -12933,6 +12958,7 @@ async def procesar_resultado(
                 "ordenados": int(len(df_resultados_ordenado)),
                 "oportunidades": int(len(df_filtrado)),
             },
+            "top_timeframe": top_timeframe_final,
             "priority_assets": priority_assets,  # ✅ Activos prioritarios para monitoreo
             "ready_for_monitoring": [],  # Se actualizará a medida que se suban
         }
