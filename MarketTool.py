@@ -5302,14 +5302,10 @@ class IndicatorsCache:
                             logger.info(f"[IndicatorsCache] Other pod finished, using result: {symbol}/{tf}")
                             return True
                 
-                # Exponential backoff: esperar antes de próximo check
-                time.sleep(check_interval)
+                # Exponential backoff + jitter (un solo sleep por iteración)
                 check_interval = min(max_interval, check_interval * 1.5)  # Crecer hasta max
-                
-                # Agregar pequeño jitter para evitar thundering herd
                 jitter = random.uniform(0, check_interval * 0.1)
-                time.sleep(jitter)
-                time.sleep(check_interval)
+                time.sleep(check_interval + jitter)
             
             except Exception as e:
                 logger.warning(f"[IndicatorsCache] Wait error {symbol}/{tf}: {e}")
@@ -5443,6 +5439,76 @@ class IndicatorsCache:
                                      datetime.fromisoformat(cached["metadata"]["last_update_utc"].replace('Z', '+00:00'))).total_seconds() / 3600,
                 "pod_id": self._pod_id
             }
+
+        # Mismas filas pero hash cambió (ej. última vela en formación): recalcular solo cola/contexto
+        if current_rows == cached_rows and current_rows > 0:
+            lock_acquired = self._acquire_lock(symbol, tf)
+
+            if not lock_acquired:
+                if self._wait_for_lock_release(symbol, tf, max_wait_sec=120):
+                    cached = self.load(symbol, tf)
+                    if cached is not None:
+                        df_result = self._apply_indicators_to_df(df_historicos.copy(), cached["indicators"])
+                        return df_result, {
+                            "cache_hit": True,
+                            "incremental": True,
+                            "calc_time_ms": 0,
+                            "source": "waited_for_other_pod_tail_refresh",
+                            "pod_id": self._pod_id
+                        }
+
+            try:
+                window = definir_window(tf)
+                context_start = max(0, current_rows - window)
+                df_to_calc = df_historicos.iloc[context_start:].copy()
+
+                logger.info(
+                    f"[IndicatorsCache] Tail refresh: {symbol}/{tf} "
+                    f"(rows={current_rows}, context={window}, pod={self._pod_id})"
+                )
+
+                start_time = time.time()
+                df_partial = calc_func(df_to_calc, tf)
+                calc_time_ms = (time.time() - start_time) * 1000
+
+                indicators_partial = self._extract_indicators_from_df(df_partial)
+
+                # Reemplaza solo la cola recalculada; preserva histórico previo.
+                indicators_merged = merge_indicators_incremental(
+                    cached["indicators"],
+                    indicators_partial,
+                    context_start,
+                    0,
+                )
+
+                df_result = self._apply_indicators_to_df(df_historicos.copy(), indicators_merged)
+
+                self.save(
+                    symbol,
+                    tf,
+                    indicators_merged,
+                    df_historicos,
+                    calc_time_ms,
+                    analysis_audit={
+                        "last_mode": "incremental",
+                        "last_incremental_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                        "last_incremental_bars": 0,
+                    },
+                )
+
+                return df_result, {
+                    "cache_hit": True,
+                    "incremental": True,
+                    "calc_time_ms": calc_time_ms,
+                    "source": "incremental_tail_refresh",
+                    "new_bars": 0,
+                    "cached_rows": cached_rows,
+                    "total_rows": current_rows,
+                    "pod_id": self._pod_id
+                }
+            finally:
+                if lock_acquired:
+                    self._release_lock(symbol, tf)
         
         # 4. Cálculo incremental: solo nuevas velas
         if current_rows > cached_rows:
