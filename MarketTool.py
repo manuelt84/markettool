@@ -12665,6 +12665,31 @@ async def procesar_resultado(
         )[0][0]
         return str(top_tf)
 
+    def _pick_top_timeframe_by_asset(rows: list[dict]) -> dict:
+        per_asset: dict[str, dict[str, int]] = {}
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            sym = r.get("Activo")
+            tf = r.get("Temporalidad")
+            if sym is None or tf is None:
+                continue
+            s_sym = str(sym).strip().upper()
+            s_tf = str(tf).strip()
+            if not s_sym or not s_tf:
+                continue
+            bucket = per_asset.setdefault(s_sym, {})
+            bucket[s_tf] = bucket.get(s_tf, 0) + 1
+
+        out: dict[str, str] = {}
+        for sym, counts in per_asset.items():
+            top_tf = sorted(
+                counts.items(),
+                key=lambda kv: (-kv[1], _tf_priority(kv[0]), str(kv[0]))
+            )[0][0]
+            out[sym] = str(top_tf)
+        return out
+
     async def _upload_enriched(res: dict):
         if not isinstance(res, dict):
             return None
@@ -12831,6 +12856,7 @@ async def procesar_resultado(
         )
 
         top_timeframe_temp = _pick_top_timeframe(ordenados_prelim)
+        top_timeframe_by_asset_temp = _pick_top_timeframe_by_asset(ordenados_prelim)
 
         # Oportunidades preliminares (sin ponderación, solo por zona válida)
         df_opp_prelim = df_prelim[
@@ -12855,6 +12881,7 @@ async def procesar_resultado(
                 "oportunidades": int(len(df_opp_prelim)),
             },
             "top_timeframe": top_timeframe_temp,
+            "top_timeframe_by_asset": top_timeframe_by_asset_temp,
         }
 
         # Publicar inmediatamente antes de calcular ponderaciones
@@ -12941,6 +12968,7 @@ async def procesar_resultado(
         )
 
         top_timeframe_final = _pick_top_timeframe(ordenados_top)
+        top_timeframe_by_asset_final = _pick_top_timeframe_by_asset(ordenados_top)
 
         opp_top = (
             df_filtrado[cols_ui]
@@ -12959,6 +12987,7 @@ async def procesar_resultado(
                 "oportunidades": int(len(df_filtrado)),
             },
             "top_timeframe": top_timeframe_final,
+            "top_timeframe_by_asset": top_timeframe_by_asset_final,
             "priority_assets": priority_assets,  # ✅ Activos prioritarios para monitoreo
             "ready_for_monitoring": [],  # Se actualizará a medida que se suban
         }
