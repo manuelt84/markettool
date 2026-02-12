@@ -12156,6 +12156,89 @@ async def procesar_resultado(
     can_archive = bool(exec_id)
     urls_generadas = []
 
+    # Limitar concurrencia de uploads para evitar saturar CPU/GCS
+    upload_sem = asyncio.Semaphore(6)
+
+    async def _upload_enriched(res: dict):
+        if not isinstance(res, dict):
+            return None
+
+        sym       = res.get("Activo")
+        tf        = res.get("Temporalidad")
+        df_velas  = res.get("_ohlcv_df")
+        df_inds   = res.get("_indicadores_df")
+        niveles   = res.get("_niveles") or {}
+        entradas  = res.get("_entradas") or {}
+
+        tiene_datos = (
+            isinstance(df_velas, pd.DataFrame) and not df_velas.empty
+        ) or (isinstance(df_inds, pd.DataFrame) and not df_inds.empty)
+
+        if not (sym and tf and tiene_datos):
+            return None
+
+        async with upload_sem:
+            try:
+                return await subir_ohlcv_enriquecido_y_registrar(
+                    exec_id=exec_id,
+                    chat_id=user_chat_id,
+                    symbol=sym,
+                    temporalidad=tf,
+                    df_velas=df_velas if isinstance(df_velas, pd.DataFrame) else pd.DataFrame(),
+                    df_indicadores=df_inds if isinstance(df_inds, pd.DataFrame) else None,
+                    subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
+                    niveles=niveles,
+                    entradas=entradas,
+                    extra_metadata={"moneda_filtro": moneda_filtro},
+                    user_id=user_id
+                )
+            except Exception as e:
+                logger.info(f"No se pudo subir JSON enriquecido de {sym}-{tf}: {e}")
+                return None
+
+    async def _upload_json_registrar(nombre_base: str, data, metadata: dict):
+        async with upload_sem:
+            return await guardar_json_en_storage_y_registrar(
+                exec_id=exec_id,
+                chat_id=user_chat_id,
+                user_id=user_id,
+                nombre_base=nombre_base,
+                data=data,
+                subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
+                metadata=metadata,
+            )
+
+    async def _upload_csv_and_register(df: pd.DataFrame, nombre_archivo: str, metadata: dict):
+        ruta_local = os.path.join("/tmp", nombre_archivo)
+        await asyncio.to_thread(save_df_as_csv, df, ruta_local, cfg)
+        object_path = build_object_path(exec_id, nombre_archivo) if can_archive else nombre_archivo
+        async with upload_sem:
+            url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
+        if url_publica and can_archive:
+            await asyncio.to_thread(
+                fs_registrar_archivo_generado,
+                exec_id=exec_id,
+                user_id=user_id,
+                chat_id=user_chat_id,
+                tipo="csv",
+                nombre=nombre_archivo,
+                gcs_path=object_path,
+                signed_url=url_publica,
+                content_type="text/csv",
+                metadata=metadata,
+            )
+        return url_publica
+
+    async def _collect_urls(tasks, label: str):
+        if not tasks:
+            return
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.info(f"No se pudo subir {label}: {result}")
+            elif result:
+                urls_generadas.append(result)
+
     # >>> registros sin DataFrames ni claves privadas
     registros_limpios = _sanitize_records_for_json(
         [r for r in resultados if isinstance(r, dict)]
@@ -12238,47 +12321,21 @@ async def procesar_resultado(
         by="Ponderacion", ascending=False
     )
 
-    # 7) Subir enriquecidos por símbolo/TF
+    # 7) Subir enriquecidos por símbolo/TF (paralelizado)
     if can_archive:
+        upload_tasks = [_upload_enriched(res) for res in resultados]
+        upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
         urls_enriched = []
-        for res in resultados:
-            if not isinstance(res, dict):
-                continue
-
-            sym       = res.get("Activo")
-            tf        = res.get("Temporalidad")
-            df_velas  = res.get("_ohlcv_df")
-            df_inds   = res.get("_indicadores_df")
-            niveles   = res.get("_niveles") or {}
-            entradas  = res.get("_entradas") or {}
-
-            tiene_datos = (
-                isinstance(df_velas, pd.DataFrame) and not df_velas.empty
-            ) or (isinstance(df_inds, pd.DataFrame) and not df_inds.empty)
-
-            if sym and tf and tiene_datos:
-                try:
-                    url = await subir_ohlcv_enriquecido_y_registrar(
-                        exec_id=exec_id,
-                        chat_id=user_chat_id,
-                        symbol=sym,
-                        temporalidad=tf,
-                        df_velas=df_velas if isinstance(df_velas, pd.DataFrame) else pd.DataFrame(),
-                        df_indicadores=df_inds if isinstance(df_inds, pd.DataFrame) else None,
-                        subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
-                        niveles=niveles,
-                        entradas=entradas,
-                        extra_metadata={"moneda_filtro": moneda_filtro},
-                        user_id=user_id
-                    )
-                    if url:
-                        urls_enriched.append(url)
-                except Exception as e:
-                    logger.info(f"No se pudo subir JSON enriquecido de {sym}-{tf}: {e}")
+        for result in upload_results:
+            if isinstance(result, Exception):
+                logger.info(f"No se pudo subir JSON enriquecido: {result}")
+            elif result:
+                urls_enriched.append(result)
         if urls_enriched:
             urls_generadas.extend(urls_enriched)
 
     # 8) (Solo app) Subir **ordenado** saneado
+    json_tasks = []
     if can_archive:
         df_ord = (
             df_resultados_ordenado
@@ -12293,17 +12350,13 @@ async def procesar_resultado(
 
         ordered_records = sanitize_for_json(df_ord.to_dict("records"))
 
-        url_ordenado = await guardar_json_en_storage_y_registrar(
-            exec_id=exec_id,
-            chat_id=user_chat_id,
-            user_id=user_id,
-            nombre_base=f"{moneda_filtro.upper()}_resultados_ordenados",
-            data=ordered_records,
-            subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
-            metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado"},
-        )
-        if url_ordenado:
-            urls_generadas.append(url_ordenado)
+        json_tasks.append(asyncio.create_task(
+            _upload_json_registrar(
+                nombre_base=f"{moneda_filtro.upper()}_resultados_ordenados",
+                data=ordered_records,
+                metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado"},
+            )
+        ))
 
     # Oportunidades base (solo zona válida)
     df_filtrado = df_resultados_ordenado[
@@ -12314,17 +12367,15 @@ async def procesar_resultado(
     # --- JSON oportunidades ---
     if can_archive:
         opp_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
-        url_opp = await guardar_json_en_storage_y_registrar(
-            exec_id=exec_id,
-            chat_id=user_chat_id,
-            user_id=user_id,
-            nombre_base=f"{moneda_filtro.upper()}_oportunidades",
-            data=opp_records,
-            subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
-            metadata={"moneda_filtro": moneda_filtro, "scope": "oportunidades"},
-        )
-        if url_opp:
-            urls_generadas.append(url_opp)
+        json_tasks.append(asyncio.create_task(
+            _upload_json_registrar(
+                nombre_base=f"{moneda_filtro.upper()}_oportunidades",
+                data=opp_records,
+                metadata={"moneda_filtro": moneda_filtro, "scope": "oportunidades"},
+            )
+        ))
+
+    await _collect_urls(json_tasks, "JSON")
 
     df_resultadosToImage = pd.DataFrame(df_filtrado)
 
@@ -12379,6 +12430,8 @@ async def procesar_resultado(
                            ["USD","EUR","JPY","GBP","AUD","CAD","CHF","NZD"]))
     is_principal_moneda = str(moneda_filtro or "").upper() in _principales
 
+    csv_upload_tasks = []
+
     if is_principal_moneda:
         # Dividir por posición de la divisa (prefijo/sufijo)
         df_principal  = df_resultados_ordenado[df_resultados_ordenado["Activo"].astype(str).str.startswith(moneda_filtro.upper())].copy()
@@ -12389,24 +12442,13 @@ async def procesar_resultado(
 
         if not df_principal.empty:
             if origen == "app":
-                ruta_local = os.path.join("/tmp", nombre_archivo_principal)
-                save_df_as_csv(df_principal, ruta_local, cfg)
-                object_path = build_object_path(exec_id, nombre_archivo_principal) if can_archive else nombre_archivo_principal
-                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
-                urls_generadas.append(url_publica)
-                if can_archive:
-                    await asyncio.to_thread(
-                        fs_registrar_archivo_generado,
-                        exec_id=exec_id,
-                        user_id=user_id,
-                        chat_id=user_chat_id,
-                        tipo="csv",
-                        nombre=nombre_archivo_principal,
-                        gcs_path=object_path,
-                        signed_url=url_publica,
-                        content_type="text/csv",
+                csv_upload_tasks.append(asyncio.create_task(
+                    _upload_csv_and_register(
+                        df_principal,
+                        nombre_archivo_principal,
                         metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
                     )
+                ))
             if send_to_tg:
                 if origen == "telegram":
                     asyncio.create_task(enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id, cfg=cfg))
@@ -12417,24 +12459,13 @@ async def procesar_resultado(
 
         if not df_secundaria.empty:
             if origen == "app":
-                ruta_local = os.path.join("/tmp", nombre_archivo_secundaria)
-                save_df_as_csv(df_secundaria, ruta_local, cfg)
-                object_path = build_object_path(exec_id, nombre_archivo_secundaria) if can_archive else nombre_archivo_secundaria
-                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
-                urls_generadas.append(url_publica)
-                if can_archive:
-                    await asyncio.to_thread(
-                        fs_registrar_archivo_generado,
-                        exec_id=exec_id,
-                        user_id=user_id,
-                        chat_id=user_chat_id,
-                        tipo="csv",
-                        nombre=nombre_archivo_secundaria,
-                        gcs_path=object_path,
-                        signed_url=url_publica,
-                        content_type="text/csv",
+                csv_upload_tasks.append(asyncio.create_task(
+                    _upload_csv_and_register(
+                        df_secundaria,
+                        nombre_archivo_secundaria,
                         metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
                     )
+                ))
             if send_to_tg:
                 if origen == "telegram":
                     asyncio.create_task(enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id, cfg=cfg))
@@ -12452,24 +12483,13 @@ async def procesar_resultado(
 
         if not df_filtrado_principal.empty:
             if origen == "app":
-                ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_principal)
-                save_df_as_csv(df_filtrado_principal, ruta_local, cfg)
-                object_path = build_object_path(exec_id, nombre_archivo_filtrado_principal) if can_archive else nombre_archivo_filtrado_principal
-                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
-                urls_generadas.append(url_publica)
-                if can_archive:
-                    await asyncio.to_thread(
-                        fs_registrar_archivo_generado,
-                        exec_id=exec_id,
-                        user_id=user_id,
-                        chat_id=user_chat_id,
-                        tipo="csv",
-                        nombre=nombre_archivo_filtrado_principal,
-                        gcs_path=object_path,
-                        signed_url=url_publica,
-                        content_type="text/csv",
+                csv_upload_tasks.append(asyncio.create_task(
+                    _upload_csv_and_register(
+                        df_filtrado_principal,
+                        nombre_archivo_filtrado_principal,
                         metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": True},
                     )
+                ))
             if send_to_tg:
                 if origen == "telegram":
                     asyncio.create_task(enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id, cfg=cfg))
@@ -12480,24 +12500,13 @@ async def procesar_resultado(
 
         if not df_filtrado_secundaria.empty:
             if origen == "app":
-                ruta_local = os.path.join("/tmp", nombre_archivo_filtrado_secundaria)
-                save_df_as_csv(df_filtrado_secundaria, ruta_local, cfg)
-                object_path = build_object_path(exec_id, nombre_archivo_filtrado_secundaria) if can_archive else nombre_archivo_filtrado_secundaria
-                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
-                urls_generadas.append(url_publica)
-                if can_archive:
-                    await asyncio.to_thread(
-                        fs_registrar_archivo_generado,
-                        exec_id=exec_id,
-                        user_id=user_id,
-                        chat_id=user_chat_id,
-                        tipo="csv",
-                        nombre=nombre_archivo_filtrado_secundaria,
-                        gcs_path=object_path,
-                        signed_url=url_publica,
-                        content_type="text/csv",
+                csv_upload_tasks.append(asyncio.create_task(
+                    _upload_csv_and_register(
+                        df_filtrado_secundaria,
+                        nombre_archivo_filtrado_secundaria,
                         metadata={"moneda_filtro": moneda_filtro, "particion": "secundaria", "filtrado": True},
                     )
+                ))
             if send_to_tg:
                 if origen == "telegram":
                     asyncio.create_task(enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id, cfg=cfg))
@@ -12508,6 +12517,8 @@ async def procesar_resultado(
     else:
         logger.info(f"La divisa '{moneda_filtro}' NO es principal: se omiten artefactos principal/secundaria.")
     # ---------- ⬆️ FIN LÓGICA PRINCIPAL / SECUNDARIA ⬆️ ----------
+
+    await _collect_urls(csv_upload_tasks, "CSV")
 
     # Guardar CSVs “globales”
     nombre_archivo          = generar_nombre_archivo(moneda_filtro)
@@ -12524,22 +12535,18 @@ async def procesar_resultado(
     async with user_states[user_chat_id]["lock"]:
         user_states[user_chat_id]["lock_holder"] = asyncio.current_task()
 
+        csv_global_tasks = []
+
         # CSV “completo”
         if not df_resultados.empty:
             if origen == "app":
-                ruta_local = os.path.join("/tmp", nombre_archivo)
-                save_df_as_csv(df_resultados, ruta_local, cfg)
-                object_path = build_object_path(exec_id, nombre_archivo) if can_archive else nombre_archivo
-                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
-                urls_generadas.append(url_publica)
-                if can_archive:
-                    await asyncio.to_thread(
-                        fs_registrar_archivo_generado,
-                        exec_id=exec_id, user_id=user_id, chat_id=user_chat_id,
-                        tipo="csv", nombre=nombre_archivo, gcs_path=object_path,
-                        signed_url=url_publica, content_type="text/csv",
+                csv_global_tasks.append(asyncio.create_task(
+                    _upload_csv_and_register(
+                        df_resultados,
+                        nombre_archivo,
                         metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
                     )
+                ))
             if send_to_tg:
                 if origen == "telegram":
                     asyncio.create_task(enviar_csv_telegram(df_resultados, context, nombre_archivo, user_chat_id, cfg=cfg))
@@ -12551,19 +12558,13 @@ async def procesar_resultado(
         # CSV “filtrado”
         if not df_filtrado.empty:
             if origen == "app":
-                ruta_local = os.path.join("/tmp", nombre_archivo_filtrado)
-                save_df_as_csv(df_filtrado, ruta_local, cfg)
-                object_path = build_object_path(exec_id, nombre_archivo_filtrado) if can_archive else nombre_archivo_filtrado
-                url_publica = await subir_a_bucket_y_obtener_url(ruta_local, object_path)
-                urls_generadas.append(url_publica)
-                if can_archive:
-                    await asyncio.to_thread(
-                        fs_registrar_archivo_generado,
-                        exec_id=exec_id, user_id=user_id, chat_id=(user_chat_id or None),
-                        tipo="csv", nombre=nombre_archivo_filtrado, gcs_path=object_path,
-                        signed_url=url_publica, content_type="text/csv",
+                csv_global_tasks.append(asyncio.create_task(
+                    _upload_csv_and_register(
+                        df_filtrado,
+                        nombre_archivo_filtrado,
                         metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": True},
                     )
+                ))
             if send_to_tg:
                 if origen == "telegram":
                     asyncio.create_task(enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id, cfg=cfg))
@@ -12571,6 +12572,8 @@ async def procesar_resultado(
                     await enviar_csv_telegram(df_filtrado, context, nombre_archivo_filtrado, user_chat_id, cfg=cfg)
         else:
             logger.info(f"DF df_filtrado vacío; no se envía {nombre_archivo_filtrado}")
+
+        await _collect_urls(csv_global_tasks, "CSV global")
 
         user_states[user_chat_id]["archivos_enviados"] = True
 
