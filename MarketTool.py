@@ -995,14 +995,7 @@ class HistoryManager:
                         if isinstance(arr, list):
                             activos.update(arr)
                 # 3. lists (campo 'symbol')
-                try:
-                    lists_docs = list(db.collection('lists').stream())
-                    for doc in lists_docs:
-                        d = doc.to_dict()
-                        if 'symbol' in d:
-                            activos.add(d['symbol'])
-                except Exception as e:
-                    logger.warning(f"[FIRESTORE] Error al recuperar lista de símbolos: {e}")
+                # OMITIDO: No se toma en cuenta la colección 'lists' por tamaño y performance
                 self._valid_symbols = set(str(s).strip().upper() for s in activos if isinstance(s, str) and s.strip())
             except Exception as e:
                 logger.warning(f"[FIRESTORE] Error al recuperar activos válidos: {e}")
@@ -4340,7 +4333,7 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
 
                     # Procesar fechas en 'publishedDate'
                     if 'publishedDate' in df_nuevas.columns:
-                        df_nuevas['publishedDate'] = pd.to_datetime(df_nuevas['publishedDate'], errors='coerce')
+                        df_nuevas['publishedDate'] = pd.to_datetime(df_nuevas['publishedDate'], format="%Y-%m-%dT%H:%M:%SZ", errors='coerce')
 
                         # Validar si las fechas son tz-naive o ya tienen información de zona horaria
                         if df_nuevas['publishedDate'].dt.tz is None:
