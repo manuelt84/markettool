@@ -12501,6 +12501,7 @@ async def ejecutar_analisis_con_hilos(
 ):
     resultados = []
     errores = []
+    start_all = time.time()
 
     cfg_overrides       = overrides or {}
     fmp_map   = cfg_overrides.get('fmpWindows')
@@ -12527,6 +12528,16 @@ async def ejecutar_analisis_con_hilos(
     # --- Semaphore para limitar concurrencia (balance entre throughput y recursos) ---
     # Aumentado a 24 para maximizar uso de CPU/RAM disponible
     sem = asyncio.Semaphore(24)
+    slow_task_sec = int(os.environ.get("ANALYSIS_SLOW_TASK_SEC", "30"))
+    total_tasks = len(activos_filtrados) * len(temps)
+    logger.info(
+        "[Analisis] Inicio: activos=%d tfs=%d tasks=%d workers=%d sem=%d",
+        len(activos_filtrados),
+        len(temps),
+        total_tasks,
+        max_workers,
+        24,
+    )
     
     async def bounded_analysis(symbol, temporalidad):
         """Envuelve procesar_simbolo_temporalidad con límite de concurrencia."""
@@ -12538,7 +12549,17 @@ async def ejecutar_analisis_con_hilos(
                 calc_windows=calc_map,
                 cfg=cfg_for_process
             )
-            return await loop.run_in_executor(executor, fn)
+            t0 = time.time()
+            result = await loop.run_in_executor(executor, fn)
+            elapsed = time.time() - t0
+            if elapsed >= slow_task_sec:
+                logger.info(
+                    "[Analisis] Lento: %s/%s %.1fs",
+                    symbol,
+                    temporalidad,
+                    elapsed,
+                )
+            return result
 
     # --- Análisis principal ---
     analisis_tasks = []
@@ -12566,6 +12587,12 @@ async def ejecutar_analisis_con_hilos(
         logger.info("No se pudieron obtener resultados debido a errores.")
         for error in errores:
             logger.info(f" - {error}")
+    logger.info(
+        "[Analisis] Fin: resultados=%d errores=%d elapsed=%.1fs",
+        len(resultados),
+        len(errores),
+        time.time() - start_all,
+    )
 
     return resultados
 
@@ -12798,6 +12825,7 @@ async def procesar_resultado(
     exec_id: str | None = None,
     cfg: dict | None = None
 ):
+    t_proc_start = time.time()
     # --- CARGA CFG
     if cfg is None:
         cfg, _ = await asyncio.to_thread(
@@ -12825,7 +12853,7 @@ async def procesar_resultado(
     urls_generadas = []
 
     # Limitar concurrencia de uploads para evitar saturar CPU/GCS
-    upload_sem = asyncio.Semaphore(6)
+    upload_sem = asyncio.Semaphore(30)  # ✅ Aumentado de 6 a 30 para acelerar subidas GCS masivas
 
     # Función para priorizar temporalidades bajas (traders intradía)
     def _tf_priority(tf_str: str) -> int:
@@ -12982,14 +13010,20 @@ async def procesar_resultado(
                 urls_generadas.append(result)
 
     # >>> registros sin DataFrames ni claves privadas
+    t_clean_start = time.time()
     registros_limpios = _sanitize_records_for_json(
         [r for r in resultados if isinstance(r, dict)]
     )
+    logger.info("[preview timing] sanitize_records: %.1fms", (time.time() - t_clean_start) * 1000)
 
     # --- JSON completo (antes de filtrar) ---
+    t_df_start = time.time()
     df_resultados = pd.DataFrame(registros_limpios)
+    logger.info("[preview timing] create DataFrame (%d rows): %.1fms", len(df_resultados), (time.time() - t_df_start) * 1000)
+    logger.info("[preview] df_resultados rows=%d", len(df_resultados))
 
         # Serializadores locales (no crean funciones globales)
+    t_fmt_start = time.time()
     def _fmt_toques_cell(v):
         try:
 
@@ -13039,9 +13073,12 @@ async def procesar_resultado(
     if "Niveles Confirmados Reduced (Nivel)" in df_resultados.columns:
         df_resultados["Niveles Confirmados Reduced (Nivel)"] = df_resultados["Niveles Confirmados Reduced (Nivel)"].apply(_fmt_niveles_cell)
 
+    logger.info("[preview timing] formateo niveles/toques: %.1fms", (time.time() - t_fmt_start) * 1000)
+
     # --- PUBLICAR UI_RESUMEN TEMPRANO (sin ponderaciones completas) ---
     # Esto permite que el front navegue inmediatamente mientras se calculan ponderaciones
     if can_archive:
+        t_preview_start = time.time()
         # Crear versión preliminar ordenada alfabéticamente (sin ponderaciones todavía)
         df_prelim = df_resultados.sort_values(by="Activo")
         
@@ -13113,13 +13150,19 @@ async def procesar_resultado(
                 "updated_at": datetime.utcnow().isoformat() + "Z",
             },
         )
+        logger.info("[preview] early_preview publicado en %.1fs", time.time() - t_preview_start)
 
     # Ponderaciones (usa versión vectorizada para acelerar)
+    t_pond_inc_start = time.time()
     df_resultados = df_resultados.copy()
     df_resultados = calcular_ponderacion_incremental_por_divisa(df_resultados, cfg)
+    logger.info("[preview timing] ponder_incremental: %.1fms", (time.time() - t_pond_inc_start) * 1000)
 
+    t_pond_vec_start = time.time()
     df_resultados = df_resultados.copy()
     df_resultados["Ponderacion"] = calcular_ponderacion_vectorizado(df_resultados, cfg)
+    logger.info("[preview timing] ponder_vectorizado: %.1fms", (time.time() - t_pond_vec_start) * 1000)
+    logger.info("[preview] ponderaciones listas en %.1fs", time.time() - t_proc_start)
 
     # Limpia columnas internas si existen
     if not df_resultados.empty:
@@ -13130,17 +13173,22 @@ async def procesar_resultado(
 
     
     # Ordenado por ponderación
+    t_sort_start = time.time()
     df_resultados_ordenado = df_resultados.sort_values(
         by="Ponderacion", ascending=False
     )
+    logger.info("[preview timing] sort by Ponderacion: %.1fms", (time.time() - t_sort_start) * 1000)
 
     # Oportunidades base (solo zona válida) - DEFINIR ANTES DE USAR
+    t_filter_start = time.time()
     df_filtrado = df_resultados_ordenado[
         (df_resultados_ordenado.get('Oportunidad') == True) &
         (df_resultados_ordenado.get('Zona No Trading') == False)
     ].copy()
+    logger.info("[preview timing] filter oportunidades: %.1fms", (time.time() - t_filter_start) * 1000)
 
     # --- IDENTIFICAR ACTIVOS PRIORITARIOS PARA MONITOREO ---
+    t_priority_start = time.time()
     # Top 2 Long + Top 2 Short (más ponderados de cada tipo)
     priority_assets = []
     if not df_filtrado.empty:
@@ -13160,7 +13208,10 @@ async def procesar_resultado(
             priority_assets = df_priority['Activo'].unique().tolist()
             logger.info(f"✅ Activos prioritarios para monitoreo (top 2 long + top 2 short): {priority_assets}")
 
+    logger.info("[preview timing] identificar priority_assets: %.1fms", (time.time() - t_priority_start) * 1000)
+
     # --- ACTUALIZAR UI_RESUMEN CON PONDERACIONES FINALES ANTES DE SUBIR ---
+    t_ui_final_start = time.time()
     # ✅ Esto permite navegación inmediata con el activo top seleccionado
     if can_archive:
 
@@ -13231,6 +13282,8 @@ async def procesar_resultado(
             },
         )
         logger.info(f"✅ UI Resumen actualizado con ponderaciones - Usuario puede navegar ahora")
+        logger.info("[preview] ui_resumen_final publicado en %.1fs", time.time() - t_proc_start)
+        logger.info("[preview timing] ui_resumen final (.head, .to_dict, publish): %.1fms", (time.time() - t_ui_final_start) * 1000)
 
     # 7) Subir enriquecidos PRIORIZANDO activos para monitoreo
     if can_archive:
@@ -13359,6 +13412,7 @@ async def procesar_resultado(
                 "updated_at": datetime.utcnow().isoformat() + "Z",
             },
         )
+        logger.info("[preview] core_ready en %.1fs", time.time() - t_proc_start)
 
     df_resultadosToImage = pd.DataFrame(df_filtrado)
 
