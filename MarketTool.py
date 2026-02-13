@@ -1676,7 +1676,14 @@ def get_easyocr_reader(prefer_gpu: bool = True):
         return _reader
 
 # Inicializar EasyOCR (solo una vez, fuera de la función)
-reader = get_easyocr_reader(prefer_gpu=True) 
+# Con manejo graceful de fallos si no hay conectividad
+try:
+    reader = get_easyocr_reader(prefer_gpu=True)
+    logger.info("[EasyOCR] Inicialización exitosa")
+except Exception as e:
+    logger.warning(f"[EasyOCR] No se pudo inicializar EasyOCR en startup: {e}")
+    logger.warning("[EasyOCR] El sistema operará sin OCR. La funcionalidad OCR no estará disponible.")
+    reader = None 
 
 
 #@profile
@@ -2953,7 +2960,11 @@ def infer_symbol_tf_from_image(img_bgr, stop_cb=None, include_tech: bool=False) 
     y2 = max(1, int(h * 0.22))
     header = img_bgr[0:y2, 0:w].copy()
 
-    # OCR solo header
+    # OCR solo header (graceful degradation si EasyOCR no está disponible)
+    if reader is None:
+        logger.warning("[OCR] EasyOCR no está disponible. No se puede detectar símbolo de imagen.")
+        return {}  # Retornar vacío en lugar de crashear
+    
     ocr = reader.readtext(header)  # [(bbox, text, conf), ...]
     if stop_now():
         raise RuntimeError("stopped")
@@ -3687,22 +3698,23 @@ def analizar_con_yolo(ruta_imagen: str, stop_cb=None, include_tech: bool=False, 
     else:
         logger.debug("[analizar_con_yolo] modelo_ruido no disponible; se omite limpieza de ruido.")
 
-    if reader is None:
-        raise RuntimeError("EasyOCR no disponible en este entorno")
+    # OCR opcional: si no está disponible EasyOCR, se omite esta fase (graceful degradation)
+    if reader is not None:
+        resultados_ocr = reader.readtext(ruta_imagen)
+        for (bbox, _texto, conf) in resultados_ocr:
+            if stop_now(): raise RuntimeError("stopped")
+            if conf < 0.4:
+                continue
+            pts = np.array(bbox).astype(np.int32)
 
-    resultados_ocr = reader.readtext(ruta_imagen)
-    for (bbox, _texto, conf) in resultados_ocr:
-        if stop_now(): raise RuntimeError("stopped")
-        if conf < 0.4:
-            continue
-        pts = np.array(bbox).astype(np.int32)
+            # evitar tapar zonas grandes (posible área de gráfico)
+            poly_area = abs(cv2.contourArea(pts))
+            if (poly_area / img_area) > 0.02:   # 2% del área total
+                continue
 
-        # evitar tapar zonas grandes (posible área de gráfico)
-        poly_area = abs(cv2.contourArea(pts))
-        if (poly_area / img_area) > 0.02:   # 2% del área total
-            continue
-
-        cv2.fillPoly(imagen, [pts], (255, 255, 255))
+            cv2.fillPoly(imagen, [pts], (255, 255, 255))
+    else:
+        logger.warning("[analizar_con_yolo] EasyOCR no disponible. Se omite limpieza de texto en imagen.")
 
     cv2.imwrite(imagen_limpia_path, imagen)
 
