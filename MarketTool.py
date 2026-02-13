@@ -11528,14 +11528,16 @@ def generar_entradas_multiples(
                             is_dup = False
                             for e in entries:
                                 if e.get("side") == candidate.get("side") and \
-                                   _near(e.get("precio_entrada", 0.0), candidate.get("precio_entrada", 0.0), dedupe_tol_atr * ATR):\n                                    is_dup = True
+                                   _near(e.get("precio_entrada", 0.0), candidate.get("precio_entrada", 0.0), dedupe_tol_atr * ATR):
+                                    is_dup = True
                                     break
                             
                             if not is_dup:
                                 entries.append(candidate)
-                                logging.info(f\" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}\")
+                                logging.info(f" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}")
                     except Exception as e:
-                        logger.debug(f\"Error ejecutando tarea de entrada: {e}\")\n                        continue
+                        logger.debug(f"Error ejecutando tarea de entrada: {e}")
+                        continue
         except Exception as e:
             logger.warning(f\"Error en paralelización de entradas para {ATR}: {e}. Fallback a secuencial.\")
             # Fallback: ejecutar secuencial si paralelización falla
