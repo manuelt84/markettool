@@ -2766,8 +2766,15 @@ async def warmup_cache_all_assets(reason: str = "scheduled"):
 
     async def _warm_symbol_tf(symbol: str, tf: str):
         async with sem:
-            await asyncio.to_thread(load_cached_history, symbol, tf)
-            await asyncio.to_thread(_INDICATORS_CACHE.load, symbol, tf)
+            try:
+                await asyncio.to_thread(load_cached_history, symbol, tf)
+            except Exception as e:
+                logger.debug(f"[Warmup] Failed to load history {symbol}/{tf}: {type(e).__name__}: {e}")
+            
+            try:
+                await asyncio.to_thread(_INDICATORS_CACHE.load, symbol, tf)
+            except Exception as e:
+                logger.debug(f"[Warmup] Failed to load indicators {symbol}/{tf}: {type(e).__name__}: {e}")
 
     limit_reached = False
     warmed_symbols = 0
@@ -2801,13 +2808,19 @@ async def warmup_cache_all_assets(reason: str = "scheduled"):
         for completed_task in asyncio.as_completed(all_warmup_tasks):
             try:
                 result = await completed_task
-                symbol, tf = task_to_pair[id(completed_task)]
+                task_id = id(completed_task)
+                if task_id not in task_to_pair:
+                    logger.debug(f"[Warmup] Task {task_id} not found in mapping (already processed)")
+                    continue
+                symbol, tf = task_to_pair[task_id]
                 if symbol not in unique_symbols:
                     unique_symbols.add(symbol)
                     warmed_symbols = len(unique_symbols)
                 warmed_pairs += 1
             except Exception as e:
-                logger.warning(f"[Warmup] Error en task: {e}")
+                task_id = id(completed_task)
+                symbol_tf = task_to_pair.get(task_id, ("?", "?"))
+                logger.debug(f"[Warmup] Error warming {symbol_tf[0]}/{symbol_tf[1]} (task {task_id}): {type(e).__name__}: {e}")
     
     # 🔔 Cargar eventos económicos y noticias en paralelo (si habilitado)
     additional_tasks = []
