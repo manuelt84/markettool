@@ -1014,19 +1014,24 @@ class HistoryManager:
         if cache_df.empty:
             from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
         else:
-            last = cache_df.index[-1]
-            # Refuerzo: convierte a tz-aware UTC
             try:
-                last = pd.to_datetime(last, utc=True)
-            except Exception:
-                logging.warning(f"[HIST][BUG] Index type not datetime: {type(last)}. Using now as fallback.")
-                last = now
-            if getattr(last, 'tzinfo', None) is None or last.tzinfo is None:
-                last = last.tz_localize(pytz.UTC)
-            elif last.tzinfo != pytz.UTC:
-                last = last.tz_convert(pytz.UTC)
-            base_tf = self._base_interval_for(tf)
-            from_dt = last + self._timedelta_for(base_tf, 1)
+                last = cache_df.index[-1]
+                # Refuerzo: convierte a tz-aware UTC
+                if not isinstance(last, pd.Timestamp):
+                    last = pd.to_datetime(last, utc=True)
+                else:
+                    last = last.to_pydatetime()
+                
+                if getattr(last, 'tzinfo', None) is None or last.tzinfo is None:
+                    last = pytz.UTC.localize(last)
+                elif last.tzinfo != pytz.UTC:
+                    last = last.astimezone(pytz.UTC)
+                    
+                base_tf = self._base_interval_for(tf)
+                from_dt = last + self._timedelta_for(base_tf, 1)
+            except Exception as idx_err:
+                logging.warning(f"[HIST][ERROR] Index parsing failed for {symbol}/{tf}: {idx_err}. Using fallback (1900).")
+                from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
 
         to_dt = now
         new_df = pd.DataFrame()
@@ -7865,39 +7870,14 @@ def obtener_datos_con_hilos(
 
         bars_effective = None if (persist_full_series or force_full_history or cold_start) else bars
 
-        # 3) histórico: ✅ OPTIMIZACIÓN - usar cache cuando está disponible
-        if not cold_start and cached_df is not None and not cached_df.empty and persist_full_series:
-            # Tenemos cache: solo actualizar con velas nuevas (incremental)
-            logging.info("[HIST][INCREMENTAL] %s-%s usando cache (%d rows) + actualizando nuevas velas", symbol, tf, len(cached_df))
-            
-            # Obtener solo últimas velas desde FMP (ventana pequeña para actualización)
-            update_bars = min(100, bars or 100)  # Suficiente para actualizar
-            df_new = obtener_datos_historicos_fmp(symbol, tf, bars=update_bars)
-            
-            if df_new is not None and not df_new.empty:
-                # Combinar: cache antiguo + nuevas velas (sin duplicados)
-                df_combined = pd.concat([cached_df, df_new]).sort_index()
-                df_out = df_combined[~df_combined.index.duplicated(keep='last')]
-                
-                # Guardar actualizado para próxima vez
-                save_cached_history(symbol, tf, df_out)
-                logging.info("[HIST][INCREMENTAL] %s-%s actualizado: %d → %d rows", symbol, tf, len(cached_df), len(df_out))
-            else:
-                # No hay nuevas velas, usar cache tal cual
-                df_out = cached_df
-                logging.info("[HIST][INCREMENTAL] %s-%s sin cambios, usando cache (%d rows)", symbol, tf, len(cached_df))
-        else:
-            # Cold start o modo legacy: descargar completo desde FMP
-            df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars_effective)
-            if df_historico is None or df_historico.empty:
-                logger.info("Datos históricos no disponibles para %s en %s", symbol, tf)
-                return pd.DataFrame()
-            
-            df_out = df_historico.sort_index()
-            
-            # Guardar en cache para próximas ejecuciones
-            if persist_full_series:
-                save_cached_history(symbol, tf, df_out)
+        # 3) histórico: descarga desde FMP (caching está en load_cached_history internamente)
+        # El cache inteligente ocurre automáticamente en load_cached_history cuando es disponible
+        df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars_effective)
+        if df_historico is None or df_historico.empty:
+            logger.info("Datos históricos no disponibles para %s en %s", symbol, tf)
+            return pd.DataFrame()
+
+        df_out = df_historico.sort_index()
 
         # 4) recorte final si bars es numérico (solo si NO estamos preservando serie completa)
         if (not persist_full_series) and (not force_full_history) and (not cold_start) and isinstance(bars, int) and bars > 0 and len(df_out) > bars:
