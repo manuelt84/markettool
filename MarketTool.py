@@ -977,19 +977,43 @@ class HistoryManager:
         tf = normalize_tf(tf)
         cache_df = load_cached_history(symbol, tf)
 
+        # --- FILTRO DE ACTIVOS VÁLIDOS ---
+        if not hasattr(self, '_valid_symbols'):
+            try:
+                db = firestore.Client()
+                activos_docs = db.collection('config').document('activos').get()
+                activos = set()
+                if activos_docs.exists:
+                    activos_data = activos_docs.to_dict()
+                    activos.update(activos_data.get('symbols', []))
+                lists_docs = db.collection('lists').stream()
+                for doc in lists_docs:
+                    d = doc.to_dict()
+                    if 'symbol' in d:
+                        activos.add(d['symbol'])
+                self._valid_symbols = activos
+            except Exception as e:
+                logger.warning(f"[FIRESTORE] Error al recuperar activos válidos: {e}")
+                self._valid_symbols = set()
+        if symbol not in self._valid_symbols:
+            logger.info(f"[FILTRO] Ignorado símbolo no válido: {symbol}")
+            return pd.DataFrame()
+
         now = utc_now()
         if cache_df.empty:
-            # Cold-start: sin cache local/remota -> pedir toda la historia disponible en FMP.
             from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
         else:
             last = cache_df.index[-1]
-            # Ensure 'last' is a datetime object
-            if not isinstance(last, datetime):
-                try:
-                    last = pd.to_datetime(last)
-                except Exception:
-                    logging.warning(f"[HIST][BUG] Index type not datetime: {type(last)}. Using now as fallback.")
-                    last = now
+            # Refuerzo: convierte a tz-aware UTC
+            try:
+                last = pd.to_datetime(last, utc=True)
+            except Exception:
+                logging.warning(f"[HIST][BUG] Index type not datetime: {type(last)}. Using now as fallback.")
+                last = now
+            if getattr(last, 'tzinfo', None) is None or last.tzinfo is None:
+                last = last.tz_localize(pytz.UTC)
+            elif last.tzinfo != pytz.UTC:
+                last = last.tz_convert(pytz.UTC)
             base_tf = self._base_interval_for(tf)
             from_dt = last + self._timedelta_for(base_tf, 1)
 
