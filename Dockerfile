@@ -25,11 +25,11 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 # ✅ MEJORA: Copiar modelos YOLO PRIMERO (cachea correctamente)
 COPY patrones.pt ruido.pt ./
 
+# ✅ Crear directorio de modelos ANTES de copiar config
+RUN mkdir -p /app/models/torch /app/models/easyocr /root/.ultralytics
+
 # ✅ Copiar configuración YOLO (para NO descargar de internet)
 COPY .ultralytics.yaml /root/.ultralytics/.ultralytics.yaml
-
-# ✅ MEJORA: Crear directorio de modelos para EasyOCR/Torch
-RUN mkdir -p /app/models/torch /app/models/easyocr /root/.ultralytics
 
 # Copiar el resto del código
 COPY . .
@@ -55,8 +55,15 @@ ENV MALLOC_MMAP_THRESHOLD_=100000
 # ✅ Cache de modelos (para evitar descargas)
 ENV TORCH_HOME=/app/models/torch
 ENV EASY_OCR_MODEL_DIR=/app/models/easyocr
+ENV YOLO_CACHE_DIR=/app/models/yolo
 
-# ✅ CRÍTICO: Desabilitar descargas automáticas de YOLO
+# 🚫 CRÍTICO: Desabilitar TODAS las descargas automáticas
+ENV YOLO_SETTINGS_RUN_IN_BACKGROUND=False
+ENV YOLO_SETTINGS_ANALYTICS=False
+ENV YOLO_SETTINGS_ENABLED=False
+ENV YOLO_AUTOINSTALL=0
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
 ENV YOLO_ENV_VARS_SERVER=https://disabled
 ENV YOLO_CACHE=/app/models/yolo
 RUN mkdir -p /app/models/yolo
