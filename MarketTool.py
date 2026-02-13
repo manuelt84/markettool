@@ -27,7 +27,7 @@ from asyncio import Lock, Semaphore, iscoroutinefunction
 from collections import Counter
 from collections import defaultdict
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from datetime import timedelta, date, datetime, timezone, UTC, timezone as dt_timezone
 from flask import Flask, request, jsonify
 from functools import partial
@@ -134,8 +134,8 @@ class AppConfig:
     cache_ttl_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_HISTORICOS", "7200")))
     cache_max_size_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_MAX_SIZE_HISTORICOS", "100")))
     cache_warmup_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_ENABLED", "true").lower() == "true")
-    cache_warmup_blocking_startup: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_BLOCKING_STARTUP", "false").lower() == "true")
-    cache_warmup_interval_minutes: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_INTERVAL_MINUTES", "480")))
+    cache_warmup_blocking_startup: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_BLOCKING_STARTUP", "true").lower() == "true")
+    cache_warmup_interval_minutes: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_INTERVAL_MINUTES", "240")))
     cache_warmup_max_ram_percent: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_MAX_RAM_PERCENT", "80")))
     cache_warmup_concurrency: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "4")))
     cache_warmup_news_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_NEWS_ENABLED", "false").lower() == "true")
@@ -626,6 +626,42 @@ def _save_local_history_df(symbol: str, tf: str, df: pd.DataFrame) -> None:
     except Exception as e:
         logger.debug("[hist_local] Save failed %s/%s: %s", symbol, tf, e)
 
+def _load_local(symbol: str, tf: str) -> Optional[pd.DataFrame]:
+    """Best-effort local load for historicos using the JSON cache."""
+    try:
+        local_hist = _hist_path_json(symbol, tf)
+        if not os.path.exists(local_hist):
+            return None
+
+        ttl_seconds = int(os.environ.get("HIST_LOCAL_TTL_SECONDS", APP_CONFIG.cache_ttl_historicos))
+        if ttl_seconds > 0:
+            age_seconds = time.time() - os.path.getmtime(local_hist)
+            if age_seconds > ttl_seconds:
+                return None
+
+        raw = Path(local_hist).read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else []
+        if isinstance(data, dict):
+            data = data.get("data", data.get("payload", []))
+
+        df = pd.DataFrame(data)
+        if df.empty:
+            return df
+
+        if "time" not in df.columns and "date" not in df.columns:
+            return pd.DataFrame(columns=["open","high","low","close","volume"])
+
+        time_col = "time" if "time" in df.columns else "date"
+        df[time_col] = pd.to_datetime(df[time_col], errors="coerce", utc=True)
+        df = df.dropna(subset=[time_col]).set_index(time_col).sort_index()
+        df = _ensure_cols(df)
+        if df.index.tz is None:
+            df.index = df.index.tz_localize(pytz.UTC)
+        return df
+    except Exception as e:
+        logger.debug("[hist_local] Load failed %s/%s: %s", symbol, tf, e)
+        return None
+
 def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in ["open","high","low","close","volume"]:
@@ -1104,6 +1140,28 @@ user_states = {}
 # Timeout aumentado para APIs externas (FMP, Investing) bajo alta concurrencia
 timeout_request_global = 10  # Tiempo máximo de espera en segundos
 max_workers_global = min(32, (os.cpu_count() or 1) * 2) #puede tener 64
+
+# Concurrency knobs (override via env for stronger machines)
+_CPU_COUNT = os.cpu_count() or 1
+_ANALYSIS_MAX_WORKERS = int(os.environ.get("ANALYSIS_MAX_WORKERS", str(min(64, _CPU_COUNT * 2))))
+_ANALYSIS_SEM = int(os.environ.get("ANALYSIS_SEMAPHORE", str(min(_ANALYSIS_MAX_WORKERS, max(8, _CPU_COUNT)))) )
+_ANALYSIS_INNER_WORKERS = int(os.environ.get("ANALYSIS_INNER_WORKERS", "2"))
+_ANALYSIS_PRED_WORKERS = int(os.environ.get("ANALYSIS_PRED_WORKERS", "3"))
+_ANALYSIS_PRED_USE_PROCESS = os.environ.get("ANALYSIS_PRED_USE_PROCESS", "false").lower() == "true"
+
+_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_MAX_WORKERS))
+_ANALYSIS_INNER_EXECUTOR = (
+    ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_INNER_WORKERS))
+    if _ANALYSIS_INNER_WORKERS > 0
+    else None
+)
+if _ANALYSIS_PRED_WORKERS > 0:
+    if _ANALYSIS_PRED_USE_PROCESS:
+        _ANALYSIS_PRED_EXECUTOR = ProcessPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
+    else:
+        _ANALYSIS_PRED_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
+else:
+    _ANALYSIS_PRED_EXECUTOR = None
 cache_noticias = {}
 subscriptions = {}
 subscriptions_type = {}
@@ -10082,11 +10140,14 @@ _atr_cache_ttl = 3600  # 1 hora de vigencia
 _atr_cache_hits = 0
 _atr_cache_misses = 0
 
-def _get_niveles_cache_key(symbol: str, tf: str, df_len: int) -> str:
-    """Genera clave de cache para niveles basada SOLO en símbolo, TF y tamaño del DF.
-    El precio NO está en la clave porque los soportes/resistencias son estables mientras
-    el número de velas sea el mismo. Esto maximiza los hits de caché.
+def _get_niveles_cache_key(symbol: str, tf: str, df_len: int, precio_actual: float | None = None) -> str:
+    """Genera clave de cache para niveles basada en símbolo, TF y tamaño del DF.
+    Opcionalmente incluye precio discretizado si NIVELES_CACHE_INCLUDE_PRICE=true.
     """
+    include_price = os.environ.get("NIVELES_CACHE_INCLUDE_PRICE", "false").lower() == "true"
+    if include_price and precio_actual is not None:
+        precio_hash = int(precio_actual * 100)
+        return f"{symbol}|{tf}|{precio_hash}|{df_len}"
     return f"{symbol}|{tf}|{df_len}"
 
 def _get_atr_cache_key(symbol: str, tf: str, df_len: int) -> str:
@@ -10159,10 +10220,11 @@ async def _calcular_predicciones_paralelo(df, tf, symbol, window):
     loop = asyncio.get_event_loop()
     
     # Ejecutar en threads separados para no bloquear el event loop
-    arima_task = loop.run_in_executor(None, predecir_arima, df, tf, symbol)
-    mm_task = loop.run_in_executor(None, predecir_media_movil, df, window)
+    exec_used = _ANALYSIS_PRED_EXECUTOR
+    arima_task = loop.run_in_executor(exec_used, predecir_arima, df, tf, symbol)
+    mm_task = loop.run_in_executor(exec_used, predecir_media_movil, df, window)
     mc_task = loop.run_in_executor(
-        None, 
+        exec_used,
         lambda: simulacion_monte_carlo(df, tf, num_simulaciones=50, num_dias=5, seed=42)
     )
     
@@ -11248,58 +11310,63 @@ def calcular_entradas(
 
         # --- PARALELIZACIÓN DE OPERACIONES COSTOSAS ---
         # Ejecutar en paralelo: patrones, rango, técnica, fundamental
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            # Lanzar tareas en paralelo 
-            future_patrones = executor.submit(detectar_patrones_confirmados_velas, df, window)
-            future_rango = executor.submit(
-                lambda: detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
-            )
-            future_tecnica = executor.submit(analisis_tecnico_detallado, df, tf, window, cfg)
-            
-            fecha_inicio = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            fecha_fin = datetime.now().strftime("%Y-%m-%d")
-            future_fundamental = executor.submit(
-                ajustar_probabilidad_fundamental,
-                50, df_eventos, symbol, tf, fecha_inicio, fecha_fin, cfg, True  # return_meta=True
-            )
-            
-            # Recoger resultados
-            try:
-                resultados = future_patrones.result()
-                patrones_detectados = {}
-                for _, _, nombre in resultados:
-                    patrones_detectados[nombre] = True
-            except Exception as e:
-                logger.info(f"Error detectando patrones para {symbol}-{tf}: {e}")
-                patrones_detectados = {}
-            
-            try:
-                en_rango = future_rango.result()
-            except Exception:
-                en_rango = {
-                    "es_rango_repetitivo": False,
-                    "estructura_tendencia": "indefinida",
-                    "rebotes": [],
-                    "rango_dinamico": [None, None],
-                }
-            
-            try:
-                tecnica_meta = future_tecnica.result()
-            except Exception as e:
-                logger.info(f"Error en análisis técnico para {symbol}-{tf}: {e}")
-                tecnica_meta = None
-            
-            try:
-                prob_funda_out = future_fundamental.result()
-                if isinstance(prob_funda_out, tuple):
-                    prob_funda, fundamental_meta = prob_funda_out
-                else:
-                    prob_funda, fundamental_meta = prob_funda_out, None
-                probabilidad_fundamental = round(prob_funda if prob_funda is not None else 50, 2)
-            except Exception as e:
-                logger.info(f"Error en análisis fundamental para {symbol}-{tf}: {e}")
-                probabilidad_fundamental = 50.0
-                fundamental_meta = None
+        _inner_exec = _ANALYSIS_INNER_EXECUTOR
+        if _inner_exec is None:
+            _inner_exec = ThreadPoolExecutor(max_workers=1)
+
+        future_patrones = _inner_exec.submit(detectar_patrones_confirmados_velas, df, window)
+        future_rango = _inner_exec.submit(
+            lambda: detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
+        )
+        future_tecnica = _inner_exec.submit(analisis_tecnico_detallado, df, tf, window, cfg)
+    
+        fecha_inicio = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        fecha_fin = datetime.now().strftime("%Y-%m-%d")
+        future_fundamental = _inner_exec.submit(
+            ajustar_probabilidad_fundamental,
+            50, df_eventos, symbol, tf, fecha_inicio, fecha_fin, cfg, True  # return_meta=True
+        )
+    
+        # Recoger resultados
+        try:
+            resultados = future_patrones.result()
+            patrones_detectados = {}
+            for _, _, nombre in resultados:
+                patrones_detectados[nombre] = True
+        except Exception as e:
+            logger.info(f"Error detectando patrones para {symbol}-{tf}: {e}")
+            patrones_detectados = {}
+    
+        try:
+            en_rango = future_rango.result()
+        except Exception:
+            en_rango = {
+                "es_rango_repetitivo": False,
+                "estructura_tendencia": "indefinida",
+                "rebotes": [],
+                "rango_dinamico": [None, None],
+            }
+    
+        try:
+            tecnica_meta = future_tecnica.result()
+        except Exception as e:
+            logger.info(f"Error en análisis técnico para {symbol}-{tf}: {e}")
+            tecnica_meta = None
+    
+        try:
+            prob_funda_out = future_fundamental.result()
+            if isinstance(prob_funda_out, tuple):
+                prob_funda, fundamental_meta = prob_funda_out
+            else:
+                prob_funda, fundamental_meta = prob_funda_out, None
+            probabilidad_fundamental = round(prob_funda if prob_funda is not None else 50, 2)
+        except Exception as e:
+            logger.info(f"Error en análisis fundamental para {symbol}-{tf}: {e}")
+            probabilidad_fundamental = 50.0
+            fundamental_meta = None
+
+        if _inner_exec is not _ANALYSIS_INNER_EXECUTOR:
+            _inner_exec.shutdown(wait=False)
 
         # --- Predicciones/MC (PARALELIZADAS para mejor rendimiento) ---
         try:
@@ -11326,8 +11393,7 @@ def calcular_entradas(
         probabilidad_baja = probabilidad_baja if probabilidad_baja is not None else 50
 
         # --- Soportes/Resistencias dinámicos (CON CACHE) ---
-        # ✅ MEJORA: Clave de caché sin precio (más estable, maximiza hits)
-        cache_key = _get_niveles_cache_key(symbol, tf, len(df))
+        cache_key = _get_niveles_cache_key(symbol, tf, len(df), precio_actual)
         soportes_cached, resistencias_cached = _get_cached_niveles(cache_key)
         
         if soportes_cached is not None and resistencias_cached is not None:
@@ -12661,23 +12727,21 @@ async def ejecutar_analisis_con_hilos(
         cfg_for_process["whitelist"] = white_cfg
 
     # --- ThreadPoolExecutor dedicado con más workers para alto rendimiento ---
-    # Optimizado para hardware multi-core (i9/i7) con 16-32GB RAM
-    # Permite procesamiento paralelo completo de todos los pares activo-timeframe
-    max_workers = min(32, len(activos_filtrados) * len(temps))
-    executor = ThreadPoolExecutor(max_workers=max_workers)
+    # Controlado por ANALYSIS_MAX_WORKERS (env) y reutiliza un pool global
+    total_tasks = len(activos_filtrados) * len(temps)
+    max_workers = min(_ANALYSIS_MAX_WORKERS, total_tasks) if total_tasks else 1
+    executor = _ANALYSIS_EXECUTOR
     
     # --- Semaphore para limitar concurrencia (balance entre throughput y recursos) ---
-    # Aumentado a 24 para maximizar uso de CPU/RAM disponible
-    sem = asyncio.Semaphore(24)
+    sem = asyncio.Semaphore(max(1, _ANALYSIS_SEM))
     slow_task_sec = int(os.environ.get("ANALYSIS_SLOW_TASK_SEC", "30"))
-    total_tasks = len(activos_filtrados) * len(temps)
     logger.info(
         "[Analisis] Inicio: activos=%d tfs=%d tasks=%d workers=%d sem=%d",
         len(activos_filtrados),
         len(temps),
         total_tasks,
         max_workers,
-        24,
+        _ANALYSIS_SEM,
     )
     
     # 📊 Resetear estadísticas de caché para esta ejecución
@@ -13013,7 +13077,7 @@ async def procesar_resultado(
     urls_generadas = []
 
     # Limitar concurrencia de uploads para evitar saturar CPU/GCS
-    upload_sem = asyncio.Semaphore(30)  # ✅ Aumentado de 6 a 30 para acelerar subidas GCS masivas
+    upload_sem = asyncio.Semaphore(int(os.environ.get("UPLOAD_SEM", "30")))
 
     # Función para priorizar temporalidades bajas (traders intradía)
     def _tf_priority(tf_str: str) -> int:
