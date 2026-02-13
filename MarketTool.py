@@ -11539,14 +11539,14 @@ def generar_entradas_multiples(
                         logger.debug(f"Error ejecutando tarea de entrada: {e}")
                         continue
         except Exception as e:
-            logger.warning(f\"Error en paralelización de entradas para {ATR}: {e}. Fallback a secuencial.\")
+            logger.warning(f"Error en paralelización de entradas para {ATR}: {e}. Fallback a secuencial.")
             # Fallback: ejecutar secuencial si paralelización falla
             for task in entry_tasks:
                 result = _execute_entry_task(task)
                 if result:
                     candidate, basado_en = result
                     entries.append(candidate)
-                    logging.info(f\" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}\")
+                    logging.info(f" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}")
     
     # ====== LIMITE DE CANDIDATOS (por performance/ruido) ======
     if len(entries) > max_candidates:
