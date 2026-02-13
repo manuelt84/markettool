@@ -13901,7 +13901,19 @@ async def procesar_resultado(
         logger.info("[preview] ui_resumen_final publicado en %.1fs", time.time() - t_proc_start)
         logger.info("[preview timing] ui_resumen final (.head, .to_dict, publish): %.1fms", (time.time() - t_ui_final_start) * 1000)
 
-    # 7) Subir enriquecidos PRIORIZANDO activos para monitoreo
+    # 🚀 PARALELIZACIÓN GLOBAL: Recopilar TODAS las tasks (enriched + JSON) para ejecutarlas en paralelo
+    all_upload_tasks = []        # Lista global para TODAS las tasks  
+    priority_task_map = {}       # Map de task -> índice en priority_sorted para feedback
+    rest_task_map = {}           # Map de task -> índice en rest_sorted para feedback
+    json_task_label_map = {}     # Map de task ID -> label para JSON tasks
+    ready_for_monitoring = []
+    resultados_priority_sorted = []
+    resultados_rest_sorted = []
+    
+    # === FASE DE PREPARACIÓN: Crear todas las tasks sin ejecutarlas ===
+    
+    # 7) Preparar uploads de enriquecidos PRIORIZANDO activos para monitoreo
+    # OPTIMIZADO: Paralelizar uploads en lugar de ejecutar en dos fases secuenciales
     if can_archive:
         # Separar resultados en prioritarios y resto
         resultados_priority = []
@@ -13927,63 +13939,23 @@ async def procesar_resultado(
             key=lambda r: _tf_priority(r.get("Temporalidad"))
         )
         
-        ready_for_monitoring = []
-        
-        # ✅ FASE 1: Subir activos prioritarios primero
+        # ✅ FASE 1: Crear tasks para activos prioritarios (NO esperar aún)
         if resultados_priority_sorted:
-            logger.info(f"📤 Subiendo {len(resultados_priority_sorted)} archivos de activos prioritarios...")
-            priority_tasks = [_upload_enriched(res) for res in resultados_priority_sorted]
-            priority_results = await asyncio.gather(*priority_tasks, return_exceptions=True)
-            
-            # Procesar resultados y actualizar ready_for_monitoring
-            for i, result in enumerate(priority_results):
-                if isinstance(result, Exception):
-                    logger.info(f"No se pudo subir JSON prioritario: {result}")
-                elif result:
-                    urls_generadas.append(result)
-                    # Añadir símbolo a ready si no está ya
-                    sym = resultados_priority_sorted[i].get("Activo")
-                    if sym and sym not in ready_for_monitoring:
-                        ready_for_monitoring.append(sym)
-            
-            # Actualizar ui_resumen con activos listos para monitoreo
-            if ready_for_monitoring:
-                fs_actualizar_ejecucion(
-                    exec_id,
-                    ui_resumen={"ready_for_monitoring": ready_for_monitoring},
-                    upload_state={
-                        "status": "publishing",
-                        "phase": "priority_ready",
-                        "updated_at": datetime.now(UTC).isoformat() + "Z",
-                    },
-                )
-                logger.info(f"✅ Activos prioritarios listos para monitoreo: {ready_for_monitoring}")
+            logger.info(f"📤 Preparando {len(resultados_priority_sorted)} archivos de activos prioritarios...")
+            for i, res in enumerate(resultados_priority_sorted):
+                task = asyncio.create_task(_upload_enriched(res))
+                all_upload_tasks.append(task)
+                priority_task_map[id(task)] = i
         
-        # ✅ FASE 2: Subir resto de activos en background
+        # ✅ FASE 2: Crear tasks para resto de activos (NO esperar aún)
         if resultados_rest_sorted:
-            logger.info(f"📤 Subiendo {len(resultados_rest_sorted)} archivos restantes...")
-            rest_tasks = [_upload_enriched(res) for res in resultados_rest_sorted]
-            rest_results = await asyncio.gather(*rest_tasks, return_exceptions=True)
-            
-            for i, result in enumerate(rest_results):
-                if isinstance(result, Exception):
-                    logger.info(f"No se pudo subir JSON enriquecido: {result}")
-                elif result:
-                    urls_generadas.append(result)
-                    # Añadir símbolo a ready
-                    sym = resultados_rest_sorted[i].get("Activo")
-                    if sym and sym not in ready_for_monitoring:
-                        ready_for_monitoring.append(sym)
-            
-            # Actualizar con lista completa
-            if ready_for_monitoring:
-                fs_actualizar_ejecucion(
-                    exec_id,
-                    ui_resumen={"ready_for_monitoring": ready_for_monitoring},
-                )
+            logger.info(f"📤 Preparando {len(resultados_rest_sorted)} archivos de activos restantes...")
+            for i, res in enumerate(resultados_rest_sorted):
+                task = asyncio.create_task(_upload_enriched(res))
+                all_upload_tasks.append(task)
+                rest_task_map[id(task)] = i
 
-    # 8) (Solo app) Subir **ordenado** saneado (OPTIMIZADO: core fields only)
-    json_tasks = []
+    # 8) Preparar uploads de **ordenado** saneado (OPTIMIZADO: core fields only)
     if can_archive:
         df_ord = (
             df_resultados_ordenado
@@ -14008,15 +13980,17 @@ async def procesar_resultado(
             len(json.dumps(ordered_records[:10] if ordered_records else [])) * len(ordered_records) / 10240
         )
 
-        json_tasks.append(asyncio.create_task(
+        json_task = asyncio.create_task(
             _upload_json_registrar(
                 nombre_base=f"{moneda_filtro.upper()}_resultados_ordenados",
                 data=ordered_records,
                 metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado", "upload_mode": upload_mode},
             )
-        ))
+        )
+        all_upload_tasks.append(json_task)
+        json_task_label_map[id(json_task)] = "resultados_ordenados"
 
-    # 9) (Solo app) Subir oportunidades (OPTIMIZADO: core fields only)
+    # 9) Preparar uploads de oportunidades (OPTIMIZADO: core fields only)
     if can_archive:
         opp_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
         
@@ -14025,22 +13999,95 @@ async def procesar_resultado(
         
         logger.info("[Upload] oportunidades: %d records", len(opp_records))
         
-        json_tasks.append(asyncio.create_task(
+        json_task = asyncio.create_task(
             _upload_json_registrar(
                 nombre_base=f"{moneda_filtro.upper()}_oportunidades",
                 data=opp_records,
                 metadata={"moneda_filtro": moneda_filtro, "scope": "oportunidades", "upload_mode": upload_mode},
             )
-        ))
+        )
+        all_upload_tasks.append(json_task)
+        json_task_label_map[id(json_task)] = "oportunidades"
 
-    await _collect_urls(json_tasks, "JSON")
+    # === FASE DE EJECUCIÓN PARALELA: Procesar TODAS las tasks conforme se completan ===
+    if all_upload_tasks:
+        logger.info(f"🚀 Ejecutando {len(all_upload_tasks)} uploads en paralelo (prioritarios: {len(resultados_priority_sorted)}, resto: {len(resultados_rest_sorted)}, json: {len(json_task_label_map)})")
+        
+        priority_complete = False
+        priority_count = 0
+        rest_count = 0
+        json_count = 0
+        
+        # Procesar tasks conforme se completan usando as_completed (streaming results)
+        # Esto permite actualizar Firestore cuando prioritarios terminen, sin bloquear el resto
+        for completed_task in asyncio.as_completed(all_upload_tasks):
+            try:
+                result = await completed_task
+                task_id = id(completed_task)
+                
+                if task_id in priority_task_map:
+                    # Resultado prioritario
+                    i = priority_task_map[task_id]
+                    if isinstance(result, Exception):
+                        logger.debug(f"❌ No se pudo subir JSON prioritario[{i}]: {result}")
+                    elif result:
+                        urls_generadas.append(result)
+                        sym = resultados_priority_sorted[i].get("Activo")
+                        if sym and sym not in ready_for_monitoring:
+                            ready_for_monitoring.append(sym)
+                    priority_count += 1
+                    
+                    # Cuando ALL prioritarios terminen, actualizar Firestore inmediatamente
+                    if priority_count == len(resultados_priority_sorted) and not priority_complete and resultados_priority_sorted:
+                        priority_complete = True
+                        if ready_for_monitoring:
+                            fs_actualizar_ejecucion(
+                                exec_id,
+                                ui_resumen={"ready_for_monitoring": ready_for_monitoring},
+                                upload_state={
+                                    "status": "publishing",
+                                    "phase": "priority_ready",
+                                    "updated_at": datetime.now(UTC).isoformat() + "Z",
+                                },
+                            )
+                            logger.info(f"✅ Activos prioritarios listos para monitoreo: {ready_for_monitoring}")
+                
+                elif task_id in rest_task_map:
+                    # Resultado resto
+                    i = rest_task_map[task_id]
+                    if isinstance(result, Exception):
+                        logger.debug(f"❌ No se pudo subir JSON enriquecido[{i}]: {result}")
+                    elif result:
+                        urls_generadas.append(result)
+                        sym = resultados_rest_sorted[i].get("Activo")
+                        if sym and sym not in ready_for_monitoring:
+                            ready_for_monitoring.append(sym)
+                    rest_count += 1
+                
+                elif task_id in json_task_label_map:
+                    # Resultado JSON
+                    label = json_task_label_map[task_id]
+                    if isinstance(result, Exception):
+                        logger.debug(f"❌ No se pudo subir JSON {label}: {result}")
+                    elif result:
+                        urls_generadas.append(result)
+                    json_count += 1
+            
+            except Exception as e:
+                logger.warning(f"Excepción en procesamiento de upload: {e}")
+        
+        # Actualizar con lista completa al final si hay prioritarios
+        if ready_for_monitoring and priority_complete:
+            fs_actualizar_ejecucion(
+                exec_id,
+                ui_resumen={"ready_for_monitoring": ready_for_monitoring},
+            )
 
     if can_archive:
         fs_actualizar_ejecucion(
             exec_id,
             upload_state={
-                "status": "partial_ready",
-                "phase": "core_ready",
+                "status": "partial_ready","phase": "core_ready",
                 "updated_at": datetime.now(UTC).isoformat() + "Z",
             },
         )
