@@ -13209,21 +13209,27 @@ def _is_uploads_enabled(cfg: Optional[dict]) -> bool:
 
 # Campos "core" para frontend (usados en DetalleEjecucion y Monitoreo)
 _CORE_FIELDS = {
+    # Trading Basics
     'Activo', 'Temporalidad', 'Tipo de Operacion', 'Oportunidad', 
     'Zona No Trading', 'entry', 'tp', 'sl', 'stop_loss_pips',
+    # Scoring & Weighting
     'Ponderacion', 'PonderacionIncremental', 'Confianza', 'score_final',
-    'Cruce MACD', 'Bollinger Signal', 'ultimo',
     'expectativa', 'probabilidad_tecnica', 'probabilidad_fundamental',
-    'autorizado', 'rechazo'
+    'autorizado', 'rechazo',
+    # Technical Signals
+    'Cruce MACD', 'Bollinger Signal', 'ultimo',
+    # Support/Resistance Levels (CRITICAL for DetalleEjecucionScreen)
+    'Soportes Alcanzados', 'Resistencias Alcanzadas',
+    'Soportes Importantes Alcanzados', 'Resistencias Importantes Alcanzadas',
+    'Cerca de Soporte Resistencia', 'Cerca de S/R',
+    'soporte_nivel_1', 'soporte_nivel_2', 'resistencia_nivel_1', 'resistencia_nivel_2',
+    'Niveles Confirmados (Toques)', 'Niveles Confirmados (Nivel)',
 }
 
 # Campos "extended" (detalle completo con técnica + Monte Carlo)
 _EXTENDED_FIELDS = _CORE_FIELDS | {
-    'Patrones Detectados', 'Soportes Alcanzados', 'Resistencias Alcanzadas',
-    'Niveles Confirmados (Toques)', 'Niveles Confirmados (Nivel)',
-    'Soportes Importantes Alcanzados', 'Resistencias Importantes Alcanzadas',
+    'Patrones Detectados',
     'Rebotes', 'Rango Dinamico', 'Es Rango Repetitivo', 'Estructura Tendencia',
-    'Cerca de Soporte Resistencia',
     'Probabilidad Alza (Montecarlo)', 'Probabilidad Baja (Montecarlo)',
     'MACD Tendencia Predicha',
 }
