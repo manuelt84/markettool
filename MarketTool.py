@@ -11481,6 +11481,13 @@ def calcular_entradas(
         )
 
         ATR = _tofloat(df["ATR"].iloc[-1]) if "ATR" in df.columns else None
+        atr_missing = not (ATR and _finite(ATR) and ATR > 0)
+        if atr_missing:
+            # Fallback ATR if indicator is missing/NaN on the last row.
+            ATR = _atr14(df)
+            if not (ATR and _finite(ATR) and ATR > 0):
+                ATR = float(df["close"].iloc[-1]) * 0.002
+            logger.info(f"[ATR] Fallback usado para {symbol}/{tf}: ATR={ATR}")
 
         # --- Prob. técnica (ya calculamos tecnica_meta y fundamental_meta en paralelo) ---
         probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df, tf, window, cfg), 2)
