@@ -11083,6 +11083,80 @@ def _rrr(entry: float, tp: float, sl: float, side: str) -> Optional[float]:
     return reward / risk
 
 #@profile
+def _create_entry_candidate(
+    side: str,                       # "long" | "short"
+    entry: float,
+    atr: float,
+    mult_tp_sl,                      # float  ó  (tp_mult, sl_mult)
+    make_tp_sl: Callable[..., tuple[Optional[float], Optional[float]]],
+    basado_en: str,
+    precio_actual: float,
+    niveles: dict,
+    rango_dinamico: Iterable[Optional[float]] = (None, None),
+    min_rrr: float = 1.5,
+    dedupe_entries: list[dict] = None
+) -> Optional[dict]:
+    """Crea candidato de entrada sin mutar lista. Devuelve entry dict o None si se descarta."""
+    if dedupe_entries is None:
+        dedupe_entries = []
+    
+    if not (_finite(entry) and _finite(atr) and atr > 0):
+        return None
+
+    # Soportar multiplicadores asimétricos (tp_mult, sl_mult)
+    if isinstance(mult_tp_sl, (tuple, list)) and len(mult_tp_sl) == 2:
+        tp_mult, sl_mult = float(mult_tp_sl[0]), float(mult_tp_sl[1])
+        if side == "long":
+            tp, sl = calc_tp_sl_compra_asym(entry, atr, tp_mult, sl_mult)
+        else:
+            tp, sl = calc_tp_sl_venta_asym(entry, atr, tp_mult, sl_mult)
+    else:
+        tp, sl = make_tp_sl(entry, atr, mult_tp_sl)
+
+    if not (_finite(tp) and _finite(sl)):
+        return None
+
+    if side == "long" and not (sl < entry < tp):
+        return None
+    if side == "short" and not (tp < entry < sl):
+        return None
+
+    rrr = _rrr(entry, tp, sl, side)
+    if rrr is None or rrr < min_rrr:
+        return None
+
+    # Score
+    try:
+        lo, hi = rango_dinamico
+    except Exception:
+        lo, hi = None, None
+    score = abs(entry - (precio_actual or entry)) / (atr or 1e-9)
+    if _finite(lo) and _finite(hi):
+        if side == "long" and entry > hi: score += 1.0
+        if side == "short" and entry < lo: score += 1.0
+
+    return {
+        "side": side,
+        "basado_en": basado_en,
+        "precio_entrada": float(entry),
+        "take_profit": float(tp),
+        "stop_loss": float(sl),
+        "rrr": float(rrr),
+        "score": float(score),
+        "meta": {
+            "atr": float(atr),
+            "precio_actual": float(precio_actual),
+            "rango_dinamico": [lo, hi] if (_finite(lo) and _finite(hi)) else None,
+            "niveles": {
+                "s1": niveles.get("soporte_nivel_1"),
+                "s2": niveles.get("soporte_nivel_2"),
+                "r1": niveles.get("resistencia_nivel_1"),
+                "r2": niveles.get("resistencia_nivel_2"),
+            }
+        }
+    }
+
+#@profile
 def _add_entry(
     entries: list[dict],
     *,
@@ -11098,8 +11172,17 @@ def _add_entry(
     min_rrr: float = 1.5  # ✅ PHASE 2: Cambiado de 1.2 a 1.5 (estándar profesional)
 ):
     """Calcula TP/SL, RRR y agrega la entrada si pasa validaciones."""
-    if not (_finite(entry) and _finite(atr) and atr > 0):
-        logging.info(" - DESCARTADA: entry/ATR no finitos")
+    candidate = _create_entry_candidate(
+        side=side, entry=entry, atr=atr, mult_tp_sl=mult_tp_sl,
+        make_tp_sl=make_tp_sl, basado_en=basado_en,
+        precio_actual=precio_actual, niveles=niveles,
+        rango_dinamico=rango_dinamico, min_rrr=min_rrr,
+        dedupe_entries=entries
+    )
+    
+    if candidate is None:
+        if not (_finite(entry) and _finite(atr) and atr > 0):
+            logging.info(" - DESCARTADA: entry/ATR no finitos")
         return
 
     # Soportar multiplicadores asimétricos (tp_mult, sl_mult)
@@ -11292,21 +11375,18 @@ def generar_entradas_multiples(
     def _near(a: float, b: float, tol: float) -> bool:
         return abs(a - b) <= tol
 
-    def _try_add(side: str, entry: float, mult_base: tuple[float, float], basado_en: str):
-        """Aplica adaptadores, crea y filtra por RRR, dedup y límites."""
-        if not _finite(entry): 
+    # ====== PARALELIZACIÓN: Coleccionar tareas ======
+    entry_tasks = []  # lista de (side, entry, mult_base, basado_en) para ejecutar en paralelo
+    
+    def _queue_add(side: str, entry: float, mult_base: tuple[float, float], basado_en: str):
+        """En lugar de ejecutar directamente, colecciona la tarea para paralelizar."""
+        if not _finite(entry):
             return
-        # dedupe
-        for e in entries:
-            if e.get("side") == side and _near(e.get("precio_entrada", 0.0), entry, dedupe_tol_atr * ATR):
-                return  # muy cercano a otro ya agregado
-
-        mult_adj = _adapt_mult(mult_base, side)
-        make = calc_tp_sl_compra if side == "long" else calc_tp_sl_venta
-        _add_entry(entries, side=side, entry=entry, atr=ATR, mult_tp_sl=mult_adj,
-                   make_tp_sl=make, basado_en=basado_en,
-                   precio_actual=precio_actual, niveles=niveles, rango_dinamico=rango_dinamico,
-                   min_rrr=min_rrr)
+        entry_tasks.append((side, entry, mult_base, basado_en))
+    
+    def _try_add(side: str, entry: float, mult_base: tuple[float, float], basado_en: str):
+        """(Deprecated - usar _queue_add) Aplica adaptadores, crea y filtra por RRR, dedup y límites."""
+        _queue_add(side, entry, mult_base, basado_en)
 
     # ====== ESTRATEGIAS BASE (tus originales) ======
     if sesgo_long:
@@ -11378,6 +11458,64 @@ def generar_entradas_multiples(
             e_high = rango_high - range_pad_atr * ATR
             _try_add("short", e_high, mult_mid, "range_upper_reversion")
 
+    # ====== EJECUCIÓN PARALELA DE TODAS LAS TAREAS ======
+    if entry_tasks:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        def _execute_entry_task(task_tuple):
+            """Ejecuta una tarea de generación de entrada. Devuelve (candidate_dict, side) o None."""
+            side, entry, mult_base, basado_en = task_tuple
+            
+            # Dedupe check rápido (contra lista actual que va creciendo)
+            for e in entries:
+                if e.get("side") == side and _near(e.get("precio_entrada", 0.0), entry, dedupe_tol_atr * ATR):
+                    return None  # muy cercano
+            
+            mult_adj = _adapt_mult(mult_base, side)
+            make = calc_tp_sl_compra if side == "long" else calc_tp_sl_venta
+            candidate = _create_entry_candidate(
+                side=side, entry=entry, atr=ATR, mult_tp_sl=mult_adj,
+                make_tp_sl=make, basado_en=basado_en,
+                precio_actual=precio_actual, niveles=niveles,
+                rango_dinamico=rango_dinamico, min_rrr=min_rrr,
+                dedupe_entries=entries
+            )
+            return (candidate, basado_en) if candidate else None
+        
+        # Ejecutar con ThreadPoolExecutor (max 4 workers para no desbordar)
+        try:
+            max_workers = max(2, min(4, len(entry_tasks) // 2))  # Auto-ajust workers
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_execute_entry_task, task) for task in entry_tasks]
+                
+                for future in as_completed(futures):
+                    try:
+                        result = future.result(timeout=2.0)  # 2s timeout por tarea
+                        if result:
+                            candidate, basado_en = result
+                            
+                            # Final dedupe check antes de agregar
+                            is_dup = False
+                            for e in entries:
+                                if e.get("side") == candidate.get("side") and \
+                                   _near(e.get("precio_entrada", 0.0), candidate.get("precio_entrada", 0.0), dedupe_tol_atr * ATR):\n                                    is_dup = True
+                                    break
+                            
+                            if not is_dup:
+                                entries.append(candidate)
+                                logging.info(f\" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}\")
+                    except Exception as e:
+                        logger.debug(f\"Error ejecutando tarea de entrada: {e}\")\n                        continue
+        except Exception as e:
+            logger.warning(f\"Error en paralelización de entradas para {ATR}: {e}. Fallback a secuencial.\")
+            # Fallback: ejecutar secuencial si paralelización falla
+            for task in entry_tasks:
+                result = _execute_entry_task(task)
+                if result:
+                    candidate, basado_en = result
+                    entries.append(candidate)
+                    logging.info(f\" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}\")
+    
     # ====== LIMITE DE CANDIDATOS (por performance/ruido) ======
     if len(entries) > max_candidates:
         entries = entries[:max_candidates]
