@@ -8,6 +8,7 @@ import json
 import logging
 import signal
 import functools
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List, Callable, Iterable, Mapping
@@ -174,6 +175,51 @@ _early_load_env()
 # -------------------------------------------------------
 APP_CONFIG = AppConfig()
 FMP_INTRADAY_SOURCE_TZ = os.getenv("FMP_INTRADAY_SOURCE_TZ", "America/New_York")
+
+FMP_MAX_CONCURRENCY = int(os.environ.get("FMP_MAX_CONCURRENCY", "6"))
+FMP_PER_SYMBOL_CONCURRENCY = int(os.environ.get("FMP_PER_SYMBOL_CONCURRENCY", "1"))
+_FMP_GLOBAL_SEM = threading.BoundedSemaphore(FMP_MAX_CONCURRENCY) if FMP_MAX_CONCURRENCY > 0 else None
+_FMP_SYMBOL_SEMS: dict[str, threading.BoundedSemaphore] = {}
+_FMP_SYMBOL_SEMS_LOCK = threading.Lock()
+
+def _get_fmp_symbol_sem(symbol: str) -> threading.BoundedSemaphore | None:
+    if FMP_PER_SYMBOL_CONCURRENCY <= 0:
+        return None
+    key = (symbol or "").strip().upper()
+    if not key:
+        return None
+    with _FMP_SYMBOL_SEMS_LOCK:
+        sem = _FMP_SYMBOL_SEMS.get(key)
+        if sem is None:
+            sem = threading.BoundedSemaphore(FMP_PER_SYMBOL_CONCURRENCY)
+            _FMP_SYMBOL_SEMS[key] = sem
+    return sem
+
+@contextmanager
+def _fmp_http_guard(symbol: str | None = None):
+    sems: list[threading.BoundedSemaphore] = []
+    if _FMP_GLOBAL_SEM is not None:
+        sems.append(_FMP_GLOBAL_SEM)
+    if symbol:
+        sym_sem = _get_fmp_symbol_sem(symbol)
+        if sym_sem is not None:
+            sems.append(sym_sem)
+    for sem in sems:
+        sem.acquire()
+    try:
+        yield
+    finally:
+        for sem in reversed(sems):
+            sem.release()
+
+def _fmp_http_get(
+    url: str,
+    params: Dict[str, Any] | None = None,
+    timeout: int | None = None,
+    symbol: str | None = None,
+) -> requests.Response:
+    with _fmp_http_guard(symbol):
+        return HTTP_SESSION.get(url, params=params, timeout=timeout or APP_CONFIG.http_timeout)
 
 
 # Structured logging
@@ -480,10 +526,10 @@ class FMPClient:
     plan: str = "premium"
     timeout: int = field(default_factory=lambda: APP_CONFIG.http_timeout)
 
-    def _get(self, url: str, params: Dict[str, Any] | None = None) -> requests.Response:
+    def _get(self, url: str, params: Dict[str, Any] | None = None, symbol: str | None = None) -> requests.Response:
         params = dict(params or {})
         params.setdefault("apikey", self.api_key)
-        r = HTTP_SESSION.get(url, params=params, timeout=self.timeout)
+        r = _fmp_http_get(url, params=params, timeout=self.timeout, symbol=symbol)
         if r.status_code == 402:
             raise FMPPlanNotAllowed(f"402 Payment Required: {url}")
         return r
@@ -496,7 +542,7 @@ class FMPClient:
         fmt = "%Y-%m-%d %H:%M:%S"
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{interval}/{symbol}"
         logging.info(f"[FMP] Historical Intraday {url}")
-        r = self._get(url, {"from": from_utc.strftime(fmt), "to": to_utc.strftime(fmt)})
+        r = self._get(url, {"from": from_utc.strftime(fmt), "to": to_utc.strftime(fmt)}, symbol=symbol)
         if r.status_code != 200: return pd.DataFrame()
         data = r.json() or []
         if not isinstance(data, list) or not data: return pd.DataFrame()
@@ -536,7 +582,7 @@ class FMPClient:
     def historical_eod(self, symbol: str, from_date: datetime, to_date: datetime) -> pd.DataFrame:
         url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
         logging.info(f"[FMP] Historical Daily {url}")
-        r = self._get(url, {"from": from_date.strftime("%Y-%m-%d"), "to": to_date.strftime("%Y-%m-%d")})
+        r = self._get(url, {"from": from_date.strftime("%Y-%m-%d"), "to": to_date.strftime("%Y-%m-%d")}, symbol=symbol)
         if r.status_code != 200: return pd.DataFrame()
         payload = r.json() or {}; hist = payload.get("historical") or []
         if not hist: return pd.DataFrame()
@@ -565,7 +611,7 @@ class FMPClient:
     def quote_last(self, symbol: str) -> Optional[float]:
         url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}"
         logging.info(f"[FMP] Quote {url}")
-        r = self._get(url, {})
+        r = self._get(url, {}, symbol=symbol)
         if r.status_code != 200: return None
         arr = r.json() or []
         if not arr or not isinstance(arr, list): return None
@@ -12838,14 +12884,22 @@ async def ejecutar_analisis_con_hilos(
     
     # --- Semaphore para limitar concurrencia (balance entre throughput y recursos) ---
     sem = asyncio.Semaphore(max(1, _ANALYSIS_SEM))
+    per_symbol_concurrency = int(os.environ.get("ANALYSIS_PER_SYMBOL_CONCURRENCY", "1"))
+    per_symbol_concurrency = max(0, per_symbol_concurrency)
+    symbol_sems = (
+        {symbol: asyncio.Semaphore(per_symbol_concurrency) for symbol in activos_filtrados}
+        if per_symbol_concurrency > 0
+        else None
+    )
     slow_task_sec = int(os.environ.get("ANALYSIS_SLOW_TASK_SEC", "30"))
     logger.info(
-        "[Analisis] Inicio: activos=%d tfs=%d tasks=%d workers=%d sem=%d",
+        "[Analisis] Inicio: activos=%d tfs=%d tasks=%d workers=%d sem=%d per_symbol=%d",
         len(activos_filtrados),
         len(temps),
         total_tasks,
         max_workers,
         _ANALYSIS_SEM,
+        per_symbol_concurrency,
     )
     
     # 📊 Resetear estadísticas de caché para esta ejecución
@@ -12857,16 +12911,29 @@ async def ejecutar_analisis_con_hilos(
     
     async def bounded_analysis(symbol, temporalidad):
         """Envuelve procesar_simbolo_temporalidad con límite de concurrencia."""
+        sym_sem = symbol_sems.get(symbol) if symbol_sems else None
         async with sem:
-            fn = partial(
-                procesar_simbolo_temporalidad,
-                symbol, temporalidad, df_eventos, user_chat_id, context,
-                fmp_windows=fmp_map,
-                calc_windows=calc_map,
-                cfg=cfg_for_process
-            )
-            t0 = time.time()
-            result = await loop.run_in_executor(executor, fn)
+            if sym_sem is not None:
+                async with sym_sem:
+                    fn = partial(
+                        procesar_simbolo_temporalidad,
+                        symbol, temporalidad, df_eventos, user_chat_id, context,
+                        fmp_windows=fmp_map,
+                        calc_windows=calc_map,
+                        cfg=cfg_for_process
+                    )
+                    t0 = time.time()
+                    result = await loop.run_in_executor(executor, fn)
+            else:
+                fn = partial(
+                    procesar_simbolo_temporalidad,
+                    symbol, temporalidad, df_eventos, user_chat_id, context,
+                    fmp_windows=fmp_map,
+                    calc_windows=calc_map,
+                    cfg=cfg_for_process
+                )
+                t0 = time.time()
+                result = await loop.run_in_executor(executor, fn)
             elapsed = time.time() - t0
             if elapsed >= slow_task_sec:
                 logger.info(
@@ -13134,6 +13201,83 @@ def _is_uploads_enabled(cfg: Optional[dict]) -> bool:
     if "enable_file_uploads" in cfg:
         return bool(cfg.get("enable_file_uploads"))
     return bool((cfg.get("features") or {}).get("enable_file_uploads"))
+
+
+# ============================================================================
+# Field Filtering for GCP Uploads (optimize storage & frontend bandwidth)
+# ============================================================================
+
+# Campos "core" para frontend (usados en DetalleEjecucion y Monitoreo)
+_CORE_FIELDS = {
+    'Activo', 'Temporalidad', 'Tipo de Operacion', 'Oportunidad', 
+    'Zona No Trading', 'entry', 'tp', 'sl', 'stop_loss_pips',
+    'Ponderacion', 'PonderacionIncremental', 'Confianza', 'score_final',
+    'Cruce MACD', 'Bollinger Signal', 'ultimo',
+    'expectativa', 'probabilidad_tecnica', 'probabilidad_fundamental',
+    'autorizado', 'rechazo'
+}
+
+# Campos "extended" (detalle completo con técnica + Monte Carlo)
+_EXTENDED_FIELDS = _CORE_FIELDS | {
+    'Patrones Detectados', 'Soportes Alcanzados', 'Resistencias Alcanzadas',
+    'Niveles Confirmados (Toques)', 'Niveles Confirmados (Nivel)',
+    'Soportes Importantes Alcanzados', 'Resistencias Importantes Alcanzadas',
+    'Rebotes', 'Rango Dinamico', 'Es Rango Repetitivo', 'Estructura Tendencia',
+    'Cerca de Soporte Resistencia',
+    'Probabilidad Alza (Montecarlo)', 'Probabilidad Baja (Montecarlo)',
+    'MACD Tendencia Predicha',
+}
+
+# Campos que NUNCA subir (internos)
+_FORBIDDEN_FIELDS = {
+    '_ohlcv_df', '_indicadores_df', '_niveles', '_entradas',
+    '_internal', '_debug', '_logs', '_temp'
+}
+
+def _filter_fields_for_json(record: dict, field_set: set) -> dict:
+    """
+    Filtra un record dict manteniendo solo los campos en field_set
+    y removiendo campos internos (_ prefix).
+    """
+    if not isinstance(record, dict):
+        return record
+    out = {}
+    for key, value in record.items():
+        # Skip forbidden fields
+        if key in _FORBIDDEN_FIELDS or key.startswith('_'):
+            continue
+        # Keep if in allowed set (if empty set = keep all non-forbidden)
+        if not field_set or key in field_set:
+            out[key] = value
+    return out
+
+def _optimize_records_for_upload(
+    records: list[dict],
+    upload_mode: str = "core"  # "core" | "extended" | "full"
+) -> list[dict]:
+    """
+    Optimiza registros para subida a GCP.
+    
+    Modes:
+    - "core": solo campos necesarios para frontend (más liviano)
+    - "extended": core + técnica/Monte Carlo detallada
+    - "full": todos los campos (legacy, no recomendado)
+    """
+    if upload_mode == "full":
+        field_set = set()  # sin restricción
+    elif upload_mode == "extended":
+        field_set = _EXTENDED_FIELDS
+    else:  # "core" (default)
+        field_set = _CORE_FIELDS
+    
+    out = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        filtered = _filter_fields_for_json(rec, field_set)
+        if filtered:
+            out.append(filtered)
+    return out
 
 
 #@profile
@@ -13694,7 +13838,7 @@ async def procesar_resultado(
                     ui_resumen={"ready_for_monitoring": ready_for_monitoring},
                 )
 
-    # 8) (Solo app) Subir **ordenado** saneado
+    # 8) (Solo app) Subir **ordenado** saneado (OPTIMIZADO: core fields only)
     json_tasks = []
     if can_archive:
         df_ord = (
@@ -13709,23 +13853,39 @@ async def procesar_resultado(
                 df_ord[col] = df_ord[col].apply(sanitize_for_json)
 
         ordered_records = sanitize_for_json(df_ord.to_dict("records"))
+        
+        # 🎯 Optimize: filter to core fields for frontend (reduce size ~40%)
+        upload_mode = os.environ.get("GCP_UPLOAD_MODE", "core")  # "core" | "extended" | "full"
+        ordered_records = _optimize_records_for_upload(ordered_records, upload_mode=upload_mode)
+        
+        logger.info(
+            "[Upload] resultados_ordenados: %d records, mode=%s, size_est=%.1fKB",
+            len(ordered_records), upload_mode,
+            len(json.dumps(ordered_records[:10] if ordered_records else [])) * len(ordered_records) / 10240
+        )
 
         json_tasks.append(asyncio.create_task(
             _upload_json_registrar(
                 nombre_base=f"{moneda_filtro.upper()}_resultados_ordenados",
                 data=ordered_records,
-                metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado"},
+                metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado", "upload_mode": upload_mode},
             )
         ))
 
-    # 9) (Solo app) Subir oportunidades
+    # 9) (Solo app) Subir oportunidades (OPTIMIZADO: core fields only)
     if can_archive:
         opp_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
+        
+        # 🎯 Optimize: filter to core fields (reduce size ~40%)
+        opp_records = _optimize_records_for_upload(opp_records, upload_mode=upload_mode)
+        
+        logger.info("[Upload] oportunidades: %d records", len(opp_records))
+        
         json_tasks.append(asyncio.create_task(
             _upload_json_registrar(
                 nombre_base=f"{moneda_filtro.upper()}_oportunidades",
                 data=opp_records,
-                metadata={"moneda_filtro": moneda_filtro, "scope": "oportunidades"},
+                metadata={"moneda_filtro": moneda_filtro, "scope": "oportunidades", "upload_mode": upload_mode},
             )
         ))
 
@@ -18642,7 +18802,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
         # 1) estable/realtime (forex)
         url1 = f"https://financialmodelingprep.com/stable/quote?symbol={symbol}&apikey={API_KEY}"
         logging.info(f"[Quote-Fallback-v4] URL: {url1}")
-        r = HTTP_SESSION.get(url1, timeout=8)
+        r = _fmp_http_get(url1, timeout=8, symbol=symbol)
         if r.ok:
             arr = r.json() or []
             if isinstance(arr, list) and arr:
@@ -18651,7 +18811,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
         # 2) fallback v3
         url2 = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={API_KEY}"
         logging.info(f"[Quote-Fallback-v3] URL: {url2}")
-        r = HTTP_SESSION.get(url2, timeout=8)
+        r = _fmp_http_get(url2, timeout=8, symbol=symbol)
         if r.ok:
             arr = r.json() or []
             if isinstance(arr, list) and arr:
@@ -18669,7 +18829,7 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
         iv = _fmp_interval(tf)
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}?apikey={API_KEY}"
         logging.info(f"[Historical-Fetch] URL: {url}")
-        r = HTTP_SESSION.get(url, timeout=5)
+        r = _fmp_http_get(url, timeout=5, symbol=symbol)
         if not r.ok:
             return []
         arr = r.json() or []
@@ -18930,7 +19090,7 @@ def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> l
             "to":   _ms_to_fmp_local(to_ms)
         }
         logging.info(f"[Historical-Range] URL: {url} params: from={params['from']} to={params['to']}")
-        r = HTTP_SESSION.get(url, params=params, timeout=5)
+        r = _fmp_http_get(url, params=params, timeout=5, symbol=symbol)
         if not r.ok:
             logging.info(f"[Historical-Range] HTTP {r.status_code}: {r.text[:200]}")
             return []
@@ -20565,6 +20725,89 @@ async def ejecutar_analisis_desde_app():
         except Exception:
             pass
         # ocupado_lock no se usa en este endpoint (lock distribuido por usuario)
+
+
+@webhook_app.route('/analisis/resultados', methods=['GET'])
+def obtener_resultados_analisis():
+    """
+    GET /analisis/resultados?exec_id=xxx&mode=core|extended|full
+    Retorna los resultados del análisis con campos filtrados según modo.
+    
+    Modes:
+    - "core" (default): solo campos para frontend (DetalleEjecucion, Monitoreo) 
+    - "extended": core + técnica/Monte Carlo detallada
+    - "full": todos los campos (no recomendado)
+    """
+    try:
+        exec_id = request.args.get("exec_id", "").strip()
+        mode = request.args.get("mode", "core").strip().lower()
+        
+        if not exec_id:
+            return jsonify({"status": "error", "message": "exec_id es obligatorio"}), 400
+        
+        if mode not in ("core", "extended", "full"):
+            mode = "core"
+        
+        # Busca archivos_generados con este exec_id
+        docs = list(db.collection("archivos_generados")
+                   .where("exec_id", "==", exec_id)
+                   .stream())
+        
+        if not docs:
+            return jsonify({"status": "error", "message": f"No results for exec_id={exec_id}"}), 404
+        
+        result = {
+            "status": "ok",
+            "exec_id": exec_id,
+            "mode": mode,
+            "files": []
+        }
+        
+        for doc in docs:
+            data = doc.to_dict() or {}
+            nombre = data.get("metadata", {}).get("nombre") or data.get("gcs_path", "")
+            
+            # Filtra por tipo de archivo (solo JSONs de análisis)
+            if not nombre or not nombre.endswith(".json"):
+                continue
+            if "_ordenados" not in nombre and "_oportunidades" not in nombre:
+                continue
+            
+            file_info = {
+                "id": doc.id,
+                "nombre": nombre,
+                "gcs_path": data.get("gcs_path"),
+                "tipo": data.get("tipo"),
+                "created_at": data.get("created_at"),
+            }
+            
+            # Intenta descargar y filtrar si es posible
+            try:
+                signed_url = data.get("metadata", {}).get("signed_url") or data.get("gcs_path")
+                if signed_url:
+                    # Fetch JSON desde GCS
+                    import requests
+                    resp = requests.get(signed_url, timeout=10)
+                    if resp.status_code == 200:
+                        raw_records = resp.json() if isinstance(resp.json(), list) else [resp.json()]
+                        # Aplica filtering
+                        filtered_records = _optimize_records_for_upload(raw_records, upload_mode=mode)
+                        file_info["records_count"] = len(filtered_records)
+                        file_info["size_est_kb"] = len(json.dumps(filtered_records)) / 1024
+                        # Incluye primeras 5 records como preview
+                        file_info["preview"] = filtered_records[:5] if filtered_records else []
+            except Exception as e:
+                logger.debug(f"[resultados] No se pudo procesar {nombre}: {e}")
+                file_info["error"] = str(e)
+            
+            result["files"].append(file_info)
+        
+        return jsonify(result), 200
+    
+    except Exception as e:
+        logger.exception("Error en /analisis/resultados")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @webhook_app.route('/analisis/stop', methods=['POST'])
 async def detener_analisis_desde_app():
