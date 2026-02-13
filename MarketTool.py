@@ -133,15 +133,15 @@ class AppConfig:
     cache_ttl_config: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_CONFIG", "600")))
     cache_ttl_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_HISTORICOS", "7200")))
     cache_max_size_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_MAX_SIZE_HISTORICOS", "100")))
-    cache_warmup_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_ENABLED", "false").lower() == "true")
+    cache_warmup_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_ENABLED", "true").lower() == "true")
     cache_warmup_blocking_startup: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_BLOCKING_STARTUP", "false").lower() == "true")
     cache_warmup_interval_minutes: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_INTERVAL_MINUTES", "480")))
     cache_warmup_max_ram_percent: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_MAX_RAM_PERCENT", "80")))
-    cache_warmup_concurrency: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "2")))
+    cache_warmup_concurrency: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "4")))
     cache_warmup_news_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_NEWS_ENABLED", "false").lower() == "true")
     cache_warmup_events_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_EVENTS_ENABLED", "false").lower() == "true")
     cache_warmup_news_limit: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_NEWS_LIMIT", "1")))
-    cache_warmup_leader_only: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_LEADER_ONLY", "true").lower() == "true")
+    cache_warmup_leader_only: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_LEADER_ONLY", "false").lower() == "true")
 
 
 
@@ -2563,12 +2563,18 @@ def _memory_usage_percent() -> Optional[float]:
 
 async def warmup_cache_all_assets(reason: str = "scheduled"):
     """
-    Warm caches for historicos, indicators, news, and events.
-    This is intended for all-assets runs to avoid repeated GCS access.
+    Precalienta cachés para historicos, indicadores, noticias y eventos.
+    ✅ TODOS los pods se pre-calientan EN PARALELO para máximo rendimiento.
+    Solo el líder ejecuta esto si cache_warmup_leader_only=true (obsoleto, para compat).
     """
+    global _warmup_start_time, _warmup_end_time
+    
     if not APP_CONFIG.cache_warmup_enabled:
         return
+    
+    # Verificación de liderazgo: solo si EXPLÍCITAMENTE está configurado que solo el líder lo haga
     if APP_CONFIG.cache_warmup_leader_only and not _POD_COORDINATOR.should_run_scheduled_task("warmup_cache"):
+        logger.info("[Warmup] %s: SKIPPED (leader-only mode, this pod is not the leader)", reason)
         return
 
     _ensure_globals_loaded()
@@ -2578,13 +2584,15 @@ async def warmup_cache_all_assets(reason: str = "scheduled"):
         logger.info("[Warmup] No symbols/timeframes available")
         return
 
-    start = time.time()
+    _warmup_start_time = time.time()
+    start = _warmup_start_time
     logger.info(
-        "[Warmup] Starting (%s). symbols=%d, tfs=%d, concurrency=%d",
+        "[Warmup] ===== INICIANDO ===== reason=%s, symbols=%d, timeframes=%d, concurrency=%d, leader_only=%s",
         reason,
         len(symbols),
         len(tfs),
         APP_CONFIG.cache_warmup_concurrency,
+        APP_CONFIG.cache_warmup_leader_only,
     )
 
     sem = asyncio.Semaphore(max(1, APP_CONFIG.cache_warmup_concurrency))
@@ -2631,9 +2639,13 @@ async def warmup_cache_all_assets(reason: str = "scheduled"):
         except Exception:
             pass
 
+    elapsed = time.time() - start
+    _warmup_end_time = time.time()
+    
     if limit_reached:
-        logger.info("[Warmup] Finished early due to memory limit.")
-    logger.info("[Warmup] Finished in %.2fs", time.time() - start)
+        logger.warning("[Warmup] ===== COMPLETADO (anticipado) ===== reason=%s, symbols=%d/%d, tiempo=%.1fs", reason, warmed_symbols, len(symbols), elapsed)
+    else:
+        logger.info("[Warmup] ===== COMPLETADO ===== reason=%s, símbolos=%d, timeframes=%d, tiempo=%.1fs", reason, len(symbols), len(tfs), elapsed)
 
 # --------------------------
 # Normalización OCR
@@ -2886,7 +2898,7 @@ def build_insights_from_fmp(symbol: str, tf: str, stop_cb=None) -> dict:
         return bool(stop_cb and stop_cb())
 
     tf = normalize_tf(tf or "1hour")
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
 
     # ventana de data según tf
     if tf in {"1min","5min","15min","30min"}:
@@ -4855,7 +4867,7 @@ def set_historicos_metadata(symbol: str, tf: str, gcs_path: str, rows_count: int
             return False
         
         doc_id = f"{symbol.upper()}_{normalize_tf(tf)}"
-        now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+        now_utc = datetime.now(UTC).replace(tzinfo=timezone.utc)
         
         metadata = {
             "symbol": symbol.upper(),
@@ -4906,7 +4918,7 @@ def is_metadata_stale(metadata: Dict[str, Any]) -> bool:
         else:
             return True
         
-        age_seconds = (datetime.utcnow().replace(tzinfo=timezone.utc) - last_update).total_seconds()
+        age_seconds = (datetime.now(UTC).replace(tzinfo=timezone.utc) - last_update).total_seconds()
         is_stale = age_seconds > ttl_seconds
         
         return is_stale
@@ -5090,7 +5102,7 @@ class IndicatorsCache:
                 return None
 
             last_update = datetime.fromisoformat(str(last_update_raw).replace('Z', '+00:00'))
-            age_hours = (datetime.utcnow().replace(tzinfo=timezone.utc) - last_update).total_seconds() / 3600
+            age_hours = (datetime.now(UTC).replace(tzinfo=timezone.utc) - last_update).total_seconds() / 3600
             if age_hours > _INDICATORS_CACHE_TTL_HOURS:
                 logger.info(f"[IndicatorsCache] Local stale (age={age_hours:.1f}h): {symbol}/{tf}")
                 return None
@@ -5201,7 +5213,7 @@ class IndicatorsCache:
             # Validar TTL
             metadata = data["metadata"]
             last_update = datetime.fromisoformat(metadata["last_update_utc"].replace('Z', '+00:00'))
-            age_hours = (datetime.utcnow().replace(tzinfo=timezone.utc) - last_update).total_seconds() / 3600
+            age_hours = (datetime.now(UTC).replace(tzinfo=timezone.utc) - last_update).total_seconds() / 3600
             
             if age_hours > _INDICATORS_CACHE_TTL_HOURS:
                 logger.info(f"[IndicatorsCache] Stale (age={age_hours:.1f}h): {symbol}/{tf}")
@@ -5242,7 +5254,7 @@ class IndicatorsCache:
         
         try:
             with self._lock:
-                now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+                now_utc = datetime.now(UTC).replace(tzinfo=timezone.utc)
                 data_hash = hash_dataframe(df_historicos)
                 
                 # Preparar metadata de auditoría de análisis (bootstrap/incremental)
@@ -5329,7 +5341,7 @@ class IndicatorsCache:
                 doc_id = self._metadata_doc_id(symbol, tf)
                 self.db.collection("indicators_metadata").document(doc_id).update({
                     "is_valid": False,
-                    "invalidated_at": datetime.utcnow().replace(tzinfo=timezone.utc)
+                    "invalidated_at": datetime.now(UTC).replace(tzinfo=timezone.utc)
                 })
             
             logger.info(f"[IndicatorsCache] Invalidated: {symbol}/{tf} (pod={self._pod_id})")
@@ -5357,7 +5369,7 @@ class IndicatorsCache:
             doc_id = self._metadata_doc_id(symbol, tf)
             doc_ref = self.db.collection("indicators_metadata").document(doc_id)
             
-            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(UTC).replace(tzinfo=timezone.utc)
             
             # Leer estado actual
             doc = doc_ref.get()
@@ -5416,7 +5428,7 @@ class IndicatorsCache:
                     doc_ref.update({
                         "calculating_by_pod": firestore.DELETE_FIELD,
                         "calculating_since": firestore.DELETE_FIELD,
-                        "lock_released_at": datetime.utcnow().replace(tzinfo=timezone.utc)
+                        "lock_released_at": datetime.now(UTC).replace(tzinfo=timezone.utc)
                     })
                     logger.debug(f"[IndicatorsCache] Lock released: {symbol}/{tf} (pod={self._pod_id})")
         
@@ -5573,7 +5585,7 @@ class IndicatorsCache:
                         calc_time_ms,
                         analysis_audit={
                             "last_mode": "bootstrap",
-                            "last_bootstrap_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                            "last_bootstrap_at": datetime.now(UTC).replace(tzinfo=timezone.utc).isoformat(),
                         },
                     )
                     
@@ -5612,7 +5624,7 @@ class IndicatorsCache:
                 "incremental": False,
                 "calc_time_ms": 0,
                 "source": "cache_perfect_match",
-                "cached_age_hours": (datetime.utcnow().replace(tzinfo=timezone.utc) - 
+                "cached_age_hours": (datetime.now(UTC).replace(tzinfo=timezone.utc) - 
                                      datetime.fromisoformat(cached["metadata"]["last_update_utc"].replace('Z', '+00:00'))).total_seconds() / 3600,
                 "pod_id": self._pod_id
             }
@@ -5684,7 +5696,7 @@ class IndicatorsCache:
                     calc_time_ms,
                     analysis_audit={
                         "last_mode": "incremental",
-                        "last_incremental_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                        "last_incremental_at": datetime.now(UTC).replace(tzinfo=timezone.utc).isoformat(),
                         "last_incremental_bars": 0,
                     },
                 )
@@ -5775,7 +5787,7 @@ class IndicatorsCache:
                     calc_time_ms,
                     analysis_audit={
                         "last_mode": "incremental",
-                        "last_incremental_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                        "last_incremental_at": datetime.now(UTC).replace(tzinfo=timezone.utc).isoformat(),
                         "last_incremental_bars": int(new_bars),
                     },
                 )
@@ -5813,7 +5825,7 @@ class IndicatorsCache:
                     calc_time_ms,
                     analysis_audit={
                         "last_mode": "data_mismatch",
-                        "last_data_mismatch_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                        "last_data_mismatch_at": datetime.now(UTC).replace(tzinfo=timezone.utc).isoformat(),
                     },
                 )
                 
@@ -5898,7 +5910,7 @@ class IndicatorsCache:
                     calc_time_ms,
                     analysis_audit={
                         "last_mode": "data_mismatch",
-                        "last_data_mismatch_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                        "last_data_mismatch_at": datetime.now(UTC).replace(tzinfo=timezone.utc).isoformat(),
                     },
                 )
                 return df_result, {
@@ -9995,6 +10007,10 @@ def _clean_levels(L):
 
 # ========== OPTIMIZACIONES: Cache de niveles y paralelización ==========
 
+# ⏱️ Timestamps de warmup (para diagnosticar)
+_warmup_start_time = None
+_warmup_end_time = None
+
 # Cache global para niveles de soporte/resistencia (evita recalcular)
 # Estructura: {"symbol|tf|df_len": {"soportes": [...], "resistencias": [...], "timestamp": ...}}
 # ✅ OPTIMIZACIÓN: Clave sin precio (es estable mientras no haya nuevas velas)
@@ -10027,7 +10043,7 @@ def _get_cached_atr(symbol: str, tf: str, df_len: int):
     cache_key = _get_atr_cache_key(symbol, tf, df_len)
     if cache_key in _atr_cache:
         entry = _atr_cache[cache_key]
-        age = (datetime.utcnow() - entry['timestamp']).total_seconds()
+        age = (datetime.now(UTC) - entry['timestamp']).total_seconds()
         if age < _atr_cache_ttl:
             _atr_cache_hits += 1
             return entry['atr']
@@ -10039,11 +10055,11 @@ def _cache_atr(symbol: str, tf: str, df_len: int, atr: float):
     cache_key = _get_atr_cache_key(symbol, tf, df_len)
     _atr_cache[cache_key] = {
         'atr': atr,
-        'timestamp': datetime.utcnow()
+        'timestamp': datetime.now(UTC)
     }
     # Limpiar entradas antiguas si el cache crece mucho
     if len(_atr_cache) > 100:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         keys_to_remove = [
             k for k, v in _atr_cache.items()
             if (now - v['timestamp']).total_seconds() > _atr_cache_ttl
@@ -10056,7 +10072,7 @@ def _get_cached_niveles(cache_key: str):
     global _niveles_cache_hits, _niveles_cache_misses
     if cache_key in _niveles_cache:
         entry = _niveles_cache[cache_key]
-        age = (datetime.utcnow() - entry['timestamp']).total_seconds()
+        age = (datetime.now(UTC) - entry['timestamp']).total_seconds()
         if age < _niveles_cache_ttl:
             _niveles_cache_hits += 1
             logger.debug(f"[Cache] Niveles HIT para {cache_key} (edad: {age:.1f}s)")
@@ -10070,11 +10086,11 @@ def _cache_niveles(cache_key: str, soportes: list, resistencias: list):
     _niveles_cache[cache_key] = {
         'soportes': soportes,
         'resistencias': resistencias,
-        'timestamp': datetime.utcnow()
+        'timestamp': datetime.now(UTC)
     }
     # Limpiar entradas antiguas si el cache crece mucho
     if len(_niveles_cache) > 200:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         keys_to_remove = [
             k for k, v in _niveles_cache.items()
             if (now - v['timestamp']).total_seconds() > _niveles_cache_ttl
@@ -13235,7 +13251,7 @@ async def procesar_resultado(
             upload_state={
                 "status": "calculating",
                 "phase": "early_preview",
-                "updated_at": datetime.utcnow().isoformat() + "Z",
+                "updated_at": datetime.now(UTC).isoformat() + "Z",
             },
         )
         logger.info("[preview] early_preview publicado en %.1fs", time.time() - t_preview_start)
@@ -13366,7 +13382,7 @@ async def procesar_resultado(
             upload_state={
                 "status": "publishing",
                 "phase": "ponderaciones_completas",
-                "updated_at": datetime.utcnow().isoformat() + "Z",
+                "updated_at": datetime.now(UTC).isoformat() + "Z",
             },
         )
         logger.info(f"✅ UI Resumen actualizado con ponderaciones - Usuario puede navegar ahora")
@@ -13426,7 +13442,7 @@ async def procesar_resultado(
                     upload_state={
                         "status": "publishing",
                         "phase": "priority_ready",
-                        "updated_at": datetime.utcnow().isoformat() + "Z",
+                        "updated_at": datetime.now(UTC).isoformat() + "Z",
                     },
                 )
                 logger.info(f"✅ Activos prioritarios listos para monitoreo: {ready_for_monitoring}")
@@ -13497,7 +13513,7 @@ async def procesar_resultado(
             upload_state={
                 "status": "partial_ready",
                 "phase": "core_ready",
-                "updated_at": datetime.utcnow().isoformat() + "Z",
+                "updated_at": datetime.now(UTC).isoformat() + "Z",
             },
         )
         logger.info("[preview] core_ready en %.1fs", time.time() - t_proc_start)
@@ -13747,7 +13763,7 @@ async def procesar_resultado(
             upload_state={
                 "status": "completed",
                 "phase": "done",
-                "updated_at": datetime.utcnow().isoformat() + "Z",
+                "updated_at": datetime.now(UTC).isoformat() + "Z",
             },
         )
 
@@ -17661,9 +17677,14 @@ async def initialize_bot():
         loop = asyncio.get_event_loop()
         await _POD_COORDINATOR.start_heartbeat(loop)
 
-        # Warmup cache (blocking) for all-assets workflows
-        if APP_CONFIG.cache_warmup_enabled and APP_CONFIG.cache_warmup_blocking_startup:
-            await warmup_cache_all_assets("startup")
+        # ✅ Warmup cache para TODOS los pods
+        if APP_CONFIG.cache_warmup_enabled:
+            if APP_CONFIG.cache_warmup_blocking_startup:
+                logger.info("[Warmup] Ejecutando pre-calentamiento bloqueante al startup...")
+                await warmup_cache_all_assets("startup_blocking")
+            else:
+                logger.info("[Warmup] Programando pre-calentamiento en background...")
+                asyncio.create_task(warmup_cache_all_assets("startup_background"))
 
         # Programar el guardado diario (todas las tareas arrancan, pero solo líder ejecuta)
         asyncio.create_task(guardar_noticias_forex_diarias())
@@ -20600,6 +20621,47 @@ def health():
 #@profile
 def health_check():
     return jsonify({"status": "ok"}), 200
+
+@webhook_app.route('/cache-status', methods=['GET'])
+#@profile
+def cache_status():
+    """Endpoint para verificar el estado del caché y el warmup progress."""
+    warmup_status = "not started"
+    warmup_time_taken = None
+    
+    if _warmup_start_time is not None:
+        if _warmup_end_time is not None:
+            warmup_status = "completed"
+            warmup_time_taken = _warmup_end_time - _warmup_start_time
+        else:
+            warmup_status = "in progress"
+            warmup_time_taken = time.time() - _warmup_start_time
+    
+    return jsonify({
+        "status": "ok",
+        "instance": socket.gethostname(),
+        "warmup": {
+            "status": warmup_status,
+            "start_time": _warmup_start_time,
+            "end_time": _warmup_end_time,
+            "elapsed_seconds": warmup_time_taken,
+        },
+        "cache_stats": {
+            "niveles_hits": _niveles_cache_hits,
+            "niveles_misses": _niveles_cache_misses,
+            "niveles_hit_rate": round(100 * _niveles_cache_hits / max(1, _niveles_cache_hits + _niveles_cache_misses), 1),
+            "atr_hits": _atr_cache_hits,
+            "atr_misses": _atr_cache_misses,
+            "atr_hit_rate": round(100 * _atr_cache_hits / max(1, _atr_cache_hits + _atr_cache_misses), 1),
+        },
+        "warmup_config": {
+            "enabled": APP_CONFIG.cache_warmup_enabled,
+            "blocking_startup": APP_CONFIG.cache_warmup_blocking_startup,
+            "leader_only": APP_CONFIG.cache_warmup_leader_only,
+            "concurrency": APP_CONFIG.cache_warmup_concurrency,
+            "max_ram_percent": APP_CONFIG.cache_warmup_max_ram_percent,
+        }
+    }), 200
 
 @webhook_app.route('/', methods=['GET'])
 #@profile
