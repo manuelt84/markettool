@@ -996,7 +996,13 @@ class HistoryManager:
                             activos.update(arr)
                 # 3. lists (campo 'symbol')
                 # OMITIDO: No se toma en cuenta la colección 'lists' por tamaño y performance
-                self._valid_symbols = set(str(s).strip().upper() for s in activos if isinstance(s, str) and s.strip())
+                cat_words = {k.strip().upper() for k in categorias_data.keys() if isinstance(k, str) and k.strip()}
+                cat_words.update({"TODOS", "ALL"})
+                self._valid_symbols = set(
+                    str(s).strip().upper()
+                    for s in activos
+                    if isinstance(s, str) and s.strip() and str(s).strip().upper() not in cat_words
+                )
             except Exception as e:
                 logger.warning(f"[FIRESTORE] Error al recuperar activos válidos: {e}")
                 self._valid_symbols = set()
@@ -2532,6 +2538,13 @@ def _universe_symbols() -> set:
     except Exception:
         pass
     cleaned = set(s.strip().upper() for s in out if isinstance(s, str) and s.strip())
+    # Excluir palabras de categorias u otros tokens no simbolo
+    try:
+        category_words = {k.strip().upper() for k in (categorias or {}).keys() if isinstance(k, str) and k.strip()}
+    except Exception:
+        category_words = set()
+    category_words.update({"TODOS", "ALL"})
+    cleaned = set(s for s in cleaned if s not in category_words)
     # Evita intentar cachear codigos de moneda sueltos (ej: AUD) que no tienen historicos.
     return set(s for s in cleaned if not (len(s) == 3 and s in _CURRENCY_CODES))
 
