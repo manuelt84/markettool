@@ -8026,7 +8026,7 @@ def obtener_datos_con_hilos(
 
 # Función para calcular indicadores
 #@profile
-def calcular_indicadores_impl(df, temporalidad):
+def calcular_indicadores_impl(df, temporalidad, window: int | None = None):
     """
     Implementación original de cálculo de indicadores.
     Esta función NO debe llamarse directamente; usar calcular_indicadores() que incluye caché.
@@ -8038,7 +8038,10 @@ def calcular_indicadores_impl(df, temporalidad):
     Returns:
         DataFrame con indicadores calculados
     """
-    window = min(definir_window(temporalidad), len(df))
+    if window is None:
+        window = min(definir_window(temporalidad), len(df))
+    else:
+        window = min(window, len(df))
 
     # Media Móvil Simple (SMA)
     df['SMA'] = df['close'].rolling(window=window).mean()
@@ -8100,6 +8103,8 @@ def calcular_indicadores_impl(df, temporalidad):
                    (df['low'] - df['close'].shift(1)).abs())
     )
     df['ATR'] = df['true_range'].rolling(window=window).mean()
+    if 'atr' not in df.columns:
+        df['atr'] = df['ATR']
 
     # Señales de divergencia
     df['divergencia_macd'] = (df['macd'] > df['macd'].shift(1)) & (df['close'] < df['close'].shift(1))
@@ -8111,7 +8116,7 @@ def calcular_indicadores_impl(df, temporalidad):
     df['divergencia_rsi_bear']  = (df['rsi']  < df['rsi'].shift(1))  & (df['close'] > df['close'].shift(1))
 
     # Convertir columnas clave a tipo numérico
-    for col in ['rsi', '%K', '%D', 'ATR', 'macd', 'signal', 'ema_12', 'ema_26']:
+    for col in ['rsi', '%K', '%D', 'ATR', 'atr', 'macd', 'signal', 'ema_12', 'ema_26']:
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
     # Interpolación optimizada: evita df.drop + df.update (costoso en DF grandes)
@@ -8124,8 +8129,9 @@ def calcular_indicadores_impl(df, temporalidad):
         df.loc[:, cols_interp] = df.loc[:, cols_interp].interpolate(method='linear')
 
     # Rellenar valores restantes con forward fill y backward fill (mantiene comportamiento original)
-    df.ffill(inplace=True)
-    df.bfill(inplace=True)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) > 0:
+        df.loc[:, numeric_cols] = df.loc[:, numeric_cols].ffill().bfill()
 
     return df
 
@@ -8230,9 +8236,11 @@ def calcular_indicadores(df, temporalidad, symbol=None):
     """
     REQUIRED_INDICATORS = {"macd", "signal", "rsi", "%K", "%D", "close", "high", "low", "ATR"}
     
+    window = min(definir_window(temporalidad), len(df))
+
     if symbol is None or not _INDICATORS_CACHE_ENABLED:
         # Modo legacy: sin caché
-        df_result = calcular_indicadores_impl(df, temporalidad)
+        df_result = calcular_indicadores_impl(df, temporalidad, window=window)
         # Validar que se calcularon todos los indicadores
         missing = REQUIRED_INDICATORS - set(df_result.columns)
         if missing:
@@ -8244,7 +8252,7 @@ def calcular_indicadores(df, temporalidad, symbol=None):
         symbol=symbol,
         tf=temporalidad,
         df_historicos=df,
-        calc_func=calcular_indicadores_impl
+        calc_func=partial(calcular_indicadores_impl, window=window)
     )
     
     # ✅ VALIDACIÓN CRÍTICA: Asegurar que el caché devolvió un DataFrame completo
@@ -8287,7 +8295,10 @@ def limitar_probabilidad(probabilidad_exito):
 
 # Función para ajustar la probabilidad técnica con incrementos controlados
 #@profile
-def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] = None):
+_prob_tecnica_cache = {}
+_prob_tecnica_cache_ttl = 600  # 10 minutos
+
+def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] = None, niveles: Optional[dict] = None, symbol: str | None = None):
     """
     Calcula la probabilidad técnica usando:
       - flags de activación y magnitudes desde cfg.tecnica si existen
@@ -8333,6 +8344,20 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
     if len(df) < 2:
         logger.info("No hay suficientes datos para calcular la probabilidad técnica.")
         return 50.0
+
+    # Cache simple por simbolo/TF cuando no hay cambios en la ultima vela
+    cache_key = None
+    if symbol:
+        try:
+            last_ts = df.index[-1] if len(df.index) else None
+            cache_key = f"{symbol}|{temporalidad}|{window}|{len(df)}|{last_ts}"
+            entry = _prob_tecnica_cache.get(cache_key)
+            if entry:
+                age = (datetime.now(UTC) - entry['timestamp']).total_seconds()
+                if age < _prob_tecnica_cache_ttl:
+                    return entry['value']
+        except Exception:
+            cache_key = None
     
     # ✅ Verificar que los indicadores requeridos existan
     required_cols = ["macd", "signal", "rsi", "%K", "%D", "close", "high", "low", "ATR"]
@@ -8345,9 +8370,16 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
     penultima_fila = df.iloc[-2]
     probabilidad_tecnica = 50.0
 
-    # Soportes / resistencias sobre ventana
-    soporte_nivel_1 = df["low"].rolling(window=window).min().iloc[-1]
-    resistencia_nivel_1 = df["high"].rolling(window=window).max().iloc[-1]
+    # Soportes / resistencias: reutilizar niveles precomputados si están disponibles
+    soporte_nivel_1 = None
+    resistencia_nivel_1 = None
+    if isinstance(niveles, dict):
+        soporte_nivel_1 = _coerce_float(niveles.get("soporte_nivel_1"))
+        resistencia_nivel_1 = _coerce_float(niveles.get("resistencia_nivel_1"))
+
+    if not (_finite(soporte_nivel_1) and _finite(resistencia_nivel_1)):
+        soporte_nivel_1 = df["low"].rolling(window=window).min().iloc[-1]
+        resistencia_nivel_1 = df["high"].rolling(window=window).max().iloc[-1]
 
     # Señales detectadas para el bono triple
     senal_macd = False
@@ -8433,7 +8465,17 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
     # Limitar al rango [1,75] - máximo 75% refleja realidad
     # Incluso con múltiples señales, raramente supera 75%
     probabilidad_tecnica = min(probabilidad_tecnica, 75.0)
-    return limitar_probabilidad(probabilidad_tecnica)
+    probabilidad_tecnica = limitar_probabilidad(probabilidad_tecnica)
+
+    if cache_key:
+        _prob_tecnica_cache[cache_key] = {
+            "value": probabilidad_tecnica,
+            "timestamp": datetime.now(UTC)
+        }
+        if len(_prob_tecnica_cache) > 500:
+            _prob_tecnica_cache.clear()
+
+    return probabilidad_tecnica
 
 
 #@profile
@@ -9807,7 +9849,6 @@ def predecir_arima(df, temporalidad, symbol, steps=5):
         return None
 
     # Convertir a tipos numéricos e interpolar
-    df = df.infer_objects(copy=False)
     try:
         # Convertir columnas específicas a tipo numérico
         for col in df.columns:
@@ -10064,7 +10105,12 @@ def calcular_soportes_resistencias(df, window, atr_multiplier, precio_actual, mi
     soportes = df['low'].iloc[min_indices].tolist()
     resistencias = df['high'].iloc[max_indices].tolist()
 
-    atr_mean = df['atr'].mean() if 'atr' in df.columns else 0
+    if 'atr' in df.columns:
+        atr_mean = df['atr'].mean()
+    elif 'ATR' in df.columns:
+        atr_mean = pd.to_numeric(df['ATR'], errors='coerce').mean()
+    else:
+        atr_mean = 0
     tolerancia = atr_multiplier * atr_mean
     
     # Filtrar niveles cercanos
@@ -10301,9 +10347,13 @@ def ajustar_window_dinamico_optimizado(
             f"El DataFrame {symbol} en {temporalidad} tiene menos filas ({len(df)}) que el tamaño mínimo de ventana ({window})."
         )
 
-    # Calcular TR y ATR (hacerlo una vez para evitar cálculos repetidos)
-    df['tr'] = calcular_tr(df['high'].values, df['low'].values, df['close'].values)
-    df['atr'] = df['tr'].rolling(window).mean()
+    # Asegurar ATR para tolerancias sin recalcular si ya existe
+    if 'atr' not in df.columns:
+        if 'ATR' in df.columns:
+            df['atr'] = pd.to_numeric(df['ATR'], errors='coerce')
+        else:
+            df['tr'] = calcular_tr(df['high'].values, df['low'].values, df['close'].values)
+            df['atr'] = df['tr'].rolling(window).mean()
 
     # Inicializar variables
     soportes_dinamicos, resistencias_dinamicas = set(), set()
@@ -11111,14 +11161,14 @@ def generar_entradas_multiples(
     """
     entries: list[dict] = []
 
-    logging.info("===== INPUT =====")
-    logging.info(f"precio_actual={precio_actual:.6f}, ATR={ATR if ATR is not None else None}")
-    logging.info(f"niveles: S1={niveles.get('soporte_nivel_1')}, S2={niveles.get('soporte_nivel_2')}, "
+    logger.debug("===== INPUT =====")
+    logger.debug(f"precio_actual={precio_actual:.6f}, ATR={ATR if ATR is not None else None}")
+    logger.debug(f"niveles: S1={niveles.get('soporte_nivel_1')}, S2={niveles.get('soporte_nivel_2')}, "
                  f"R1={niveles.get('resistencia_nivel_1')}, R2={niveles.get('resistencia_nivel_2')}")
-    logging.info(f"tipo_operacion={tipo_operacion}, estructura={(en_rango or {}).get('estructura_tendencia')}, "
+    logger.debug(f"tipo_operacion={tipo_operacion}, estructura={(en_rango or {}).get('estructura_tendencia')}, "
                  f"es_rango={bool((en_rango or {}).get('es_rango_repetitivo'))}")
-    logging.info(f"rango_dinamico={(en_rango or {}).get('rango_dinamico')} prob_general={prob_general}")
-    logging.info("=================")
+    logger.debug(f"rango_dinamico={(en_rango or {}).get('rango_dinamico')} prob_general={prob_general}")
+    logger.debug("=================")
 
     # Validaciones básicas
     if not (_finite(precio_actual) and ATR is not None and _finite(ATR) and ATR > 0):
@@ -11139,7 +11189,7 @@ def generar_entradas_multiples(
     sesgo_long = (tipo_operacion in señales_compra) or (tipo_operacion == "Neutral" and estructura in ("alcista", "indefinida"))
     sesgo_short = (tipo_operacion in señales_venta)  or (tipo_operacion == "Neutral" and estructura == "bajista")
 
-    logging.info(f"sesgo_long={sesgo_long}, sesgo_short={sesgo_short}, min_rrr={min_rrr}")
+    logger.debug(f"sesgo_long={sesgo_long}, sesgo_short={sesgo_short}, min_rrr={min_rrr}")
 
     midpoint = ((r1 + s1) / 2.0) if _finite(r1) and _finite(s1) else precio_actual
 
@@ -11287,8 +11337,8 @@ def generar_entradas_multiples(
         entries = entries[:max_candidates]
 
     # ====== ORDENACIÓN Y LOG ======
-    logging.info("===== RESUMEN =====")
-    logging.info(f"Intentos totales: {len(entries)} (antes de ordenar)")
+    logger.debug("===== RESUMEN =====")
+    logger.debug(f"Intentos totales: {len(entries)} (antes de ordenar)")
 
     # Mejora de score: pondera RRR alto, cercanía a precio, y confluencia (señales/estructura)
     def _confluence_boost(e: dict) -> float:
@@ -11316,9 +11366,9 @@ def generar_entradas_multiples(
     entries.sort(key=lambda e: e.get("score", 1e9))
 
     for i, e in enumerate(entries[:10], 1):
-        logging.info(f"{i:02d}) {e['side'].upper()} {e['basado_en']} "
-                     f"entry={e['precio_entrada']:.6f} tp={e['take_profit']:.6f} "
-                     f"sl={e['stop_loss']:.6f} RRR={e['rrr']:.3f} score={e['score']:.3f}")
+        logger.debug(f"{i:02d}) {e['side'].upper()} {e['basado_en']} "
+                 f"entry={e['precio_entrada']:.6f} tp={e['take_profit']:.6f} "
+                 f"sl={e['stop_loss']:.6f} RRR={e['rrr']:.3f} score={e['score']:.3f}")
 
     return entries
 
@@ -11490,7 +11540,9 @@ def calcular_entradas(
             logger.info(f"[ATR] Fallback usado para {symbol}/{tf}: ATR={ATR}")
 
         # --- Prob. técnica (ya calculamos tecnica_meta y fundamental_meta en paralelo) ---
-        probabilidad_tecnica = round(ajustar_probabilidad_tecnica(df, tf, window, cfg), 2)
+        probabilidad_tecnica = round(ajustar_probabilidad_tecnica(
+            df, tf, window, cfg, niveles=niveles_clave, symbol=symbol
+        ), 2)
 
         # --- Prob. general (con pesos desde cfg.general) ---
         probabilidad_general = calcular_probabilidad_general(
@@ -12569,10 +12621,19 @@ def procesar_simbolo_temporalidad(
     # ------------------- Indicadores -------------------
     # ✅ FASE 3: Validar calidad OHLCV antes de procesar
     try:
-        es_valido, problemas = validar_ohlcv_calidad(df_combinado, symbol, tf, strict=False)
-        if not es_valido:
-            logger.warning(f"[VALIDACIÓN] {symbol}-{tf}: Datos OHLCV no válidos. Problemas: {problemas}")
-            # En modo no-strict, continuamos pero registramos la advertencia
+        sample_n = int(os.environ.get("OHLCV_VALIDATE_SAMPLE_N", "1"))
+        if sample_n <= 1:
+            do_validate = True
+        else:
+            key = f"{symbol}|{tf}".encode("utf-8")
+            bucket = int(hashlib.md5(key).hexdigest(), 16) % sample_n
+            do_validate = bucket == 0
+
+        if do_validate:
+            es_valido, problemas = validar_ohlcv_calidad(df_combinado, symbol, tf, strict=False)
+            if not es_valido:
+                logger.warning(f"[VALIDACIÓN] {symbol}-{tf}: Datos OHLCV no válidos. Problemas: {problemas}")
+                # En modo no-strict, continuamos pero registramos la advertencia
     except Exception as e:
         logger.warning(f"[VALIDACIÓN] Error validando OHLCV para {symbol}-{tf}: {e}")
     
