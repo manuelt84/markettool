@@ -10215,6 +10215,25 @@ def _cache_niveles(cache_key: str, soportes: list, resistencias: list):
         for k in keys_to_remove:
             _niveles_cache.pop(k, None)
 
+# ========================================================================================
+# 🔧 MODULE-LEVEL WRAPPER PARA MONTE CARLO (pickle-compatible para ProcessPoolExecutor)
+# ========================================================================================
+def _wrapper_simulacion_monte_carlo(
+    df: pd.DataFrame,
+    tf: str,
+    num_simulaciones: int = 50,
+    num_dias: int = 5,
+    seed: int | None = 42
+) -> tuple[float, float]:
+    """
+    Wrapper a nivel módulo para simulacion_monte_carlo.
+    Esto permite que ProcessPoolExecutor pueda serializar la tarea.
+    
+    ⚠️  CRÍTICO: Esta función DEBE estar a nivel módulo para que pickle pueda serializarla.
+    Las funciones locales dentro de async no pueden ser pickleadas.
+    """
+    return simulacion_monte_carlo(df, tf, num_simulaciones=num_simulaciones, num_dias=num_dias, seed=seed)
+
 async def _calcular_predicciones_paralelo(df, tf, symbol, window):
     """Ejecuta predicciones ARIMA, Media Móvil y Monte Carlo en paralelo."""
     loop = asyncio.get_event_loop()
@@ -10223,9 +10242,12 @@ async def _calcular_predicciones_paralelo(df, tf, symbol, window):
     exec_used = _ANALYSIS_PRED_EXECUTOR
     arima_task = loop.run_in_executor(exec_used, predecir_arima, df, tf, symbol)
     mm_task = loop.run_in_executor(exec_used, predecir_media_movil, df, window)
+    # ✅ FIX: Usar wrapper a nivel módulo en lugar de lambda
     mc_task = loop.run_in_executor(
         exec_used,
-        lambda: simulacion_monte_carlo(df, tf, num_simulaciones=50, num_dias=5, seed=42)
+        _wrapper_simulacion_monte_carlo,
+        df,
+        tf
     )
     
     # Esperar a que todas terminen
