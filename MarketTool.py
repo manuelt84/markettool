@@ -657,8 +657,22 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     except Exception as e:
         logger.debug(f"[LazyLoader] Failed to load {symbol}/{tf}: {e}")
     
-    # Opción 2: Firestore Metadata (TTL compartido entre pods) ← NEW
-    # Si otro pod actualizó recientemente, evitamos llamar a FMP nuevamente
+    # Opción 2: Local files PRIMERO (muy rápido ~5ms, sin esperar red)
+    # Si local es fresco (<4h), es mucho más rápido que Firestore/GCS
+    try:
+        df = _load_local(symbol, tf)
+        if df is not None and not df.empty:
+            logger.debug(f"[load_cached] Hit Local: {symbol}/{tf}")
+            try:
+                _LAZY_HIST_LOADER.put(symbol, tf, df)
+            except Exception:
+                pass
+            return df
+    except Exception as e:
+        logger.debug(f"[load_cached] Local check failed: {e}")
+    
+    # Opción 3: Firestore Metadata (solo si local falló) ← Multi-pod coordination
+    # Para coordinación entre pods, pero solo si no hay cache local
     try:
         metadata = get_historicos_metadata(symbol, tf)
         if metadata is not None and not is_metadata_stale(metadata):
@@ -682,7 +696,7 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     except Exception as e:
         logger.debug(f"[Firestore] Metadata check failed (not fatal): {e}")
     
-    # Opción 3: GCS (permanente, 300-500ms) - si no hay metadata
+    # Opción 4: GCS fallback (300-500ms) - solo si Firestore/Local falló
     try:
         df = load_from_gcs(symbol, tf)
         if df is not None and not df.empty:
@@ -697,7 +711,7 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     except Exception as e:
         logger.debug(f"[GCS] Load failed for {symbol}/{tf}, trying local: {e}")
     
-    # Opción 4: Archivos locales (CSV/JSON legacy)
+    # Opción 5: Archivos locales legacy (CSV/JSON)
     primary = _hist_path(symbol, tf)
     alt = _hist_path_json(symbol, tf) if primary.endswith(".csv") else _hist_path_csv(symbol, tf)
     
@@ -818,33 +832,16 @@ def save_cached_history(symbol: str, tf: str, out: pd.DataFrame, *, storage_dir:
 
         payload = out.tail(1000).to_dict(orient="records")
         
-        # ===== GUARDAR EN GCS (permanente) + FIRESTORE METADATA =====
+        # ✅ OPTIMIZACIÓN: Solo guardar LOCALMENTE (rápido ~5ms)
+        # GCS/Firestore se hace en background cada 4h por warmup job
+        # Esto evita que el análisis espere a red cada vez
         try:
-            gcs_success = save_to_gcs(symbol, tf, out)
-            if gcs_success:
-                logger.debug(f"[save_cached_history] Saved to GCS for {symbol}/{tf}")
-                
-                # Guardar metadata en Firestore para sincronizar TTL entre pods
-                try:
-                    safe_sym = _safe_symbol_for_filename(symbol)
-                    safe_tf = normalize_tf(tf)
-                    gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
-                    set_historicos_metadata(
-                        symbol, tf, gcs_path, 
-                        len(payload), 
-                        ttl_seconds=APP_CONFIG.cache_ttl_historicos
-                    )
-                except Exception as meta_err:
-                    logger.debug(f"[save_cached_history] Firestore metadata save failed (not fatal): {meta_err}")
-        except Exception as e:
-            logger.debug(f"[save_cached_history] GCS save failed: {e}")
-        
-        # ===== GUARDAR LOCALMENTE (backup) =====
-        _save_local_history_df(symbol, tf, out)
-        with open(local_json, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-
-        logger.debug("[save_cached_history] guardado %s filas=%d (local backup)", local_json, len(payload))
+            _save_local_history_df(symbol, tf, out)
+            with open(local_json, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, default=str)
+            logger.debug("[save_cached_history] Local saved: %s rows=%d (GCS deferred to warmup)", symbol, len(out))
+        except Exception as local_err:
+            logger.warning(f"[save_cached_history] Even local save failed for {symbol}/{tf}: {local_err}")
 
     except Exception as e:
         # MUY importante mantener este mensaje, porque tus logs lo buscan por texto
@@ -15188,19 +15185,19 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Construir los botones para la categoría seleccionada
     if categoria in categorias:
-        if categoria == "Todos":
-            botones = [
-                [InlineKeyboardButton(f"{categoria} - {activos_con_descripcion.get(par, {}).get('descripcion', par)}", 
-                                    callback_data=f"{user_id}_par_{par}")] 
-                                    for par in categorias[categoria]
-            ]
-        else:
-            botones = [
-                [InlineKeyboardButton(f"{par} - {activos_con_descripcion.get(par, {}).get('descripcion', par)}",
-                                    callback_data=f"{user_id}_par_{par}")]
-                                    for par in categorias[categoria]
-            ]
-
+        activos_en_categoria = categorias.get(categoria, [])
+        
+        # Botones individuales para cada activo
+        botones = [
+            [InlineKeyboardButton(f"{par} - {activos_con_descripcion.get(par, {}).get('descripcion', par)}",
+                                callback_data=f"{user_id}_par_{par}")]
+                                for par in activos_en_categoria
+        ]
+        
+        # Agregar botón "Analizar TODOS" si la categoría tiene múltiples activos
+        if len(activos_en_categoria) > 1:
+            botones.insert(0, [InlineKeyboardButton("✅ Analizar TODOS", callback_data=f"{user_id}_par_TODOS")])
+        
         botones.append([InlineKeyboardButton("Volver", callback_data=f"{user_id}_menu_volver")])  # Botón para volver al menú principal
 
         reply_markup = InlineKeyboardMarkup(botones)
@@ -15247,8 +15244,15 @@ async def seleccionar_par(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     par = query.data.split("_")[2]  # Extraer el par del callback_data
+    
+    # Normalizar para que sea case-insensitive
+    par_display = par.upper()
 
-    await query.edit_message_text(f"Has seleccionado el activo: {par}")
+    # Mensaje más descriptivo según si es un par individual o un filtro de categoría
+    if par_display in ("TODOS", "ALL"):
+        await query.edit_message_text(f"Iniciando análisis de TODOS los activos...")
+    else:
+        await query.edit_message_text(f"Has seleccionado el activo: {par}")
 
     # Lock distribuido por usuario (multi-pod)
     lock_id = uuid.uuid4().hex
