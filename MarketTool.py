@@ -1140,9 +1140,8 @@ señales_venta = ['Venta', 'Venta Fuerte', 'Venta Predicha', 'Venta Predicha con
 file_locks = {}
 guardar_lock = asyncio.Lock()
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout, format='%(levelname)s:%(message)s')
-logger = logging.getLogger(__name__)
-
+# logging.basicConfig already configured at line 182 - don't duplicate it
+# Suppress verbose loggers from external libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)  # Para httpx
 logging.getLogger("urllib3").setLevel(logging.WARNING)  # Para requests
 
@@ -1152,12 +1151,8 @@ if not API_KEY:
     raise RuntimeError("Falta API_FMP (o FMP_API_KEY) en el entorno/.env. Usa --env .env o define la variable antes de ejecutar.")
 db = firestore.Client()
 
-# Personalizar los logs
-LOGGING_CONFIG["handlers"]["default"] = {
-    "level": "INFO",
-    "class": "logging.StreamHandler",
-    "stream": "ext://sys.stdout",  # Enviar a stdout
-}
+# NOTE: Don't modify LOGGING_CONFIG here - it would add duplicate handlers
+# The root logger is already configured at line 182
 
 #log_file = open('output.log', 'w')
 #sys.stdout = log_file
@@ -10001,22 +9996,73 @@ def _clean_levels(L):
 # ========== OPTIMIZACIONES: Cache de niveles y paralelización ==========
 
 # Cache global para niveles de soporte/resistencia (evita recalcular)
-# Estructura: {"symbol|tf|precio_hash|df_len": {"soportes": [...], "resistencias": [...], "timestamp": ...}}
+# Estructura: {"symbol|tf|df_len": {"soportes": [...], "resistencias": [...], "timestamp": ...}}
+# ✅ OPTIMIZACIÓN: Clave sin precio (es estable mientras no haya nuevas velas)
 _niveles_cache = {}
-_niveles_cache_ttl = 300  # 5 minutos de vigencia
+_niveles_cache_ttl = 3600  # 1 hora de vigencia (mucho más largo)
+_niveles_cache_hits = 0
+_niveles_cache_misses = 0
 
-def _get_niveles_cache_key(symbol: str, tf: str, precio_actual: float, df_len: int) -> str:
-    """Genera clave de cache para niveles basada en símbolo, TF, precio y tamaño del DF."""
-    precio_hash = int(precio_actual * 100)  # Discretizar precio para permitir pequeñas variaciones
-    return f"{symbol}|{tf}|{precio_hash}|{df_len}"
+# Cache global para ATR (evita recalcular)
+# Estructura: {"symbol|tf|df_len": {"atr": float, "timestamp": ...}}
+_atr_cache = {}
+_atr_cache_ttl = 3600  # 1 hora de vigencia
+_atr_cache_hits = 0
+_atr_cache_misses = 0
+
+def _get_niveles_cache_key(symbol: str, tf: str, df_len: int) -> str:
+    """Genera clave de cache para niveles basada SOLO en símbolo, TF y tamaño del DF.
+    El precio NO está en la clave porque los soportes/resistencias son estables mientras
+    el número de velas sea el mismo. Esto maximiza los hits de caché.
+    """
+    return f"{symbol}|{tf}|{df_len}"
+
+def _get_atr_cache_key(symbol: str, tf: str, df_len: int) -> str:
+    """Genera clave de cache para ATR basada en símbolo, TF y tamaño del DF."""
+    return f"{symbol}|{tf}|{df_len}"
+
+def _get_cached_atr(symbol: str, tf: str, df_len: int):
+    """Obtiene ATR del cache si es reciente."""
+    global _atr_cache_hits, _atr_cache_misses
+    cache_key = _get_atr_cache_key(symbol, tf, df_len)
+    if cache_key in _atr_cache:
+        entry = _atr_cache[cache_key]
+        age = (datetime.utcnow() - entry['timestamp']).total_seconds()
+        if age < _atr_cache_ttl:
+            _atr_cache_hits += 1
+            return entry['atr']
+    _atr_cache_misses += 1
+    return None
+
+def _cache_atr(symbol: str, tf: str, df_len: int, atr: float):
+    """Almacena ATR en cache."""
+    cache_key = _get_atr_cache_key(symbol, tf, df_len)
+    _atr_cache[cache_key] = {
+        'atr': atr,
+        'timestamp': datetime.utcnow()
+    }
+    # Limpiar entradas antiguas si el cache crece mucho
+    if len(_atr_cache) > 100:
+        now = datetime.utcnow()
+        keys_to_remove = [
+            k for k, v in _atr_cache.items()
+            if (now - v['timestamp']).total_seconds() > _atr_cache_ttl
+        ]
+        for k in keys_to_remove:
+            _atr_cache.pop(k, None)
 
 def _get_cached_niveles(cache_key: str):
     """Obtiene niveles del cache si son recientes."""
+    global _niveles_cache_hits, _niveles_cache_misses
     if cache_key in _niveles_cache:
         entry = _niveles_cache[cache_key]
         age = (datetime.utcnow() - entry['timestamp']).total_seconds()
         if age < _niveles_cache_ttl:
+            _niveles_cache_hits += 1
+            logger.debug(f"[Cache] Niveles HIT para {cache_key} (edad: {age:.1f}s)")
             return entry['soportes'], entry['resistencias']
+    _niveles_cache_misses += 1
+    logger.debug(f"[Cache] Niveles MISS para {cache_key}")
     return None, None
 
 def _cache_niveles(cache_key: str, soportes: list, resistencias: list):
@@ -10325,8 +10371,29 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soport
         logger.info(f"Advertencia: No se encontraron resistencias para {symbol} en {temporalidad_actual}.")
         resistencias = []
 
-    # Obtener el ATR y el precio actual
-    atr = df['atr'].iloc[-1]
+    # Obtener el ATR (desde caché si está disponible)
+    atr = _get_cached_atr(symbol, temporalidad_actual, len(df))
+    
+    if atr is None:
+        # Buscar ATR: primero 'atr', luego 'ATR', si no existe, calcularlo
+        if 'atr' in df.columns:
+            atr = df['atr'].iloc[-1]
+        elif 'ATR' in df.columns:
+            atr = df['ATR'].iloc[-1]
+        else:
+            # Calcular ATR si no existe
+            window = min(14, len(df))  # Usar una ventana por defecto
+            df['tr'] = calcular_tr(df['high'].values, df['low'].values, df['close'].values)
+            df['atr'] = df['tr'].rolling(window).mean()
+            atr = df['atr'].iloc[-1]
+        
+        # Asegurar que atr es un valor válido
+        if pd.isna(atr):
+            atr = df['high'].iloc[-window:].mean() - df['low'].iloc[-window:].mean() if 'window' in locals() else 0.01
+        
+        # Cachear el resultado
+        _cache_atr(symbol, temporalidad_actual, len(df), atr)
+    
     precio_actual = df['close'].iloc[-1]
     umbral = atr * umbral_atr
 
@@ -11187,7 +11254,8 @@ def calcular_entradas(
         probabilidad_baja = probabilidad_baja if probabilidad_baja is not None else 50
 
         # --- Soportes/Resistencias dinámicos (CON CACHE) ---
-        cache_key = _get_niveles_cache_key(symbol, tf, precio_actual, len(df))
+        # ✅ MEJORA: Clave de caché sin precio (más estable, maximiza hits)
+        cache_key = _get_niveles_cache_key(symbol, tf, len(df))
         soportes_cached, resistencias_cached = _get_cached_niveles(cache_key)
         
         if soportes_cached is not None and resistencias_cached is not None:
@@ -12540,6 +12608,13 @@ async def ejecutar_analisis_con_hilos(
         24,
     )
     
+    # 📊 Resetear estadísticas de caché para esta ejecución
+    global _niveles_cache_hits, _niveles_cache_misses, _atr_cache_hits, _atr_cache_misses
+    _niveles_cache_hits = 0
+    _niveles_cache_misses = 0
+    _atr_cache_hits = 0
+    _atr_cache_misses = 0
+    
     async def bounded_analysis(symbol, temporalidad):
         """Envuelve procesar_simbolo_temporalidad con límite de concurrencia."""
         async with sem:
@@ -12594,6 +12669,18 @@ async def ejecutar_analisis_con_hilos(
         len(errores),
         time.time() - start_all,
     )
+    
+    # 📊 Reporte de estadísticas del caché
+    niveles_total = _niveles_cache_hits + _niveles_cache_misses
+    atr_total = _atr_cache_hits + _atr_cache_misses
+    if niveles_total > 0 or atr_total > 0:
+        niv_hit_rate = round(100 * _niveles_cache_hits / max(1, niveles_total), 1)
+        atr_hit_rate = round(100 * _atr_cache_hits / max(1, atr_total), 1)
+        logger.info(
+            "[Cache] Niveles: %d hits + %d misses = %.1f%% | ATR: %d hits + %d misses = %.1f%%",
+            _niveles_cache_hits, _niveles_cache_misses, niv_hit_rate,
+            _atr_cache_hits, _atr_cache_misses, atr_hit_rate
+        )
 
     return resultados
 
