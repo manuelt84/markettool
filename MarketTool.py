@@ -995,11 +995,14 @@ class HistoryManager:
                         if isinstance(arr, list):
                             activos.update(arr)
                 # 3. lists (campo 'symbol')
-                lists_docs = db.collection('lists').stream()
-                for doc in lists_docs:
-                    d = doc.to_dict()
-                    if 'symbol' in d:
-                        activos.add(d['symbol'])
+                try:
+                    lists_docs = list(db.collection('lists').stream())
+                    for doc in lists_docs:
+                        d = doc.to_dict()
+                        if 'symbol' in d:
+                            activos.add(d['symbol'])
+                except Exception as e:
+                    logger.warning(f"[FIRESTORE] Error al recuperar lista de símbolos: {e}")
                 self._valid_symbols = set(str(s).strip().upper() for s in activos if isinstance(s, str) and s.strip())
             except Exception as e:
                 logger.warning(f"[FIRESTORE] Error al recuperar activos válidos: {e}")
