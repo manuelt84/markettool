@@ -67,6 +67,8 @@ Thumbs.db
 backup/
 historicos/
 indicators/
+forex_news/
+app/
 
 # ===================================
 # FIRESTORE / JSON CONFIGS (opcional)
