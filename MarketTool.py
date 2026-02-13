@@ -981,17 +981,26 @@ class HistoryManager:
         if not hasattr(self, '_valid_symbols'):
             try:
                 db = firestore.Client()
-                activos_docs = db.collection('config').document('activos').get()
                 activos = set()
+                # 1. config/activos (campo 'symbols')
+                activos_docs = db.collection('config').document('activos').get()
                 if activos_docs.exists:
                     activos_data = activos_docs.to_dict()
                     activos.update(activos_data.get('symbols', []))
+                # 2. config/categorias (todas las listas de cada categoría)
+                categorias_docs = db.collection('config').document('categorias').get()
+                if categorias_docs.exists:
+                    categorias_data = categorias_docs.to_dict().get('data', {})
+                    for arr in categorias_data.values():
+                        if isinstance(arr, list):
+                            activos.update(arr)
+                # 3. lists (campo 'symbol')
                 lists_docs = db.collection('lists').stream()
                 for doc in lists_docs:
                     d = doc.to_dict()
                     if 'symbol' in d:
                         activos.add(d['symbol'])
-                self._valid_symbols = activos
+                self._valid_symbols = set(str(s).strip().upper() for s in activos if isinstance(s, str) and s.strip())
             except Exception as e:
                 logger.warning(f"[FIRESTORE] Error al recuperar activos válidos: {e}")
                 self._valid_symbols = set()
