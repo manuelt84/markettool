@@ -1,0 +1,27 @@
+# ✅ Configuración YOLO para NO descargar modelos de internet
+# Esto evita la barra de progreso y descargas innecesarias
+
+# Desabilitar telemetría y análitica
+analytics: false
+
+# Usar caché local solamente
+datasets_dir: /app/datasets
+weights_dir: /app/models/yolo
+runs_dir: /app/runs
+
+# No conectar a internet
+api_key: ''
+enabled: false
+server: https://disabled
+
+# Configuración de ejecución
+mode: 'infer'
+task: 'detect'
+device: null  # auto-detect
+
+# Limites de memoria
+max_size: 1920
+workers: 4
+
+# Logging
+verbose: false
