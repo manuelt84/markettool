@@ -983,6 +983,13 @@ class HistoryManager:
             from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
         else:
             last = cache_df.index[-1]
+            # Ensure 'last' is a datetime object
+            if not isinstance(last, datetime):
+                try:
+                    last = pd.to_datetime(last)
+                except Exception:
+                    logging.warning(f"[HIST][BUG] Index type not datetime: {type(last)}. Using now as fallback.")
+                    last = now
             base_tf = self._base_interval_for(tf)
             from_dt = last + self._timedelta_for(base_tf, 1)
 
@@ -2495,7 +2502,9 @@ def _universe_symbols() -> set:
                 out.update(arr)
     except Exception:
         pass
-    return set(s.strip().upper() for s in out if isinstance(s, str) and s.strip())
+    cleaned = set(s.strip().upper() for s in out if isinstance(s, str) and s.strip())
+    # Evita intentar cachear codigos de moneda sueltos (ej: AUD) que no tienen historicos.
+    return set(s for s in cleaned if not (len(s) == 3 and s in _CURRENCY_CODES))
 
 # temporalidades válidas del sistema
 def _valid_timeframes() -> set:
@@ -2602,6 +2611,13 @@ _TF_ALIASES = {
 }
 
 _PROVIDERS = {"OANDA","FXCM","FOREXCOM","FX","TV","TRADINGVIEW","BINANCE","COINBASE","BITSTAMP","KRAKEN"}
+_CURRENCY_CODES = {
+    "USD","EUR","JPY","GBP","CHF","CAD","AUD","NZD",
+    "MXN","BRL","CLP","COP","PEN","ARS","TRY","ZAR","RUB",
+    "CNY","CNH","HKD","SGD","NOK","SEK","DKK","PLN","CZK","HUF","RON",
+    "ILS","SAR","AED","QAR","KWD","BHD","OMR","JOD","EGP",
+    "THB","IDR","MYR","PHP","KRW","TWD","INR","PKR","BDT","VND",
+}
 
 def _clean_token(s: str) -> str:
     s = (s or "").strip().upper()
