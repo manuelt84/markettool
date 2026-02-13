@@ -1162,6 +1162,10 @@ if _ANALYSIS_PRED_WORKERS > 0:
         _ANALYSIS_PRED_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
 else:
     _ANALYSIS_PRED_EXECUTOR = None
+
+# 🔍 DEBUG: Log de inicialización de executores
+_pred_executor_type = type(_ANALYSIS_PRED_EXECUTOR).__name__ if _ANALYSIS_PRED_EXECUTOR else "None"
+logger.info(f"[Init] Executor predicciones: {_pred_executor_type} (workers={_ANALYSIS_PRED_WORKERS}, use_process={_ANALYSIS_PRED_USE_PROCESS})")
 cache_noticias = {}
 subscriptions = {}
 subscriptions_type = {}
@@ -10232,7 +10236,14 @@ def _wrapper_simulacion_monte_carlo(
     ⚠️  CRÍTICO: Esta función DEBE estar a nivel módulo para que pickle pueda serializarla.
     Las funciones locales dentro de async no pueden ser pickleadas.
     """
-    return simulacion_monte_carlo(df, tf, num_simulaciones=num_simulaciones, num_dias=num_dias, seed=seed)
+    # 🔍 DEBUG: Confirmar que este wrapper está siendo ejecutado en paralelo
+    import os
+    import multiprocessing
+    pid = os.getpid()
+    logger.debug(f"[MC-Wrapper] Ejecutando en PID={pid} (main={multiprocessing.current_process().name})")
+    result = simulacion_monte_carlo(df, tf, num_simulaciones=num_simulaciones, num_dias=num_dias, seed=seed)
+    logger.debug(f"[MC-Wrapper] Completó: {result}")
+    return result
 
 async def _calcular_predicciones_paralelo(df, tf, symbol, window):
     """Ejecuta predicciones ARIMA, Media Móvil y Monte Carlo en paralelo."""
@@ -10240,6 +10251,9 @@ async def _calcular_predicciones_paralelo(df, tf, symbol, window):
     
     # Ejecutar en threads separados para no bloquear el event loop
     exec_used = _ANALYSIS_PRED_EXECUTOR
+    # 🔍 DEBUG: Log del tipo de executor siendo usado
+    executor_type = type(exec_used).__name__ if exec_used else "None"
+    logger.debug(f"[Predicciones] {symbol}-{tf} usando executor: {executor_type}")
     arima_task = loop.run_in_executor(exec_used, predecir_arima, df, tf, symbol)
     mm_task = loop.run_in_executor(exec_used, predecir_media_movil, df, window)
     # ✅ FIX: Usar wrapper a nivel módulo en lugar de lambda
