@@ -131,17 +131,17 @@ class AppConfig:
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
     econ_chunk_days: int= field(default_factory=lambda: int(os.environ.get("ECON_CHUNK_DAYS","31")))
     cache_ttl_config: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_CONFIG", "600")))
-    cache_ttl_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_HISTORICOS", "1800")))
+    cache_ttl_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_HISTORICOS", "7200")))
     cache_max_size_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_MAX_SIZE_HISTORICOS", "100")))
-    cache_warmup_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_ENABLED", "true").lower() == "true")
-    cache_warmup_blocking_startup: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_BLOCKING_STARTUP", "true").lower() == "true")
-    cache_warmup_interval_minutes: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_INTERVAL_MINUTES", "240")))
+    cache_warmup_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_ENABLED", "false").lower() == "true")
+    cache_warmup_blocking_startup: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_BLOCKING_STARTUP", "false").lower() == "true")
+    cache_warmup_interval_minutes: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_INTERVAL_MINUTES", "480")))
     cache_warmup_max_ram_percent: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_MAX_RAM_PERCENT", "80")))
-    cache_warmup_concurrency: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "4")))
-    cache_warmup_news_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_NEWS_ENABLED", "true").lower() == "true")
-    cache_warmup_events_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_EVENTS_ENABLED", "true").lower() == "true")
-    cache_warmup_news_limit: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_NEWS_LIMIT", "2")))
-    cache_warmup_leader_only: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_LEADER_ONLY", "false").lower() == "true")
+    cache_warmup_concurrency: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "2")))
+    cache_warmup_news_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_NEWS_ENABLED", "false").lower() == "true")
+    cache_warmup_events_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_EVENTS_ENABLED", "false").lower() == "true")
+    cache_warmup_news_limit: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_NEWS_LIMIT", "1")))
+    cache_warmup_leader_only: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_LEADER_ONLY", "true").lower() == "true")
 
 
 
@@ -4912,9 +4912,9 @@ def is_metadata_stale(metadata: Dict[str, Any]) -> bool:
 # ======================================================================
 
 _INDICATORS_CACHE_ENABLED = os.environ.get("INDICATORS_CACHE_ENABLED", "true").lower() == "true"
-_INDICATORS_CACHE_TTL_HOURS = int(os.environ.get("INDICATORS_CACHE_TTL_HOURS", "4"))
+_INDICATORS_CACHE_TTL_HOURS = int(os.environ.get("INDICATORS_CACHE_TTL_HOURS", "8"))
 _INDICATORS_FORCE_RECALC = os.environ.get("INDICATORS_FORCE_RECALC", "false").lower() == "true"
-_INDICATORS_MEMORY_CACHE_SIZE = int(os.environ.get("INDICATORS_MEMORY_CACHE_SIZE", "5"))  # LRU pequeño
+_INDICATORS_MEMORY_CACHE_SIZE = int(os.environ.get("INDICATORS_MEMORY_CACHE_SIZE", "10"))  # LRU moderado
 _INDICATORS_LOCK_TIMEOUT_SEC = int(os.environ.get("INDICATORS_LOCK_TIMEOUT_SEC", "180"))  # 3 min
 
 
