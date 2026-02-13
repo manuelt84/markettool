@@ -2764,48 +2764,78 @@ async def warmup_cache_all_assets(reason: str = "scheduled"):
 
     limit_reached = False
     warmed_symbols = 0
+    warmed_pairs = 0
+    
+    # 🚀 PARALELIZACIÓN OPTIMIZADA: Crear TODAS las tasks sin bloquear por símbolo
+    all_warmup_tasks = []
+    task_to_pair = {}  # Map id(task) -> (symbol, tf)
+    
     for symbol in symbols:
         mem_pct = _memory_usage_percent()
         if mem_pct is not None and mem_pct >= APP_CONFIG.cache_warmup_max_ram_percent:
             logger.warning(
-                "[Warmup] Memory usage %.1f%% >= %d%%. Stopping warmup.",
+                "[Warmup] Memory usage %.1f%% >= %d%%. Stopping task creation.",
                 mem_pct,
                 APP_CONFIG.cache_warmup_max_ram_percent,
             )
-            logger.info("[Warmup] Limit reached. Cached %d/%d symbols.", warmed_symbols, len(symbols))
             limit_reached = True
             break
-
-        tasks = []
+        
         for tf in tfs:
-            tasks.append(asyncio.create_task(_warm_symbol_tf(symbol, tf)))
-            if len(tasks) >= APP_CONFIG.cache_warmup_concurrency:
-                await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        if APP_CONFIG.cache_warmup_news_enabled:
+            task = asyncio.create_task(_warm_symbol_tf(symbol, tf))
+            all_warmup_tasks.append(task)
+            task_to_pair[id(task)] = (symbol, tf)
+    
+    # Ejecutar TODOS los warmups en paralelo, procesando resultados conforme se completan
+    if all_warmup_tasks:
+        logger.info(f"[Warmup] Procesando {len(all_warmup_tasks)} pares (symbol, TF) con as_completed()")
+        
+        unique_symbols = set()
+        for completed_task in asyncio.as_completed(all_warmup_tasks):
             try:
-                await get_noticias_cached(symbol, limite=APP_CONFIG.cache_warmup_news_limit)
-            except Exception:
-                pass
-
-        warmed_symbols += 1
-
+                result = await completed_task
+                symbol, tf = task_to_pair[id(completed_task)]
+                if symbol not in unique_symbols:
+                    unique_symbols.add(symbol)
+                    warmed_symbols = len(unique_symbols)
+                warmed_pairs += 1
+            except Exception as e:
+                logger.warning(f"[Warmup] Error en task: {e}")
+    
+    # 🔔 Cargar eventos económicos y noticias en paralelo (si habilitado)
+    additional_tasks = []
     if APP_CONFIG.cache_warmup_events_enabled:
         try:
-            await get_eventos_economicos_cached()
+            additional_tasks.append(asyncio.create_task(get_eventos_economicos_cached()))
         except Exception:
             pass
-
+    
+    if APP_CONFIG.cache_warmup_news_enabled:
+        # Cargar noticias para cada símbolo en paralelo
+        for symbol in symbols:
+            if limit_reached:
+                break
+            try:
+                additional_tasks.append(asyncio.create_task(
+                    get_noticias_cached(symbol, limite=APP_CONFIG.cache_warmup_news_limit)
+                ))
+            except Exception:
+                pass
+    
+    # Ejecutar tareas adicionales (eventos + noticias) 
+    if additional_tasks:
+        await asyncio.gather(*additional_tasks, return_exceptions=True)
+    
     elapsed = time.time() - start
     _warmup_end_time = time.time()
     
     if limit_reached:
-        logger.warning("[Warmup] ===== COMPLETADO (anticipado) ===== reason=%s, symbols=%d/%d, tiempo=%.1fs", reason, warmed_symbols, len(symbols), elapsed)
+        logger.warning("[Warmup] ===== COMPLETADO (anticipado) ===== reason=%s, symbols=%d, pairs=%d, tiempo=%.1fs", 
+                      reason, warmed_symbols, warmed_pairs, elapsed)
     else:
-        logger.info("[Warmup] ===== COMPLETADO ===== reason=%s, símbolos=%d, timeframes=%d, tiempo=%.1fs", reason, len(symbols), len(tfs), elapsed)
+        warmed_symbols = len(symbols)
+        logger.info("[Warmup] ===== COMPLETADO ===== reason=%s, símbolos=%d, timeframes=%d, pairs=%d, tiempo=%.1fs", 
+                   reason, warmed_symbols, len(tfs), len(all_warmup_tasks), elapsed)
 
 # --------------------------
 # Normalización OCR
