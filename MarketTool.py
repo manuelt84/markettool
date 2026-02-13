@@ -1202,7 +1202,10 @@ _ANALYSIS_INNER_EXECUTOR = (
     else None
 )
 if _ANALYSIS_PRED_WORKERS > 0:
+    # ⚠️ IMPORTANT: ProcessPoolExecutor + asyncio + gRPC can cause GIL violations
+    # Only use if explicitly enabled and no asyncio/gRPC threads active
     if _ANALYSIS_PRED_USE_PROCESS:
+        logger.warning("[Init] Using ProcessPoolExecutor for predictions - ensure no gRPC activity during predictions!")
         _ANALYSIS_PRED_EXECUTOR = ProcessPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
     else:
         _ANALYSIS_PRED_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
@@ -8282,7 +8285,12 @@ def validar_ohlcv_calidad(df: pd.DataFrame, symbol: str, tf: str, strict: bool =
     
     # Validar volumen cero
     vol_cero = (df['volume'] == 0).sum()
-    if vol_cero > len(df) * 0.1:  # Si >10% tienen volumen 0
+    vol_cero_pct = vol_cero / len(df)
+    # Threshold: 25% for forex (XxxxYyy), 10% for stocks/commodities
+    # Forex often has zero-volume candles during illiquid periods
+    is_forex = len(symbol) == 7 and symbol[3] in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'  # e.g., EURCAD
+    threshold = 0.25 if is_forex else 0.10
+    if vol_cero_pct > threshold:
         problemas.append(f"⚠️ {vol_cero} candles con volumen cero ({vol_cero/len(df)*100:.1f}%)")
     
     # Validar gaps sospechosos (>5%)

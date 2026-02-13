@@ -27,6 +27,22 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 # 🚫 PASO 5: Validar modelos estan presentes
 RUN [ -f /app/patrones.pt ] && [ -f /app/ruido.pt ] && ls -lh /app/*.pt && echo "✅ Models present" || (echo "❌ Models missing" && exit 1)
 
+# 🚫 PASO 5.5: Pre-descargar modelos de EasyOCR (evita descargas en runtime sin internet)
+RUN mkdir -p /app/models/easyocr && \
+    python3 << 'EOF'
+import os
+os.environ['EASY_OCR_MODEL_DIR'] = '/app/models/easyocr'
+os.environ['TORCH_HOME'] = '/app/models/torch'
+try:
+    import easyocr
+    print("[EasyOCR] Descargando modelos...")
+    reader = easyocr.Reader(['en', 'es'], gpu=False, model_storage_directory='/app/models/easyocr', verbose=True)
+    print("[EasyOCR] ✅ Modelos pre-cacheados")
+except Exception as e:
+    print(f"[EasyOCR] ⚠️  Adviso (no crítico): {e}")
+    print("[EasyOCR] Continuando build - descargará en runtime si es necesario")
+EOF
+
 # PASO 6: Copiar codigo
 COPY . .
 
@@ -37,5 +53,14 @@ ENV PYTHONOPTIMIZE=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV MALLOC_TRIM_THRESHOLD_=100000
 ENV MALLOC_MMAP_THRESHOLD_=100000
+
+# 🔐 THREAD SAFETY: Disable ProcessPoolExecutor for predictions (avoid fork() with gRPC threads)
+# ProcessPoolExecutor causes GIL violations when mixed with asyncio + gRPC/GCP auth
+ENV ANALYSIS_PRED_USE_PROCESS=false
+ENV PYTHONMALLOC=malloc
+
+# 🔐 GCP/gRPC thread safety: Disable fork-based multiprocessing
+ENV GRPC_PYTHON_BUILD_WITH_CYTHON=false
+ENV GRPC_WORKER_THREADS=1
 
 CMD ["python", "MarketTool.py", "--host", "0.0.0.0", "--port", "8080"]
