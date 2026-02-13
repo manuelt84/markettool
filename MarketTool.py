@@ -5537,7 +5537,15 @@ class IndicatorsCache:
                     # Otro pod terminó: cargar resultado
                     cached = self.load(symbol, tf)
                     if cached is not None:
-                        df_result = self._apply_indicators_to_df(df_historicos.copy(), cached["indicators"])
+                        df_result, override = self._apply_indicators_or_recalc(
+                            df_historicos,
+                            cached["indicators"],
+                            symbol,
+                            tf,
+                            calc_func,
+                        )
+                        if override is not None:
+                            return df_result, override
                         return df_result, {
                             "cache_hit": True,
                             "incremental": False,
@@ -5592,7 +5600,15 @@ class IndicatorsCache:
         if cached_hash == current_hash and cached_rows == current_rows:
             # Hit perfecto: datos idénticos
             logger.info(f"[IndicatorsCache] Perfect hit: {symbol}/{tf} ({current_rows} rows, pod={self._pod_id})")
-            df_result = self._apply_indicators_to_df(df_historicos.copy(), cached["indicators"])
+            df_result, override = self._apply_indicators_or_recalc(
+                df_historicos,
+                cached["indicators"],
+                symbol,
+                tf,
+                calc_func,
+            )
+            if override is not None:
+                return df_result, override
             
             return df_result, {
                 "cache_hit": True,
@@ -5612,7 +5628,15 @@ class IndicatorsCache:
                 if self._wait_for_lock_release(symbol, tf, max_wait_sec=120):
                     cached = self.load(symbol, tf)
                     if cached is not None:
-                        df_result = self._apply_indicators_to_df(df_historicos.copy(), cached["indicators"])
+                        df_result, override = self._apply_indicators_or_recalc(
+                            df_historicos,
+                            cached["indicators"],
+                            symbol,
+                            tf,
+                            calc_func,
+                        )
+                        if override is not None:
+                            return df_result, override
                         return df_result, {
                             "cache_hit": True,
                             "incremental": True,
@@ -5645,7 +5669,15 @@ class IndicatorsCache:
                     0,
                 )
 
-                df_result = self._apply_indicators_to_df(df_historicos.copy(), indicators_merged)
+                df_result, override = self._apply_indicators_or_recalc(
+                    df_historicos,
+                    indicators_merged,
+                    symbol,
+                    tf,
+                    calc_func,
+                )
+                if override is not None:
+                    return df_result, override
 
                 self.save(
                     symbol,
@@ -5684,7 +5716,15 @@ class IndicatorsCache:
                 if self._wait_for_lock_release(symbol, tf, max_wait_sec=120):
                     cached = self.load(symbol, tf)
                     if cached is not None:
-                        df_result = self._apply_indicators_to_df(df_historicos.copy(), cached["indicators"])
+                        df_result, override = self._apply_indicators_or_recalc(
+                            df_historicos,
+                            cached["indicators"],
+                            symbol,
+                            tf,
+                            calc_func,
+                        )
+                        if override is not None:
+                            return df_result, override
                         return df_result, {
                             "cache_hit": True,
                             "incremental": True,
@@ -5719,7 +5759,15 @@ class IndicatorsCache:
                 )
                 
                 # Aplicar al DataFrame completo
-                df_result = self._apply_indicators_to_df(df_historicos.copy(), indicators_merged)
+                df_result, override = self._apply_indicators_or_recalc(
+                    df_historicos,
+                    indicators_merged,
+                    symbol,
+                    tf,
+                    calc_func,
+                )
+                if override is not None:
+                    return df_result, override
                 
                 # Guardar actualizado
                 self.save(
@@ -5804,16 +5852,68 @@ class IndicatorsCache:
     
     def _apply_indicators_to_df(self, df: pd.DataFrame, indicators: dict) -> pd.DataFrame:
         """Aplica indicadores desde dict a DataFrame."""
+        mismatch = False
         for col, values in indicators.items():
             try:
                 if len(values) == len(df):
                     df[col] = values
                 else:
                     logger.warning(f"[IndicatorsCache] Length mismatch for {col}: {len(values)} vs {len(df)}")
+                    mismatch = True
             except Exception as e:
                 logger.warning(f"[IndicatorsCache] Error applying column {col}: {e}")
         
+        if mismatch:
+            raise ValueError("indicator_length_mismatch")
         return df
+
+    def _apply_indicators_or_recalc(
+        self,
+        df_historicos: pd.DataFrame,
+        indicators: dict,
+        symbol: str,
+        tf: str,
+        calc_func: Callable[[pd.DataFrame, str], pd.DataFrame],
+    ) -> Tuple[pd.DataFrame, dict | None]:
+        try:
+            return self._apply_indicators_to_df(df_historicos.copy(), indicators), None
+        except ValueError:
+            lock_acquired = self._acquire_lock(symbol, tf)
+            try:
+                if not lock_acquired and self._wait_for_lock_release(symbol, tf, max_wait_sec=120):
+                    cached = self.load(symbol, tf)
+                    if cached is not None:
+                        try:
+                            return self._apply_indicators_to_df(df_historicos.copy(), cached["indicators"]), None
+                        except ValueError:
+                            pass
+
+                logger.warning(f"[IndicatorsCache] Length mismatch triggers full recalc: {symbol}/{tf}")
+                start_time = time.time()
+                df_result = calc_func(df_historicos.copy(), tf)
+                calc_time_ms = (time.time() - start_time) * 1000
+                indicators_full = self._extract_indicators_from_df(df_result)
+                self.save(
+                    symbol,
+                    tf,
+                    indicators_full,
+                    df_historicos,
+                    calc_time_ms,
+                    analysis_audit={
+                        "last_mode": "data_mismatch",
+                        "last_data_mismatch_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+                    },
+                )
+                return df_result, {
+                    "cache_hit": False,
+                    "incremental": False,
+                    "calc_time_ms": calc_time_ms,
+                    "source": "full_calc_indicator_mismatch",
+                    "pod_id": self._pod_id,
+                }
+            finally:
+                if lock_acquired:
+                    self._release_lock(symbol, tf)
 
 
 # Instancia global del caché
