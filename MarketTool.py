@@ -1264,18 +1264,71 @@ def compute_lock_ttl(activos_count: int) -> int:
     ttl = max(USER_LOCK_MIN_SECONDS, count * USER_LOCK_SEC_PER_ASSET)
     return min(USER_LOCK_MAX_SECONDS, ttl)
 
+# ✅ Ruta base del app (para buscar modelos YOLO)
+_APP_ROOT = Path(__file__).parent.absolute()
+logger.info(f"[Startup] APP_ROOT={_APP_ROOT}")
+
 def _load_yolo_model(model_path: str):
+    """
+    Carga modelo YOLO desde archivo local.
+    Busca en: app_root/model_path o simplemente model_path si es absoluto.
+    """
     if YOLO is None:
         logger.warning("Ultralytics YOLO no esta instalado; modelo %s deshabilitado.", model_path)
         return None
-    try:
-        return YOLO(model_path)
-    except Exception as e:
-        logger.warning("No se pudo cargar YOLO %s: %s", model_path, e)
-        return None
+    
+    # Intentar ruta relativa al directorio del app primero
+    relative_path = _APP_ROOT / model_path
+    if relative_path.exists():
+        logger.info(f"[YOLO] Cargando modelo local: {relative_path}")
+        try:
+            return YOLO(str(relative_path))
+        except Exception as e:
+            logger.warning("No se pudo cargar YOLO desde %s: %s", relative_path, e)
+            return None
+    
+    # Si no existe localmente, intentar con la ruta como está (por si es absoluta o en otro lugar)
+    if Path(model_path).exists():
+        logger.info(f"[YOLO] Cargando modelo: {model_path}")
+        try:
+            return YOLO(model_path)
+        except Exception as e:
+            logger.warning("No se pudo cargar YOLO %s: %s", model_path, e)
+            return None
+    
+    # No existe localmente, loguear y retornar None (no descargar de internet)
+    logger.warning(f"[YOLO] Modelo NO encontrado: {model_path} (buscado en {relative_path}). No se descargará de internet.")
+    return None
 
-modelo_patrones = _load_yolo_model("patrones.pt")
-modelo_ruido = _load_yolo_model("ruido.pt")
+# ✅ LAZY LOADING: Los modelos se cargan bajo demanda, NO en el startup
+# Esto evita que la startup se bloquee descargando modelos de YOLO
+_modelo_patrones_cache = None
+_modelo_ruido_cache = None
+_yolo_models_lock = threading.Lock()
+
+def get_modelo_patrones():
+    """Carga YOLO para patrones bajo demanda (la primera vez que se use)."""
+    global _modelo_patrones_cache
+    if _modelo_patrones_cache is None:
+        with _yolo_models_lock:
+            if _modelo_patrones_cache is None:
+                logger.info("[YOLO] Cargando modelo de patrones (primera vez)...")
+                _modelo_patrones_cache = _load_yolo_model("patrones.pt") or False
+    return _modelo_patrones_cache if _modelo_patrones_cache is not False else None
+
+def get_modelo_ruido():
+    """Carga YOLO para ruido bajo demanda (la primera vez que se use)."""
+    global _modelo_ruido_cache
+    if _modelo_ruido_cache is None:
+        with _yolo_models_lock:
+            if _modelo_ruido_cache is None:
+                logger.info("[YOLO] Cargando modelo de ruido (primera vez)...")
+                _modelo_ruido_cache = _load_yolo_model("ruido.pt") or False
+    return _modelo_ruido_cache if _modelo_ruido_cache is not False else None
+
+# Compatibilidad hacia atrás (por si algo usa `modelo_patrones` directamente)
+modelo_patrones = None  # Nunca se usa directamente, usar get_modelo_patrones()
+modelo_ruido = None     # Nunca se usa directamente, usar get_modelo_ruido()
 
 # Lock global para simular carga
 ocupado_lock = threading.Lock()
@@ -3426,6 +3479,10 @@ def analizar_con_yolo(ruta_imagen: str, stop_cb=None, include_tech: bool=False, 
     texto_resultado = ""  # ✅ evita NameError
     entradas = {}
 
+    # ✅ Carga lazy de modelos YOLO (NO bloquea el startup)
+    modelo_patrones = get_modelo_patrones()
+    modelo_ruido = get_modelo_ruido()
+    
     if modelo_patrones is None or modelo_ruido is None:
         raise RuntimeError("Modelos YOLO no disponibles en este entorno")
 
