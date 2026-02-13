@@ -13082,27 +13082,37 @@ async def ejecutar_analisis_con_hilos(
                 )
             return result
 
-    # --- Análisis principal ---
+    # --- Análisis principal (PARALELIZACIÓN OPTIMIZADA) ---
+    # Opción 2: asyncio.as_completed() en lugar de asyncio.gather()
+    # Beneficio: Procesa resultados conforme se completan (streaming) sin "olas" secuenciales
     analisis_tasks = []
-    meta = []  # (symbol, temporalidad) alineado con analisis_tasks
+    task_to_meta = {}  # Map de id(task) -> (symbol, temporalidad) para identificar cada resultado
 
     for symbol in activos_filtrados:
         for temporalidad in temps:
-            task = bounded_analysis(symbol, temporalidad)
+            task = asyncio.create_task(bounded_analysis(symbol, temporalidad))
             analisis_tasks.append(task)
-            meta.append((symbol, temporalidad))
+            task_to_meta[id(task)] = (symbol, temporalidad)
 
-    analisis_results = await asyncio.gather(*analisis_tasks, return_exceptions=True)
-
-    for idx, result in enumerate(analisis_results):
-        symbol, temporalidad = meta[idx]
-        if isinstance(result, Exception):
-            logger.info(f"Error en análisis para símbolo {symbol} y temporalidad {temporalidad}: {result}")
-            errores.append(str(result))
-        elif result is not None:
-            resultados.append(result)
-        else:
-            logger.info(f"Resultado vacío para símbolo {symbol} y temporalidad {temporalidad}.")
+    # 🚀 Procesar resultados CONFORME se completan (no esperar "ola" completa)
+    # Esto permite actualizar Firestore, UI, etc incrementalmente mientras restan análisis
+    if analisis_tasks:
+        logger.debug(f"[Analisis] Procesando {len(analisis_tasks)} tasks con as_completed() (streaming)")
+        
+        for completed_task in asyncio.as_completed(analisis_tasks):
+            try:
+                result = await completed_task
+                symbol, temporalidad = task_to_meta[id(completed_task)]
+                
+                if isinstance(result, Exception):
+                    logger.info(f"Error en análisis para símbolo {symbol} y temporalidad {temporalidad}: {result}")
+                    errores.append(str(result))
+                elif result is not None:
+                    resultados.append(result)
+                else:
+                    logger.info(f"Resultado vacío para símbolo {symbol} y temporalidad {temporalidad}.")
+            except Exception as e:
+                logger.warning(f"Excepción en procesamiento de resultado: {e}")
 
     if not resultados and errores:
         logger.info("No se pudieron obtener resultados debido a errores.")
