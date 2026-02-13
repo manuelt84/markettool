@@ -1,17 +1,6 @@
 
 import os
 import sys
-
-# 🚫 BLOCK YOLO/ULTRALYTICS INTERNET DOWNLOADS BEFORE ANY IMPORTS
-# Set environment variables to prevent YOLO from downloading models
-os.environ['YOLO_SETTINGS_RUN_IN_BACKGROUND'] = 'False'
-os.environ['YOLO_SETTINGS_ANALYTICS'] = 'False'
-os.environ['YOLO_SETTINGS_ENABLED'] = 'False'
-os.environ['YOLO_AUTOINSTALL'] = '0'
-os.environ['TORCH_HOME'] = os.environ.get('TORCH_HOME', '/app/models/torch')
-os.environ['HF_HUB_OFFLINE'] = '1'
-os.environ['TRANSFORMERS_OFFLINE'] = '1'
-
 import math
 import random
 import time
@@ -1277,51 +1266,37 @@ def compute_lock_ttl(activos_count: int) -> int:
 
 # ✅ Ruta base del app (para buscar modelos YOLO)
 _APP_ROOT = Path(__file__).parent.absolute()
-logger.info(f"[Startup] APP_ROOT={_APP_ROOT}")
+logger.info(f"[Startup] APP_ROOT={_APP_ROOT}, cwd={os.getcwd()}")
 
 def _load_yolo_model(model_path: str):
     """
-    Carga modelo YOLO desde archivo local SOLAMENTE.
-    ¡¡¡NUNCA descarga de internet!!!
+    Carga modelo YOLO desde archivo local.
+    Busca en: cwd, _APP_ROOT, /app
     """
     if YOLO is None:
-        logger.warning("[YOLO] Ultralytics no instalado; modelo %s deshabilitado", model_path)
+        logger.warning("[YOLO] Ultralytics no instalado")
         return None
     
-    # 🚫 AGGRESSIVE: Solo buscar en ubicaciones específicas, nada más
-    searched_paths = []
+    paths_to_try = [
+        Path(model_path),                    # cwd=/app, busca en raíz
+        _APP_ROOT / model_path,              # relativo a script
+        Path("/app") / model_path,           # Docker absolute
+    ]
     
-    # 1. Ruta relativa a app root
-    relative_path = _APP_ROOT / model_path
-    searched_paths.append(relative_path)
-    if relative_path.exists() and relative_path.is_file():
-        logger.info(f"[YOLO] ✅ Modelo encontrado: {relative_path}")
-        try:
-            # 🚫 Prevenir cualquier descarga incluso si YOLO lo intenta
-            model = YOLO(str(relative_path), verbose=False)
-            logger.info(f"[YOLO] ✅ Modelo cargado exitosamente: {relative_path}")
-            return model
-        except Exception as e:
-            logger.error(f"[YOLO] ❌ Error cargando {relative_path}: {e}")
-            return None
+    logger.info(f"[YOLO] Buscando {model_path} en: {', '.join(str(p) for p in paths_to_try)}")
     
-    # 2. Ruta absoluta /app/ (Docker)
-    docker_path = Path("/app") / model_path
-    searched_paths.append(docker_path)
-    if docker_path.exists() and docker_path.is_file():
-        logger.info(f"[YOLO] ✅ Modelo encontrado: {docker_path}")
-        try:
-            model = YOLO(str(docker_path), verbose=False)
-            logger.info(f"[YOLO] ✅ Modelo cargado exitosamente: {docker_path}")
-            return model
-        except Exception as e:
-            logger.error(f"[YOLO] ❌ Error cargando {docker_path}: {e}")
-            return None
+    for path in paths_to_try:
+        if path.exists():
+            logger.info(f"[YOLO] ✅ Encontrado: {path}")
+            try:
+                model = YOLO(str(path))
+                logger.info(f"[YOLO] ✅ Cargado: {path}")
+                return model
+            except Exception as e:
+                logger.error(f"[YOLO] Error cargando {path}: {e}")
+                continue
     
-    # 3. NADA MÁS - No intentar ninguna otra ubicación
-    logger.error(f"[YOLO] ❌ MODELO NO ENCONTRADO: {model_path}")
-    logger.error(f"[YOLO] ❌ Buscado en: {', '.join(str(p) for p in searched_paths)}")
-    logger.error(f"[YOLO] ❌ NO SE DESCARGARÁ DE INTERNET - Usar solo archivos locales")
+    logger.error(f"[YOLO] ❌ No encontrado: {model_path} (sin descargar de internet)")
     return None
 
 # ✅ LAZY LOADING: Los modelos se cargan bajo demanda, NO en el startup
