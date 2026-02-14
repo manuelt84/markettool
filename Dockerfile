@@ -38,12 +38,12 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV MALLOC_TRIM_THRESHOLD_=100000
 ENV MALLOC_MMAP_THRESHOLD_=100000
 
-# 🔐 THREAD SAFETY: Disable ProcessPoolExecutor for predictions (avoid fork() with gRPC threads)
-# ProcessPoolExecutor causes GIL violations when mixed with asyncio + gRPC/GCP auth
-ENV ANALYSIS_PRED_USE_PROCESS=false
-ENV PYTHONMALLOC=malloc
+# 🔐 THREAD SAFETY: Enable ProcessPoolExecutor with spawn context (safer than fork with gRPC)
+# spawn creates fresh Python interpreter, avoiding fork() issues with gRPC threads
+ENV ANALYSIS_PRED_USE_PROCESS=true
+ENV PYTHONMALLOC=pymalloc
 
-# 🔐 GCP/gRPC thread safety: Disable fork-based multiprocessing
+# 🔐 GCP/gRPC thread safety settings
 ENV GRPC_PYTHON_BUILD_WITH_CYTHON=false
 ENV GRPC_WORKER_THREADS=1
 

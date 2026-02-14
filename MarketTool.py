@@ -8,6 +8,7 @@ import json
 import logging
 import signal
 import functools
+import multiprocessing
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1202,11 +1203,19 @@ _ANALYSIS_INNER_EXECUTOR = (
     else None
 )
 if _ANALYSIS_PRED_WORKERS > 0:
-    # ⚠️ IMPORTANT: ProcessPoolExecutor + asyncio + gRPC can cause GIL violations
-    # Only use if explicitly enabled and no asyncio/gRPC threads active
+    # ✅ FIX: Use spawn context for ProcessPoolExecutor (safer than fork with gRPC)
+    # fork() can corrupt gRPC state; spawn() is slower but thread-safe
     if _ANALYSIS_PRED_USE_PROCESS:
-        logger.warning("[Init] Using ProcessPoolExecutor for predictions - ensure no gRPC activity during predictions!")
-        _ANALYSIS_PRED_EXECUTOR = ProcessPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
+        try:
+            ctx = multiprocessing.get_context('spawn')
+            _ANALYSIS_PRED_EXECUTOR = ProcessPoolExecutor(
+                max_workers=max(1, _ANALYSIS_PRED_WORKERS),
+                mp_context=ctx
+            )
+            logger.info("[Init] Using ProcessPoolExecutor with spawn context (gRPC-safe)")
+        except Exception as e:
+            logger.warning(f"[Init] Failed to create spawn-based ProcessPoolExecutor ({e}), falling back to ThreadPoolExecutor")
+            _ANALYSIS_PRED_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
     else:
         _ANALYSIS_PRED_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
 else:
