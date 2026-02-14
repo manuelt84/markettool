@@ -14095,87 +14095,93 @@ async def procesar_resultado(
 
     # === FASE DE EJECUCIÓN PARALELA: Procesar TODAS las tasks conforme se completan ===
     if all_upload_tasks:
-        logger.info(f"🚀 Ejecutando {len(all_upload_tasks)} uploads en paralelo (prioritarios: {len(resultados_priority_sorted)}, resto: {len(resultados_rest_sorted)}, json: {len(json_task_label_map)})")
-        
-        priority_complete = False
-        ready_for_monitoring = []
-        
-        # Usar gather() para ejecutar todos los uploads en paralelo sin problemas de as_completed()
-        results = await asyncio.gather(*all_upload_tasks, return_exceptions=True)
-        
-        priority_count = 0
-        rest_count = 0
-        json_count = 0
-        
-        # Procesar resultados por índice
-        for idx, result in enumerate(results):
-            try:
-                # Determinar si es prioritario, resto, o JSON por el índice
-                task_idx = idx
-                
-                # Range de prioritarios
-                priority_end = len(resultados_priority_sorted)
-                
-                # Range de resto
-                rest_end = priority_end + len(resultados_rest_sorted)
-                
-                if task_idx < priority_end:
-                    # Resultado prioritario
-                    i = task_idx
-                    if isinstance(result, Exception):
-                        logger.debug(f"❌ No se pudo subir JSON prioritario[{i}]: {result}")
-                    elif result:
-                        urls_generadas.append(result)
-                        sym = resultados_priority_sorted[i].get("Activo")
-                        if sym and sym not in ready_for_monitoring:
-                            ready_for_monitoring.append(sym)
-                    priority_count += 1
-                    
-                    # Cuando ALL prioritarios terminen, actualizar Firestore inmediatamente
-                    if priority_count == len(resultados_priority_sorted) and not priority_complete and resultados_priority_sorted:
-                        priority_complete = True
-                        if ready_for_monitoring:
-                            fs_actualizar_ejecucion(
-                                exec_id,
-                                ui_resumen={"ready_for_monitoring": ready_for_monitoring},
-                                upload_state={
-                                    "status": "publishing",
-                                    "phase": "priority_ready",
-                                    "updated_at": datetime.now(UTC).isoformat() + "Z",
-                                },
-                            )
-                            logger.info(f"✅ Activos prioritarios listos para monitoreo: {ready_for_monitoring}")
-                
-                elif task_idx < rest_end:
-                    # Resultado resto
-                    i = task_idx - priority_end
-                    if isinstance(result, Exception):
-                        logger.debug(f"❌ No se pudo subir JSON enriquecido[{i}]: {result}")
-                    elif result:
-                        urls_generadas.append(result)
-                        sym = resultados_rest_sorted[i].get("Activo")
-                        if sym and sym not in ready_for_monitoring:
-                            ready_for_monitoring.append(sym)
-                    rest_count += 1
-                
-                else:
-                    # Resultado JSON (ordenado, filtrado, etc)
-                    if isinstance(result, Exception):
-                        logger.debug(f"❌ No se pudo subir JSON: {result}")
-                    elif result:
-                        urls_generadas.append(result)
-                    json_count += 1
+        try:
+            logger.info(f"🚀 Ejecutando {len(all_upload_tasks)} uploads en paralelo (prioritarios: {len(resultados_priority_sorted)}, resto: {len(resultados_rest_sorted)}, json: {len(json_task_label_map)})")
             
-            except Exception as e:
-                logger.warning(f"Excepción en procesamiento de upload: {e}")
+            priority_complete = False
+            ready_for_monitoring = []
+            
+            # Usar gather() para ejecutar todos los uploads en paralelo sin problemas de as_completed()
+            results = await asyncio.gather(*all_upload_tasks, return_exceptions=True)
+            
+            priority_count = 0
+            rest_count = 0
+            json_count = 0
+            
+            # Procesar resultados por índice
+            for idx, result in enumerate(results):
+                try:
+                    # Determinar si es prioritario, resto, o JSON por el índice
+                    task_idx = idx
+                    
+                    # Range de prioritarios
+                    priority_end = len(resultados_priority_sorted)
+                    
+                    # Range de resto
+                    rest_end = priority_end + len(resultados_rest_sorted)
+                    
+                    if task_idx < priority_end:
+                        # Resultado prioritario
+                        i = task_idx
+                        if isinstance(result, Exception):
+                            logger.debug(f"❌ No se pudo subir JSON prioritario[{i}]: {result}")
+                        elif result:
+                            urls_generadas.append(result)
+                            sym = resultados_priority_sorted[i].get("Activo")
+                            if sym and sym not in ready_for_monitoring:
+                                ready_for_monitoring.append(sym)
+                        priority_count += 1
+                        
+                        # Cuando ALL prioritarios terminen, actualizar Firestore inmediatamente
+                        if priority_count == len(resultados_priority_sorted) and not priority_complete and resultados_priority_sorted:
+                            priority_complete = True
+                            if ready_for_monitoring:
+                                fs_actualizar_ejecucion(
+                                    exec_id,
+                                    ui_resumen={"ready_for_monitoring": ready_for_monitoring},
+                                    upload_state={
+                                        "status": "publishing",
+                                        "phase": "priority_ready",
+                                        "updated_at": datetime.now(UTC).isoformat() + "Z",
+                                    },
+                                )
+                                logger.info(f"✅ Activos prioritarios listos para monitoreo: {ready_for_monitoring}")
+                    
+                    elif task_idx < rest_end:
+                        # Resultado resto
+                        i = task_idx - priority_end
+                        if isinstance(result, Exception):
+                            logger.debug(f"❌ No se pudo subir JSON enriquecido[{i}]: {result}")
+                        elif result:
+                            urls_generadas.append(result)
+                            sym = resultados_rest_sorted[i].get("Activo")
+                            if sym and sym not in ready_for_monitoring:
+                                ready_for_monitoring.append(sym)
+                        rest_count += 1
+                    
+                    else:
+                        # Resultado JSON (ordenado, filtrado, etc)
+                        if isinstance(result, Exception):
+                            logger.debug(f"❌ No se pudo subir JSON: {result}")
+                        elif result:
+                            urls_generadas.append(result)
+                        json_count += 1
+                
+                except Exception as e:
+                    logger.warning(f"Excepción en procesamiento de upload[{idx}]: {type(e).__name__}: {e}", exc_info=True)
+            
+            # Actualizar con lista completa al final si hay prioritarios
+            if ready_for_monitoring and priority_complete:
+                fs_actualizar_ejecucion(
+                    exec_id,
+                    ui_resumen={"ready_for_monitoring": ready_for_monitoring},
+                )
+            
+            logger.info(f"✅ uploads completados: prioritarios={priority_count}, resto={rest_count}, json={json_count}, urls_total={len(urls_generadas)}")
         
-        # Actualizar con lista completa al final si hay prioritarios
-        if ready_for_monitoring and priority_complete:
-            fs_actualizar_ejecucion(
-                exec_id,
-                ui_resumen={"ready_for_monitoring": ready_for_monitoring},
-            )
-
+        except Exception as e:
+            logger.error(f"[gather uploads] Error crítico en fase de uploads: {type(e).__name__}: {e}", exc_info=True)
+            
     if can_archive:
         fs_actualizar_ejecucion(
             exec_id,
@@ -15774,6 +15780,7 @@ async def ejecutar_recurrente(
             },
             cfg=cfg,
         )
+        logger.info(f"[Analisis completado] Retornando {len(resultados) if resultados else 0} resultados")
 
         if not resultados:
             if send_to_tg:
@@ -15786,11 +15793,27 @@ async def ejecutar_recurrente(
                     logger.warning(f"No se pudo enviar mensaje Telegram (sin resultados): {e}")
             return
 
-        url_generadas = await procesar_resultado(
-            resultados, df_eventos, context, update,
-            moneda_filtro, user_id, user_chat_id, opciones_usuario, origen,
-            exec_id=exec_id, cfg=cfg
-        )
+        try:
+            logger.info(f"[procesar_resultado] Iniciando procesamiento de {len(resultados)} resultados")
+            url_generadas = await procesar_resultado(
+                resultados, df_eventos, context, update,
+                moneda_filtro, user_id, user_chat_id, opciones_usuario, origen,
+                exec_id=exec_id, cfg=cfg
+            )
+            logger.info(f"[procesar_resultado] Completado, {len(url_generadas) if url_generadas else 0} URLs generadas")
+        except Exception as e:
+            logger.error(f"[procesar_resultado] Error crítico durante procesamiento: {type(e).__name__}: {e}", exc_info=True)
+            if can_archive:
+                try:
+                    await asyncio.to_thread(
+                        fs_finalizar_ejecucion,
+                        exec_id,
+                        "fallido",
+                        {"error": f"procesar_resultado: {str(e)}"}
+                    )
+                except Exception as e2:
+                    logger.warning(f"No se pudo marcar fallido exec_id={exec_id}: {e2}")
+            raise  # Re-raise para que sea capturado por el bloque except principal
 
         elapsed_time = (datetime.now() - start_time).total_seconds()
         logger.info(
