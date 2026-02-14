@@ -13183,13 +13183,7 @@ async def ejecutar_analisis_con_hilos(
                     logger.info(f"Error en análisis para símbolo {symbol} y temporalidad {temporalidad}: {result}")
                     errores.append(str(result))
                 elif result is not None:
-                    # Solo agregar si está autorizado (rechazados se descartan silenciosamente)
-                    if isinstance(result, dict) and result.get("autorizado"):
-                        resultados.append(result)
-                    elif isinstance(result, dict) and not result.get("autorizado"):
-                        logger.debug(f"Resultado rechazado para {symbol}/{temporalidad}: {result.get('razon_rechazo', 'Desconocida')}")
-                    else:
-                        resultados.append(result)  # Backwards compat: agregar si no es dict
+                    resultados.append(result)
                 else:
                     logger.debug(f"Resultado vacío para símbolo {symbol} y temporalidad {temporalidad}.")
             except Exception as e:
@@ -15778,7 +15772,7 @@ async def ejecutar_recurrente(
                 try:
                     await context.bot.send_message(
                         chat_id=user_chat_id,
-                        text="El análisis no produjo resultados. Todos los pares fueron rechazados por criterios de confluencia técnica o expectativa matemática. Verifique la configuración de whitelist."
+                        text="El análisis no produjo resultados."
                     )
                 except Exception as e:
                     logger.warning(f"No se pudo enviar mensaje Telegram (sin resultados): {e}")
