@@ -29,19 +29,20 @@ RUN [ -f /app/patrones.pt ] && [ -f /app/ruido.pt ] && ls -lh /app/*.pt && echo 
 
 # 🚫 PASO 5.5: Pre-descargar modelos de EasyOCR (evita descargas en runtime sin internet)
 RUN mkdir -p /app/models/easyocr && \
-    python3 << 'EOF'
+    bash -c 'python3 << PYEOF
 import os
-os.environ['EASY_OCR_MODEL_DIR'] = '/app/models/easyocr'
-os.environ['TORCH_HOME'] = '/app/models/torch'
+os.environ["EASY_OCR_MODEL_DIR"] = "/app/models/easyocr"
+os.environ["TORCH_HOME"] = "/app/models/torch"
 try:
     import easyocr
     print("[EasyOCR] Descargando modelos...")
-    reader = easyocr.Reader(['en', 'es'], gpu=False, model_storage_directory='/app/models/easyocr', verbose=True)
+    reader = easyocr.Reader(["en", "es"], gpu=False, model_storage_directory="/app/models/easyocr", verbose=True)
     print("[EasyOCR] ✅ Modelos pre-cacheados")
 except Exception as e:
-    print(f"[EasyOCR] ⚠️  Adviso (no crítico): {e}")
+    print(f"[EasyOCR] ⚠️ Adviso (no crítico): {e}")
     print("[EasyOCR] Continuando build - descargará en runtime si es necesario")
-EOF
+PYEOF
+'
 
 # PASO 6: Copiar codigo
 COPY . .
