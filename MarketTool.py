@@ -13160,13 +13160,13 @@ async def ejecutar_analisis_con_hilos(
     # Opción 2: asyncio.as_completed() en lugar de asyncio.gather()
     # Beneficio: Procesa resultados conforme se completan (streaming) sin "olas" secuenciales
     analisis_tasks = []
-    task_to_meta = {}  # Map de id(task) -> (symbol, temporalidad) para identificar cada resultado
+    task_to_meta = {}  # Map de task object -> (symbol, temporalidad) para identificar cada resultado
 
     for symbol in activos_filtrados:
         for temporalidad in temps:
             task = asyncio.create_task(bounded_analysis(symbol, temporalidad))
             analisis_tasks.append(task)
-            task_to_meta[id(task)] = (symbol, temporalidad)
+            task_to_meta[task] = (symbol, temporalidad)  # Use task object as key, not id()
 
     # 🚀 Procesar resultados CONFORME se completan (no esperar "ola" completa)
     # Esto permite actualizar Firestore, UI, etc incrementalmente mientras restan análisis
@@ -13176,7 +13176,7 @@ async def ejecutar_analisis_con_hilos(
         for completed_task in asyncio.as_completed(analisis_tasks):
             try:
                 result = await completed_task
-                symbol, temporalidad = task_to_meta[id(completed_task)]
+                symbol, temporalidad = task_to_meta[completed_task]  # Look up by task object directly
                 
                 if isinstance(result, Exception):
                     logger.info(f"Error en análisis para símbolo {symbol} y temporalidad {temporalidad}: {result}")
@@ -13192,8 +13192,7 @@ async def ejecutar_analisis_con_hilos(
                 else:
                     logger.debug(f"Resultado vacío para símbolo {symbol} y temporalidad {temporalidad}.")
             except Exception as e:
-                task_id = id(completed_task)
-                symbol, temporalidad = task_to_meta.get(task_id, ("?", "?"))
+                symbol, temporalidad = task_to_meta.get(completed_task, ("?", "?"))
                 logger.warning(f"Excepción en procesamiento de resultado {symbol}/{temporalidad}: {type(e).__name__}: {e}", exc_info=True)
 
     if not resultados and errores:
