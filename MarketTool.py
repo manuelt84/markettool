@@ -11557,12 +11557,17 @@ def generar_entradas_multiples(
         # Ejecutar con ThreadPoolExecutor (max 4 workers para no desbordar)
         try:
             max_workers = max(2, min(4, len(entry_tasks) // 2))  # Auto-ajust workers
+            import time
+            t_entries_start = time.time()
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submitir TODAS las tareas en paralelo sin esperar
                 futures = [executor.submit(_execute_entry_task, task) for task in entry_tasks]
+                logger.debug(f"[Entradas] Ejecutando {len(futures)} tareas en paralelo (workers={max_workers})")
                 
-                for future in as_completed(futures):
+                # Procesar resultados conforme se completan (no secuencial)
+                for future in as_completed(futures, timeout=3.0):
                     try:
-                        result = future.result(timeout=2.0)  # 2s timeout por tarea
+                        result = future.result()  # Sin timeout adicional, ya está en as_completed
                         if result:
                             candidate, basado_en = result
                             
@@ -11576,10 +11581,11 @@ def generar_entradas_multiples(
                             
                             if not is_dup:
                                 entries.append(candidate)
-                                logging.info(f" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}")
+                                logger.info(f" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}")
                     except Exception as e:
                         logger.debug(f"Error ejecutando tarea de entrada: {e}")
                         continue
+            logger.debug(f"[Entradas] Generación paralela completada en {(time.time()-t_entries_start)*1000:.1f}ms para {len(entries)} entradas")
         except Exception as e:
             logger.warning(f"Error en paralelización de entradas para {ATR}: {e}. Fallback a secuencial.")
             # Fallback: ejecutar secuencial si paralelización falla
