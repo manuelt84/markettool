@@ -48,6 +48,8 @@ spec:
           value: "true"
         - name: CACHE_WARMUP_CONCURRENCY
           value: "2"
+        - name: ANALYSIS_PER_SYMBOL_CONCURRENCY
+          value: "8"  # Permite 8 temporalidades por activo en paralelo (aumenta throughput)
         volumeMounts:
         - name: gcp-key-volume
           mountPath: "/var/secrets/google"

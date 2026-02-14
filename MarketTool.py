@@ -365,6 +365,12 @@ SYNC_TTL     = {
 _LAST_QUOTE_TICK: Dict[tuple, float] = {}  # (exec_id, symbol, tf) -> epoch_s
 _LAST_SYNC: Dict[tuple, float] = {}
 
+# ========================================================================================
+# 🔒 THREAD SAFETY LOCKS (Protegen diccionarios globales contra race conditions)
+# ========================================================================================
+_LAST_QUOTE_TICK_LOCK = threading.Lock()
+_LAST_SYNC_LOCK = threading.Lock()
+
 _STOP_WORDS = {"stopped", "paused", "off", "detenido", "parado"}
 
 def normalize_tf_canonical(tf: str) -> str:
@@ -1192,7 +1198,7 @@ max_workers_global = min(32, (os.cpu_count() or 1) * 2) #puede tener 64
 _CPU_COUNT = os.cpu_count() or 1
 _ANALYSIS_MAX_WORKERS = int(os.environ.get("ANALYSIS_MAX_WORKERS", str(min(64, _CPU_COUNT * 2))))
 _ANALYSIS_SEM = int(os.environ.get("ANALYSIS_SEMAPHORE", str(min(_ANALYSIS_MAX_WORKERS, max(8, _CPU_COUNT)))) )
-_ANALYSIS_INNER_WORKERS = int(os.environ.get("ANALYSIS_INNER_WORKERS", "2"))
+_ANALYSIS_INNER_WORKERS = int(os.environ.get("ANALYSIS_INNER_WORKERS", "4"))
 _ANALYSIS_PRED_WORKERS = int(os.environ.get("ANALYSIS_PRED_WORKERS", "3"))
 _ANALYSIS_PRED_USE_PROCESS = os.environ.get("ANALYSIS_PRED_USE_PROCESS", "false").lower() == "true"
 
@@ -3899,16 +3905,25 @@ def analizar_con_yolo(ruta_imagen: str, stop_cb=None, include_tech: bool=False, 
 
 #@profile
 async def subir_a_bucket_y_obtener_url(nombre_local, nombre_remoto=None, carpeta='analisis'):
+    """
+    Sube un archivo a GCS de forma asíncrona (no bloquea el event loop).
+    ✅ Usa asyncio.to_thread() para evitar bloquear 40+ uploads paralelos
+    """
     nombre_remoto = nombre_remoto or os.path.basename(nombre_local)
     bucket_name = "markettool_bucket"  # 🔁 Reemplazar con el nombre real de tu bucket
 
-    client = storage.Client()
-    bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(f"{carpeta}/{nombre_remoto}")
-    blob.upload_from_filename(nombre_local)
-    blob.make_public()  # O usar signed_url si prefieres enlaces temporales
-
-    return blob.public_url
+    def _upload_sync():
+        """Operación sincrónica envuelta para ejecutarse en thread pool"""
+        client = storage.Client()
+        bucket = client.bucket(BUCKET_NAME)
+        blob = bucket.blob(f"{carpeta}/{nombre_remoto}")
+        blob.upload_from_filename(nombre_local)
+        blob.make_public()  # O usar signed_url si prefieres enlaces temporales
+        return blob.public_url
+    
+    # Ejecutar I/O sincrónico en thread pool para no bloquear event loop
+    # ✅ Permite que 40 uploads se entrelacen sin bloqueo
+    return await asyncio.to_thread(_upload_sync)
 
 #@profile
 def obtener_datos_firestore():
@@ -5602,8 +5617,13 @@ class IndicatorsCache:
             
             now_utc = datetime.now(UTC).replace(tzinfo=timezone.utc)
             
-            # Leer estado actual
-            doc = doc_ref.get()
+            # Leer estado actual (ADD FIRESTORE TIMEOUT: fail fast if Google Cloud unresponsive)
+            try:
+                doc = doc_ref.get(timeout=5)  # CRITICAL: 5s timeout on Firestore read
+            except Exception as get_err:
+                logger.debug(f"[IndicatorsCache] Firestore read timeout {symbol}/{tf}, acquiring lock locally: {get_err}")
+                # If Firestore is down, acquire lock locally and proceed
+                return True
             
             if doc.exists:
                 data = doc.to_dict()
@@ -5626,18 +5646,22 @@ class IndicatorsCache:
                             return False
                         # else: mismo pod, re-adquirir lock
             
-            # Adquirir lock
-            doc_ref.set({
-                "calculating_by_pod": self._pod_id,
-                "calculating_since": now_utc,
-                "lock_acquired_at": now_utc
-            }, merge=True)
+            # Adquirir lock (ADD FIRESTORE TIMEOUT: fail fast if write times out)
+            try:
+                doc_ref.set({
+                    "calculating_by_pod": self._pod_id,
+                    "calculating_since": now_utc,
+                    "lock_acquired_at": now_utc
+                }, merge=True, timeout=5)  # CRITICAL: 5s timeout on Firestore write
+            except Exception as set_err:
+                logger.debug(f"[IndicatorsCache] Firestore write timeout {symbol}/{tf}, proceeding without lock: {set_err}")
+                return True  # Firestore down, proceed locally
             
             logger.debug(f"[IndicatorsCache] Lock acquired: {symbol}/{tf} (pod={self._pod_id})")
             return True
         
         except Exception as e:
-            logger.warning(f"[IndicatorsCache] Lock acquisition error {symbol}/{tf}: {e}")
+            logger.debug(f"[IndicatorsCache] Lock acquisition error {symbol}/{tf}: {type(e).__name__}: {e}")
             return True  # En caso de error, proceder sin lock
     
     def _release_lock(self, symbol: str, tf: str):
@@ -5651,31 +5675,40 @@ class IndicatorsCache:
             doc_id = self._metadata_doc_id(symbol, tf)
             doc_ref = self.db.collection("indicators_metadata").document(doc_id)
             
-            # Solo liberar si el lock es de este pod
-            doc = doc_ref.get()
+            # Solo liberar si el lock es de este pod (ADD FIRESTORE TIMEOUT)
+            try:
+                doc = doc_ref.get(timeout=5)  # CRITICAL: 5s timeout on Firestore read
+            except Exception as get_err:
+                logger.debug(f"[IndicatorsCache] Firestore read timeout on _release_lock {symbol}/{tf}: {get_err}")
+                return  # Don't block on lock release if Firestore is down
+            
             if doc.exists:
                 data = doc.to_dict()
                 if data.get("calculating_by_pod") == self._pod_id:
-                    doc_ref.update({
-                        "calculating_by_pod": firestore.DELETE_FIELD,
-                        "calculating_since": firestore.DELETE_FIELD,
-                        "lock_released_at": datetime.now(UTC).replace(tzinfo=timezone.utc)
-                    })
+                    try:
+                        doc_ref.update({
+                            "calculating_by_pod": firestore.DELETE_FIELD,
+                            "calculating_since": firestore.DELETE_FIELD,
+                            "lock_released_at": datetime.now(UTC).replace(tzinfo=timezone.utc)
+                        }, timeout=5)  # CRITICAL: 5s timeout on Firestore write
+                    except Exception as update_err:
+                        logger.debug(f"[IndicatorsCache] Firestore write timeout on _release_lock {symbol}/{tf}: {update_err}")
+                        return  # Don't block on lock release if Firestore is down
+                    
                     logger.debug(f"[IndicatorsCache] Lock released: {symbol}/{tf} (pod={self._pod_id})")
         
         except Exception as e:
-            logger.warning(f"[IndicatorsCache] Lock release error {symbol}/{tf}: {e}")
+            logger.debug(f"[IndicatorsCache] Lock release error {symbol}/{tf}: {type(e).__name__}: {e}")
     
-    def _wait_for_lock_release(self, symbol: str, tf: str, max_wait_sec: int = 200) -> bool:
+    def _wait_for_lock_release(self, symbol: str, tf: str, max_wait_sec: int = 30) -> bool:
         """
         Espera a que otro pod termine de calcular y libere el lock.
-        
-        OPTIMIZACION: Exponential backoff con jitter para reducir retry storms
+        **AGGRESSIVE TIMEOUT**: Max 30s (reduced from 200s) para evitar que se cuelgue con Firestore issues
         
         Args:
             symbol: Trading symbol
             tf: Timeframe
-            max_wait_sec: Tiempo máximo de espera
+            max_wait_sec: Tiempo máximo de espera (default: 30s, aggressive para evitar EOF)
         
         Returns:
             True si el cálculo está listo, False si timeout
@@ -5683,17 +5716,24 @@ class IndicatorsCache:
         if self.db is None:
             return False
         
-        logger.info(f"[IndicatorsCache] Waiting for other pod to finish: {symbol}/{tf}")
+        logger.info(f"[IndicatorsCache] Waiting for other pod (max={max_wait_sec}s): {symbol}/{tf}")
         
         start_time = time.time()
-        check_interval = 0.5  # Comienza con 0.5s
-        max_interval = 10.0   # Máximo 10s entre checks
+        check_interval = 1.0  # Comenzar más agresivo con 1s
+        max_interval = 5.0   # Máximo 5s entre checks
         
         while (time.time() - start_time) < max_wait_sec:
             try:
-                # Check si el lock se liberó
+                # Check si el lock se liberó (con timeout propio en Firestore)
                 doc_id = self._metadata_doc_id(symbol, tf)
-                doc = self.db.collection("indicators_metadata").document(doc_id).get()
+                
+                # Agregar timeout explícito a la llamada Firestore (máximo 5s)
+                try:
+                    doc = self.db.collection("indicators_metadata").document(doc_id).get(timeout=5)
+                except Exception as fire_err:
+                    logger.debug(f"[IndicatorsCache] Firestore timeout during wait {symbol}/{tf}: {fire_err}")
+                    # En caso de error Firestore, romper y calcular nosotros (no esperar más)
+                    break
                 
                 if doc.exists:
                     data = doc.to_dict()
@@ -5701,21 +5741,26 @@ class IndicatorsCache:
                     
                     if not lock_pod:
                         # Lock liberado: intentar cargar resultado
-                        cached = self.load(symbol, tf)
-                        if cached is not None:
-                            logger.info(f"[IndicatorsCache] Other pod finished, using result: {symbol}/{tf}")
-                            return True
+                        logger.info(f"[IndicatorsCache] Lock released by {lock_pod}, loading: {symbol}/{tf}")
+                        try:
+                            cached = self.load(symbol, tf)
+                            if cached is not None:
+                                logger.info(f"[IndicatorsCache] Other pod result loaded: {symbol}/{tf}")
+                                return True
+                        except Exception as load_err:
+                            logger.debug(f"[IndicatorsCache] Could not load result after wait: {load_err}")
+                            break
                 
-                # Exponential backoff + jitter (un solo sleep por iteración)
-                check_interval = min(max_interval, check_interval * 1.5)  # Crecer hasta max
+                # Exponential backoff + jitter
+                check_interval = min(max_interval, check_interval * 1.5)
                 jitter = random.uniform(0, check_interval * 0.1)
                 time.sleep(check_interval + jitter)
             
             except Exception as e:
-                logger.warning(f"[IndicatorsCache] Wait error {symbol}/{tf}: {e}")
+                logger.debug(f"[IndicatorsCache] Wait loop exception {symbol}/{tf}: {type(e).__name__}: {e}")
                 break
         
-        logger.warning(f"[IndicatorsCache] Wait timeout: {symbol}/{tf} (waited {max_wait_sec}s)")
+        logger.debug(f"[IndicatorsCache] Wait ended (timeout OR error): {symbol}/{tf} (waited {time.time()-start_time:.1f}s)")
         return False
     
     def get_or_calculate(
@@ -10300,6 +10345,7 @@ _niveles_cache = {}
 _niveles_cache_ttl = 3600  # 1 hora de vigencia (mucho más largo)
 _niveles_cache_hits = 0
 _niveles_cache_misses = 0
+_NIVELES_CACHE_LOCK = threading.Lock()
 
 # Cache global para ATR (evita recalcular)
 # Estructura: {"symbol|tf|df_len": {"atr": float, "timestamp": ...}}
@@ -10307,6 +10353,7 @@ _atr_cache = {}
 _atr_cache_ttl = 3600  # 1 hora de vigencia
 _atr_cache_hits = 0
 _atr_cache_misses = 0
+_ATR_CACHE_LOCK = threading.Lock()
 
 def _get_niveles_cache_key(symbol: str, tf: str, df_len: int, precio_actual: float | None = None) -> str:
     """Genera clave de cache para niveles basada en símbolo, TF y tamaño del DF.
@@ -10323,65 +10370,72 @@ def _get_atr_cache_key(symbol: str, tf: str, df_len: int) -> str:
     return f"{symbol}|{tf}|{df_len}"
 
 def _get_cached_atr(symbol: str, tf: str, df_len: int):
-    """Obtiene ATR del cache si es reciente."""
+    """Obtiene ATR del cache si es reciente. THREAD-SAFE."""
     global _atr_cache_hits, _atr_cache_misses
     cache_key = _get_atr_cache_key(symbol, tf, df_len)
-    if cache_key in _atr_cache:
-        entry = _atr_cache[cache_key]
-        age = (datetime.now(UTC) - entry['timestamp']).total_seconds()
-        if age < _atr_cache_ttl:
-            _atr_cache_hits += 1
-            return entry['atr']
-    _atr_cache_misses += 1
+    
+    with _ATR_CACHE_LOCK:  # ✅ Thread-safe read + increment
+        if cache_key in _atr_cache:
+            entry = _atr_cache[cache_key]
+            age = (datetime.now(UTC) - entry['timestamp']).total_seconds()
+            if age < _atr_cache_ttl:
+                _atr_cache_hits += 1
+                return entry['atr']
+        _atr_cache_misses += 1
     return None
 
 def _cache_atr(symbol: str, tf: str, df_len: int, atr: float):
-    """Almacena ATR en cache."""
+    """Almacena ATR en cache. THREAD-SAFE."""
     cache_key = _get_atr_cache_key(symbol, tf, df_len)
-    _atr_cache[cache_key] = {
-        'atr': atr,
-        'timestamp': datetime.now(UTC)
-    }
-    # Limpiar entradas antiguas si el cache crece mucho
-    if len(_atr_cache) > 100:
-        now = datetime.now(UTC)
-        keys_to_remove = [
-            k for k, v in _atr_cache.items()
-            if (now - v['timestamp']).total_seconds() > _atr_cache_ttl
-        ]
-        for k in keys_to_remove:
-            _atr_cache.pop(k, None)
+    
+    with _ATR_CACHE_LOCK:  # ✅ Thread-safe write
+        _atr_cache[cache_key] = {
+            'atr': atr,
+            'timestamp': datetime.now(UTC)
+        }
+        # Limpiar entradas antiguas si el cache crece mucho
+        if len(_atr_cache) > 100:
+            now = datetime.now(UTC)
+            keys_to_remove = [
+                k for k, v in _atr_cache.items()
+                if (now - v['timestamp']).total_seconds() > _atr_cache_ttl
+            ]
+            for k in keys_to_remove:
+                _atr_cache.pop(k, None)
 
 def _get_cached_niveles(cache_key: str):
-    """Obtiene niveles del cache si son recientes."""
+    """Obtiene niveles del cache si son recientes. THREAD-SAFE."""
     global _niveles_cache_hits, _niveles_cache_misses
-    if cache_key in _niveles_cache:
-        entry = _niveles_cache[cache_key]
-        age = (datetime.now(UTC) - entry['timestamp']).total_seconds()
-        if age < _niveles_cache_ttl:
-            _niveles_cache_hits += 1
-            logger.debug(f"[Cache] Niveles HIT para {cache_key} (edad: {age:.1f}s)")
-            return entry['soportes'], entry['resistencias']
-    _niveles_cache_misses += 1
-    logger.debug(f"[Cache] Niveles MISS para {cache_key}")
+    
+    with _NIVELES_CACHE_LOCK:  # ✅ Thread-safe read + increment
+        if cache_key in _niveles_cache:
+            entry = _niveles_cache[cache_key]
+            age = (datetime.now(UTC) - entry['timestamp']).total_seconds()
+            if age < _niveles_cache_ttl:
+                _niveles_cache_hits += 1
+                logger.debug(f"[Cache] Niveles HIT para {cache_key} (edad: {age:.1f}s)")
+                return entry['soportes'], entry['resistencias']
+        _niveles_cache_misses += 1
+        logger.debug(f"[Cache] Niveles MISS para {cache_key}")
     return None, None
 
 def _cache_niveles(cache_key: str, soportes: list, resistencias: list):
-    """Almacena niveles en cache."""
-    _niveles_cache[cache_key] = {
-        'soportes': soportes,
-        'resistencias': resistencias,
-        'timestamp': datetime.now(UTC)
-    }
-    # Limpiar entradas antiguas si el cache crece mucho
-    if len(_niveles_cache) > 200:
-        now = datetime.now(UTC)
-        keys_to_remove = [
-            k for k, v in _niveles_cache.items()
-            if (now - v['timestamp']).total_seconds() > _niveles_cache_ttl
-        ]
-        for k in keys_to_remove:
-            _niveles_cache.pop(k, None)
+    """Almacena niveles en cache. THREAD-SAFE."""
+    with _NIVELES_CACHE_LOCK:  # ✅ Thread-safe write
+        _niveles_cache[cache_key] = {
+            'soportes': soportes,
+            'resistencias': resistencias,
+            'timestamp': datetime.now(UTC)
+        }
+        # Limpiar entradas antiguas si el cache crece mucho
+        if len(_niveles_cache) > 200:
+            now = datetime.now(UTC)
+            keys_to_remove = [
+                k for k, v in _niveles_cache.items()
+                if (now - v['timestamp']).total_seconds() > _niveles_cache_ttl
+            ]
+            for k in keys_to_remove:
+                _niveles_cache.pop(k, None)
 
 # ========================================================================================
 # 🔧 MODULE-LEVEL WRAPPER PARA MONTE CARLO (pickle-compatible para ProcessPoolExecutor)
@@ -11720,27 +11774,38 @@ def calcular_entradas(
 
         # --- Predicciones/MC (PARALELIZADAS para mejor rendimiento) ---
         try:
-            # Ejecutar predicciones en paralelo usando asyncio
-            # Detectar si ya hay un loop corriendo (ej: en Flask con asyncio) 
-            try:
-                loop = asyncio.get_running_loop()
-                # Si hay loop, usar run_in_executor directamente (no podemos usar asyncio.run)
-                raise RuntimeError("Loop already running, use sequential")
-            except RuntimeError:
-                # No hay loop corriendo, crear uno temporal
-                predicciones_arima, predicciones_media_movil, probabilidad_alza, probabilidad_baja = \
-                    asyncio.run(_calcular_predicciones_paralelo(df, tf, symbol, window))
+            # ✅ OPTIMIZACIÓN: Usar ThreadPoolExecutor directamente en lugar de asyncio.run() anidado
+            # asyncio.run() es muy costoso cuando se invoca 56×8 veces (activos × temporalidades)
+            pred_exec = _ANALYSIS_PRED_EXECUTOR
+            if pred_exec is None:
+                # Fallback: usar INNER_EXECUTOR
+                pred_exec = _inner_exec
+            
+            if pred_exec is not None:
+                # Usar executor para paralelizar ARIMA, Media Móvil y Monte Carlo
+                future_arima = pred_exec.submit(predecir_arima, df, tf, symbol)
+                future_mm = pred_exec.submit(predecir_media_movil, df, window)
+                future_mc = pred_exec.submit(_wrapper_simulacion_monte_carlo, df, tf)
+                
+                predicciones_arima = future_arima.result(timeout=30)
+                predicciones_media_movil = future_mm.result(timeout=30)
+                prob_alza, prob_baja = future_mc.result(timeout=30)
+            else:
+                # No hay executor, secuencial
+                predicciones_arima = predecir_arima(df, tf, symbol)
+                predicciones_media_movil = predecir_media_movil(df, window)
+                prob_alza, prob_baja = simulacion_monte_carlo(df, tf, num_simulaciones=50, num_dias=5, seed=42)
+            
+            probabilidad_alza = prob_alza if prob_alza is not None else 50
+            probabilidad_baja = prob_baja if prob_baja is not None else 50
         except Exception as e:
-            logger.info(f"Paralelización no disponible para {symbol}-{tf}: {e}. Usando secuencial.")
+            logger.info(f"Error en predicciones para {symbol}-{tf}: {e}. Usando secuencial.")
             # Fallback a ejecución secuencial
             predicciones_arima = predecir_arima(df, tf, symbol)
             predicciones_media_movil = predecir_media_movil(df, window)
             probabilidad_alza, probabilidad_baja = simulacion_monte_carlo(
                 df, tf, num_simulaciones=50, num_dias=5, seed=42
             )
-        
-        probabilidad_alza = probabilidad_alza if probabilidad_alza is not None else 50
-        probabilidad_baja = probabilidad_baja if probabilidad_baja is not None else 50
 
         # --- Soportes/Resistencias dinámicos (CON CACHE) ---
         cache_key = _get_niveles_cache_key(symbol, tf, len(df), precio_actual)
@@ -13110,6 +13175,14 @@ async def ejecutar_analisis_con_hilos(
         else None
     )
     slow_task_sec = int(os.environ.get("ANALYSIS_SLOW_TASK_SEC", "30"))
+    
+    # Calculate effective concurrency limit
+    effective_concurrency = (
+        min(len(activos_filtrados) * per_symbol_concurrency, _ANALYSIS_SEM)
+        if per_symbol_concurrency > 0
+        else _ANALYSIS_SEM
+    )
+    
     logger.info(
         "[Analisis] Inicio: activos=%d tfs=%d tasks=%d workers=%d sem=%d per_symbol=%d",
         len(activos_filtrados),
@@ -13119,6 +13192,13 @@ async def ejecutar_analisis_con_hilos(
         _ANALYSIS_SEM,
         per_symbol_concurrency,
     )
+    
+    # Warn if parallelism is severely limited
+    if per_symbol_concurrency > 0 and effective_concurrency < (total_tasks / 4):
+        logger.warning(
+            f"[Analisis] ⚠️ Paralelismo limitado: per_symbol={per_symbol_concurrency} permite max {effective_concurrency} tasks concurrentes "
+            f"(de {total_tasks} totales). Aumenta ANALYSIS_PER_SYMBOL_CONCURRENCY={len(temps)} para paralelismo completo."
+        )
     
     # 📊 Resetear estadísticas de caché para esta ejecución
     global _niveles_cache_hits, _niveles_cache_misses, _atr_cache_hits, _atr_cache_misses
@@ -13130,7 +13210,13 @@ async def ejecutar_analisis_con_hilos(
     async def bounded_analysis(symbol, temporalidad):
         """Envuelve procesar_simbolo_temporalidad con límite de concurrencia."""
         sym_sem = symbol_sems.get(symbol) if symbol_sems else None
+        t_queued = time.time()
         async with sem:
+            t_acquired = time.time()
+            wait_time_ms = (t_acquired - t_queued) * 1000
+            if wait_time_ms > 100:  # Log only if waited >100ms for semaphore
+                logger.debug(f"[Analisis] {symbol}/{temporalidad} adquirió semáforo después de {wait_time_ms:.0f}ms")
+            
             if sym_sem is not None:
                 async with sym_sem:
                     fn = partial(
@@ -13177,9 +13263,21 @@ async def ejecutar_analisis_con_hilos(
     # 🚀 Ejecutar todas las tareas con gather (return_exceptions=True para capturar errores)
     # Cada resultado se alinea con su correspondiente (symbol, temporalidad) por índice
     if analisis_tasks:
-        logger.debug(f"[Analisis] Procesando {len(analisis_tasks)} tasks con gather() (índice-sincronizado)")
+        t_gather_start = time.time()
+        logger.info(
+            f"[Analisis] 🚀 Iniciando gather() de {len(analisis_tasks)} tasks "
+            f"(sem={_ANALYSIS_SEM}, per_symbol={per_symbol_concurrency}, workers={max_workers})"
+        )
         
         results = await asyncio.gather(*analisis_tasks, return_exceptions=True)
+        
+        t_gather_elapsed = (time.time() - t_gather_start)
+        avg_time_per_task = (t_gather_elapsed / len(analisis_tasks)) if analisis_tasks else 0
+        logger.info(
+            f"[Analisis] ✅ gather() completado en {t_gather_elapsed:.1f}s "
+            f"(promedio: {avg_time_per_task*1000:.0f}ms/task, "
+            f"paralelismo efectivo: {len(analisis_tasks)/t_gather_elapsed:.1f}x)"
+        )
         
         for idx, result in enumerate(results):
             symbol, temporalidad = task_meta[idx]  # Index-based lookup: O(1) y determinístico
@@ -13199,11 +13297,16 @@ async def ejecutar_analisis_con_hilos(
         logger.info("No se pudieron obtener resultados debido a errores.")
         for error in errores:
             logger.info(f" - {error}")
+    
+    elapsed_total = time.time() - start_all
+    avg_per_task = (elapsed_total / len(analisis_tasks)) * 1000 if analisis_tasks else 0
     logger.info(
-        "[Analisis] Fin: resultados=%d errores=%d elapsed=%.1fs",
+        "[Analisis] Fin: resultados=%d errores=%d elapsed=%.1fs (%.0fms/task promedio, %d tasks totales)",
         len(resultados),
         len(errores),
-        time.time() - start_all,
+        elapsed_total,
+        avg_per_task,
+        len(analisis_tasks),
     )
     
     # 📊 Reporte de estadísticas del caché
@@ -13654,9 +13757,17 @@ async def procesar_resultado(
         if not (sym and tf and tiene_datos):
             return None
 
+        # Timing instrumentation: Track semaphore wait + upload time per symbol/tf
+        t_queued = time.time()
         async with upload_sem:
+            t_acquired = time.time()
+            wait_ms = (t_acquired - t_queued) * 1000
+            if wait_ms > 500:
+                logger.debug(f"[Upload] {sym}/{tf} esperó {wait_ms:.0f}ms por semáforo")
+            
             try:
-                return await subir_ohlcv_enriquecido_y_registrar(
+                t_upload_start = time.time()
+                result = await subir_ohlcv_enriquecido_y_registrar(
                     exec_id=exec_id,
                     chat_id=user_chat_id,
                     symbol=sym,
@@ -13669,6 +13780,10 @@ async def procesar_resultado(
                     extra_metadata={"moneda_filtro": moneda_filtro},
                     user_id=user_id
                 )
+                upload_ms = (time.time() - t_upload_start) * 1000
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[Upload] {sym}/{tf} completado en {upload_ms:.0f}ms")
+                return result
             except Exception as e:
                 logger.info(f"No se pudo subir JSON enriquecido de {sym}-{tf}: {e}")
                 return None
@@ -14096,13 +14211,21 @@ async def procesar_resultado(
     # === FASE DE EJECUCIÓN PARALELA: Procesar TODAS las tasks conforme se completan ===
     if all_upload_tasks:
         try:
-            logger.info(f"🚀 Ejecutando {len(all_upload_tasks)} uploads en paralelo (prioritarios: {len(resultados_priority_sorted)}, resto: {len(resultados_rest_sorted)}, json: {len(json_task_label_map)})")
+            # Calcular cantidad de JSONs (resultados_ordenados + oportunidades = 2 si can_archive)
+            json_count_expected = 2 if can_archive else 0
+            t_uploads_start = time.time()
+            logger.info(f"🚀 Ejecutando {len(all_upload_tasks)} uploads en paralelo (prioritarios: {len(resultados_priority_sorted)}, resto: {len(resultados_rest_sorted)}, json: {json_count_expected}, UPLOAD_SEM={int(os.environ.get('UPLOAD_SEM', '30'))})")
             
             priority_complete = False
             ready_for_monitoring = []
             
             # Usar gather() para ejecutar todos los uploads en paralelo sin problemas de as_completed()
+            # ✅ asyncio.to_thread() en subir_a_bucket_y_obtener_url ahora permite verdadero paralelismo
             results = await asyncio.gather(*all_upload_tasks, return_exceptions=True)
+            t_uploads_elapsed = (time.time() - t_uploads_start)
+            t_uploads_ms = t_uploads_elapsed * 1000
+            
+            logger.info(f"✅ gather() uploads completado en {t_uploads_elapsed:.1f}s (promedio: {t_uploads_ms/len(all_upload_tasks):.0f}ms/upload, paralelismo efectivo: {len(all_upload_tasks)/t_uploads_elapsed:.1f}x)")
             
             priority_count = 0
             rest_count = 0
@@ -19197,12 +19320,20 @@ def _maybe_tick_quote(exec_id: str, symbol: str, tf: str, st: dict) -> bool:
     key = (exec_id, symbol, tf)
     now = time.time()
     ttl = QUOTE_TTL.get(tf, 3)
-    last = _LAST_QUOTE_TICK.get(key, 0)
+    
+    # ✅ THREAD-SAFE: Protege lectura de _LAST_QUOTE_TICK
+    with _LAST_QUOTE_TICK_LOCK:
+        last = _LAST_QUOTE_TICK.get(key, 0)
+    
     if now - last < ttl:
         return False
 
     price = _fetch_quote(symbol)
-    _LAST_QUOTE_TICK[key] = now
+    
+    # ✅ THREAD-SAFE: Protege escritura en _LAST_QUOTE_TICK
+    with _LAST_QUOTE_TICK_LOCK:
+        _LAST_QUOTE_TICK[key] = now
+    
     if price is None:
         return False
 
