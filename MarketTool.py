@@ -13157,27 +13157,28 @@ async def ejecutar_analisis_con_hilos(
             return result
 
     # --- Análisis principal (PARALELIZACIÓN OPTIMIZADA) ---
-    # Opción 2: asyncio.as_completed() en lugar de asyncio.gather()
-    # Beneficio: Procesa resultados conforme se completan (streaming) sin "olas" secuenciales
+    # Opción 2: asyncio.gather() con return_exceptions=True
+    # Beneficio: Procesa todos los resultados, capturando excepciones sin perder contexto
     analisis_tasks = []
-    task_to_meta = {}  # Map de task object -> (symbol, temporalidad) para identificar cada resultado
+    task_meta = []  # Parallel list: task_meta[i] = (symbol, temporalidad) for task i
 
     for symbol in activos_filtrados:
         for temporalidad in temps:
             task = asyncio.create_task(bounded_analysis(symbol, temporalidad))
             analisis_tasks.append(task)
-            task_to_meta[task] = (symbol, temporalidad)  # Use task object as key, not id()
+            task_meta.append((symbol, temporalidad))
 
-    # 🚀 Procesar resultados CONFORME se completan (no esperar "ola" completa)
-    # Esto permite actualizar Firestore, UI, etc incrementalmente mientras restan análisis
+    # 🚀 Ejecutar todas las tareas con gather (return_exceptions=True para capturar errores)
+    # Cada resultado se alinea con su correspondiente (symbol, temporalidad) por índice
     if analisis_tasks:
-        logger.debug(f"[Analisis] Procesando {len(analisis_tasks)} tasks con as_completed() (streaming)")
+        logger.debug(f"[Analisis] Procesando {len(analisis_tasks)} tasks con gather() (índice-sincronizado)")
         
-        for completed_task in asyncio.as_completed(analisis_tasks):
+        results = await asyncio.gather(*analisis_tasks, return_exceptions=True)
+        
+        for idx, result in enumerate(results):
+            symbol, temporalidad = task_meta[idx]  # Index-based lookup: O(1) y determinístico
+            
             try:
-                result = await completed_task
-                symbol, temporalidad = task_to_meta[completed_task]  # Look up by task object directly
-                
                 if isinstance(result, Exception):
                     logger.info(f"Error en análisis para símbolo {symbol} y temporalidad {temporalidad}: {result}")
                     errores.append(str(result))
@@ -13192,7 +13193,6 @@ async def ejecutar_analisis_con_hilos(
                 else:
                     logger.debug(f"Resultado vacío para símbolo {symbol} y temporalidad {temporalidad}.")
             except Exception as e:
-                symbol, temporalidad = task_to_meta.get(completed_task, ("?", "?"))
                 logger.warning(f"Excepción en procesamiento de resultado {symbol}/{temporalidad}: {type(e).__name__}: {e}", exc_info=True)
 
     if not resultados and errores:
