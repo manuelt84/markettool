@@ -13182,11 +13182,19 @@ async def ejecutar_analisis_con_hilos(
                     logger.info(f"Error en análisis para símbolo {symbol} y temporalidad {temporalidad}: {result}")
                     errores.append(str(result))
                 elif result is not None:
-                    resultados.append(result)
+                    # Solo agregar si está autorizado (rechazados se descartan silenciosamente)
+                    if isinstance(result, dict) and result.get("autorizado"):
+                        resultados.append(result)
+                    elif isinstance(result, dict) and not result.get("autorizado"):
+                        logger.debug(f"Resultado rechazado para {symbol}/{temporalidad}: {result.get('razon_rechazo', 'Desconocida')}")
+                    else:
+                        resultados.append(result)  # Backwards compat: agregar si no es dict
                 else:
-                    logger.info(f"Resultado vacío para símbolo {symbol} y temporalidad {temporalidad}.")
+                    logger.debug(f"Resultado vacío para símbolo {symbol} y temporalidad {temporalidad}.")
             except Exception as e:
-                logger.warning(f"Excepción en procesamiento de resultado: {e}")
+                task_id = id(completed_task)
+                symbol, temporalidad = task_to_meta.get(task_id, ("?", "?"))
+                logger.warning(f"Excepción en procesamiento de resultado {symbol}/{temporalidad}: {type(e).__name__}: {e}", exc_info=True)
 
     if not resultados and errores:
         logger.info("No se pudieron obtener resultados debido a errores.")
@@ -15771,7 +15779,7 @@ async def ejecutar_recurrente(
                 try:
                     await context.bot.send_message(
                         chat_id=user_chat_id,
-                        text="El análisis no produjo resultados. Verifique los datos y vuelva a intentarlo."
+                        text="El análisis no produjo resultados. Todos los pares fueron rechazados por criterios de confluencia técnica o expectativa matemática. Verifique la configuración de whitelist."
                     )
                 except Exception as e:
                     logger.warning(f"No se pudo enviar mensaje Telegram (sin resultados): {e}")
