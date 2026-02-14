@@ -43,7 +43,10 @@ ENV MALLOC_MMAP_THRESHOLD_=100000
 ENV ANALYSIS_PRED_USE_PROCESS=true
 ENV PYTHONMALLOC=pymalloc
 
-# 🔐 GCP/gRPC thread safety settings
+# � CACHE WARMUP: Optimize GCP downloads with higher concurrency (I/O-bound)
+ENV CACHE_WARMUP_CONCURRENCY=16
+
+# �🔐 GCP/gRPC thread safety settings
 ENV GRPC_PYTHON_BUILD_WITH_CYTHON=false
 ENV GRPC_WORKER_THREADS=1
 

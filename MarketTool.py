@@ -139,7 +139,7 @@ class AppConfig:
     cache_warmup_blocking_startup: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_BLOCKING_STARTUP", "true").lower() == "true")
     cache_warmup_interval_minutes: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_INTERVAL_MINUTES", "240")))
     cache_warmup_max_ram_percent: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_MAX_RAM_PERCENT", "80")))
-    cache_warmup_concurrency: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "4")))
+    cache_warmup_concurrency: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "16")))
     cache_warmup_news_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_NEWS_ENABLED", "false").lower() == "true")
     cache_warmup_events_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_EVENTS_ENABLED", "false").lower() == "true")
     cache_warmup_news_limit: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_NEWS_LIMIT", "1")))
