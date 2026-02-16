@@ -7089,6 +7089,8 @@ def _investing_com_econ_fetch(*, timeout: int = 15, allow_playwright: bool = Tru
     Fetch economic calendar from investing.com via web scraping.
     Faster than FMP, with real-time data. Returns UTC timestamps.
     """
+    if not APP_CONFIG.investing_scraping_enabled:
+        return pd.DataFrame()
     try:
         from bs4 import BeautifulSoup
     except ImportError:
@@ -7220,6 +7222,8 @@ def _investing_com_econ_fetch_playwright() -> pd.DataFrame:
     Fallback: Use Playwright to render investing.com calendar.
     More robust for dynamic content but slower.
     """
+    if not APP_CONFIG.investing_scraping_enabled:
+        return pd.DataFrame()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -7504,11 +7508,11 @@ def obtener_eventos_economicos(
         now_utc=datetime.now(timezone.utc),
         grace_minutes=grace_minutes,
     )
-    if need_investing and need_reason:
+    if need_investing and need_reason and APP_CONFIG.investing_scraping_enabled:
         logger.info("[Eventos] %s; enabling Investing fallback", need_reason)
 
-    # Try investing.com only if FMP is empty or missing actuals for past events
-    if need_investing:
+    # Try investing.com only if enabled and missing actuals for past events
+    if need_investing and APP_CONFIG.investing_scraping_enabled:
         try:
             inv_com = _investing_com_econ_fetch(
                 timeout=APP_CONFIG.http_timeout,
@@ -7665,7 +7669,7 @@ def obtener_eventos_economicos_futuros(
         now_utc=datetime.now(timezone.utc),
         grace_minutes=grace_minutes,
     )
-    if need_investing:
+    if need_investing and APP_CONFIG.investing_scraping_enabled:
         if need_reason:
             logger.info("[Eventos] %s; enabling Investing fallback (futuros)", need_reason)
         try:

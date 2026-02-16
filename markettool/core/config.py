@@ -36,6 +36,7 @@ class AppConfig:
     cache_warmup_events_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_EVENTS_ENABLED", "false").lower() == "true")
     cache_warmup_news_limit: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_NEWS_LIMIT", "1")))
     cache_warmup_leader_only: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_LEADER_ONLY", "false").lower() == "true")
+    investing_scraping_enabled: bool = field(default_factory=lambda: os.environ.get("INVESTING_SCRAPING_ENABLED", "false").lower() == "true")
 
 
 def early_load_env(argv: list[str] | None = None) -> None:
