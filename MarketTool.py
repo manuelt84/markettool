@@ -4579,11 +4579,19 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
         fecha_inicio = ultima_fecha + timedelta(seconds=1)  # Buscar desde la última fecha más 1 segundo
         logger.info(f"Última fecha en caché para {symbol}: {ultima_fecha}")
     elif fecha_inicio is None:
-        fecha_inicio = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')  # Predeterminado: última semana
+        # ✅ FIX: Convert UTC to NY timezone for FMP API consistency
+        now_utc = datetime.now(timezone.utc)
+        ny_tz = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)  # "America/New_York"
+        now_ny = now_utc.astimezone(ny_tz)
+        fecha_inicio = (now_ny - timedelta(days=7)).strftime('%Y-%m-%d')  # Default: últimas 7 días
 
     # Asegúrate de que fecha_fin esté establecida
     if fecha_fin is None:
-        fecha_fin = datetime.now().strftime('%Y-%m-%d')  # Hasta la fecha actual
+        # ✅ FIX: Convert UTC to NY timezone for FMP API consistency
+        now_utc = datetime.now(timezone.utc)
+        ny_tz = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)  # "America/New_York"
+        now_ny = now_utc.astimezone(ny_tz)
+        fecha_fin = now_ny.strftime('%Y-%m-%d')  # Hasta la fecha actual (en NY)
 
     # Convertir fechas de inicio y fin a UTC
     fecha_inicio = pd.to_datetime(fecha_inicio).tz_localize(pytz.UTC) if pd.to_datetime(fecha_inicio).tzinfo is None else pd.to_datetime(fecha_inicio)
@@ -7267,10 +7275,14 @@ def _investing_econ_fetch() -> pd.DataFrame:
     try:
         # investiny.economic_calendar() retorna un dict con eventos
         from datetime import datetime, timedelta
-        # Obtener eventos de la próxima semana
+        # ✅ FIX: Convert UTC to NY timezone for consistency with FMP
+        now_utc = datetime.now(timezone.utc)
+        ny_tz = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)  # "America/New_York"
+        now_ny = now_utc.astimezone(ny_tz)
+        # Obtener eventos de la próxima semana (usando NY time)
         events = investiny.economic_calendar(
-            from_date=(datetime.now() - timedelta(days=1)).strftime("%d/%m/%Y"),
-            to_date=(datetime.now() + timedelta(days=7)).strftime("%d/%m/%Y")
+            from_date=(now_ny - timedelta(days=1)).strftime("%d/%m/%Y"),
+            to_date=(now_ny + timedelta(days=7)).strftime("%d/%m/%Y")
         )
         
         if not events:
@@ -12024,8 +12036,12 @@ def calcular_entradas(
         )
         future_tecnica = _inner_exec.submit(analisis_tecnico_detallado, df, tf, window, cfg)
     
-        fecha_inicio = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-        fecha_fin = datetime.now().strftime("%Y-%m-%d")
+        # ✅ FIX: Convert UTC to NY timezone for fundamental analysis consistency
+        now_utc = datetime.now(timezone.utc)
+        ny_tz = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)  # "America/New_York"
+        now_ny = now_utc.astimezone(ny_tz)
+        fecha_inicio = (now_ny - timedelta(days=7)).strftime("%Y-%m-%d")
+        fecha_fin = now_ny.strftime("%Y-%m-%d")
         future_fundamental = _inner_exec.submit(
             ajustar_probabilidad_fundamental,
             50, df_eventos, symbol, tf, fecha_inicio, fecha_fin, cfg, True  # return_meta=True

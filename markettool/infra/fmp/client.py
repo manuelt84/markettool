@@ -142,7 +142,17 @@ class FMPClient:
     def historical_eod(self, symbol: str, from_date: datetime, to_date: datetime) -> pd.DataFrame:
         url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
         self._log.info("[FMP] Historical Daily %s", url)
-        r = self._get(url, {"from": from_date.strftime("%Y-%m-%d"), "to": to_date.strftime("%Y-%m-%d")}, symbol=symbol)
+        
+        # ✅ FIX: Convert UTC to NY timezone for FMP API consistency
+        try:
+            ny_tz = pytz.timezone(self.intraday_source_tz)  # "America/New_York"
+        except Exception:
+            ny_tz = pytz.timezone("America/New_York")
+        
+        from_ny = from_date.astimezone(ny_tz) if from_date.tzinfo else ny_tz.localize(from_date)
+        to_ny = to_date.astimezone(ny_tz) if to_date.tzinfo else ny_tz.localize(to_date)
+        
+        r = self._get(url, {"from": from_ny.strftime("%Y-%m-%d"), "to": to_ny.strftime("%Y-%m-%d")}, symbol=symbol)
         if r.status_code != 200:
             return pd.DataFrame()
         payload = r.json() or {}
