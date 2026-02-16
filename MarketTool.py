@@ -1762,10 +1762,12 @@ if 'RECOMMENDED_TF_OPTIONS' not in globals():
         ],
     }
 REQUEST_OPERATORIA: dict[str, dict] = {}
+REQUEST_OPERATORIA_LOCK = threading.Lock()
 
 #@profile
 def clear_current_request_cfg(user_chat_id: str) -> None:
-    REQUEST_OPERATORIA.pop(user_chat_id, None)
+    with REQUEST_OPERATORIA_LOCK:
+        REQUEST_OPERATORIA.pop(user_chat_id, None)
 
 #@profile
 def normalize_operatoria_payload(cfg: dict | None) -> dict:
@@ -16012,19 +16014,21 @@ async def ejecutar_recurrente(
         origen_norm == "telegram" or (origen_norm == "app" and send_results)
     )
 
-    # Estado local por chat
-    if user_chat_id and user_chat_id not in user_states:
-        user_states[user_chat_id] = {}
+    # Estado local por chat (protegido con lock)
+    with user_states_lock:
+        if user_chat_id and user_chat_id not in user_states:
+            user_states[user_chat_id] = {}
 
     cfg_overrides = operatoria_cfg or {}
     temps = cfg_overrides.get("tfs") or temporalidades
 
-    # Contabilizar transacciones (activo x tf)
+    # Contabilizar transacciones (activo x tf) - protegido con lock
     n = len(activos_filtrados) * len(temps)
-    if user_id:
-        user_states.setdefault(str(user_id), {})["numero_transacciones"] = n
-    if user_chat_id:
-        user_states.setdefault(str(user_chat_id), {})["numero_transacciones"] = n
+    with user_states_lock:
+        if user_id:
+            user_states.setdefault(str(user_id), {})["numero_transacciones"] = n
+        if user_chat_id:
+            user_states.setdefault(str(user_chat_id), {})["numero_transacciones"] = n
 
     # Sin activos
     if not activos_filtrados:
