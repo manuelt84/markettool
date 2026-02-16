@@ -29,8 +29,28 @@ try:
         gpu=False,  # CPU durante el build
         model_storage_directory='/app/models/easyocr',
         user_network_directory='/app/models/easyocr',
-        verbose=True
+        verbose=True,
+        download_enabled=True
     )
+    
+    # Forzar extracción de cualquier zip pendiente
+    import zipfile
+    import glob
+    for zip_path in glob.glob('/app/models/easyocr/*.zip'):
+        try:
+            print(f"[EasyOCR] Extrayendo {zip_path}...")
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall('/app/models/easyocr')
+            os.remove(zip_path)
+            print(f"[EasyOCR] ✅ {zip_path} extraído y eliminado")
+        except Exception as e:
+            print(f"[EasyOCR] ⚠️  Error extrayendo {zip_path}: {e}")
+    
+    # Verificar que los modelos existen
+    pth_files = glob.glob('/app/models/easyocr/*.pth')
+    print(f"[EasyOCR] Modelos .pth encontrados: {len(pth_files)}")
+    for pth in pth_files:
+        print(f"  - {os.path.basename(pth)} ({os.path.getsize(pth) / 1024 / 1024:.1f} MB)")
     
     print("[EasyOCR] ✅ Modelos descargados correctamente en /app/models/easyocr")
     print("[EasyOCR] ✅ Todas las dependencias pre-cacheadas exitosamente")
