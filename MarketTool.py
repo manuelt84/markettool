@@ -1138,6 +1138,53 @@ else:
 _pred_executor_type = type(_ANALYSIS_PRED_EXECUTOR).__name__ if _ANALYSIS_PRED_EXECUTOR else "None"
 logger.info(f"[Init] Executor predicciones: {_pred_executor_type} (workers={_ANALYSIS_PRED_WORKERS}, use_process={_ANALYSIS_PRED_USE_PROCESS})")
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# THREAD POOL HEALTH MONITORING (detect starvation, failed tasks)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ExecutorHealthMonitor:
+    """Monitors thread pool health metrics without overhead."""
+    def __init__(self, name: str):
+        self.name = name
+        self.task_count = 0
+        self.failed_tasks = 0
+        self.total_time = 0
+        self.lock = threading.Lock()
+    
+    def record_task(self, elapsed_s: float = 0, failed: bool = False):
+        """Record task completion metrics."""
+        with self.lock:
+            self.task_count += 1
+            if failed:
+                self.failed_tasks += 1
+            self.total_time += elapsed_s
+    
+    def get_stats(self) -> dict:
+        """Get current health metrics."""
+        with self.lock:
+            avg_time = self.total_time / max(1, self.task_count)
+            fail_rate = self.failed_tasks / max(1, self.task_count)
+            return {
+                "name": self.name,
+                "tasks": self.task_count,
+                "failures": self.failed_tasks,
+                "fail_rate": fail_rate,
+                "avg_time_s": avg_time,
+            }
+    
+    def log_health(self):
+        """Log health metrics if failures detected."""
+        stats = self.get_stats()
+        if stats["fail_rate"] > 0.01:  # >1% failure rate
+            logger.warning(f"[ThreadPool:{self.name}] high failure rate: {stats['fail_rate']:.1%} ({stats['failures']}/{stats['tasks']})")
+        if stats["avg_time_s"] > 60:  # >60s average time
+            logger.warning(f"[ThreadPool:{self.name}] slow tasks: avg {stats['avg_time_s']:.1f}s")
+
+# Create monitors for main executors
+_analysis_monitor = ExecutorHealthMonitor("ANALYSIS")
+_analysis_inner_monitor = ExecutorHealthMonitor("ANALYSIS_INNER")
+_analysis_pred_monitor = ExecutorHealthMonitor("ANALYSIS_PRED")
+
 subscriptions = {}
 subscriptions_type = {}
 admin_ids = {}
