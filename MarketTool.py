@@ -1195,7 +1195,9 @@ subscriptions = {}
 subscriptions_type = {}
 admin_ids = {}
 
-user_states_lock = threading.Lock()  # ✅ FIX: Protect user_states dict from concurrent access
+# ✅ FIX: Use RLock (Reentrant Lock) to allow same thread to acquire lock multiple times
+# This prevents deadlocks when functions call each other (e.g., limpiar_soportes_resistencias_cache -> mark_user_state)
+user_states_lock = threading.RLock()  # Reentrant: safe for nested lock acquisitions
 matplotlib_lock = threading.Lock()
 
 CARPETA_HISTORICOS = "historicos"
@@ -14954,6 +14956,7 @@ def limpiar_estado_usuario(user_chat_id):
 
 #@profile
 def limpiar_soportes_resistencias_cache(user_chat_id):
+    # Actualizar memoria local bajo lock
     with user_states_lock:  # ✅ FIX: Protect against concurrent modifications
         if user_chat_id in user_states:
             user_states[user_chat_id]["soportes_resistencias_cache"] = {}
@@ -14964,9 +14967,14 @@ def limpiar_soportes_resistencias_cache(user_chat_id):
             "estado": "disponible",
             "soportes_resistencias_cache": {}
         }
+            logger.info(f"[Init] Estado inicializado para usuario {user_chat_id}.")
+    
+    # Actualizar estado remoto (Firestore) FUERA del lock para evitar bloqueos prolongados
+    try:
         # ¡Ojo! Este es un chat_id, por eso usamos chat_id=... (no user_id)
         mark_user_state(chat_id=user_chat_id, estado="disponible")
-        logger.info(f"[Init] Estado inicializado para usuario {user_chat_id}.")
+    except Exception as e:
+        logger.warning(f"[limpiar_soportes_resistencias_cache] Error al marcar estado en Firestore: {e}")
 
 # ----------------- Comandos / Flujos Telegram -----------------
 #@profile
