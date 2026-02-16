@@ -1676,19 +1676,31 @@ def get_easyocr_reader(prefer_gpu: bool = True):
         _reader = _try_init(False)
         return _reader
 
-# ✅ Eager initialization de EasyOCR (ahora rápido porque modelos están en imagen Docker)
-# Pre-descarga en build time elimina delays de startup (fue el problema original)
-# Modelos ~200MB ya están en /app/models/easyocr/ desde la imagen Docker
+# ✅ IMPROVED LAZY LOADING: Modelos se descargan en background (no bloquean startup)
+# - Server inicia rápido (<30s, healthcheck pasa)
+# - Modelos se descargan en paralelo en background
+# - Cuando se usan, probablemente ya estén listos
+logger.info("[EasyOCR] Lazy loading con background warmup habilitado")
+reader = None  # Se inicializa a demanda, pero se descarga en background
+
+# Iniciar warmup de modelos en background (no bloqueante)
+def _ocr_warmup_background():
+    """Descarga modelos de easyocr en background para evitar delays de la primera llamada."""
+    try:
+        logger.info("[EasyOCR-Warmup] Iniciando descarga en background...")
+        get_easyocr_reader(prefer_gpu=True)
+        logger.info("[EasyOCR-Warmup] ✅ Modelos descargados")
+    except Exception as e:
+        logger.warning(f"[EasyOCR-Warmup] Error al descargar: {e} (no blockeante, se reintentará en uso)")
+
+# Spawn background task para warmup (solo si tenemos asyncio running)
 try:
-    reader = get_easyocr_reader(prefer_gpu=True)
-    if reader:
-        logger.info("[EasyOCR] ✅ Inicialización exitosa (modelos from Docker image)")
-    else:
-        logger.warning("[EasyOCR] Reader initialization returned None (OCR disabled)")
+    import threading
+    warmup_thread = threading.Thread(target=_ocr_warmup_background, daemon=True, name="easyocr-warmup")
+    warmup_thread.start()
+    logger.debug("[EasyOCR-Warmup] Daemon thread iniciado")
 except Exception as e:
-    logger.warning(f"[EasyOCR] No se pudo inicializar EasyOCR en startup: {e}")
-    logger.warning("[EasyOCR] El sistema operará sin OCR. La funcionalidad OCR no estará disponible.")
-    reader = None 
+    logger.debug(f"[EasyOCR-Warmup] No se pudo iniciar warmup: {e}") 
 
 
 #@profile
