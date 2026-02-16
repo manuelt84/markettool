@@ -6166,9 +6166,6 @@ class IndicatorsCache:
                     self._release_lock(symbol, tf)
 
 
-# Instancia global del caché
-_INDICATORS_CACHE = IndicatorsCache()
-
 # ======================================================================
 # Indicators cache overrides (module extraction)
 # ======================================================================
