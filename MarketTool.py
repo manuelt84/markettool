@@ -9315,8 +9315,13 @@ def ajustar_probabilidad_fundamental(probabilidad_exito, df_eventos, symbol, tem
                 cache_noticias = {}
             
             # ✅ Primero intenta caché local, luego fetch
-            df_noticias = cache_noticias.get(symbol) or obtener_noticias(symbol, fecha_inicio, fecha_fin)
-            cache_noticias[symbol] = df_noticias
+            df_noticias = None
+            with cache_noticias_lock:
+                df_noticias = cache_noticias.get(symbol)
+            if df_noticias is None:
+                df_noticias = obtener_noticias(symbol, fecha_inicio, fecha_fin)
+            with cache_noticias_lock:
+                cache_noticias[symbol] = df_noticias
         else:
             df_noticias = None
 
@@ -14797,7 +14802,8 @@ async def procesar_resultado(
     nombre_archivo          = generar_nombre_archivo(moneda_filtro)
     nombre_archivo_filtrado = generar_nombre_archivo(moneda_filtro, filtro=True)
 
-    # Asegurar llaves en user_states (FIXED: use lock to prevent TOCTOU)
+    # Asegurar llaves en user_states y obtener lock de forma segura
+    lock_to_use = None
     with user_states_lock:
         user_states.setdefault(user_chat_id, {})
         if "lock" not in user_states[user_chat_id]:
@@ -14805,8 +14811,10 @@ async def procesar_resultado(
             user_states[user_chat_id]["lock_holder"] = None
         for k in ("archivos_enviados","imagenes_oportunidades_enviadas","imagenes_eventos_enviadas"):
             user_states[user_chat_id].setdefault(k, False)
+        # ✅ Capturar referencia dentro del lock para evitar race condition
+        lock_to_use = user_states[user_chat_id]["lock"]
 
-    async with user_states[user_chat_id]["lock"]:
+    async with lock_to_use:
         user_states[user_chat_id]["lock_holder"] = asyncio.current_task()
 
         csv_global_tasks = []
@@ -15285,8 +15293,8 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 state.setdefault("imagenes_enviadas", False)
                 state.setdefault("lock", asyncio.Lock())
                 state.setdefault("lock_holder", None)
-            state["fecha_inicio"] = None
-            state["fecha_fin"] = None
+                state["fecha_inicio"] = None
+                state["fecha_fin"] = None
 
             partes = (update.message.text or "").split()
             if len(partes) != 2:
@@ -15334,19 +15342,34 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                     f"No se encontraron eventos económicos entre {fecha_inicio.strftime('%Y-%m-%d')} y {fecha_fin.strftime('%Y-%m-%d')}."
                 )
             else:
-                async with state["lock"]:
-                    state["lock_holder"] = asyncio.current_task()
+                # ✅ Obtener referencia del lock de forma segura
+                async_lock = None
+                with user_states_lock:
+                    if uid_chat in user_states and "lock" in user_states[uid_chat]:
+                        async_lock = user_states[uid_chat]["lock"]
+                
+                if async_lock is None:
+                    await update.message.reply_text("Error interno: no se pudo obtener lock de usuario.")
+                    return
+                
+                async with async_lock:
+                    # Re-obtener state dentro del asyncio.Lock (pero fuera del threading lock para evitar deadlock)
+                    with user_states_lock:
+                        state = user_states.get(uid_chat, {})
+                    if state:
+                        state["lock_holder"] = asyncio.current_task()
                     await enviar_imagenes_por_currency_a_usuario(df_eventos, context, uid_chat)
-                    state["imagenes_enviadas"] = True
+                    if state:
+                        state["imagenes_enviadas"] = True
 
-                    if state["imagenes_enviadas"]:
-                        asyncio.create_task(enviar_eventos_y_archivo_calendar(df_eventos, context, uid_chat))
-                        state["links_enviados"] = True
+                        if state["imagenes_enviadas"]:
+                            asyncio.create_task(enviar_eventos_y_archivo_calendar(df_eventos, context, uid_chat))
+                            state["links_enviados"] = True
 
-                    if not es_administrador(uid_chat):
-                        success, mensaje = await descontar_transaccion(uid_chat, 1, origen="telegram")
-                        if not success:
-                            await update.message.reply_text(mensaje)
+                        if not es_administrador(uid_chat):
+                            success, mensaje = await descontar_transaccion(uid_chat, 1, origen="telegram")
+                            if not success:
+                                await update.message.reply_text(mensaje)
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando las fechas: {e}")
         finally:
@@ -15575,10 +15598,12 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando las fechas para noticias: {e}")
         finally:
-            if user_chat_id in user_states:
-                user_states[user_chat_id]["fecha_inicio"] = None
-                user_states[user_chat_id]["fecha_fin"] = None
-                user_states[user_chat_id]["estado"] = "disponible"
+            # Limpieza de estado (protegido con lock)
+            with user_states_lock:
+                if user_chat_id in user_states:
+                    user_states[user_chat_id]["fecha_inicio"] = None
+                    user_states[user_chat_id]["fecha_fin"] = None
+                    user_states[user_chat_id]["estado"] = "disponible"
             mark_user_state(chat_id=user_chat_id, estado="disponible")
             if lock_id:
                 try:
@@ -18280,9 +18305,11 @@ async def cargar_noticias_en_memoria():
                                     .dt.tz_localize(pytz.UTC)  # Asignar timezone UTC
                                     .dt.tz_convert(pytz.UTC)  # Convertir al timezone del usuario
                                 )
-                            if symbol not in cache_noticias:
-                                cache_noticias[symbol] = {}
-                            cache_noticias[symbol][temporalidad] = df_local.sort_values("publishedDate")
+                            # ✅ Proteger acceso con lock
+                            with cache_noticias_lock:
+                                if symbol not in cache_noticias:
+                                    cache_noticias[symbol] = {}
+                                cache_noticias[symbol][temporalidad] = df_local.sort_values("publishedDate")
                             logger.info(f"Noticias cargadas en memoria para {symbol} ({temporalidad}).")
                     except Exception as e:
                         logger.info(f"Error al cargar noticias de {symbol} ({temporalidad}): {e}")
