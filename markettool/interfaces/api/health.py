@@ -376,4 +376,12 @@ def register_health_routes(
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }), 500
     
-    logger.info("✅ Health check routes registered: /health, /ready, /healthz, /startup, /cache-status")
+    @app.route("/", methods=["GET"])
+    def index() -> tuple[str, int]:
+        """
+        Root endpoint.
+        Returns simple status message.
+        """
+        return "El bot esta funcionando", 200
+    
+    logger.info("✅ Health check routes registered: /health, /ready, /healthz, /startup, /cache-status, /")

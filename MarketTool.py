@@ -1680,10 +1680,14 @@ def get_easyocr_reader(prefer_gpu: bool = True):
 # - Server inicia rápido (<30s, healthcheck pasa)
 # - Modelos se descargan en paralelo en background
 # - Cuando se usan, probablemente ya estén listos
+# - SINGLETON: Solo un thread de warmup por proceso (no por worker)
 logger.info("[EasyOCR] Lazy loading con background warmup habilitado")
 reader = None  # Se inicializa a demanda, pero se descarga en background
 
-# Iniciar warmup de modelos en background (no bloqueante)
+# Singleton para evitar múltiples warmup threads
+_warmup_started = False
+_warmup_lock = threading.Lock()
+
 def _ocr_warmup_background():
     """Descarga modelos de easyocr en background para evitar delays de la primera llamada."""
     try:
@@ -1693,14 +1697,19 @@ def _ocr_warmup_background():
     except Exception as e:
         logger.warning(f"[EasyOCR-Warmup] Error al descargar: {e} (no blockeante, se reintentará en uso)")
 
-# Spawn background task para warmup (solo si tenemos asyncio running)
-try:
-    import threading
-    warmup_thread = threading.Thread(target=_ocr_warmup_background, daemon=True, name="easyocr-warmup")
-    warmup_thread.start()
-    logger.debug("[EasyOCR-Warmup] Daemon thread iniciado")
-except Exception as e:
-    logger.debug(f"[EasyOCR-Warmup] No se pudo iniciar warmup: {e}") 
+# Spawn background task para warmup (SINGLETON: solo una vez por proceso)
+with _warmup_lock:
+    if not _warmup_started:
+        _warmup_started = True
+        try:
+            warmup_thread = threading.Thread(target=_ocr_warmup_background, daemon=True, name="easyocr-warmup")
+            warmup_thread.start()
+            logger.debug("[EasyOCR-Warmup] Daemon thread iniciado")
+        except Exception as e:
+            logger.debug(f"[EasyOCR-Warmup] No se pudo iniciar warmup: {e}")
+            _warmup_started = False  # Reset para permitir reintento
+    else:
+        logger.debug("[EasyOCR-Warmup] Thread ya iniciado (singleton protegido)") 
 
 
 #@profile
