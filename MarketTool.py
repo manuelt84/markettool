@@ -859,6 +859,10 @@ class HistoryManager:
         self.client = client
         self._quote_cache: dict[str, dict] = {}
         self._quote_cache_ttl = int(os.environ.get("HISTORY_QUOTE_CACHE_SECONDS", "10"))
+        # FMP call deduplicator: prevent simultaneous calls for same symbol/TF
+        import threading
+        self._fmp_locks: dict[str, threading.Lock] = {}
+        self._fmp_lock_mutex = threading.Lock()
 
     def _base_interval_for(self, tf: str) -> str:
         tf = normalize_tf(tf)
@@ -908,6 +912,15 @@ class HistoryManager:
         price = self.client.quote_last(symbol)
         self._quote_cache[key] = {"ts": now, "price": price}
         return price
+
+    def _get_fmp_lock(self, symbol: str, tf: str) -> "threading.Lock":
+        """Get or create a lock for this symbol/TF to deduplicate FMP calls."""
+        key = f"{symbol}_{tf}".upper()
+        with self._fmp_lock_mutex:
+            if key not in self._fmp_locks:
+                import threading
+                self._fmp_locks[key] = threading.Lock()
+            return self._fmp_locks[key]
 
     def _append_realtime_last_bar(self, symbol: str, tf: str, df: pd.DataFrame) -> pd.DataFrame:
         try:
@@ -992,22 +1005,32 @@ class HistoryManager:
         to_dt = now
         new_df = pd.DataFrame()
         if allow_refresh and from_dt < to_dt:
-            try:
-                if _is_intraday(tf):
-                    base_tf = self._base_interval_for(tf)
-                    raw = self.client.historical_intraday(symbol, base_tf, from_dt, to_dt)
-                    raw = ensure_utc_index(raw)
-                    new_df = self._maybe_resample(raw, tf)
+            lock = self._get_fmp_lock(symbol, tf)
+            with lock:
+                # Double-check cache after acquiring lock (another worker may have fetched)
+                cache_df_check = load_cached_history(symbol, tf)
+                if not cache_df_check.empty and cache_df == cache_df_check:
+                    # Cache hasn't changed, skip FMP fetch
+                    logger.info(f"[FMP-DEDUP] {symbol}/{tf}: Worker ahead already fetched, using cache")
+                    new_df = pd.DataFrame()
                 else:
-                    raw = self.client.historical_eod(symbol, from_dt, to_dt)
-                    raw = ensure_utc_index(raw)
-                    new_df = self._maybe_resample_eod(raw, tf) if tf in EOD_RESAMPLE_RULE else raw
-            except FMPPlanNotAllowed:
-                logger.info("Plan no permite intradía para %s (%s).", symbol, tf)
-                new_df = pd.DataFrame()
-            except Exception as e:
-                logger.warning("Descarga fallida %s %s: %s", symbol, tf, e)
-                new_df = pd.DataFrame()
+                    # Proceed with FMP fetch
+                    try:
+                        if _is_intraday(tf):
+                            base_tf = self._base_interval_for(tf)
+                            raw = self.client.historical_intraday(symbol, base_tf, from_dt, to_dt)
+                            raw = ensure_utc_index(raw)
+                            new_df = self._maybe_resample(raw, tf)
+                        else:
+                            raw = self.client.historical_eod(symbol, from_dt, to_dt)
+                            raw = ensure_utc_index(raw)
+                            new_df = self._maybe_resample_eod(raw, tf) if tf in EOD_RESAMPLE_RULE else raw
+                    except FMPPlanNotAllowed:
+                        logger.info("Plan no permite intradía para %s (%s).", symbol, tf)
+                        new_df = pd.DataFrame()
+                    except Exception as e:
+                        logger.warning("Descarga fallida %s %s: %s", symbol, tf, e)
+                        new_df = pd.DataFrame()
 
         out_full = merge_histories(cache_df, new_df)
         out = out_full
