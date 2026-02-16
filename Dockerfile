@@ -24,10 +24,9 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN python -m pip install --no-cache-dir torch==2.2.2+cu121 torchvision==0.17.2+cu121 torchaudio==2.2.2 --extra-index-url https://download.pytorch.org/whl/cu121
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-# 🚫 PASO 4b: pip install completado
-# Nota: easyocr models se descargan on-demand (lazy loading)
-#       pero inician en background para la mayoría de casos
-# Esto mantiene imagen Docker pequeña (~1GB en lugar de ~1.2GB)
+# 🚫 PASO 4b: Descargar modelos de EasyOCR durante build (evita descargas en runtime)
+COPY scripts/download_easyocr_models.py scripts/
+RUN python scripts/download_easyocr_models.py || echo "⚠️  EasyOCR download falló, se descargará en runtime"
 
 # Install Playwright browsers at build time so runtime doesn't need downloads
 RUN python -m playwright install --with-deps
