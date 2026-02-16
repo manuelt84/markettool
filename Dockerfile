@@ -24,6 +24,9 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN python -m pip install --no-cache-dir torch==2.2.2+cu121 torchvision==0.17.2+cu121 torchaudio==2.2.2 --extra-index-url https://download.pytorch.org/whl/cu121
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
+# Install Playwright browsers at build time so runtime doesn't need downloads
+RUN python -m playwright install --with-deps
+
 # 🚫 PASO 5: Validar modelos estan presentes
 RUN [ -f /app/patrones.pt ] && [ -f /app/ruido.pt ] && ls -lh /app/*.pt && echo "✅ Models present" || (echo "❌ Models missing" && exit 1)
 

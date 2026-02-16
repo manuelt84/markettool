@@ -1094,9 +1094,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # Para httpx
 logging.getLogger("urllib3").setLevel(logging.WARNING)  # Para requests
 
 # API Key de FMP (Premium)
-API_KEY = (os.environ.get("API_FMP") or os.environ.get("FMP_API_KEY") or "").strip()
+API_KEY = (os.environ.get("FMP_API_KEY") or "").strip()
 if not API_KEY:
-    raise RuntimeError("Falta API_FMP (o FMP_API_KEY) en el entorno/.env. Usa --env .env o define la variable antes de ejecutar.")
+    raise RuntimeError("Falta FMP_API_KEY en el entorno/.env. Usa --env .env o define la variable antes de ejecutar.")
 
 # Firestore and GCS clients (public exports for bootstrap.py and hexagonal architecture)
 db = firestore.Client()
@@ -2669,7 +2669,7 @@ async def warmup_cache_all_assets(reason: str = "scheduled"):
     additional_tasks = []
     if APP_CONFIG.cache_warmup_events_enabled:
         try:
-            additional_tasks.append(asyncio.create_task(get_eventos_economicos_cached()))
+            additional_tasks.append(asyncio.create_task(get_eventos_economicos_cached(grace_minutes=0)))
         except Exception:
             pass
     
@@ -7084,7 +7084,7 @@ def _investing_econ_fetch() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _investing_com_econ_fetch(*, timeout: int = 15) -> pd.DataFrame:
+def _investing_com_econ_fetch(*, timeout: int = 15, allow_playwright: bool = True) -> pd.DataFrame:
     """
     Fetch economic calendar from investing.com via web scraping.
     Faster than FMP, with real-time data. Returns UTC timestamps.
@@ -7176,8 +7176,11 @@ def _investing_com_econ_fetch(*, timeout: int = 15) -> pd.DataFrame:
                         pass
         
         if not events:
-            logger.info("[Investing.com] No events found in HTML, trying Playwright fallback...")
-            return _investing_com_econ_fetch_playwright()
+            if allow_playwright:
+                logger.info("[Investing.com] No events found in HTML, trying Playwright fallback...")
+                return _investing_com_econ_fetch_playwright()
+            logger.info("[Investing.com] No events found in HTML; Playwright disabled")
+            return pd.DataFrame()
         
         df = pd.DataFrame(events)
         
@@ -7186,8 +7189,11 @@ def _investing_com_econ_fetch(*, timeout: int = 15) -> pd.DataFrame:
         
         # If parsing failed, use Playwright
         if df["date"].isna().all():
-            logger.info("[Investing.com] Date parsing failed, trying Playwright fallback...")
-            return _investing_com_econ_fetch_playwright()
+            if allow_playwright:
+                logger.info("[Investing.com] Date parsing failed, trying Playwright fallback...")
+                return _investing_com_econ_fetch_playwright()
+            logger.info("[Investing.com] Date parsing failed; Playwright disabled")
+            return pd.DataFrame()
         
         # Localize to UTC
         df["date"] = df["date"].dt.tz_localize("UTC", ambiguous="infer", nonexistent="shift_forward")
@@ -7202,8 +7208,11 @@ def _investing_com_econ_fetch(*, timeout: int = 15) -> pd.DataFrame:
         return df[["date", "currency", "event", "actual", "estimate", "previous", "impact"]].sort_values("date").reset_index(drop=True)
         
     except Exception as e:
-        logger.warning("[Investing.com] Requests+BS4 failed: %s. Trying Playwright...", e)
-        return _investing_com_econ_fetch_playwright()
+        if allow_playwright:
+            logger.warning("[Investing.com] Requests+BS4 failed: %s. Trying Playwright...", e)
+            return _investing_com_econ_fetch_playwright()
+        logger.warning("[Investing.com] Requests+BS4 failed: %s. Playwright disabled", e)
+        return pd.DataFrame()
 
 
 def _investing_com_econ_fetch_playwright() -> pd.DataFrame:
@@ -7299,6 +7308,38 @@ def _to_local_df(df: pd.DataFrame) -> pd.DataFrame:
     out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce").dt.tz_convert(pytz.UTC)
     out["date_country"] = out["date"]
     return out
+
+
+def _needs_investing_fallback(
+    df: pd.DataFrame,
+    *,
+    now_utc: datetime | None = None,
+    grace_minutes: int = 10,
+) -> tuple[bool, str, bool]:
+    """
+    Decide if we should use Investing fallback.
+    Only trigger when FMP is empty or past events are missing actuals.
+    """
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    if df is None or df.empty:
+        return False, "", False
+    if "date" not in df.columns or "actual" not in df.columns:
+        return False, "", False
+    cutoff = now - timedelta(minutes=grace_minutes)
+
+    dates = pd.to_datetime(df["date"], errors="coerce", utc=True)
+    past_mask = dates <= cutoff
+    if not past_mask.any():
+        return False, "", False
+
+    actuals = pd.to_numeric(df["actual"], errors="coerce")
+    if actuals.loc[past_mask].isna().any():
+        return True, "FMP missing actuals for past events", True
+
+    return False, "", False
 
 
 def obtener_dias_habiles_mercado() -> list:
@@ -7413,7 +7454,12 @@ class UserConfigCache:
 _USER_CONFIG_CACHE = UserConfigCache()
 
 
-def obtener_eventos_economicos(*, plan: str | None = None, desde_inicio: bool = False) -> pd.DataFrame:
+def obtener_eventos_economicos(
+    *,
+    plan: str | None = None,
+    desde_inicio: bool = False,
+    grace_minutes: int = 10,
+) -> pd.DataFrame:
     """
     Pulls economic events around the FX window:
       - starter: only [yesterday, tomorrow]
@@ -7433,8 +7479,9 @@ def obtener_eventos_economicos(*, plan: str | None = None, desde_inicio: bool = 
     else:
         start, end = y, tm
 
+
     # paginate if needed
-    parts = []
+    fmp_parts = []
     if plan == "premium" and desde_inicio:
         fi = pd.to_datetime(start)
         ff = pd.to_datetime(end)
@@ -7444,20 +7491,34 @@ def obtener_eventos_economicos(*, plan: str | None = None, desde_inicio: bool = 
             a = cur.strftime("%Y-%m-%d")
             b = min(cur + timedelta(days=step-1), ff).strftime("%Y-%m-%d")
             d = _fmp_econ_fetch(a, b, timeout=APP_CONFIG.http_timeout)
-            if not d.empty: parts.append(d)
+            if not d.empty: fmp_parts.append(d)
             cur = pd.to_datetime(b) + timedelta(days=1)
     else:
         d = _fmp_econ_fetch(start, end, timeout=APP_CONFIG.http_timeout)
-        if not d.empty: parts.append(d)
+        if not d.empty: fmp_parts.append(d)
 
-    # Try investing.com web scraping first (faster + real-time)
-    try:
-        inv_com = _investing_com_econ_fetch(timeout=APP_CONFIG.http_timeout)
-        if not inv_com.empty:
-            logger.info("[Eventos] Got %d events from investing.com scraping", len(inv_com))
-            parts.append(inv_com)
-    except Exception as e:
-        logger.warning("[Eventos] investing.com scraping failed: %s", e)
+    parts = list(fmp_parts)
+    fmp_df = pd.concat(fmp_parts, ignore_index=True) if fmp_parts else pd.DataFrame()
+    need_investing, need_reason, allow_playwright = _needs_investing_fallback(
+        fmp_df,
+        now_utc=datetime.now(timezone.utc),
+        grace_minutes=grace_minutes,
+    )
+    if need_investing and need_reason:
+        logger.info("[Eventos] %s; enabling Investing fallback", need_reason)
+
+    # Try investing.com only if FMP is empty or missing actuals for past events
+    if need_investing:
+        try:
+            inv_com = _investing_com_econ_fetch(
+                timeout=APP_CONFIG.http_timeout,
+                allow_playwright=allow_playwright,
+            )
+            if not inv_com.empty:
+                logger.info("[Eventos] Got %d events from investing.com scraping", len(inv_com))
+                parts.append(inv_com)
+        except Exception as e:
+            logger.warning("[Eventos] investing.com scraping failed: %s", e)
 
     # Fallback to investiny
     try:
@@ -7478,7 +7539,12 @@ def obtener_eventos_economicos(*, plan: str | None = None, desde_inicio: bool = 
     return df.reset_index(drop=True)
 
 
-async def get_eventos_economicos_cached(*, plan: str | None = None, desde_inicio: bool = False) -> pd.DataFrame:
+async def get_eventos_economicos_cached(
+    *,
+    plan: str | None = None,
+    desde_inicio: bool = False,
+    grace_minutes: int = 10,
+) -> pd.DataFrame:
     """
     Obtiene eventos económicos con caché multi-pod (1 hora TTL).
     
@@ -7492,7 +7558,11 @@ async def get_eventos_economicos_cached(*, plan: str | None = None, desde_inicio
     
     # Función auxiliar para llamar obtener_eventos_economicos de forma async
     def _fetch():
-        return obtener_eventos_economicos(plan=plan, desde_inicio=desde_inicio)
+        return obtener_eventos_economicos(
+            plan=plan,
+            desde_inicio=desde_inicio,
+            grace_minutes=grace_minutes,
+        )
     
     # Usar caché compartido con timeout
     try:
@@ -7516,7 +7586,12 @@ def invalidate_economic_events_cache_many(keys: Iterable[str]):
     _ECONOMIC_EVENTS_CACHE.invalidate_many(keys)
 
 
-def obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin) -> pd.DataFrame:
+def obtener_eventos_economicos_futuros(
+    fecha_inicio,
+    fecha_fin,
+    *,
+    grace_minutes: int = 10,
+) -> pd.DataFrame:
     """
     Future window [fecha_inicio, fecha_fin] ingresada en timezone_country (usuario).
     La ventana de consulta a FMP se calcula en America/New_York (FMP_TZ).
@@ -7555,7 +7630,7 @@ def obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin) -> pd.DataFrame:
     ff_day = ff_fmp.strftime("%Y-%m-%d")
 
     # --- Loop chunked ---
-    parts = []
+    fmp_parts = []
     cur = pd.to_datetime(fi_day)  # naive date; solo usamos la parte de fecha
     end = pd.to_datetime(ff_day)
     step = APP_CONFIG.econ_chunk_days
@@ -7573,17 +7648,36 @@ def obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin) -> pd.DataFrame:
             if not d.empty:
                 # solo aplica el map sobre las filas filtradas, usando el mismo índice
                 d["ponderacion"] = impact_norm.loc[mask].map({"high": 1.0, "medium": 0.5}).fillna(0.25)
-                parts.append(d)
+            fmp_parts.append(d)
 
         cur = pd.to_datetime(b) + timedelta(days=1)
 
-    if not parts:
+    if not fmp_parts:
         return pd.DataFrame(columns=[
             "date","currency","event","actual","estimate","previous",
             "impact","ponderacion","date_country"
         ])
 
-    df = pd.concat(parts, ignore_index=True)
+    df = pd.concat(fmp_parts, ignore_index=True)
+
+    need_investing, need_reason, allow_playwright = _needs_investing_fallback(
+        df,
+        now_utc=datetime.now(timezone.utc),
+        grace_minutes=grace_minutes,
+    )
+    if need_investing:
+        if need_reason:
+            logger.info("[Eventos] %s; enabling Investing fallback (futuros)", need_reason)
+        try:
+            inv_com = _investing_com_econ_fetch(
+                timeout=APP_CONFIG.http_timeout,
+                allow_playwright=allow_playwright,
+            )
+            if not inv_com.empty:
+                logger.info("[Eventos] Got %d events from investing.com scraping (futuros)", len(inv_com))
+                df = pd.concat([df, inv_com], ignore_index=True)
+        except Exception as e:
+            logger.warning("[Eventos] investing.com scraping failed (futuros): %s", e)
 
     # Tu pipeline: aquí conviertes fechas del evento a timezone_country y deduplicas
     df = _to_local_df(df)      # asegúrate que genere 'date_country' en timezone_country
@@ -7720,13 +7814,22 @@ def guardar_eventos_completos(eventos: list[dict]) -> None:
     
 
 
-def obtener_eventos_guardados_o_futuros(fecha_inicio, fecha_fin) -> pd.DataFrame:
+def obtener_eventos_guardados_o_futuros(
+    fecha_inicio,
+    fecha_fin,
+    *,
+    grace_minutes: int = 10,
+) -> pd.DataFrame:
     """
     Try API future fetch first; if empty/error, fall back to Firestore for the range.
     """
     # 1) Try pulling from API
     try:
-        df = obtener_eventos_economicos_futuros(fecha_inicio, fecha_fin)
+        df = obtener_eventos_economicos_futuros(
+            fecha_inicio,
+            fecha_fin,
+            grace_minutes=grace_minutes,
+        )
         if not df.empty:
             # Save to Firestore
             try:
@@ -15921,7 +16024,7 @@ async def ejecutar_recurrente(
 
         # Eventos económicos (tolerante a error) ✅ Con caché multi-pod
         try:
-            df_eventos = await get_eventos_economicos_cached()
+            df_eventos = await get_eventos_economicos_cached(grace_minutes=0)
         except Exception as e:
             logger.warning(f"Error al obtener eventos económicos: {e}")
             df_eventos = None
@@ -19488,7 +19591,11 @@ def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) ->
     if memo and (time.time() - memo.get("ts", 0) < MIN_FETCH_INTERVAL_S):
         df = memo["df"].copy()
     else:
-        df = obtener_eventos_guardados_o_futuros(_iso(a), _iso(b))
+        df = obtener_eventos_guardados_o_futuros(
+            _iso(a),
+            _iso(b),
+            grace_minutes=0,
+        )
         if df is None or df.empty:
             df = pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
         # normaliza tipos

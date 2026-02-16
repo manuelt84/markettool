@@ -17,7 +17,7 @@ except Exception:
 class AppConfig:
     storage_format: str = field(default_factory=lambda: os.environ.get("STORAGE_FORMAT", "json").strip().lower())
     fmp_plan: str = field(default_factory=lambda: (os.environ.get("FMP_PLAN") or "premium").strip().lower())
-    fmp_api_key: str = field(default_factory=lambda: os.environ.get("API_FMP", ""))
+    fmp_api_key: str = field(default_factory=lambda: os.environ.get("FMP_API_KEY", ""))
     http_timeout: int = field(default_factory=lambda: int(os.environ.get("HTTP_TIMEOUT", "10")))
     http_retries: int = field(default_factory=lambda: int(os.environ.get("HTTP_RETRIES", "3")))
     http_backoff: float = field(default_factory=lambda: float(os.environ.get("HTTP_BACKOFF", "1.8")))
