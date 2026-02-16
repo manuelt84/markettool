@@ -862,7 +862,6 @@ class HistoryManager:
         self._quote_cache_ttl = int(os.environ.get("HISTORY_QUOTE_CACHE_SECONDS", "10"))
         self._quote_cache_lock = threading.Lock()  # ✅ FIX: Thread-safe quote cache
         # FMP call deduplicator: prevent simultaneous calls for same symbol/TF
-        import threading
         self._fmp_locks: dict[str, threading.Lock] = {}
         self._fmp_lock_mutex = threading.Lock()
 
