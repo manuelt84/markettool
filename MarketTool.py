@@ -859,6 +859,7 @@ class HistoryManager:
         self.client = client
         self._quote_cache: dict[str, dict] = {}
         self._quote_cache_ttl = int(os.environ.get("HISTORY_QUOTE_CACHE_SECONDS", "10"))
+        self._quote_cache_lock = threading.Lock()  # ✅ FIX: Thread-safe quote cache
         # FMP call deduplicator: prevent simultaneous calls for same symbol/TF
         import threading
         self._fmp_locks: dict[str, threading.Lock] = {}
@@ -901,16 +902,19 @@ class HistoryManager:
         return g.dropna(subset=["open","high","low","close"])
 
     def _get_quote_cached(self, symbol: str) -> Optional[float]:
-        """Cache quote locally per TTL to reduce FMP calls."""
+        """Cache quote locally per TTL to reduce FMP calls. Thread-safe."""
         key = (symbol or "").upper()
         if not key:
             return None
         now = time.time()
-        cached = self._quote_cache.get(key)
-        if cached and (now - cached.get("ts", 0)) < self._quote_cache_ttl:
-            return cached.get("price")
+        # ✅ FIX: Lock protects dict access from concurrent modifications
+        with self._quote_cache_lock:
+            cached = self._quote_cache.get(key)
+            if cached and (now - cached.get("ts", 0)) < self._quote_cache_ttl:
+                return cached.get("price")
         price = self.client.quote_last(symbol)
-        self._quote_cache[key] = {"ts": now, "price": price}
+        with self._quote_cache_lock:
+            self._quote_cache[key] = {"ts": now, "price": price}
         return price
 
     def _get_fmp_lock(self, symbol: str, tf: str) -> "threading.Lock":
@@ -1138,6 +1142,7 @@ subscriptions = {}
 subscriptions_type = {}
 admin_ids = {}
 
+user_states_lock = threading.Lock()  # ✅ FIX: Protect user_states dict from concurrent access
 matplotlib_lock = threading.Lock()
 
 CARPETA_HISTORICOS = "historicos"
@@ -1265,7 +1270,7 @@ _ALLOW_TARGET = re.compile(r"^10\.8\.0\.(\d{1,3}):8(1|2|3)\d{2}$")  # rangos 81x
 
 # Registro de ejecuciones en curso: exec_id -> asyncio.Task
 RUNNING: Dict[str, asyncio.Task] = {}
-RUNNING_LOCK = asyncio.Lock()  # Protección contra race conditions
+RUNNING_LOCK = threading.Lock()  # ✅ FIX: Use threading.Lock (NOT asyncio.Lock) for cross-thread safety
 
 STOP_EVENTS: dict[str, threading.Event] = {}
 STOP_EVENTS_LOCK = threading.Lock()
@@ -4055,24 +4060,25 @@ def mark_user_state(
     except Exception as e:
         logging.warning(f"[mark_user_state] Firestore fallo (uuid={uuid}): {e}")
 
-    # Memoria (clave principal = uuid)
-    st = user_states.setdefault(uuid, {})
-    st["estado"] = estado
-    # copia campos útiles si vinieron en extra
-    for k in ("par_seleccionado", "soportes_resistencias_cache", "cache_realtime", "moneda_filtro", "exec_id"):
-        if k in (extra or {}):
-            st[k] = (extra or {})[k]
-    user_states[uuid] = st
+    # Memoria (clave principal = uuid) - ✅ FIX: Protect with lock
+    with user_states_lock:
+        st = user_states.setdefault(uuid, {})
+        st["estado"] = estado
+        # copia campos útiles si vinieron en extra
+        for k in ("par_seleccionado", "soportes_resistencias_cache", "cache_realtime", "moneda_filtro", "exec_id"):
+            if k in (extra or {}):
+                st[k] = (extra or {})[k]
+        user_states[uuid] = st
 
-    # Espejos en memoria para compatibilidad con código existente que indexa por chat_id o user_id
-    if chat_id is not None:
-        st2 = user_states.setdefault(str(chat_id), {})
-        st2["estado"] = estado
-        user_states[str(chat_id)] = st2
-    if user_id is not None:
-        st3 = user_states.setdefault(str(user_id), {})
-        st3["estado"] = estado
-        user_states[str(user_id)] = st3
+        # Espejos en memoria para compatibilidad con código existente que indexa por chat_id o user_id
+        if chat_id is not None:
+            st2 = user_states.setdefault(str(chat_id), {})
+            st2["estado"] = estado
+            user_states[str(chat_id)] = st2
+        if user_id is not None:
+            st3 = user_states.setdefault(str(user_id), {})
+            st3["estado"] = estado
+            user_states[str(user_id)] = st3
     
     # ✅ NUEVO: Invalidar caché distribuido (sync) para que otros pods lo actualicen
     # ⚠️ SYNC invalidate porque se llama desde asyncio.to_thread()
@@ -11871,16 +11877,27 @@ def calcular_entradas(
     
         # Recoger resultados
         try:
-            resultados = future_patrones.result()
+            resultados = future_patrones.result(timeout=15)  # ✅ FIX: Add timeout to prevent hangs
             patrones_detectados = {}
             for _, _, nombre in resultados:
                 patrones_detectados[nombre] = True
+        except TimeoutError:
+            logger.warning(f"[TIMEOUT] Pattern detection timeout for {symbol}-{tf}")
+            patrones_detectados = {}
         except Exception as e:
             logger.info(f"Error detectando patrones para {symbol}-{tf}: {e}")
             patrones_detectados = {}
     
         try:
-            en_rango = future_rango.result()
+            en_rango = future_rango.result(timeout=15)  # ✅ FIX: Add timeout
+        except TimeoutError:
+            logger.warning(f"[TIMEOUT] Range detection timeout for {symbol}-{tf}")
+            en_rango = {
+                "es_rango_repetitivo": False,
+                "estructura_tendencia": "indefinida",
+                "rebotes": [],
+                "rango_dinamico": [None, None],
+            }
         except Exception:
             en_rango = {
                 "es_rango_repetitivo": False,
@@ -11890,13 +11907,16 @@ def calcular_entradas(
             }
     
         try:
-            tecnica_meta = future_tecnica.result()
+            tecnica_meta = future_tecnica.result(timeout=15)  # ✅ FIX: Add timeout
+        except TimeoutError:
+            logger.warning(f"[TIMEOUT] Technical analysis timeout for {symbol}-{tf}")
+            tecnica_meta = None
         except Exception as e:
             logger.info(f"Error en análisis técnico para {symbol}-{tf}: {e}")
             tecnica_meta = None
     
         try:
-            prob_funda_out = future_fundamental.result()
+            prob_funda_out = future_fundamental.result(timeout=15)  # ✅ FIX: Add timeout
             if isinstance(prob_funda_out, tuple):
                 prob_funda, fundamental_meta = prob_funda_out
             else:
@@ -14814,35 +14834,39 @@ def _solo_strings_urls(items: list[Any]) -> list[str]:
 # Función para obtener el estado de un usuario
 #@profile
 def obtener_estado_usuario(user_chat_id):
-    if user_chat_id not in user_states:
-        user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}, "soportes_resistencias_cache": {}}
-    return user_states[user_chat_id]
+    with user_states_lock:  # ✅ FIX: Protect against concurrent access
+        if user_chat_id not in user_states:
+            user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}, "soportes_resistencias_cache": {}}
+        return user_states[user_chat_id].copy()  # ✅ Return copy to prevent external mutations
 
 # Función para actualizar el estado de un usuario
 # ----------------- Estado en memoria -----------------
 #@profile
 def actualizar_estado_usuario(user_chat_id, estado, par_seleccionado=None):
-    estado_usuario = obtener_estado_usuario(user_chat_id)
-    estado_usuario["estado"] = estado
-    estado_usuario["par_seleccionado"] = par_seleccionado
-    estado_usuario["soportes_resistencias_cache"] = {}
-    user_states[user_chat_id] = estado_usuario
+    with user_states_lock:  # ✅ FIX: Protect against concurrent modifications
+        if user_chat_id not in user_states:
+            user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}, "soportes_resistencias_cache": {}}
+        user_states[user_chat_id]["estado"] = estado
+        user_states[user_chat_id]["par_seleccionado"] = par_seleccionado
+        user_states[user_chat_id]["soportes_resistencias_cache"] = {}
 
 #@profile
 def limpiar_estado_usuario(user_chat_id):
-    if user_chat_id in user_states:
-        user_states[user_chat_id]["estado"] = "disponible"
-        user_states[user_chat_id]["par_seleccionado"] = None
-        user_states[user_chat_id]["cache_realtime"] = {}
+    with user_states_lock:  # ✅ FIX: Protect against concurrent access
+        if user_chat_id in user_states:
+            user_states[user_chat_id]["estado"] = "disponible"
+            user_states[user_chat_id]["par_seleccionado"] = None
+            user_states[user_chat_id]["cache_realtime"] = {}
 
 #@profile
 def limpiar_soportes_resistencias_cache(user_chat_id):
-    if user_chat_id in user_states:
-        user_states[user_chat_id]["soportes_resistencias_cache"] = {}
-        logger.info(f"Cache de soportes y resistencias reseteado para usuario {user_chat_id}.")
-    else:
-        # Si no hay estado, inicialízalo como disponible
-        user_states[user_chat_id] = {
+    with user_states_lock:  # ✅ FIX: Protect against concurrent modifications
+        if user_chat_id in user_states:
+            user_states[user_chat_id]["soportes_resistencias_cache"] = {}
+            logger.info(f"Cache de soportes y resistencias reseteado para usuario {user_chat_id}.")
+        else:
+            # Si no hay estado, inicialízalo como disponible
+            user_states[user_chat_id] = {
             "estado": "disponible",
             "soportes_resistencias_cache": {}
         }
