@@ -5135,7 +5135,8 @@ normalize_resample_rule = _normalize_resample_rule
 RESAMPLE_PLAN = _RESAMPLE_PLAN
 EOD_RESAMPLE_RULE = _EOD_RESAMPLE_RULE
 
-_HIST = HistoryManager(client=_FMP)
+# ✅ Reutilizar la instancia global creada en línea 1055
+# NO crear una nueva, para preservar _quote_cache entre llamadas
 
 
 # ======================================================================
