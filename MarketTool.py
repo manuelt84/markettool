@@ -7067,10 +7067,15 @@ async def cargar_datos_historicos_inicial():
 #@profile
 async def obtener_dias_habiles_mercado():
     """
-    Obtiene los días hábiles del mercado Forex para determinar el día anterior y el día siguiente.
+    Obtiene los días hábiles del mercado Forex (versión async).
+    
+    ✅ FIX: Convert UTC to America/New_York for consistency with FMP API.
+    Returns dates in NY timezone perspective for accurate event filtering.
     """
-    # Obtener la fecha y hora actual en UTC (sin información de zona horaria para las fechas)
-    ahora = datetime.now(pytz.UTC)
+    # Get current time in NY timezone (FMP's timezone)
+    now_utc = datetime.now(pytz.UTC)
+    ny_tz = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)  # "America/New_York"
+    ahora = now_utc.astimezone(ny_tz)
     fecha_actual = ahora.date()
 
     # Horas de apertura y cierre del mercado en UTC
@@ -7218,12 +7223,16 @@ def cache_eventos_merge(df: pd.DataFrame) -> None:
 
 
 def _fmp_econ_fetch(from_date: str, to_date: str, *, timeout: int) -> pd.DataFrame:
-    """Fetch one calendar window from FMP with HTTP_SESSION (retry-enabled)."""
+    """Fetch one calendar window from FMP with HTTP_SESSION (retry-enabled).
+    
+    ⚠️  FMP API expects dates in America/New_York timezone.
+    from_date/to_date should already be in 'YYYY-MM-DD' format in NY time.
+    """
     url = "https://financialmodelingprep.com/api/v3/economic_calendar"
     params = {"from": from_date, "to": to_date, "apikey": APP_CONFIG.fmp_api_key}
     try:
         t0 = time.time()
-        logger.info("[FMP-econ] GET %s params=%s timeout=%s", url, params, timeout)
+        logger.info("[FMP-econ] GET %s params=%s timeout=%s (dates in NY timezone)", url, params, timeout)
         r = HTTP_SESSION.get(url, params=params, timeout=timeout)
         logger.info("[FMP-econ] respuesta status=%s en %.3fs", r.status_code, time.time()-t0)
 
@@ -7564,9 +7573,18 @@ def _needs_investing_fallback(
 
 
 def obtener_dias_habiles_mercado() -> list:
-    """Return [yesterday, tomorrow] dates considering FX 17:00 UTC window loosely."""
+    """Return [yesterday, tomorrow] dates in NY timezone for FMP API consistency.
+    
+    ✅ FIX: Convert UTC to America/New_York before generating date strings.
+    FMP economic_calendar API expects dates in ET/NY timezone.
+    """
+    # Get current time in both UTC and NY timezone
     now_utc = datetime.now(timezone.utc)
-    today = now_utc.date()
+    ny_tz = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)  # "America/New_York"
+    now_ny = now_utc.astimezone(ny_tz)
+    
+    # Use NY timezone date for calculations (FMP's perspective)
+    today = now_ny.date()
     y = today - timedelta(days=1)
     t = today + timedelta(days=1)
     # Loosely assume weekdays, but include late Sunday/early Friday window
@@ -7574,13 +7592,14 @@ def obtener_dias_habiles_mercado() -> list:
     # yesterday-ish
     while True:
         d = y.weekday()  # 0 Mon ... 6 Sun
-        if (d == 6 and now_utc.hour >= 17) or (0 <= d <= 4) or (d == 5 and now_utc.hour < 17):
+        # Use NY timezone hour for market window checks
+        if (d == 6 and now_ny.hour >= 17) or (0 <= d <= 4) or (d == 5 and now_ny.hour < 17):
             days.append(y); break
         y -= timedelta(days=1)
     # tomorrow-ish
     while True:
         d = t.weekday()
-        if (d == 6 and now_utc.hour >= 17) or (0 <= d <= 4) or (d == 5 and now_utc.hour < 17):
+        if (d == 6 and now_ny.hour >= 17) or (0 <= d <= 4) or (d == 5 and now_ny.hour < 17):
             days.append(t); break
         t += timedelta(days=1)
     return days
