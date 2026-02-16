@@ -14039,6 +14039,7 @@ async def procesar_resultado(
     # --- ACTUALIZAR UI_RESUMEN CON PONDERACIONES FINALES ANTES DE SUBIR ---
     t_ui_final_start = time.time()
     # ✅ Esto permite navegación inmediata con el activo top seleccionado
+    top_asset = None
     if can_archive:
 
         cols_ui = [
@@ -14065,6 +14066,11 @@ async def procesar_resultado(
 
         top_timeframe_final = _pick_top_timeframe(ordenados_top)
         top_timeframe_by_asset_final = _pick_top_timeframe_by_asset(ordenados_top)
+        if ordenados_top:
+            try:
+                top_asset = str(ordenados_top[0].get("Activo") or "").strip().upper() or None
+            except Exception:
+                top_asset = None
 
         opp_top = (
             df_filtrado[cols_ui]
@@ -14111,28 +14117,58 @@ async def procesar_resultado(
         logger.info("[preview] ui_resumen_final publicado en %.1fs", time.time() - t_proc_start)
         logger.info("[preview timing] ui_resumen final (.head, .to_dict, publish): %.1fms", (time.time() - t_ui_final_start) * 1000)
 
-    # 🚀 PRIORIZACIÓN: primero activos prioritarios, luego resto + JSON
+    # 🚀 PRIORIZACIÓN: seleccionado primero, luego principales, luego resto + JSON
+    selected_tasks = []
     priority_tasks = []
     rest_tasks = []
     json_tasks = []
     ready_for_monitoring = []
+    resultados_selected_sorted = []
     resultados_priority_sorted = []
     resultados_rest_sorted = []
 
+    # Resolver activo seleccionado (debe coincidir con el elegido por el usuario)
+    selected_asset = None
+    try:
+        if user_chat_id is not None:
+            selected_asset = user_states.get(str(user_chat_id), {}).get("par_seleccionado")
+        if not selected_asset and user_id is not None:
+            selected_asset = user_states.get(str(user_id), {}).get("par_seleccionado")
+        if selected_asset:
+            selected_asset = str(selected_asset).strip().upper()
+    except Exception:
+        selected_asset = None
+    if not selected_asset and top_asset:
+        selected_asset = top_asset
+        logger.info(f"ℹ️ Sin activo seleccionado; usando más optado para prioridad: {selected_asset}")
+
     # === FASE DE PREPARACIÓN ===
-    # 7) Preparar uploads de enriquecidos PRIORIZANDO activos para monitoreo
+    # 7) Preparar uploads de enriquecidos con orden:
+    #    1) seleccionado
+    #    2) principales (priority_assets)
+    #    3) resto
     if can_archive:
+        resultados_selected = []
         resultados_priority = []
         resultados_rest = []
+
+        priority_set = set(str(s).strip().upper() for s in (priority_assets or []) if s)
 
         for res in resultados:
             if isinstance(res, dict):
                 sym = res.get("Activo")
-                if sym in priority_assets:
+                sym_norm = str(sym).strip().upper() if sym else ""
+                if selected_asset and sym_norm == selected_asset:
+                    resultados_selected.append(res)
+                elif sym_norm in priority_set:
                     resultados_priority.append(res)
                 else:
                     resultados_rest.append(res)
 
+        resultados_selected_sorted = sorted(
+            resultados_selected,
+            key=lambda r: _tf_priority(r.get("Temporalidad"))
+        )
         resultados_priority_sorted = sorted(
             resultados_priority,
             key=lambda r: _tf_priority(r.get("Temporalidad"))
@@ -14142,8 +14178,13 @@ async def procesar_resultado(
             key=lambda r: _tf_priority(r.get("Temporalidad"))
         )
 
+        if resultados_selected_sorted:
+            logger.info(f"📤 Preparando {len(resultados_selected_sorted)} archivos del activo seleccionado...")
+            for res in resultados_selected_sorted:
+                selected_tasks.append(asyncio.create_task(_upload_enriched(res)))
+
         if resultados_priority_sorted:
-            logger.info(f"📤 Preparando {len(resultados_priority_sorted)} archivos de activos prioritarios...")
+            logger.info(f"📤 Preparando {len(resultados_priority_sorted)} archivos de activos principales...")
             for res in resultados_priority_sorted:
                 priority_tasks.append(asyncio.create_task(_upload_enriched(res)))
 
@@ -14196,17 +14237,17 @@ async def procesar_resultado(
             )
         ))
 
-    # === FASE 1: Ejecutar PRIORITARIOS y liberar monitoreo temprano ===
-    if priority_tasks:
+    # === FASE 1: Ejecutar SELECCIONADO y liberar monitoreo temprano ===
+    if selected_tasks:
         try:
-            t_priority_start = time.time()
-            results = await asyncio.gather(*priority_tasks, return_exceptions=True)
+            t_selected_start = time.time()
+            results = await asyncio.gather(*selected_tasks, return_exceptions=True)
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
-                    logger.debug(f"❌ No se pudo subir JSON prioritario[{i}]: {result}")
+                    logger.debug(f"❌ No se pudo subir JSON seleccionado[{i}]: {result}")
                 elif result:
                     urls_generadas.append(result)
-                    sym = resultados_priority_sorted[i].get("Activo")
+                    sym = resultados_selected_sorted[i].get("Activo")
                     if sym and sym not in ready_for_monitoring:
                         ready_for_monitoring.append(sym)
 
@@ -14220,14 +14261,38 @@ async def procesar_resultado(
                         "updated_at": datetime.now(UTC).isoformat() + "Z",
                     },
                 )
-                logger.info(f"✅ Activos prioritarios listos para monitoreo: {ready_for_monitoring}")
+                logger.info(f"✅ Activo seleccionado listo para monitoreo: {ready_for_monitoring}")
                 logger.info("✅ priority_ready en %.1fs", time.time() - t_proc_start)
 
-            logger.info("✅ uploads prioritarios completados en %.1fs", time.time() - t_priority_start)
+            logger.info("✅ uploads del seleccionado completados en %.1fs", time.time() - t_selected_start)
+        except Exception as e:
+            logger.error(f"[selected uploads] Error crítico: {type(e).__name__}: {e}", exc_info=True)
+
+    # === FASE 2: Ejecutar PRINCIPALES ===
+    if priority_tasks:
+        try:
+            t_priority_start = time.time()
+            results = await asyncio.gather(*priority_tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.debug(f"❌ No se pudo subir JSON principal[{i}]: {result}")
+                elif result:
+                    urls_generadas.append(result)
+                    sym = resultados_priority_sorted[i].get("Activo")
+                    if sym and sym not in ready_for_monitoring:
+                        ready_for_monitoring.append(sym)
+
+            if ready_for_monitoring:
+                fs_actualizar_ejecucion(
+                    exec_id,
+                    ui_resumen={"ready_for_monitoring": ready_for_monitoring},
+                )
+
+            logger.info("✅ uploads de principales completados en %.1fs", time.time() - t_priority_start)
         except Exception as e:
             logger.error(f"[priority uploads] Error crítico: {type(e).__name__}: {e}", exc_info=True)
 
-    # === FASE 2: Ejecutar RESTO + JSON ===
+    # === FASE 3: Ejecutar RESTO + JSON ===
     remaining_tasks = rest_tasks + json_tasks
     if remaining_tasks:
         try:
