@@ -1133,7 +1133,7 @@ else:
 # 🔍 DEBUG: Log de inicialización de executores
 _pred_executor_type = type(_ANALYSIS_PRED_EXECUTOR).__name__ if _ANALYSIS_PRED_EXECUTOR else "None"
 logger.info(f"[Init] Executor predicciones: {_pred_executor_type} (workers={_ANALYSIS_PRED_WORKERS}, use_process={_ANALYSIS_PRED_USE_PROCESS})")
-cache_noticias = {}
+
 subscriptions = {}
 subscriptions_type = {}
 admin_ids = {}
@@ -1149,7 +1149,7 @@ TIME_BETWEEN_MESSAGES = 1  # En segundos
 #DIRECCION_USDT_TRC20 = 'TJ5HvX7EfNCrNFXHGCdGYQ59n5H6pcjm6b' #BINANCE
 DIRECCION_USDT_TRC20 = 'TNYdZMs5eGYcwdY8vEAe59utu2RYhdyquh' #UNSTOPPABLE
 
-# Memoria temporal para las noticias
+# Memoria temporal para las noticias (defaultdict para auto-inicializar símbolos)
 cache_noticias = defaultdict(pd.DataFrame)  # Diccionario donde la clave es el símbolo
 cache_historicos = {}
 ultima_actualizacion_historicos = {}
