@@ -1009,7 +1009,10 @@ class HistoryManager:
             with lock:
                 # Double-check cache after acquiring lock (another worker may have fetched)
                 cache_df_check = load_cached_history(symbol, tf)
-                if not cache_df_check.empty and cache_df == cache_df_check:
+                # Compare last timestamp instead of entire DF to avoid pandas Bool comparison issues
+                if (not cache_df_check.empty and 
+                    len(cache_df) > 0 and len(cache_df_check) > 0 and
+                    cache_df.index[-1] == cache_df_check.index[-1]):
                     # Cache hasn't changed, skip FMP fetch
                     logger.info(f"[FMP-DEDUP] {symbol}/{tf}: Worker ahead already fetched, using cache")
                     new_df = pd.DataFrame()
