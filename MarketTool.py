@@ -815,9 +815,50 @@ def normalize_resample_rule(rule: str) -> str:
         return rule
     return rule.replace("H","h")
 
+
+def _parse_history_refresh_ttl_minutes() -> dict[str, int]:
+    """
+    Cache-first TTL (minutes) per timeframe.
+    Env override:
+      HISTORY_REFRESH_TTL_MINUTES="1min:1,5min:5,15min:15,30min:30,1hour:60,4hour:240,1day:1440,1week:10080"
+    """
+    policy = {
+        "1min": 1,
+        "5min": 5,
+        "15min": 15,
+        "30min": 30,
+        "1hour": 60,
+        "4hour": 240,
+        "1day": 1440,
+        "1week": 10080,
+    }
+
+    raw = str(os.getenv("HISTORY_REFRESH_TTL_MINUTES", "")).strip()
+    if not raw:
+        return policy
+
+    try:
+        for token in raw.split(","):
+            token = token.strip()
+            if not token or ":" not in token:
+                continue
+            k, v = token.split(":", 1)
+            tf = _norm_tf(k.strip())
+            minutes = int(v.strip())
+            if tf and minutes >= 0:
+                policy[tf] = minutes
+    except Exception:
+        pass
+    return policy
+
+
+_HISTORY_REFRESH_TTL_MINUTES = _parse_history_refresh_ttl_minutes()
+
 class HistoryManager:
     def __init__(self, client: FMPClient):
         self.client = client
+        self._quote_cache: dict[str, dict] = {}
+        self._quote_cache_ttl = int(os.environ.get("HISTORY_QUOTE_CACHE_SECONDS", "10"))
 
     def _base_interval_for(self, tf: str) -> str:
         tf = normalize_tf(tf)
@@ -855,13 +896,26 @@ class HistoryManager:
         })
         return g.dropna(subset=["open","high","low","close"])
 
+    def _get_quote_cached(self, symbol: str) -> Optional[float]:
+        """Cache quote locally per TTL to reduce FMP calls."""
+        key = (symbol or "").upper()
+        if not key:
+            return None
+        now = time.time()
+        cached = self._quote_cache.get(key)
+        if cached and (now - cached.get("ts", 0)) < self._quote_cache_ttl:
+            return cached.get("price")
+        price = self.client.quote_last(symbol)
+        self._quote_cache[key] = {"ts": now, "price": price}
+        return price
+
     def _append_realtime_last_bar(self, symbol: str, tf: str, df: pd.DataFrame) -> pd.DataFrame:
         try:
             last_ts = df.index[-1]; now = utc_now()
             lag_min = (now - last_ts).total_seconds() / 60.0
             tol = {"1min":3,"5min":7,"15min":18,"30min":35,"1hour":70,"4hour":260}.get(normalize_tf(tf), 180)
             if lag_min > tol: return df
-            px = self.client.quote_last(symbol)
+            px = self._get_quote_cached(symbol)
             if px is None or math.isnan(px) or px <= 0: return df
             out = df.copy()
             h = float(out.iloc[-1]["high"]); l = float(out.iloc[-1]["low"])
@@ -898,19 +952,11 @@ class HistoryManager:
                 # OMITIDO: No se toma en cuenta la colección 'lists' por tamaño y performance
                 cat_words = {k.strip().upper() for k in categorias_data.keys() if isinstance(k, str) and k.strip()}
                 cat_words.update({"TODOS", "ALL"})
-                self._valid_symbols = set(
-                    str(s).strip().upper()
-                    for s in activos
-                    if isinstance(s, str) and s.strip() and str(s).strip().upper() not in cat_words
-                )
-            except Exception as e:
-                logger.warning(f"[FIRESTORE] Error al recuperar activos válidos: {e}")
-                self._valid_symbols = set()
-        if symbol not in self._valid_symbols:
-            logger.info(f"[FILTRO] Ignorado símbolo no válido: {symbol}")
-            return pd.DataFrame()
-
+            except Exception:
+                pass
+        
         now = utc_now()
+        allow_refresh = cfg.allow_refresh
         if cache_df.empty:
             from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
         else:
@@ -926,6 +972,14 @@ class HistoryManager:
                     last = pytz.UTC.localize(last)
                 elif last.tzinfo != pytz.UTC:
                     last = last.astimezone(pytz.UTC)
+                
+                # ✅ CACHE-FIRST: Skip FMP fetch if cache is fresh within TTL
+                if allow_refresh:
+                    ttl_min = _HISTORY_REFRESH_TTL_MINUTES.get(tf, 1)
+                    age_min = max(0.0, (now - last).total_seconds() / 60.0)
+                    if age_min < ttl_min:
+                        logger.debug(f"[CACHE-FIRST] {symbol}/{tf}: age={age_min:.1f}min < ttl={ttl_min}min, skip FMP fetch")
+                        allow_refresh = False
                     
                 base_tf = self._base_interval_for(tf)
                 from_dt = last + self._timedelta_for(base_tf, 1)
@@ -935,7 +989,7 @@ class HistoryManager:
 
         to_dt = now
         new_df = pd.DataFrame()
-        if cfg.allow_refresh and from_dt < to_dt:
+        if allow_refresh and from_dt < to_dt:
             try:
                 if _is_intraday(tf):
                     base_tf = self._base_interval_for(tf)
