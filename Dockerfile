@@ -54,6 +54,11 @@ ENV PYTHONMALLOC=pymalloc
 # CACHE WARMUP: Optimize GCP downloads with higher concurrency (I/O-bound)
 ENV CACHE_WARMUP_CONCURRENCY=16
 
+# GCS UPLOAD PARALLELISM: Increase for 455+ files
+# 200 concurrent uploads to GCP bucket (default was 30)
+# GCP bucket can handle 10,000 ops/sec, so 200 is safe
+ENV UPLOAD_SEM=200
+
 # GCP/gRPC thread safety settings
 ENV GRPC_PYTHON_BUILD_WITH_CYTHON=false
 ENV GRPC_WORKER_THREADS=1
