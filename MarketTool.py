@@ -1676,15 +1676,11 @@ def get_easyocr_reader(prefer_gpu: bool = True):
         _reader = _try_init(False)
         return _reader
 
-# Inicializar EasyOCR (solo una vez, fuera de la función)
-# Con manejo graceful de fallos si no hay conectividad
-try:
-    reader = get_easyocr_reader(prefer_gpu=True)
-    logger.info("[EasyOCR] Inicialización exitosa")
-except Exception as e:
-    logger.warning(f"[EasyOCR] No se pudo inicializar EasyOCR en startup: {e}")
-    logger.warning("[EasyOCR] El sistema operará sin OCR. La funcionalidad OCR no estará disponible.")
-    reader = None 
+# ✅ LAZY LOADING: EasyOCR se inicializa solo cuando se usa por primera vez
+# Esto evita descargar modelos en el startup bloqueante 
+# (los modelos son ~200MB y pueden tardar minutos en descargar)
+logger.info("[EasyOCR] Lazy loading habilitado - modelos se descargarán en primer uso")
+reader = None  # Se inicializa a demanda en la primera llamada a get_easyocr_reader() 
 
 
 #@profile
