@@ -959,6 +959,7 @@ class HistoryManager:
         allow_refresh = cfg.allow_refresh
         if cache_df.empty:
             from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
+            logger.info(f"[CACHE-FIRST] {symbol}/{tf}: no local cache, will fetch from FMP")
         else:
             try:
                 last = cache_df.index[-1]
@@ -974,12 +975,13 @@ class HistoryManager:
                     last = last.astimezone(pytz.UTC)
                 
                 # ✅ CACHE-FIRST: Skip FMP fetch if cache is fresh within TTL
-                if allow_refresh:
-                    ttl_min = _HISTORY_REFRESH_TTL_MINUTES.get(tf, 1)
-                    age_min = max(0.0, (now - last).total_seconds() / 60.0)
-                    if age_min < ttl_min:
-                        logger.debug(f"[CACHE-FIRST] {symbol}/{tf}: age={age_min:.1f}min < ttl={ttl_min}min, skip FMP fetch")
-                        allow_refresh = False
+                ttl_min = _HISTORY_REFRESH_TTL_MINUTES.get(tf, 1)
+                age_min = max(0.0, (now - last).total_seconds() / 60.0)
+                logger.info(f"[CACHE-FIRST] {symbol}/{tf}: age={age_min:.2f}min, ttl={ttl_min}min, allow_refresh={allow_refresh}")
+                
+                if allow_refresh and age_min < ttl_min:
+                    logger.info(f"[CACHE-FIRST] {symbol}/{tf}: SKIPPING FMP (cache fresh within TTL)")
+                    allow_refresh = False
                     
                 base_tf = self._base_interval_for(tf)
                 from_dt = last + self._timedelta_for(base_tf, 1)
