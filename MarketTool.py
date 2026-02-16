@@ -1096,7 +1096,13 @@ except Exception:
     SERVER_TS = None  # fallback si no está disponible
 
 timezone_country = pytz.UTC
+
+# 📝 LOCAL MEMORY CACHE (per-pod, ephemeral - lost on pod restart)
+# Stores per-user session state: estado, par_seleccionado, cache_realtime, soportes_resistencias_cache
+# ⚠️ NOT PERSISTENT: Use Firestore 'user_states' collection for persistent storage
+# ✅ THREAD-SAFE: Protected by user_states_lock
 user_states = {}
+
 # Timeout aumentado para APIs externas (FMP, Investing) bajo alta concurrencia
 timeout_request_global = 10  # Tiempo máximo de espera en segundos
 max_workers_global = min(32, (os.cpu_count() or 1) * 2) #puede tener 64
@@ -14934,6 +14940,7 @@ def actualizar_estado_usuario(user_chat_id, estado, par_seleccionado=None):
             user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}, "soportes_resistencias_cache": {}}
         user_states[user_chat_id]["estado"] = estado
         user_states[user_chat_id]["par_seleccionado"] = par_seleccionado
+        # Cache local/temporal (se pierde si el pod se reinicia)
         user_states[user_chat_id]["soportes_resistencias_cache"] = {}
 
 #@profile
@@ -14942,6 +14949,7 @@ def limpiar_estado_usuario(user_chat_id):
         if user_chat_id in user_states:
             user_states[user_chat_id]["estado"] = "disponible"
             user_states[user_chat_id]["par_seleccionado"] = None
+            # Cache local/temporal en memoria (no persistido)
             user_states[user_chat_id]["cache_realtime"] = {}
 
 #@profile
@@ -14949,7 +14957,7 @@ def limpiar_soportes_resistencias_cache(user_chat_id):
     with user_states_lock:  # ✅ FIX: Protect against concurrent modifications
         if user_chat_id in user_states:
             user_states[user_chat_id]["soportes_resistencias_cache"] = {}
-            logger.info(f"Cache de soportes y resistencias reseteado para usuario {user_chat_id}.")
+            logger.info(f"[LOCAL CACHE] Cache temporal de soportes/resistencias reseteado para usuario {user_chat_id} en este pod.")
         else:
             # Si no hay estado, inicialízalo como disponible
             user_states[user_chat_id] = {
@@ -14958,7 +14966,7 @@ def limpiar_soportes_resistencias_cache(user_chat_id):
         }
         # ¡Ojo! Este es un chat_id, por eso usamos chat_id=... (no user_id)
         mark_user_state(chat_id=user_chat_id, estado="disponible")
-        logger.info(f"Estado inicializado para usuario {user_chat_id}.")
+        logger.info(f"[Init] Estado inicializado para usuario {user_chat_id}.")
 
 # ----------------- Comandos / Flujos Telegram -----------------
 #@profile
