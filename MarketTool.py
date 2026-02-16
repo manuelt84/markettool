@@ -15013,11 +15013,12 @@ async def manejar_fecha_eventos(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     try:
-        # Inicializa el estado
-        st = user_states.setdefault(user_chat_id, {})
-        st["estado"] = "esperando_fechas"
-        st["fecha_inicio"] = None
-        st["fecha_fin"] = None
+        # Inicializa el estado (protegido con lock para evitar TOCTOU race)
+        with user_states_lock:
+            st = user_states.setdefault(user_chat_id, {})
+            st["estado"] = "esperando_fechas"
+            st["fecha_inicio"] = None
+            st["fecha_fin"] = None
         mark_user_state(chat_id=user_chat_id, estado="esperando_fechas")
 
         await context.bot.send_message(
@@ -15058,11 +15059,12 @@ async def manejar_fecha_noticias_user(update: Update, context: ContextTypes.DEFA
         )
         return
   
-    # Cambiar el estado para capturar fecha+símbolo en el siguiente mensaje
-    st = user_states.setdefault(user_chat_id, {})
-    st["estado"] = "esperando_fechas_noticias_user"
-    st["fecha_inicio"] = None
-    st["fecha_fin"] = None
+    # Cambiar el estado para capturar fecha+símbolo en el siguiente mensaje (protegido con lock)
+    with user_states_lock:
+        st = user_states.setdefault(user_chat_id, {})
+        st["estado"] = "esperando_fechas_noticias_user"
+        st["fecha_inicio"] = None
+        st["fecha_fin"] = None
     mark_user_state(chat_id=user_chat_id, estado="esperando_fechas_noticias_user")
 
     await context.bot.send_message(
@@ -15112,11 +15114,12 @@ async def manejar_fecha_noticias_admin(update: Update, context: ContextTypes.DEF
         )
         return
 
-    # 5) Dejar el estado listo para que el próximo mensaje sea la fecha
-    st = user_states.setdefault(user_chat_id, {})
-    st["estado"] = "esperando_fechas_noticias_admin"
-    st["fecha_inicio"] = None
-    st["fecha_fin"] = None
+    # 5) Dejar el estado listo para que el próximo mensaje sea la fecha (protegido con lock)
+    with user_states_lock:
+        st = user_states.setdefault(user_chat_id, {})
+        st["estado"] = "esperando_fechas_noticias_admin"
+        st["fecha_inicio"] = None
+        st["fecha_fin"] = None
 
     # Si tu mark_user_state acepta 'extra', lo usamos para persistir y sincronizar memoria
     try:
@@ -15163,11 +15166,12 @@ async def analizar_simbolo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Dejar listo para que el próximo mensaje sea el símbolo
-    st = user_states.setdefault(user_chat_id, {})
-    st["estado"] = "esperando_simbolo"
-    st["fecha_inicio"] = None
-    st["fecha_fin"] = None
+    # Dejar listo para que el próximo mensaje sea el símbolo (protegido con lock)
+    with user_states_lock:
+        st = user_states.setdefault(user_chat_id, {})
+        st["estado"] = "esperando_simbolo"
+        st["fecha_inicio"] = None
+        st["fecha_fin"] = None
     mark_user_state(chat_id=user_chat_id, estado="esperando_simbolo")
 
     await update.message.reply_text(
@@ -15257,9 +15261,10 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando el símbolo: {e}")
         finally:
-            # Limpieza de estado local (el runner actualizará a 'en ejecución' cuando corresponda)
-            if user_chat_id in user_states:
-                user_states[user_chat_id]["estado"] = "disponible"
+            # Limpieza de estado local (protegido con lock)
+            with user_states_lock:
+                if user_chat_id in user_states:
+                    user_states[user_chat_id]["estado"] = "disponible"
             mark_user_state(chat_id=user_chat_id, estado="disponible")
         return
 
@@ -15345,10 +15350,12 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando las fechas: {e}")
         finally:
-            if uid_chat in user_states:
-                user_states[uid_chat]["fecha_inicio"] = None
-                user_states[uid_chat]["fecha_fin"] = None
-                user_states[uid_chat]["estado"] = "disponible"
+            # Limpieza de estado (protegido con lock)
+            with user_states_lock:
+                if uid_chat in user_states:
+                    user_states[uid_chat]["fecha_inicio"] = None
+                    user_states[uid_chat]["fecha_fin"] = None
+                    user_states[uid_chat]["estado"] = "disponible"
             mark_user_state(chat_id=uid_chat, estado="disponible")
             if lock_id:
                 try:
@@ -15396,10 +15403,11 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
                 )
                 return
 
-            # Inicializa en estado local
-            st = user_states.setdefault(user_chat_id, {})
-            st["fecha_inicio"] = fecha_inicio
-            st["fecha_fin"] = fecha_fin
+            # Inicializa en estado local (protegido con lock)
+            with user_states_lock:
+                st = user_states.setdefault(user_chat_id, {})
+                st["fecha_inicio"] = fecha_inicio
+                st["fecha_fin"] = fecha_fin
             actualizar_estado_usuario(user_chat_id, "en ejecución")
             mark_user_state(chat_id=user_chat_id, estado="en ejecución")
 
@@ -15457,10 +15465,12 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
         except Exception as e:
             await update.message.reply_text(f"Hubo un error procesando las fechas para noticias: {e}")
         finally:
-            if user_chat_id in user_states:
-                user_states[user_chat_id]["fecha_inicio"] = None
-                user_states[user_chat_id]["fecha_fin"] = None
-                user_states[user_chat_id]["estado"] = "disponible"
+            # Limpieza de estado (protegido con lock)
+            with user_states_lock:
+                if user_chat_id in user_states:
+                    user_states[user_chat_id]["fecha_inicio"] = None
+                    user_states[user_chat_id]["fecha_fin"] = None
+                    user_states[user_chat_id]["estado"] = "disponible"
             mark_user_state(chat_id=user_chat_id, estado="disponible")
             if lock_id:
                 try:
