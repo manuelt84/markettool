@@ -7015,7 +7015,8 @@ async def cargar_datos_historicos_inicial():
     try:
         hist_dir = APP_CONFIG.hist_dir if hasattr(APP_CONFIG, "hist_dir") else CARPETA_HISTORICOS
         if not os.path.exists(hist_dir):
-            logger.warning("[Startup] Historical folder not found: %s", hist_dir)
+            logger.warning("[Startup] Historical folder not found: %s - creating it", hist_dir)
+            os.makedirs(hist_dir, exist_ok=True)
             cache_historicos = {}
             return
 
@@ -18316,6 +18317,8 @@ async def menu_zonas_horarias(update, context):
 #@profile
 async def cargar_noticias_en_memoria():
     global cache_noticias
+    # ✅ Crear carpeta si no existe
+    os.makedirs(CARPETA_FOREX_NEWS, exist_ok=True)
     for archivo in os.listdir(CARPETA_FOREX_NEWS):
         if archivo.endswith("_noticias.json"):
             partes_archivo = archivo.split("_")
@@ -18362,6 +18365,8 @@ async def guardar_noticias_forex():
     Guarda las noticias Forex almacenadas en `cache_noticias` en archivos locales.
     """
     try:
+        # ✅ Crear carpeta si no existe
+        os.makedirs(CARPETA_FOREX_NEWS, exist_ok=True)
         for symbol, df_local in cache_noticias.items():
             archivo_cache = os.path.join(CARPETA_FOREX_NEWS, f"{symbol}_noticias.json")
             if 'publishedDate' in df_local.columns:
@@ -18379,6 +18384,8 @@ async def guardar_datos_historicos():
     """
     async with guardar_lock:
         try:
+            # ✅ Crear carpeta si no existe
+            os.makedirs(CARPETA_HISTORICOS, exist_ok=True)
             for symbol, temporalidades in cache_historicos.items():
                 if not temporalidades:
                     logger.info(f"Advertencia: No se encontraron datos para el símbolo {symbol}.")
