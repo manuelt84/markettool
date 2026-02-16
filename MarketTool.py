@@ -1414,44 +1414,60 @@ def _sweep_stuck_user_states_once():
     cutoff = now - USER_STATE_STALE_SECONDS
 
     try:
-        # No filtramos por campo de tiempo porque puede variar el tipo; filtramos en cliente.
-        docs = db.collection("user_states").stream()
-        batch = db.batch()
-        pending = 0
+        # FIXED: Wrap Firestore .stream() with timeout using ThreadPoolExecutor
+        # If Firestore is slow/down, don't block the watchdog indefinitely
+        def _load_and_sweep():
+            # No filtramos por campo de tiempo porque puede variar el tipo; filtramos en cliente.
+            docs = db.collection("user_states").stream()
+            batch = db.batch()
+            pending = 0
 
-        for doc in docs:
-            data = doc.to_dict() or {}
+            for doc in docs:
+                data = doc.to_dict() or {}
 
-            estado = str(data.get("estado") or "").lower()
-            if estado not in USER_STATE_BUSY_VALUES:
-                continue
+                estado = str(data.get("estado") or "").lower()
+                if estado not in USER_STATE_BUSY_VALUES:
+                    continue
 
-            # preferimos updated_at_unix, si no, intentamos con otros
-            ts = (
-                _as_unix(data.get("updated_at_unix"))
-                or _as_unix(data.get("updated_at"))
-                or _as_unix(data.get("fecha_inicio"))
-            )
-
-            # si nunca tuvo timestamp o está vencido, liberamos
-            if (ts is None) or (ts < cutoff):
-                batch.set(
-                    doc.reference,
-                    {
-                        "estado": "disponible",
-                        "updated_at_unix": now,
-                        "fecha_fin": datetime.now(timezone.utc).isoformat(),
-                    },
-                    merge=True,
+                # preferimos updated_at_unix, si no, intentamos con otros
+                ts = (
+                    _as_unix(data.get("updated_at_unix"))
+                    or _as_unix(data.get("updated_at"))
+                    or _as_unix(data.get("fecha_inicio"))
                 )
-                pending += 1
-                # evita batches gigantes
-                if pending % 400 == 0:
-                    batch.commit()
-                    batch = db.batch()
 
-        if pending:
-            batch.commit()
+                # si nunca tuvo timestamp o está vencido, liberamos
+                if (ts is None) or (ts < cutoff):
+                    batch.set(
+                        doc.reference,
+                        {
+                            "estado": "disponible",
+                            "updated_at_unix": now,
+                            "fecha_fin": datetime.now(timezone.utc).isoformat(),
+                        },
+                        merge=True,
+                    )
+                    pending += 1
+                    # evita batches gigantes
+                    if pending % 400 == 0:
+                        batch.commit()
+                        batch = db.batch()
+
+            if pending:
+                batch.commit()
+            
+            return pending
+        
+        # Execute with timeout (30 seconds): Firestore usually responds in <5s
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_load_and_sweep)
+            try:
+                pending = future.result(timeout=30)
+                logger.debug(f"[watchdog] cleaned {pending} stuck user states")
+            except FutureTimeoutError:
+                logger.error("[watchdog] Firestore timeout after 30s - skipping this sweep")
+                future.cancel()
 
     except Exception as e:
         logger.warning(f"[watchdog] error barriendo user_states: {e}")
@@ -4324,39 +4340,59 @@ def detectar_categoria(event):
 # Cargar la lista de chat_ids desde el archivo
 #@profile
 async def cargar_admin_ids():
-    """Carga los chat_ids desde Firestore o devuelve una lista vacía si no hay datos."""
-    try:
-        # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread to prevent event loop blocking
-        def _sync_load_admin_ids():
-            collection_ref = db.collection("admin_ids")
-            docs = collection_ref.stream()
-            return [doc.to_dict().get("chat_id") for doc in docs if doc.exists]
-        
-        admin_ids = await asyncio.to_thread(_sync_load_admin_ids)
-        return admin_ids
-    except Exception as e:
-        print(f"Error al cargar admin_ids desde Firestore: {e}")
-        return [] 
+    """Carga los chat_ids desde Firestore o devuelve una lista vacía si no hay datos.
+    
+    Implementa retry con exponential backoff para mayor confiabilidad.
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread to prevent event loop blocking
+            def _sync_load_admin_ids():
+                collection_ref = db.collection("admin_ids")
+                docs = collection_ref.stream()
+                return [doc.to_dict().get("chat_id") for doc in docs if doc.exists]
+            
+            admin_ids = await asyncio.to_thread(_sync_load_admin_ids)
+            return admin_ids
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                logger.warning(f"[cargar_admin_ids] Attempt {attempt + 1}/{max_retries} failed: {e}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"[cargar_admin_ids] Failed after {max_retries} retries: {e}")
+                return []  # Fallback: empty list 
 
 # Cargar la lista de chat_ids desde el archivo
 #@profile
 async def cargar_chat_ids():
-    """Carga los chat_ids desde Firestore o devuelve un diccionario vacío si no hay datos."""
-    try:
-        # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread to prevent event loop blocking
-        def _sync_load_chat_ids():
-            collection_ref = db.collection("chat_ids")
-            docs = collection_ref.stream()
-            return {
-                doc.id: doc.to_dict()
-                for doc in docs if doc.exists
-            }
-        
-        chat_ids = await asyncio.to_thread(_sync_load_chat_ids)
-        return chat_ids
-    except Exception as e:
-        print(f"Error al cargar chat_ids desde Firestore: {e}")
-        return {}  # Devuelve un diccionario vacío en caso de error
+    """Carga los chat_ids desde Firestore o devuelve un diccionario vacío si no hay datos.
+    
+    Implementa retry con exponential backoff para mayor confiabilidad.
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread to prevent event loop blocking
+            def _sync_load_chat_ids():
+                collection_ref = db.collection("chat_ids")
+                docs = collection_ref.stream()
+                return {
+                    doc.id: doc.to_dict()
+                    for doc in docs if doc.exists
+                }
+            
+            chat_ids = await asyncio.to_thread(_sync_load_chat_ids)
+            return chat_ids
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                logger.warning(f"[cargar_chat_ids] Attempt {attempt + 1}/{max_retries} failed: {e}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"[cargar_chat_ids] Failed after {max_retries} retries: {e}")
+                return {}  # Fallback: empty dict
 
 # Guardar la lista de chat_ids en el archivo
 #@profile
