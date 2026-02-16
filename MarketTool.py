@@ -4170,18 +4170,8 @@ def mark_user_state(
             st3["estado"] = estado
             user_states[str(user_id)] = st3
     
-    # ✅ NUEVO: Invalidar caché distribuido (sync) para que otros pods lo actualicen
-    # ⚠️ Usar invalidate() para respetar protecciones asincrónicas de la caché
-    import asyncio
-    try:
-        if uuid:
-            asyncio.create_task(_USER_STATE_CACHE.invalidate(uuid))
-        if chat_id:
-            asyncio.create_task(_USER_STATE_CACHE.invalidate(str(chat_id)))
-        if user_id:
-            asyncio.create_task(_USER_STATE_CACHE.invalidate(str(user_id)))
-    except Exception:
-        pass  # Si no podemos invalidar, continuar
+    # Nota: El cache UserStateCache se refresca automáticamente por TTL
+    # No es necesario invalidar manualmente desde contexto síncrono
 
 
 # ------------------------------------------------------------------------------------
