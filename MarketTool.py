@@ -55,6 +55,7 @@ from telegram import InputFile
 from telegram.error import TimedOut
 from telegram.ext import ApplicationBuilder, Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters, CallbackContext
 from telegram.helpers import escape_markdown
+from telegram.request import HTTPXRequest
 from textblob import TextBlob
 from textwrap import wrap
 import threading
@@ -18577,8 +18578,15 @@ async def enviar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📢 ¿A quién deseas enviar el mensaje?", reply_markup=reply_markup)
 
 
-# Crear la aplicación del bot de Telegram
-application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
+# Crear la aplicación del bot de Telegram con timeouts aumentados
+# Solución para telegram.error.TimedOut: httpcore.ConnectTimeout en redes lentas
+telegram_request = HTTPXRequest(
+    connect_timeout=30.0,  # Time to establish connection (default: 5.0)
+    read_timeout=30.0,     # Time to read response (default: 5.0)
+    write_timeout=30.0,    # Time to send request (default: 5.0)
+    pool_timeout=10.0,     # Time to get connection from pool (default: 1.0)
+)
+application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).request(telegram_request).build()
 
 # Configurar manejadores
 application.add_handler(CommandHandler('start', start))
