@@ -20,13 +20,12 @@ try:
     
     print("[EasyOCR] Descargando modelos de detección y reconocimiento...")
     
-    # Descargar modelos para inglés y español (los más comunes)
+    # Descargar modelos solo para inglés (coincide con runtime)
     # Esto descargará:
-    # - detection_craft.pth (para detección)
-    # - en_dict.txt (English OCR)
-    # - es_dict.txt (Spanish OCR) si está disponible
+    # - craft_mlt_25k.pth (modelo de detección)
+    # - english_g2.pth (modelo de reconocimiento)
     reader = easyocr.Reader(
-        ['en', 'es'],
+        ['en'],  # Solo inglés, coincide con get_easyocr_reader()
         gpu=False,  # CPU durante el build
         model_storage_directory='/app/models/easyocr',
         user_network_directory='/app/models/easyocr',
@@ -34,18 +33,10 @@ try:
     )
     
     print("[EasyOCR] ✅ Modelos descargados correctamente en /app/models/easyocr")
-    
-    # Test rápido
-    print("[EasyOCR] Realizando test de inicialización...")
-    test_result = reader.readtext(
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a5/Tsunami_by_hokusai_19th_century.jpg/1200px-Tsunami_by_hokusai_19th_century.jpg"
-    )
-    print(f"[EasyOCR] ✅ Test exitoso: {len(test_result)} textos detectados")
+    print("[EasyOCR] ✅ Todas las dependencias pre-cacheadas exitosamente")
     
 except Exception as e:
     print(f"[EasyOCR] ⚠️  Error descargando modelos: {e}", file=sys.stderr)
     print(f"[EasyOCR] ℹ️  El sistema intentará descargar en runtime si es necesario", file=sys.stderr)
     # No fallar el build si falla esto - es mejor tener imagen que nada
     sys.exit(0)
-
-print("[EasyOCR] ✅ Todas las dependencias pre-cacheadas exitosamente")

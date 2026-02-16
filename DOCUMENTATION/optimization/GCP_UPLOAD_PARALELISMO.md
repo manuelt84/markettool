@@ -81,7 +81,7 @@ batch_upload_files(
 # GCS Configuration
 GCS_ENABLED: "true"
 GCS_BUCKET_NAME: "markettool_bucket"
-UPLOAD_SEM: "60"                        # ← NUEVO: 30→60
+UPLOAD_SEM: "200"                        # ← NUEVO: 30→60
 GCP_UPLOAD_MODE: "core"                 # ← NUEVO: Modo optimización
 ```
 

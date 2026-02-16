@@ -25,7 +25,7 @@ data:
   # GCS Configuration
   GCS_ENABLED: "true"
   GCS_BUCKET_NAME: "markettool_bucket"
-  UPLOAD_SEM: "60"                        # Max concurrent uploads to GCS
+  UPLOAD_SEM: "200"                        # Max concurrent uploads to GCS
   GCP_UPLOAD_MODE: "core"                 # "core" (small) | "extended" (medium) | "full" (all)
   
   # Entries/Signals - Quality Over Quantity (v3.1)

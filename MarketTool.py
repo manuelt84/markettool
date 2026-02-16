@@ -1654,7 +1654,8 @@ def get_easyocr_reader(prefer_gpu: bool = True):
             return easyocr.Reader(
                 ['en'],
                 gpu=gpu_flag,
-                model_storage_directory=model_dir
+                model_storage_directory=model_dir,
+                user_network_directory=model_dir  # ✅ Crítico para persistir modelos
             )
 
         # 1) Intentar con GPU si se prefiere y está disponible
