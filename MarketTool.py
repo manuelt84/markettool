@@ -4155,13 +4155,17 @@ def mark_user_state(
             user_states[str(user_id)] = st3
     
     # ✅ NUEVO: Invalidar caché distribuido (sync) para que otros pods lo actualicen
-    # ⚠️ SYNC invalidate porque se llama desde asyncio.to_thread()
-    if uuid and uuid in _USER_STATE_CACHE._local_cache:
-        del _USER_STATE_CACHE._local_cache[uuid]
-    if chat_id and str(chat_id) in _USER_STATE_CACHE._local_cache:
-        del _USER_STATE_CACHE._local_cache[str(chat_id)]
-    if user_id and str(user_id) in _USER_STATE_CACHE._local_cache:
-        del _USER_STATE_CACHE._local_cache[str(user_id)]
+    # ⚠️ Usar invalidate() para respetar protecciones asincrónicas de la caché
+    import asyncio
+    try:
+        if uuid:
+            asyncio.create_task(_USER_STATE_CACHE.invalidate(uuid))
+        if chat_id:
+            asyncio.create_task(_USER_STATE_CACHE.invalidate(str(chat_id)))
+        if user_id:
+            asyncio.create_task(_USER_STATE_CACHE.invalidate(str(user_id)))
+    except Exception:
+        pass  # Si no podemos invalidar, continuar
 
 
 # ------------------------------------------------------------------------------------
@@ -6938,10 +6942,25 @@ class SharedNewsCache:
 
     def invalidate(self, symbol: str):
         """Invalida caché local para un símbolo."""
-        if symbol in self._local_cache:
-            del self._local_cache[symbol]
-            if logger.isEnabledFor(logging.INFO):
-                logger.info(f"[SharedNewsCache] Invalidated: {symbol}")
+        # ✅ SYNC invalidate para uso desde contextos que no pueden esperar async
+        # Si estás en async context, considera usar asyncio.create_task para invalidate_async
+        try:
+            # En sync context, simplemente marca como invalidado con tiempo cero
+            if symbol in self._local_cache:
+                # Usar una marca de tiempo antigua para forzar refresh en próxima lectura
+                self._local_cache[symbol] = (0, self._local_cache[symbol][1])
+                if logger.isEnabledFor(logging.INFO):
+                    logger.info(f"[SharedNewsCache] Invalidated: {symbol}")
+        except Exception:
+            pass
+    
+    async def _invalidate_async(self, symbol: str):
+        """Versión async segura de invalidate con lock."""
+        async with self._lock:
+            if symbol in self._local_cache:
+                del self._local_cache[symbol]
+                if logger.isEnabledFor(logging.INFO):
+                    logger.info(f"[SharedNewsCache] Async Invalidated: {symbol}")
 
     def invalidate_many(self, symbols: Iterable[str]):
         """Invalida caché local para múltiples símbolos."""
