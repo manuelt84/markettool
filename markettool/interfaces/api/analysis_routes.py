@@ -1,0 +1,122 @@
+"""API routes for analysis and trading signals."""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from markettool.core.errors import AnalysisError, InsufficientDataError
+
+if TYPE_CHECKING:
+    from markettool.interfaces.containers import DIContainer
+    from flask import Flask
+
+
+def register_analysis_routes(app: Flask, container: DIContainer, logger: logging.Logger) -> None:
+    """
+    Register analysis and signal routes.
+    
+    Args:
+        app: Flask application
+        container: Dependency container with use cases
+        logger: Logger instance
+    """
+    
+    @app.route("/api/v1/analysis/<symbol>/<timeframe>", methods=["GET"])
+    async def analyze_symbol(symbol: str, timeframe: str):
+        """
+        Run technical analysis on symbol and generate trading signals.
+        
+        Query params:
+            - analysis_type: Type of analysis (default: technical)
+        """
+        try:
+            from flask import request
+            
+            analysis_type = request.args.get("analysis_type", "technical")
+            
+            # First get historical data
+            historico = await container.get_historicos.execute(
+                symbol=symbol,
+                timeframe=timeframe,
+                use_cache=True,
+            )
+            
+            # Run analysis
+            signals = await container.run_analysis.execute(
+                historico=historico,
+                analysis_type=analysis_type,
+            )
+            
+            return {
+                "status": "ok",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "analysis_type": analysis_type,
+                "signals": [s.to_dict() for s in signals.signals],
+                "signal_count": len(signals),
+            }, 200
+        
+        except InsufficientDataError as e:
+            logger.warning(f"Insufficient data: {e}")
+            return {"status": "error", "message": str(e)}, 422
+        
+        except AnalysisError as e:
+            logger.warning(f"Analysis failed: {e}")
+            return {"status": "error", "message": str(e)}, 422
+        
+        except Exception as e:
+            logger.exception(f"Analysis failed: {e}")
+            return {"status": "error", "message": "Internal server error"}, 500
+    
+    @app.route("/api/v1/analysis/batch", methods=["POST"])
+    async def analyze_batch():
+        """
+        Run analysis on multiple symbols.
+        
+        Request body:
+            {
+                "symbols": ["AAPL", "GOOGL"],
+                "timeframe": "1day",
+                "analysis_type": "technical"
+            }
+        """
+        try:
+            from flask import request
+            
+            data = request.get_json()
+            symbols = data.get("symbols", [])
+            timeframe = data.get("timeframe", "1day")
+            analysis_type = data.get("analysis_type", "technical")
+            
+            if not symbols:
+                return {"status": "error", "message": "Missing symbols"}, 400
+            
+            results = {}
+            for symbol in symbols:
+                try:
+                    historico = await container.get_historicos.execute(
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        use_cache=True,
+                    )
+                    signals = await container.run_analysis.execute(
+                        historico=historico,
+                        analysis_type=analysis_type,
+                    )
+                    results[symbol] = [s.to_dict() for s in signals.signals]
+                except Exception as e:
+                    logger.error(f"Failed to analyze {symbol}: {e}")
+                    results[symbol] = {"error": str(e)}
+            
+            return {
+                "status": "ok",
+                "results": results,
+                "count": len([r for r in results.values() if not isinstance(r, dict) or "error" not in r]),
+            }, 200
+        
+        except Exception as e:
+            logger.exception(f"Batch analysis failed: {e}")
+            return {"status": "error", "message": str(e)}, 500
+    
+    logger.info("Analysis routes registered")

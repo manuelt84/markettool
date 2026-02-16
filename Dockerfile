@@ -43,11 +43,14 @@ ENV MALLOC_MMAP_THRESHOLD_=100000
 ENV ANALYSIS_PRED_USE_PROCESS=true
 ENV PYTHONMALLOC=pymalloc
 
-# � CACHE WARMUP: Optimize GCP downloads with higher concurrency (I/O-bound)
+# CACHE WARMUP: Optimize GCP downloads with higher concurrency (I/O-bound)
 ENV CACHE_WARMUP_CONCURRENCY=16
 
-# �🔐 GCP/gRPC thread safety settings
+# GCP/gRPC thread safety settings
 ENV GRPC_PYTHON_BUILD_WITH_CYTHON=false
 ENV GRPC_WORKER_THREADS=1
 
-CMD ["python", "MarketTool.py", "--host", "0.0.0.0", "--port", "8080"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+	CMD curl -fsS http://localhost:8080/healthz || exit 1
+
+CMD ["python", "-m", "markettool.bootstrap"]

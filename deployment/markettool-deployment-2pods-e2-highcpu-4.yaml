@@ -56,20 +56,28 @@ spec:
           readOnly: true
         readinessProbe:
           httpGet:
-            path: /healthz
+            path: /ready  # Phase 8: Verifica que el servicio esté listo para tráfico
             port: 8080
-          initialDelaySeconds: 5
+          initialDelaySeconds: 10
           timeoutSeconds: 5
-          periodSeconds: 120  # Verifica disponibilidad cada 60s
-          failureThreshold: 10
+          periodSeconds: 120
+          failureThreshold: 3
         livenessProbe:
           httpGet:
-            path: /healthz
+            path: /healthz  # Verifica que el proceso esté vivo
             port: 8080
-          initialDelaySeconds: 5
+          initialDelaySeconds: 15
           timeoutSeconds: 5
-          periodSeconds: 120  # Verifica cada 60s si el Pod sigue vivo
+          periodSeconds: 120
           failureThreshold: 10
+        startupProbe:
+          httpGet:
+            path: /startup  # Phase 8: Permite tiempo extra para warmup inicial
+            port: 8080
+          initialDelaySeconds: 0
+          timeoutSeconds: 5
+          periodSeconds: 10
+          failureThreshold: 30  # 5 minutos máximo para startup (10s * 30)
         resources:
           requests:
             cpu: "1000m"  # Reducir CPU para permitir más Pods

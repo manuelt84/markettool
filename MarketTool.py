@@ -111,6 +111,10 @@ import uuid
 import uvicorn
 import warnings
 import threading
+
+from markettool.core.config import AppConfig, load_config
+from markettool.infra.http.session import build_session
+from markettool.infra.fmp import FMPClient, FMPError, FMPPlanNotAllowed, normalize_tf
 try:
     import psutil
 except Exception:
@@ -121,60 +125,7 @@ except Exception:
 # Config & Infra (Production-grade)
 # ======================================================================
 
-@dataclass
-class AppConfig:
-    storage_format: str = field(default_factory=lambda: os.environ.get("STORAGE_FORMAT", "json").strip().lower())
-    fmp_plan: str = field(default_factory=lambda: (os.environ.get("FMP_PLAN") or "premium").strip().lower())
-    fmp_api_key: str = field(default_factory=lambda: os.environ.get("API_FMP", ""))
-    http_timeout: int = field(default_factory=lambda: int(os.environ.get("HTTP_TIMEOUT", "10")))
-    http_retries: int = field(default_factory=lambda: int(os.environ.get("HTTP_RETRIES", "3")))
-    http_backoff: float = field(default_factory=lambda: float(os.environ.get("HTTP_BACKOFF", "1.8")))
-    hist_dir: str = field(default_factory=lambda: os.environ.get("HIST_DIR", "historicos"))
-    log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
-    econ_chunk_days: int= field(default_factory=lambda: int(os.environ.get("ECON_CHUNK_DAYS","31")))
-    cache_ttl_config: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_CONFIG", "600")))
-    cache_ttl_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_HISTORICOS", "7200")))
-    cache_max_size_historicos: int = field(default_factory=lambda: int(os.environ.get("CACHE_MAX_SIZE_HISTORICOS", "100")))
-    cache_warmup_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_ENABLED", "true").lower() == "true")
-    cache_warmup_blocking_startup: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_BLOCKING_STARTUP", "true").lower() == "true")
-    cache_warmup_interval_minutes: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_INTERVAL_MINUTES", "240")))
-    cache_warmup_max_ram_percent: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_MAX_RAM_PERCENT", "80")))
-    cache_warmup_concurrency: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "16")))
-    cache_warmup_news_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_NEWS_ENABLED", "false").lower() == "true")
-    cache_warmup_events_enabled: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_EVENTS_ENABLED", "false").lower() == "true")
-    cache_warmup_news_limit: int = field(default_factory=lambda: int(os.environ.get("CACHE_WARMUP_NEWS_LIMIT", "1")))
-    cache_warmup_leader_only: bool = field(default_factory=lambda: os.environ.get("CACHE_WARMUP_LEADER_ONLY", "false").lower() == "true")
-
-
-
-# --------- .env loader (supports --env / -env) ---------
-import sys, argparse
-try:
-    from dotenv import load_dotenv
-except Exception:
-    load_dotenv = None
-
-def _early_load_env():
-    # Allow: python script.py --env .env   or   -env .env
-    env_path = None
-    if ('--env' in sys.argv) or ('-env' in sys.argv):
-        p = argparse.ArgumentParser(add_help=False)
-        p.add_argument('--env','-env', dest='env_path', default='.env')
-        args, _ = p.parse_known_args()
-        env_path = args.env_path
-    # If dotenv is present, load either explicit or default .env
-    if load_dotenv:
-        if env_path:
-            load_dotenv(env_path)
-        else:
-            # Load default .env if exists
-            import os
-            if os.path.exists('.env'):
-                load_dotenv('.env')
-
-_early_load_env()
-# -------------------------------------------------------
-APP_CONFIG = AppConfig()
+APP_CONFIG = load_config()
 FMP_INTRADAY_SOURCE_TZ = os.getenv("FMP_INTRADAY_SOURCE_TZ", "America/New_York")
 
 FMP_MAX_CONCURRENCY = int(os.environ.get("FMP_MAX_CONCURRENCY", "6"))
@@ -237,25 +188,7 @@ logger.info(
 )
 
 # HTTP Session with retries
-def _build_session(retries: int, backoff: float) -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        read=retries,
-        connect=retries,
-        status=retries,
-        backoff_factor=backoff,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET","POST","PUT","DELETE","HEAD","OPTIONS"]),
-        raise_on_status=False,
-    )
-    # pool_maxsize aumentado para soportar 32 workers * 4 pods = 128 análisis concurrentes
-    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=50, pool_connections=50)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-HTTP_SESSION = _build_session(APP_CONFIG.http_retries, APP_CONFIG.http_backoff)
+HTTP_SESSION = build_session(APP_CONFIG.http_retries, APP_CONFIG.http_backoff)
 
 # Graceful shutdown hooks (optional for long-running services)
 _SHOULD_STOP = False
@@ -312,26 +245,8 @@ def safe_op(default=None, log: logging.Logger | None = None):
 # FMP historicals — UTC-first with cache & resampling
 # ======================================================================
 
-class FMPError(Exception): ...
-class FMPPlanNotAllowed(FMPError): ...
-
-def normalize_tf(tf: str) -> str:
-    m = (tf or "").strip().lower()
-    tf_map = {
-        "1m":"1min","1min":"1min",
-        "5m":"5min","5min":"5min",
-        "15m":"15min","15min":"15min",
-        "30m":"30min","30min":"30min",
-        "1h":"1hour","h1":"1hour","1hour":"1hour",
-        "4h":"4hour","h4":"4hour","4hour":"4hour",
-        "1d":"1day","d1":"1day","1day":"1day",
-        "1w":"1week","w1":"1week","1week":"1week",
-        "1mo":"1month","1month":"1month",
-    }
-    return tf_map.get(m, m)
-
 def _is_intraday(tf: str) -> bool:
-    return normalize_tf(tf) in {"1min","5min","15min","30min","1hour","4hour"}
+    return normalize_tf(tf) in {"1min", "5min", "15min", "30min", "1hour", "4hour"}
 
 DEFAULT_FMP_WINDOWS: Dict[str, int] = {
     "1min":  2400, "5min": 2000, "15min": 1600, "30min": 1600,
@@ -527,107 +442,6 @@ def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
     return True
 
 
-@dataclass
-class FMPClient:
-    api_key: str
-    plan: str = "premium"
-    timeout: int = field(default_factory=lambda: APP_CONFIG.http_timeout)
-
-    def _get(self, url: str, params: Dict[str, Any] | None = None, symbol: str | None = None) -> requests.Response:
-        params = dict(params or {})
-        params.setdefault("apikey", self.api_key)
-        r = _fmp_http_get(url, params=params, timeout=self.timeout, symbol=symbol)
-        if r.status_code == 402:
-            raise FMPPlanNotAllowed(f"402 Payment Required: {url}")
-        return r
-
-    @safe_op(default=pd.DataFrame(), log=logging.getLogger("MarketTool.FMP"))
-    def historical_intraday(self, symbol: str, interval: str,
-                            from_utc: datetime, to_utc: datetime) -> pd.DataFrame:
-        interval = normalize_tf(interval)
-        assert interval in {"1min","5min","15min","30min","1hour","4hour"}
-        fmt = "%Y-%m-%d %H:%M:%S"
-        url = f"https://financialmodelingprep.com/api/v3/historical-chart/{interval}/{symbol}"
-        logging.info(f"[FMP] Historical Intraday {url}")
-        r = self._get(url, {"from": from_utc.strftime(fmt), "to": to_utc.strftime(fmt)}, symbol=symbol)
-        if r.status_code != 200: return pd.DataFrame()
-        data = r.json() or []
-        if not isinstance(data, list) or not data: return pd.DataFrame()
-        df = pd.DataFrame(data)
-        if "date" not in df.columns: return pd.DataFrame()
-        cols = [c for c in ["date","open","high","low","close","volume"] if c in df.columns]
-        df = df[cols].copy()
-        # Parse naive timestamp from FMP intraday, localize to source tz, then convert to UTC
-        s = pd.to_datetime(df["date"], errors="coerce")
-        try:
-            tz_src = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)
-        except Exception:
-            tz_src = pytz.UTC
-        try:
-            # If series is tz-naive, localize; if tz-aware, convert
-            if getattr(s.dt, "tz", None) is None:
-                try:
-                    s = s.dt.tz_localize(tz_src, ambiguous="infer", nonexistent="shift_forward")
-                except Exception:
-                    s = s.dt.tz_localize(tz_src, ambiguous="NaT", nonexistent="shift_forward")
-            else:
-                s = s.dt.tz_convert(tz_src)
-        except Exception:
-            try:
-                s = s.dt.tz_localize(tz_src)
-            except Exception:
-                pass
-        s = s.dt.tz_convert(pytz.UTC)
-        df["date"] = s
-        df = df.dropna(subset=["date"]).set_index("date").sort_index()
-        for c in ["open","high","low","close","volume"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-                return df
-
-    @safe_op(default=pd.DataFrame(), log=logging.getLogger("MarketTool.FMP"))
-    def historical_eod(self, symbol: str, from_date: datetime, to_date: datetime) -> pd.DataFrame:
-        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
-        logging.info(f"[FMP] Historical Daily {url}")
-        r = self._get(url, {"from": from_date.strftime("%Y-%m-%d"), "to": to_date.strftime("%Y-%m-%d")}, symbol=symbol)
-        if r.status_code != 200: return pd.DataFrame()
-        payload = r.json() or {}; hist = payload.get("historical") or []
-        if not hist: return pd.DataFrame()
-
-        df = pd.DataFrame(hist)
-        if "date" not in df.columns: return pd.DataFrame()
-
-        cols = [c for c in ["date","open","high","low","close","volume"] if c in df.columns]
-        df = df[cols].copy()
-
-        ny = ZoneInfo("America/New_York")
-        dt_day =  pd.to_datetime(df["date"], errors="coerce")
-
-        df["date"] = (
-        dt_day.dt.tz_localize(ny)
-              .dt.tz_convert("UTC")
-              .dt.normalize() + pd.Timedelta(hours=20)
-              )
-              
-        df = df.dropna(subset=["date"]).set_index("date").sort_index()
-        for c in ["open","high","low","close","volume"]:
-            if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df
-
-    @safe_op(default=None, log=logging.getLogger("MarketTool.FMP"))
-    def quote_last(self, symbol: str) -> Optional[float]:
-        url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}"
-        logging.info(f"[FMP] Quote {url}")
-        r = self._get(url, {}, symbol=symbol)
-        if r.status_code != 200: return None
-        arr = r.json() or []
-        if not arr or not isinstance(arr, list): return None
-        q = arr[0]
-        for k in ("price","c","close","previousClose"):
-            if k in q and q[k] is not None:
-                try: return float(q[k])
-                except Exception: continue
-        return None
 
 # Cache CSV
 def _safe_symbol_for_filename(symbol: str) -> str:
@@ -1150,7 +964,15 @@ class HistoryManager:
         return out
 
 # Public API (overrides legacy)
-_FMP = FMPClient(api_key=APP_CONFIG.fmp_api_key, plan=APP_CONFIG.fmp_plan)
+_FMP = FMPClient(
+    api_key=APP_CONFIG.fmp_api_key,
+    plan=APP_CONFIG.fmp_plan,
+    timeout=APP_CONFIG.http_timeout,
+    http_session=HTTP_SESSION,
+    intraday_source_tz=FMP_INTRADAY_SOURCE_TZ,
+    max_concurrency=FMP_MAX_CONCURRENCY,
+    per_symbol_concurrency=FMP_PER_SYMBOL_CONCURRENCY,
+)
 _HIST = HistoryManager(client=_FMP)
 
 def obtener_datos_historicos(symbol: str, temporalidad: str,
@@ -1272,10 +1094,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # Para httpx
 logging.getLogger("urllib3").setLevel(logging.WARNING)  # Para requests
 
 # API Key de FMP (Premium)
-API_KEY = (os.environ.get("API_FMP") or os.environ.get("API_FMP") or "").strip()
+API_KEY = (os.environ.get("API_FMP") or os.environ.get("FMP_API_KEY") or "").strip()
 if not API_KEY:
     raise RuntimeError("Falta API_FMP (o FMP_API_KEY) en el entorno/.env. Usa --env .env o define la variable antes de ejecutar.")
+
+# Firestore and GCS clients (public exports for bootstrap.py and hexagonal architecture)
 db = firestore.Client()
+storage_client = storage.Client()  # GCS client instance (keep 'storage' module for other uses)
 
 # NOTE: Don't modify LOGGING_CONFIG here - it would add duplicate handlers
 # The root logger is already configured at line 182
@@ -5175,6 +5000,66 @@ def is_metadata_stale(metadata: Dict[str, Any]) -> bool:
 
 
 # ======================================================================
+# Historicos cache/service overrides (module extraction)
+# ======================================================================
+from markettool.infra.cache.historicos_cache import (
+    _safe_symbol_for_filename as _hist_safe_symbol_for_filename,
+    _hist_base as _hist_hist_base,
+    _hist_path_csv as _hist_hist_path_csv,
+    _hist_path_json as _hist_hist_path_json,
+    _hist_path as _hist_hist_path,
+    _save_local_history_df as _hist_save_local_history_df,
+    _load_local as _hist_load_local,
+    _ensure_cols as _hist_ensure_cols,
+    LazyHistoricosLoader as _LazyHistoricosLoader,
+    _LAZY_HIST_LOADER as _HIST_LAZY_LOADER,
+    load_cached_history as _load_cached_history,
+    save_cached_history as _save_cached_history,
+    load_from_gcs as _load_from_gcs,
+    save_to_gcs as _save_to_gcs,
+    get_historicos_metadata as _get_historicos_metadata,
+    set_historicos_metadata as _set_historicos_metadata,
+    is_metadata_stale as _is_metadata_stale,
+)
+from markettool.application.services.historicos_service import (
+    HistoryConfig as _HistoryConfig,
+    HistoryManager as _HistoryManager,
+    merge_histories as _merge_histories,
+    normalize_resample_rule as _normalize_resample_rule,
+    RESAMPLE_PLAN as _RESAMPLE_PLAN,
+    EOD_RESAMPLE_RULE as _EOD_RESAMPLE_RULE,
+)
+
+_safe_symbol_for_filename = _hist_safe_symbol_for_filename
+_hist_base = _hist_hist_base
+_hist_path_csv = _hist_hist_path_csv
+_hist_path_json = _hist_hist_path_json
+_hist_path = _hist_hist_path
+_save_local_history_df = _hist_save_local_history_df
+_load_local = _hist_load_local
+_ensure_cols = _hist_ensure_cols
+LazyHistoricosLoader = _LazyHistoricosLoader
+_LAZY_HIST_LOADER = _HIST_LAZY_LOADER
+historicos_cache = _HIST_LAZY_LOADER  # Public alias for health checks and bootstrap
+load_cached_history = _load_cached_history
+save_cached_history = _save_cached_history
+load_from_gcs = _load_from_gcs
+save_to_gcs = _save_to_gcs
+get_historicos_metadata = _get_historicos_metadata
+set_historicos_metadata = _set_historicos_metadata
+is_metadata_stale = _is_metadata_stale
+
+HistoryConfig = _HistoryConfig
+HistoryManager = _HistoryManager
+merge_histories = _merge_histories
+normalize_resample_rule = _normalize_resample_rule
+RESAMPLE_PLAN = _RESAMPLE_PLAN
+EOD_RESAMPLE_RULE = _EOD_RESAMPLE_RULE
+
+_HIST = HistoryManager(client=_FMP)
+
+
+# ======================================================================
 # INDICATORS CACHE SYSTEM (Reduce 30min -> 2-3min)
 # Multi-pod optimized: Stateless pods, GCS as source of truth
 # ======================================================================
@@ -6203,6 +6088,30 @@ class IndicatorsCache:
 
 # Instancia global del caché
 _INDICATORS_CACHE = IndicatorsCache()
+
+# ======================================================================
+# Indicators cache overrides (module extraction)
+# ======================================================================
+from markettool.infra.cache.indicators_cache import (
+    IndicatorsCache as _IndicatorsCache,
+    hash_dataframe as _hash_dataframe,
+    merge_indicators_incremental as _merge_indicators_incremental,
+    _INDICATORS_CACHE_ENABLED as _IC_ENABLED,
+    _INDICATORS_CACHE_TTL_HOURS as _IC_TTL_HOURS,
+    _INDICATORS_FORCE_RECALC as _IC_FORCE_RECALC,
+    _INDICATORS_MEMORY_CACHE_SIZE as _IC_MEM_SIZE,
+    _INDICATORS_LOCK_TIMEOUT_SEC as _IC_LOCK_TIMEOUT,
+)
+
+IndicatorsCache = _IndicatorsCache
+hash_dataframe = _hash_dataframe
+merge_indicators_incremental = _merge_indicators_incremental
+_INDICATORS_CACHE_ENABLED = _IC_ENABLED
+_INDICATORS_CACHE_TTL_HOURS = _IC_TTL_HOURS
+_INDICATORS_FORCE_RECALC = _IC_FORCE_RECALC
+_INDICATORS_MEMORY_CACHE_SIZE = _IC_MEM_SIZE
+_INDICATORS_LOCK_TIMEOUT_SEC = _IC_LOCK_TIMEOUT
+_INDICATORS_CACHE = IndicatorsCache(window_func=definir_window)
 
 
 # ============================================================================
@@ -8583,12 +8492,14 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
 
     # ---------- Estocástico (%K/%D) ----------
     if flags["ponderacion_estocastico"]:
-        k, d = float(ultima_fila["%K"]), float(ultima_fila["%D"])
-        if k > d and k < STOCH_LOW:
-            probabilidad_tecnica += mag["estoc_base"]   # “+3”
-            senal_estocastico = True
-        elif k < d and k > STOCH_HIGH:
-            probabilidad_tecnica -= abs(mag["estoc_base"])  # “-3”
+        k = _coerce_float(ultima_fila.get("%K"))
+        d = _coerce_float(ultima_fila.get("%D"))
+        if k is not None and d is not None:
+            if k > d and k < STOCH_LOW:
+                probabilidad_tecnica += mag["estoc_base"]   # "+3"
+                senal_estocastico = True
+            elif k < d and k > STOCH_HIGH:
+                probabilidad_tecnica -= abs(mag["estoc_base"])  # "-3"
 
     # ---------- Divergencias (MACD/RSI) ----------
     if flags["divergencias"]:
@@ -9477,9 +9388,24 @@ def verificar_zona_no_trading(df, window):
         logger.error("⚠️ [verificar_zona_no_trading] Columna 'ATR' no encontrada. Indicadores incompletos. Retornando False (conservador).")
         return False
     
-    if df['ATR'].iloc[-1] < df['ATR'].rolling(window=window).mean().iloc[-1] * 0.8:
-        return True  # Baja volatilidad, podría ser una zona de no trading
-    return False
+    # Obtener último ATR y su rolling mean (con validación)
+    try:
+        atr_last = _coerce_float(df['ATR'].iloc[-1]) if len(df) > 0 else None
+        atr_rolling_mean = _coerce_float(df['ATR'].rolling(window=window).mean().iloc[-1]) if len(df) > 0 else None
+        
+        # Si falta alguno de los valores, retornar False (conservador - permitir trading)
+        if atr_last is None or atr_rolling_mean is None:
+            logger.debug("[verificar_zona_no_trading] ATR o rolling mean None/NaN. Retornando False (conservador).")
+            return False
+        
+        # Comparar solo si ambos valores son válidos
+        if atr_last < atr_rolling_mean * 0.8:
+            return True  # Baja volatilidad, podría ser una zona de no trading
+        return False
+        
+    except Exception as exc:
+        logger.error("[verificar_zona_no_trading] Error al verificar zona: %s. Retornando False.", exc)
+        return False
 
 # Calcular RSI
 #@profile
@@ -9504,20 +9430,46 @@ def calcular_estocastico(df, window):
 # Verificar si el RSI y %K indican sobreventa
 #@profile
 def verificar_zona_sobreventa(df, window, rsi_threshold=30, k_threshold=20):
-    if 'RSI' not in df.columns:
-        df = calcular_rsi(df, window)  # Calcular RSI si no existe
-    if '%K' not in df.columns:
-        df = calcular_estocastico(df, window)  # Calcular %K si no existe
-    return df['RSI'].iloc[-1] < rsi_threshold and df['%K'].iloc[-1] < k_threshold
+    try:
+        if 'RSI' not in df.columns:
+            df = calcular_rsi(df, window)  # Calcular RSI si no existe
+        if '%K' not in df.columns:
+            df = calcular_estocastico(df, window)  # Calcular %K si no existe
+        
+        rsi_last = _coerce_float(df['RSI'].iloc[-1]) if len(df) > 0 else None
+        k_last = _coerce_float(df['%K'].iloc[-1]) if len(df) > 0 else None
+        
+        # Si falta cualquier valor, retornar False (conservador)
+        if rsi_last is None or k_last is None:
+            return False
+        
+        return rsi_last < rsi_threshold and k_last < k_threshold
+        
+    except Exception as exc:
+        logger.debug("[verificar_zona_sobreventa] Error: %s. Retornando False.", exc)
+        return False
 
 # Verificar si el RSI y %K indican sobrecompra
 #@profile
 def verificar_zona_sobrecompra(df, window, rsi_threshold=70, k_threshold=80):
-    if 'RSI' not in df.columns:
-        df = calcular_rsi(df, window)  # Calcular RSI si no existe
-    if '%K' not in df.columns:
-        df = calcular_estocastico(df, window)  # Calcular %K si no existe
-    return df['RSI'].iloc[-1] > rsi_threshold and df['%K'].iloc[-1] > k_threshold
+    try:
+        if 'RSI' not in df.columns:
+            df = calcular_rsi(df, window)  # Calcular RSI si no existe
+        if '%K' not in df.columns:
+            df = calcular_estocastico(df, window)  # Calcular %K si no existe
+        
+        rsi_last = _coerce_float(df['RSI'].iloc[-1]) if len(df) > 0 else None
+        k_last = _coerce_float(df['%K'].iloc[-1]) if len(df) > 0 else None
+        
+        # Si falta cualquier valor, retornar False (conservador)
+        if rsi_last is None or k_last is None:
+            return False
+        
+        return rsi_last > rsi_threshold and k_last > k_threshold
+        
+    except Exception as exc:
+        logger.debug("[verificar_zona_sobrecompra] Error: %s. Retornando False.", exc)
+        return False
 
 # Función para predecir la tendencia basándose en datos en tiempo real
 #@profile
@@ -11946,6 +11898,13 @@ def calcular_entradas(
         )
 
         # --- Entradas múltiples ---
+        # 🎯 Lee config desde .env para privilegiar calidad sobre cantidad
+        max_candidates = int(os.environ.get("ENTRADA_MAX_CANDIDATES", "10"))
+        min_rrr = float(os.environ.get("ENTRADA_MIN_RRR", "2.0"))
+        enable_ladders = os.environ.get("ENTRADA_ENABLE_LADDERS", "false").lower() == "true"
+        enable_retest = os.environ.get("ENTRADA_ENABLE_RETEST", "false").lower() == "true"
+        enable_range_revert = os.environ.get("ENTRADA_ENABLE_RANGE_REVERT", "true").lower() == "true"
+        
         entradas_mult = generar_entradas_multiples(
             precio_actual=precio_actual,
             ATR=ATR,
@@ -11957,6 +11916,12 @@ def calcular_entradas(
             bollinger_lower=bollinger_lower,
             señales_compra=señales_compra,
             señales_venta=señales_venta,
+            # 🎯 Parámetros de calidad
+            max_candidates=max_candidates,
+            min_rrr=min_rrr,
+            enable_ladder=enable_ladders,
+            enable_breakout_retest=enable_retest,
+            enable_range_mean_revert=enable_range_revert,
         )
 
         # Adjuntar metadatos pro a cada entrada (compat UI)
@@ -13620,6 +13585,51 @@ def _optimize_records_for_upload(
 
 #@profile
 # ==============================
+# DataFrame Cache & Partitioning (Phase 2 Optimization)
+# ==============================
+class DataFramePartitionCache:
+    """
+    Cache para particiones de DataFrame por moneda.
+    Evita repetir filtros string costosos (startswith, endswith).
+    Mantiene views (sin copias) para máxima eficiencia.
+    """
+    def __init__(self):
+        self.cache = {}
+    
+    def partition_by_currency(self, df, moneda_filtro):
+        """
+        Particiona DataFrame por prefijo/sufijo de moneda.
+        
+        Args:
+            df: DataFrame con columna 'Activo'
+            moneda_filtro: código de moneda (ej: 'EUR')
+        
+        Returns:
+            dict con 'principal' (startswith) y 'secundaria' (endswith) views
+        """
+        cache_key = f"{id(df)}_{moneda_filtro}"
+        
+        if cache_key not in self.cache:
+            moneda_upper = str(moneda_filtro or "").upper()
+            
+            # Crear masks (sin copiar datos)
+            if 'Activo' in df.columns:
+                mask_principal = df["Activo"].astype(str).str.startswith(moneda_upper)
+                mask_secundaria = df["Activo"].astype(str).str.endswith(moneda_upper)
+            else:
+                mask_principal = pd.Series([False] * len(df))
+                mask_secundaria = pd.Series([False] * len(df))
+            
+            # Almacenar views (no copias)
+            self.cache[cache_key] = {
+                "principal": df[mask_principal],
+                "secundaria": df[mask_secundaria],
+                "masks": {"principal": mask_principal, "secundaria": mask_secundaria}
+            }
+        
+        return self.cache[cache_key]
+
+# ==============================
 # procesar_resultado (optimizado)
 # ==============================
 async def procesar_resultado(
@@ -13974,16 +13984,10 @@ async def procesar_resultado(
         )
         logger.info("[preview] early_preview publicado en %.1fs", time.time() - t_preview_start)
 
-    # Ponderaciones (usa versión vectorizada para acelerar)
-    t_pond_inc_start = time.time()
-    df_resultados = df_resultados.copy()
-    df_resultados = calcular_ponderacion_incremental_por_divisa(df_resultados, cfg)
-    logger.info("[preview timing] ponder_incremental: %.1fms", (time.time() - t_pond_inc_start) * 1000)
-
-    t_pond_vec_start = time.time()
-    df_resultados = df_resultados.copy()
+    # Ponderación (usa versión vectorizado - optimizado: una sola pasada sin copia redundante)
+    t_pond_start = time.time()
     df_resultados["Ponderacion"] = calcular_ponderacion_vectorizado(df_resultados, cfg)
-    logger.info("[preview timing] ponder_vectorizado: %.1fms", (time.time() - t_pond_vec_start) * 1000)
+    logger.info("[preview timing] ponderacion (vectorizado optimizado): %.1fms", (time.time() - t_pond_start) * 1000)
     logger.info("[preview] ponderaciones listas en %.1fs", time.time() - t_proc_start)
 
     # Limpia columnas internas si existen
@@ -14107,21 +14111,20 @@ async def procesar_resultado(
         logger.info("[preview] ui_resumen_final publicado en %.1fs", time.time() - t_proc_start)
         logger.info("[preview timing] ui_resumen final (.head, .to_dict, publish): %.1fms", (time.time() - t_ui_final_start) * 1000)
 
-    # 🚀 PARALELIZACIÓN GLOBAL: Recopilar TODAS las tasks para ejecutarlas en paralelo con gather()
-    all_upload_tasks = []        # Lista global para TODAS las tasks
+    # 🚀 PRIORIZACIÓN: primero activos prioritarios, luego resto + JSON
+    priority_tasks = []
+    rest_tasks = []
+    json_tasks = []
     ready_for_monitoring = []
     resultados_priority_sorted = []
     resultados_rest_sorted = []
-    
-    # === FASE DE PREPARACIÓN: Crear todas las tasks sin ejecutarlas ===
-    
+
+    # === FASE DE PREPARACIÓN ===
     # 7) Preparar uploads de enriquecidos PRIORIZANDO activos para monitoreo
-    # OPTIMIZADO: Paralelizar uploads en lugar de ejecutar en dos fases secuenciales
     if can_archive:
-        # Separar resultados en prioritarios y resto
         resultados_priority = []
         resultados_rest = []
-        
+
         for res in resultados:
             if isinstance(res, dict):
                 sym = res.get("Activo")
@@ -14129,32 +14132,25 @@ async def procesar_resultado(
                     resultados_priority.append(res)
                 else:
                     resultados_rest.append(res)
-        
-        # Ordenar prioritarios por TF (1min primero)
+
         resultados_priority_sorted = sorted(
             resultados_priority,
             key=lambda r: _tf_priority(r.get("Temporalidad"))
         )
-        
-        # Ordenar resto por TF
         resultados_rest_sorted = sorted(
             resultados_rest,
             key=lambda r: _tf_priority(r.get("Temporalidad"))
         )
-        
-        # ✅ FASE 1: Crear tasks para activos prioritarios (NO esperar aún)
+
         if resultados_priority_sorted:
             logger.info(f"📤 Preparando {len(resultados_priority_sorted)} archivos de activos prioritarios...")
-            for i, res in enumerate(resultados_priority_sorted):
-                task = asyncio.create_task(_upload_enriched(res))
-                all_upload_tasks.append(task)
-        
-        # ✅ FASE 2: Crear tasks para resto de activos (NO esperar aún)
+            for res in resultados_priority_sorted:
+                priority_tasks.append(asyncio.create_task(_upload_enriched(res)))
+
         if resultados_rest_sorted:
             logger.info(f"📤 Preparando {len(resultados_rest_sorted)} archivos de activos restantes...")
-            for i, res in enumerate(resultados_rest_sorted):
-                task = asyncio.create_task(_upload_enriched(res))
-                all_upload_tasks.append(task)
+            for res in resultados_rest_sorted:
+                rest_tasks.append(asyncio.create_task(_upload_enriched(res)))
 
     # 8) Preparar uploads de **ordenado** saneado (OPTIMIZADO: core fields only)
     if can_archive:
@@ -14164,146 +14160,121 @@ async def procesar_resultado(
             .where(pd.notnull(df_resultados_ordenado), None)
             .copy()
         )
-        # sanea celdas anidadas si las hubiera
         for col in df_ord.columns:
             if df_ord[col].apply(lambda v: isinstance(v, (dict, list, tuple, set, pd.Series))).any():
                 df_ord[col] = df_ord[col].apply(sanitize_for_json)
 
         ordered_records = sanitize_for_json(df_ord.to_dict("records"))
-        
-        # 🎯 Optimize: filter to core fields for frontend (reduce size ~40%)
-        upload_mode = os.environ.get("GCP_UPLOAD_MODE", "core")  # "core" | "extended" | "full"
+        upload_mode = os.environ.get("GCP_UPLOAD_MODE", "core")
         ordered_records = _optimize_records_for_upload(ordered_records, upload_mode=upload_mode)
-        
+
         logger.info(
             "[Upload] resultados_ordenados: %d records, mode=%s, size_est=%.1fKB",
             len(ordered_records), upload_mode,
             len(json.dumps(ordered_records[:10] if ordered_records else [])) * len(ordered_records) / 10240
         )
 
-        json_task = asyncio.create_task(
+        json_tasks.append(asyncio.create_task(
             _upload_json_registrar(
                 nombre_base=f"{moneda_filtro.upper()}_resultados_ordenados",
                 data=ordered_records,
                 metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado", "upload_mode": upload_mode},
             )
-        )
-        all_upload_tasks.append(json_task)
+        ))
 
     # 9) Preparar uploads de oportunidades (OPTIMIZADO: core fields only)
     if can_archive:
         opp_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
-        
-        # 🎯 Optimize: filter to core fields (reduce size ~40%)
         opp_records = _optimize_records_for_upload(opp_records, upload_mode=upload_mode)
-        
         logger.info("[Upload] oportunidades: %d records", len(opp_records))
-        
-        json_task = asyncio.create_task(
+
+        json_tasks.append(asyncio.create_task(
             _upload_json_registrar(
                 nombre_base=f"{moneda_filtro.upper()}_oportunidades",
                 data=opp_records,
                 metadata={"moneda_filtro": moneda_filtro, "scope": "oportunidades", "upload_mode": upload_mode},
             )
-        )
-        all_upload_tasks.append(json_task)
+        ))
 
-    # === FASE DE EJECUCIÓN PARALELA: Procesar TODAS las tasks conforme se completan ===
-    if all_upload_tasks:
+    # === FASE 1: Ejecutar PRIORITARIOS y liberar monitoreo temprano ===
+    if priority_tasks:
         try:
-            # Calcular cantidad de JSONs (resultados_ordenados + oportunidades = 2 si can_archive)
-            json_count_expected = 2 if can_archive else 0
+            t_priority_start = time.time()
+            results = await asyncio.gather(*priority_tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.debug(f"❌ No se pudo subir JSON prioritario[{i}]: {result}")
+                elif result:
+                    urls_generadas.append(result)
+                    sym = resultados_priority_sorted[i].get("Activo")
+                    if sym and sym not in ready_for_monitoring:
+                        ready_for_monitoring.append(sym)
+
+            if ready_for_monitoring:
+                fs_actualizar_ejecucion(
+                    exec_id,
+                    ui_resumen={"ready_for_monitoring": ready_for_monitoring},
+                    upload_state={
+                        "status": "publishing",
+                        "phase": "priority_ready",
+                        "updated_at": datetime.now(UTC).isoformat() + "Z",
+                    },
+                )
+                logger.info(f"✅ Activos prioritarios listos para monitoreo: {ready_for_monitoring}")
+                logger.info("✅ priority_ready en %.1fs", time.time() - t_proc_start)
+
+            logger.info("✅ uploads prioritarios completados en %.1fs", time.time() - t_priority_start)
+        except Exception as e:
+            logger.error(f"[priority uploads] Error crítico: {type(e).__name__}: {e}", exc_info=True)
+
+    # === FASE 2: Ejecutar RESTO + JSON ===
+    remaining_tasks = rest_tasks + json_tasks
+    if remaining_tasks:
+        try:
             t_uploads_start = time.time()
-            logger.info(f"🚀 Ejecutando {len(all_upload_tasks)} uploads en paralelo (prioritarios: {len(resultados_priority_sorted)}, resto: {len(resultados_rest_sorted)}, json: {json_count_expected}, UPLOAD_SEM={int(os.environ.get('UPLOAD_SEM', '30'))})")
-            
-            priority_complete = False
-            ready_for_monitoring = []
-            
-            # Usar gather() para ejecutar todos los uploads en paralelo sin problemas de as_completed()
-            # ✅ asyncio.to_thread() en subir_a_bucket_y_obtener_url ahora permite verdadero paralelismo
-            results = await asyncio.gather(*all_upload_tasks, return_exceptions=True)
+            logger.info(
+                f"🚀 Ejecutando {len(remaining_tasks)} uploads (resto: {len(rest_tasks)}, json: {len(json_tasks)}, UPLOAD_SEM={int(os.environ.get('UPLOAD_SEM', '30'))})"
+            )
+            results = await asyncio.gather(*remaining_tasks, return_exceptions=True)
             t_uploads_elapsed = (time.time() - t_uploads_start)
             t_uploads_ms = t_uploads_elapsed * 1000
-            
-            logger.info(f"✅ gather() uploads completado en {t_uploads_elapsed:.1f}s (promedio: {t_uploads_ms/len(all_upload_tasks):.0f}ms/upload, paralelismo efectivo: {len(all_upload_tasks)/t_uploads_elapsed:.1f}x)")
-            
-            priority_count = 0
+            logger.info(
+                f"✅ uploads restantes completados en {t_uploads_elapsed:.1f}s (promedio: {t_uploads_ms/len(remaining_tasks):.0f}ms/upload)"
+            )
+
             rest_count = 0
             json_count = 0
-            
-            # Procesar resultados por índice
+            rest_end = len(rest_tasks)
+
             for idx, result in enumerate(results):
-                try:
-                    # Determinar si es prioritario, resto, o JSON por el índice
-                    task_idx = idx
-                    
-                    # Range de prioritarios
-                    priority_end = len(resultados_priority_sorted)
-                    
-                    # Range de resto
-                    rest_end = priority_end + len(resultados_rest_sorted)
-                    
-                    if task_idx < priority_end:
-                        # Resultado prioritario
-                        i = task_idx
-                        if isinstance(result, Exception):
-                            logger.debug(f"❌ No se pudo subir JSON prioritario[{i}]: {result}")
-                        elif result:
-                            urls_generadas.append(result)
-                            sym = resultados_priority_sorted[i].get("Activo")
-                            if sym and sym not in ready_for_monitoring:
-                                ready_for_monitoring.append(sym)
-                        priority_count += 1
-                        
-                        # Cuando ALL prioritarios terminen, actualizar Firestore inmediatamente
-                        if priority_count == len(resultados_priority_sorted) and not priority_complete and resultados_priority_sorted:
-                            priority_complete = True
-                            if ready_for_monitoring:
-                                fs_actualizar_ejecucion(
-                                    exec_id,
-                                    ui_resumen={"ready_for_monitoring": ready_for_monitoring},
-                                    upload_state={
-                                        "status": "publishing",
-                                        "phase": "priority_ready",
-                                        "updated_at": datetime.now(UTC).isoformat() + "Z",
-                                    },
-                                )
-                                logger.info(f"✅ Activos prioritarios listos para monitoreo: {ready_for_monitoring}")
-                    
-                    elif task_idx < rest_end:
-                        # Resultado resto
-                        i = task_idx - priority_end
-                        if isinstance(result, Exception):
-                            logger.debug(f"❌ No se pudo subir JSON enriquecido[{i}]: {result}")
-                        elif result:
-                            urls_generadas.append(result)
-                            sym = resultados_rest_sorted[i].get("Activo")
-                            if sym and sym not in ready_for_monitoring:
-                                ready_for_monitoring.append(sym)
-                        rest_count += 1
-                    
-                    else:
-                        # Resultado JSON (ordenado, filtrado, etc)
-                        if isinstance(result, Exception):
-                            logger.debug(f"❌ No se pudo subir JSON: {result}")
-                        elif result:
-                            urls_generadas.append(result)
-                        json_count += 1
-                
-                except Exception as e:
-                    logger.warning(f"Excepción en procesamiento de upload[{idx}]: {type(e).__name__}: {e}", exc_info=True)
-            
-            # Actualizar con lista completa al final si hay prioritarios
-            if ready_for_monitoring and priority_complete:
+                if idx < rest_end:
+                    i = idx
+                    if isinstance(result, Exception):
+                        logger.debug(f"❌ No se pudo subir JSON enriquecido[{i}]: {result}")
+                    elif result:
+                        urls_generadas.append(result)
+                        sym = resultados_rest_sorted[i].get("Activo")
+                        if sym and sym not in ready_for_monitoring:
+                            ready_for_monitoring.append(sym)
+                    rest_count += 1
+                else:
+                    if isinstance(result, Exception):
+                        logger.debug(f"❌ No se pudo subir JSON: {result}")
+                    elif result:
+                        urls_generadas.append(result)
+                    json_count += 1
+
+            if ready_for_monitoring:
                 fs_actualizar_ejecucion(
                     exec_id,
                     ui_resumen={"ready_for_monitoring": ready_for_monitoring},
                 )
-            
-            logger.info(f"✅ uploads completados: prioritarios={priority_count}, resto={rest_count}, json={json_count}, urls_total={len(urls_generadas)}")
-        
+
+            logger.info(
+                f"✅ uploads completados: prioritarios={len(resultados_priority_sorted)}, resto={rest_count}, json={json_count}, urls_total={len(urls_generadas)}"
+            )
         except Exception as e:
-            logger.error(f"[gather uploads] Error crítico en fase de uploads: {type(e).__name__}: {e}", exc_info=True)
+            logger.error(f"[remaining uploads] Error crítico: {type(e).__name__}: {e}", exc_info=True)
             
     if can_archive:
         fs_actualizar_ejecucion(
@@ -14314,8 +14285,6 @@ async def procesar_resultado(
             },
         )
         logger.info("[preview] core_ready en %.1fs", time.time() - t_proc_start)
-
-    df_resultadosToImage = pd.DataFrame(df_filtrado)
 
     # Extraer divisas de los símbolos de las oportunidades
     if 'Activo' in df_filtrado.columns and not df_filtrado.empty:
@@ -14330,11 +14299,11 @@ async def procesar_resultado(
     else:
         divisas_oportunidades = []
 
-    # Filtro para imágenes (compras)
-    df_filtradoToImage = df_resultadosToImage[
-        (df_resultadosToImage.get('Oportunidad') == True) &
-        (df_resultadosToImage.get('Zona No Trading') == False) &
-        (df_resultadosToImage.get('Tipo de Operacion').isin([
+    # Filtro para imágenes (compras) - OPTIMIZADO: no copiar innecesariamente
+    df_filtradoToImage = df_filtrado[
+        (df_filtrado.get('Oportunidad') == True) &
+        (df_filtrado.get('Zona No Trading') == False) &
+        (df_filtrado.get('Tipo de Operacion').isin([
             "Compra", "Compra Fuerte",
             "Compra Predicha con ARIMA y Media Movil",
             "Compra Predicha con Media Movil",
@@ -14369,15 +14338,27 @@ async def procesar_resultado(
     is_principal_moneda = str(moneda_filtro or "").upper() in _principales
 
     csv_upload_tasks = []
+    
+    # --- OPTIMIZADO Phase 2: Cache para particiones, feature flag para principal/secundaria ---
+    cache = DataFramePartitionCache()
+    enable_principal_secundaria_csv = os.environ.get("CSV_ENABLE_PRINCIPAL_SECUNDARIA", "true").lower() == "true"
 
-    if is_principal_moneda:
-        # Dividir por posición de la divisa (prefijo/sufijo)
-        df_principal  = df_resultados_ordenado[df_resultados_ordenado["Activo"].astype(str).str.startswith(moneda_filtro.upper())].copy()
-        df_secundaria = df_resultados_ordenado[df_resultados_ordenado["Activo"].astype(str).str.endswith(moneda_filtro.upper())].copy()
+    if is_principal_moneda and enable_principal_secundaria_csv:
+        # OPTIMIZADO: Usar cache para evitar filtros repetidos
+        partitions_full = cache.partition_by_currency(df_resultados_ordenado, moneda_filtro)
+        partitions_filtered = cache.partition_by_currency(df_filtrado, moneda_filtro)
+        
+        df_principal = partitions_full["principal"]  # View sin copy
+        df_secundaria = partitions_full["secundaria"]  # View sin copy
+        df_filtrado_principal = partitions_filtered["principal"]  # View sin copy
+        df_filtrado_secundaria = partitions_filtered["secundaria"]  # View sin copy
 
         nombre_archivo_principal  = generar_nombre_archivo(moneda_filtro, tipo="principal")
         nombre_archivo_secundaria = generar_nombre_archivo(moneda_filtro, tipo="secundaria")
+        nombre_archivo_filtrado_principal  = generar_nombre_archivo(moneda_filtro, filtro=True, tipo="principal")
+        nombre_archivo_filtrado_secundaria = generar_nombre_archivo(moneda_filtro, filtro=True, tipo="secundaria")
 
+        # Principal completo
         if not df_principal.empty:
             if origen == "app":
                 csv_upload_tasks.append(asyncio.create_task(
@@ -14392,16 +14373,15 @@ async def procesar_resultado(
                     asyncio.create_task(enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id, cfg=cfg))
                 else:
                     await enviar_csv_telegram(df_principal, context, nombre_archivo_principal, user_chat_id, cfg=cfg)
-        else:
-            logger.info(f"DF principal vacío; no se envía {nombre_archivo_principal}")
 
+        # Secundaria completo
         if not df_secundaria.empty:
             if origen == "app":
                 csv_upload_tasks.append(asyncio.create_task(
                     _upload_csv_and_register(
                         df_secundaria,
                         nombre_archivo_secundaria,
-                        metadata={"moneda_filtro": moneda_filtro, "particion": "principal", "filtrado": False},
+                        metadata={"moneda_filtro": moneda_filtro, "particion": "secundaria", "filtrado": False},
                     )
                 ))
             if send_to_tg:
@@ -14409,16 +14389,8 @@ async def procesar_resultado(
                     asyncio.create_task(enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id, cfg=cfg))
                 else:
                     await enviar_csv_telegram(df_secundaria, context, nombre_archivo_secundaria, user_chat_id, cfg=cfg)
-        else:
-            logger.info(f"DF secundaria vacío; no se envía {nombre_archivo_secundaria}")
 
-        # Filtrados por oportunidades (principal/secundaria)
-        df_filtrado_principal  = df_filtrado[df_filtrado["Activo"].astype(str).str.startswith(moneda_filtro.upper())].copy()
-        df_filtrado_secundaria = df_filtrado[df_filtrado["Activo"].astype(str).str.endswith(moneda_filtro.upper())].copy()
-
-        nombre_archivo_filtrado_principal  = generar_nombre_archivo(moneda_filtro, filtro=True, tipo="principal")
-        nombre_archivo_filtrado_secundaria = generar_nombre_archivo(moneda_filtro, filtro=True, tipo="secundaria")
-
+        # Principal filtrado
         if not df_filtrado_principal.empty:
             if origen == "app":
                 csv_upload_tasks.append(asyncio.create_task(
@@ -14433,9 +14405,8 @@ async def procesar_resultado(
                     asyncio.create_task(enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id, cfg=cfg))
                 else:
                     await enviar_csv_telegram(df_filtrado_principal, context, nombre_archivo_filtrado_principal, user_chat_id, cfg=cfg)
-        else:
-            logger.info(f"DF filtrado principal vacío; no se envía {nombre_archivo_filtrado_principal}")
 
+        # Secundaria filtrado
         if not df_filtrado_secundaria.empty:
             if origen == "app":
                 csv_upload_tasks.append(asyncio.create_task(
@@ -14450,11 +14421,11 @@ async def procesar_resultado(
                     asyncio.create_task(enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id, cfg=cfg))
                 else:
                     await enviar_csv_telegram(df_filtrado_secundaria, context, nombre_archivo_filtrado_secundaria, user_chat_id, cfg=cfg)
-        else:
-            logger.info(f"DF filtrado secundaria vacío; no se envía {nombre_archivo_filtrado_secundaria}")
+    elif is_principal_moneda:
+        logger.info(f"CSV principal/secundaria deshabilitados (CSV_ENABLE_PRINCIPAL_SECUNDARIA={enable_principal_secundaria_csv})")
     else:
         logger.info(f"La divisa '{moneda_filtro}' NO es principal: se omiten artefactos principal/secundaria.")
-    # ---------- ⬆️ FIN LÓGICA PRINCIPAL / SECUNDARIA ⬆️ ----------
+    # ---------- ⬆️ FIN LÓGICA PRINCIPAL / SECUNDARIA OPTIMIZADA ⬆️ ----------
 
     await _collect_urls(csv_upload_tasks, "CSV")
 
@@ -14515,7 +14486,7 @@ async def procesar_resultado(
 
         user_states[user_chat_id]["archivos_enviados"] = True
 
-        # Imágenes de oportunidades
+        # Imágenes de oportunidades (secuencial para preservar orden)
         if user_states[user_chat_id]["archivos_enviados"]:
             if not df_filtradoToImage.empty:
                 df_para_imagen = preparar_df_oportunidades_para_tabla(df_filtradoToImage)
@@ -17859,34 +17830,18 @@ async def listar_pagos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# Programa la tarea para que se ejecute todos los días a las 00:00
-scheduler = BackgroundScheduler()
-#@profile
-def programar_actualizacion_menus(application: Application):
-    loop = asyncio.get_running_loop()
+# Scheduler for background tasks - uses AsyncIOScheduler (runs in event loop, not separate thread)
+scheduler = AsyncIOScheduler()
 
-    #@profile
-    def actualizar():
-        # ✅ Multi-pod coordination: Solo el líder ejecuta
-        if not _POD_COORDINATOR.should_run_scheduled_task("actualizar_menus"):
-            return
-        
-        asyncio.run_coroutine_threadsafe(actualizar_menus(application), loop)
-
-    scheduler.add_job(
-        actualizar,
-        IntervalTrigger(minutes=10),  # Se ejecutará cada 10 minutos
-    )
-
-    def _warmup_job():
-        asyncio.run_coroutine_threadsafe(warmup_cache_all_assets("scheduled"), loop)
-
-    scheduler.add_job(
-        _warmup_job,
-        IntervalTrigger(minutes=APP_CONFIG.cache_warmup_interval_minutes),
-    )
-
-    scheduler.start()
+# Legacy function - DEPRECATED: Use markettool.interfaces.scheduler.bot_init.setup_scheduler instead
+# def programar_actualizacion_menus(application: Application):
+#     """Programa la actualización periódica de menús de Telegram."""
+#     scheduler.add_job(
+#         actualizar_menus,
+#         IntervalTrigger(minutes=10),  # Se ejecutará cada 10 minutos
+#         kwargs={"application": application}  # Pasa la aplicación como argumento
+#     )
+#     scheduler.start()
 
 #@profile
 async def menu_zonas_horarias(update, context):
@@ -18169,7 +18124,7 @@ async def enviar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # Crear la aplicación del bot de Telegram
-application = Application.builder().token(os.environ["BOT_TOKEN"]).build()
+application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
 
 # Configurar manejadores
 application.add_handler(CommandHandler('start', start))
@@ -18213,198 +18168,11 @@ webhook_app = Flask(__name__)
 asgi_app = WsgiToAsgi(webhook_app)
 
 
-# ============================================================================
-# API Endpoints - Multi-Pod Coordination Status
-# ============================================================================
+from markettool.interfaces.api.pod_routes import register_pod_routes
+from markettool.interfaces.api.execution_routes import register_execution_routes
 
-@webhook_app.route("/api/pod/status", methods=["GET"])
-def get_pod_status():
-    """
-    Retorna el estado del pod actual (líder o follower).
-    
-    GET /api/pod/status
-    
-    Response:
-    {
-        "pod_id": "markettool-7d8f9-abc12",
-        "is_leader": true,
-        "firestore_enabled": true,
-        "ttl_seconds": 180,
-        "heartbeat_interval": 60
-    }
-    """
-    return jsonify({
-        "pod_id": _POD_COORDINATOR.pod_id,
-        "is_leader": _POD_COORDINATOR.is_leader,
-        "firestore_enabled": _POD_COORDINATOR.firestore_enabled,
-        "ttl_seconds": _POD_COORDINATOR.ttl_seconds,
-        "heartbeat_interval": _POD_COORDINATOR.heartbeat_interval
-    })
-
-
-@webhook_app.route("/api/pod/leader", methods=["GET"])
-def get_cluster_leader():
-    """
-    Retorna información del pod líder actual del cluster.
-    
-    GET /api/pod/leader
-    
-    Response:
-    {
-        "current_leader": "markettool-7d8f9-abc12",
-        "heartbeat_utc": "2026-02-11T15:30:00Z",
-        "elected_at_utc": "2026-02-11T15:00:00Z",
-        "seconds_since_heartbeat": 15,
-        "is_alive": true
-    }
-    """
-    if not _POD_COORDINATOR._is_firestore_available():
-        return jsonify({
-            "error": "Firestore not enabled",
-            "message": "Multi-pod coordination requires FIRESTORE_ENABLED=true"
-        }), 503
-    
-    try:
-        doc_ref = _POD_COORDINATOR.db.document(_POD_COORDINATOR.leader_doc_path)
-        doc = doc_ref.get()
-        
-        if not doc.exists:
-            return jsonify({
-                "current_leader": None,
-                "message": "No leader elected yet"
-            }), 404
-        
-        data = doc.to_dict()
-        last_heartbeat_str = data.get("heartbeat_utc")
-        last_heartbeat = datetime.fromisoformat(last_heartbeat_str.replace('Z', '+00:00'))
-        now_utc = datetime.now(timezone.utc)
-        elapsed = (now_utc - last_heartbeat).total_seconds()
-        
-        return jsonify({
-            "current_leader": data.get("pod_id"),
-            "heartbeat_utc": last_heartbeat_str,
-            "elected_at_utc": data.get("elected_at_utc"),
-            "seconds_since_heartbeat": round(elapsed, 1),
-            "is_alive": elapsed < _POD_COORDINATOR.ttl_seconds,
-            "ttl_seconds": data.get("ttl_seconds", _POD_COORDINATOR.ttl_seconds)
-        })
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@webhook_app.route("/api/pod/release-leadership", methods=["POST"])
-def release_leadership():
-    """
-    Fuerza la liberación del liderazgo del pod actual.
-    
-    POST /api/pod/release-leadership
-    
-    ⚠️ Usar con cuidado: Otro pod tomará el liderazgo inmediatamente.
-    """
-    if not _POD_COORDINATOR.is_leader:
-        return jsonify({
-            "error": "Not leader",
-            "message": f"This pod ({_POD_COORDINATOR.pod_id}) is not the current leader"
-        }), 403
-    
-    try:
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(_POD_COORDINATOR.release_leadership())
-        loop.close()
-        
-        return jsonify({
-            "success": True,
-            "message": f"Leadership released by pod {_POD_COORDINATOR.pod_id}",
-            "timestamp_utc": datetime.now(timezone.utc).isoformat()
-        })
-    
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ============================================================================
-# API Endpoints - Execution Tracking (Multi-Pod)
-# ============================================================================
-
-@webhook_app.route("/api/execution/<exec_id>/cancel", methods=["POST"])
-def cancel_execution(exec_id: str):
-    """
-    Cancela una ejecución (cross-pod compatible).
-    
-    POST /api/execution/{exec_id}/cancel
-    
-    Response:
-    {
-        "success": true,
-        "message": "Cancellation requested for exec_id",
-        "executor_pod": "markettool-abc123"
-    }
-    """
-    loop = asyncio.new_event_loop()
-    try:
-        success = loop.run_until_complete(_EXECUTION_TRACKER.request_cancel(exec_id))
-        loop.close()
-        
-        if not success:
-            return jsonify({
-                "error": "Not found",
-                "message": f"Execution {exec_id} not found"
-            }), 404
-        
-        # Check local RUNNING para respuesta más rápida
-        if exec_id in RUNNING:
-            logger.info(f"[API] Cancelling local execution: {exec_id}")
-            RUNNING[exec_id].cancel()
-        
-        return jsonify({
-            "success": True,
-            "message": f"Cancellation requested for {exec_id}"
-        })
-    
-    except Exception as e:
-        loop.close()
-        return jsonify({"error": str(e)}), 500
-
-
-@webhook_app.route("/api/execution/<exec_id>/status", methods=["GET"])
-def get_execution_status(exec_id: str):
-    """
-    Obtiene status de una ejecución.
-    
-    GET /api/execution/{exec_id}/status
-    
-    Response:
-    {
-        "exec_id": "abc-123",
-        "estado": "running",
-        "pod_id": "markettool-xyz",
-        "user_id": "user123",
-        "started_at": "2026-02-11T15:30:00Z",
-        "updated_at": "2026-02-11T15:35:00Z"
-    }
-    """
-    # Check Firestore
-    if _EXECUTION_TRACKER.firestore_enabled and _EXECUTION_TRACKER.db:
-        try:
-            doc = _EXECUTION_TRACKER.db.collection("ejecuciones").document(exec_id).get()
-            if doc.exists:
-                return jsonify(doc.to_dict())
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-    
-    # Check local RUNNING
-    if exec_id in RUNNING:
-        return jsonify({
-            "exec_id": exec_id,
-            "estado": "running" if not RUNNING[exec_id].done() else "completed",
-            "pod_id": socket.gethostname()
-        })
-    
-    return jsonify({
-        "error": "Not found",
-        "message": f"Execution {exec_id} not found"
-    }), 404
+register_pod_routes(webhook_app, _POD_COORDINATOR)
+register_execution_routes(webhook_app, _EXECUTION_TRACKER, RUNNING, logger)
 
 
 #@profile
@@ -18453,101 +18221,7 @@ async def guardar_datos_historicos_diarios():
 
 # Cargar datos iniciales
 #@profile
-async def initialize_bot():
-    try:
-        global subscriptions, subscriptions_type, clientes_chat_ids, admin_ids
-
-        # Inicializar la aplicación
-        logger.info("Inicializando la aplicación de Telegram...")
-        start_time = time.time()
-        await application.initialize()
-        logger.info(f"Tiempo en inicializar aplicación: {time.time() - start_time:.2f} segundos")
-
-        # Cargar datos iniciales
-        logger.info("Cargando datos iniciales...")
-        (
-            subscriptions,
-            subscriptions_type,
-            clientes_chat_ids,
-            admin_ids,
-        ) = await asyncio.gather(
-            cargar_datos_subscription_user(),
-            cargar_datos_subscription_type(),
-            cargar_chat_ids(),
-            cargar_admin_ids(),
-        )
-
-        logger.info("Cargando noticias y datos históricos...")
-        await asyncio.gather(
-            cargar_noticias_en_memoria(),
-            cargar_datos_historicos_inicial(),
-        )
-
-        # ✅ Multi-pod coordination: Inicializar leader election
-        logger.info("[MultiPod] Initializing pod coordinator...")
-        await _POD_COORDINATOR.try_become_leader()
-        
-        # Iniciar heartbeat si es líder
-        loop = asyncio.get_event_loop()
-        await _POD_COORDINATOR.start_heartbeat(loop)
-
-        # ✅ Warmup cache para TODOS los pods
-        if APP_CONFIG.cache_warmup_enabled:
-            if APP_CONFIG.cache_warmup_blocking_startup:
-                logger.info("[Warmup] Ejecutando pre-calentamiento bloqueante al startup...")
-                await warmup_cache_all_assets("startup_blocking")
-            else:
-                logger.info("[Warmup] Programando pre-calentamiento en background...")
-                asyncio.create_task(warmup_cache_all_assets("startup_background"))
-
-        # Programar el guardado diario (todas las tareas arrancan, pero solo líder ejecuta)
-        asyncio.create_task(guardar_noticias_forex_diarias())
-        asyncio.create_task(guardar_datos_historicos_diarios())
-
-        # Ejecutar la primera actualización de menús en segundo plano (solo líder)
-        if _POD_COORDINATOR.should_run_scheduled_task("actualizar_menus_inicial"):
-            asyncio.create_task(actualizar_menus(application))
-        
-        logger.info("Actualizar menus de usuarios telegram...")
-        programar_actualizacion_menus(application)
-
-        # Configurar webhook
-        webhook_url = os.environ.get("WEBHOOK_URL")
-        logger.info(f"WEBHOOK_URL = {webhook_url}")
-        if webhook_url:
-            logger.info("Configurando webhook...")
-            full_webhook_url = f"https://{webhook_url}/webhook"
-            current_webhook = await application.bot.get_webhook_info()
-            logger.info(f"EL Webhook configurado en telegram es: {current_webhook}")
-            if current_webhook.url != full_webhook_url:
-                logger.info(f"Entro a actualizar el Webhook {full_webhook_url}")
-                await application.bot.delete_webhook(drop_pending_updates=True)
-                cert_path = os.getenv("WEBHOOK_CERT_PATH", "cert.crt")
-                with open(cert_path, "rb") as cert:
-                    await application.bot.set_webhook(full_webhook_url, certificate=cert)
-                logger.info(await application.bot.get_webhook_info())
-                logger.info(f"Webhook configurado exitosamente en {full_webhook_url}")
-            else:
-                logger.info(f"Webhook ya se encontraba configurado en {full_webhook_url}")
-            
-        else:
-            logger.info("No se encontró WEBHOOK_URL. Se ejecutará localmente en modo local con polling...")
-            asyncio.create_task(application.start())
-            asyncio.create_task(application.updater.start_polling())
-            try:
-                await asyncio.Event().wait()
-            except KeyboardInterrupt:
-                logger.info("Deteniendo el bot...")
-            finally:
-                await guardar_datos_historicos()
-                await guardar_noticias_forex()
-                await application.updater.stop()
-                await application.stop()
-                await application.shutdown()
-
-        logger.info("Bot inicializado correctamente.")
-    except Exception as e:
-        logger.info(f"Error durante la inicialización del bot: {e}")
+# initialize_bot: moved to markettool/interfaces/scheduler/bot_init.py as initialize_bot_async
 
 
 
@@ -20055,1700 +19729,121 @@ def _filter_by_symbol_currencies(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df.copy()
 
 
-# ==========================
-# ENDPOINT
-# ==========================
-
-@webhook_app.errorhandler(404)
-def _not_found(e):
-    return jsonify({"status":"error","message":"not found"}), 404
-
-@webhook_app.errorhandler(500)
-def _server_err(e):
-    return jsonify({"status":"error","message":"internal error"}), 500
-
-@webhook_app.route("/monitoreo/eventos", methods=["POST"])
-async def monitoreo_eventos():
-    """
-    POST /monitoreo/eventos
-    Body:
-      {
-        "user_id": "...",
-        "exec_id": "...",
-        "symbol": "EURUSD",
-        "hours_back": 6,        # opcional (default 6)
-        "minutes_fwd": 5,       # opcional (default 5)
-        "cursor_hash": "..."    # opcional: hash del último snapshot recibido por el front
-      }
-
-    Respuesta:
-      {
-        "status": "ok",
-        "exec_id": "...",
-        "symbol": "EURUSD",
-        "server_time": ms_utc,
-        "hash": "abcd1234",
-        "count": N,
-        "new_results": [...],   # filas nuevas con 'actual' presente/cambiado
-        "events": [...],        # snapshot High/Medium para base/quote del símbolo
-        "signals": [...],       # señales con score/direction por cada fila con actual
-        "agg_score": float,     # agregado reciente (suma cap)
-        "agg_direction": "bullish"|"bearish"|"neutral"
-      }
-    """
-    try:
-        body = request.get_json(force=True) or {}
-        user_id  = str(body.get("user_id") or "").strip()
-        exec_id  = str(body.get("exec_id") or "").strip()
-        symbol   = str(body.get("symbol") or "").strip().upper()
-        hours_back = int(body.get("hours_back", 6))
-        minutes_fwd = int(body.get("minutes_fwd", 5))
-        cursor_hash = str(body.get("cursor_hash") or "").strip()
-
-        if not user_id or not exec_id or not symbol:
-            return jsonify({"status":"error","message":"user_id, exec_id y symbol son obligatorios"}), 400
-
-        # Cobro por llamada
-        ok, msg = await _charge_monitoreo_per_call(user_id, origen="app")
-        if not ok:
-            return jsonify({"status":"error","message": msg}), 402
-
-        logger.info(f"Llamando _fetch_events_for({symbol}, hb={hours_back}, mf={minutes_fwd})")
-        df = _fetch_events_for(symbol, hours_back=hours_back, minutes_fwd=minutes_fwd)
-        logger.info("_fetch_events_for terminó")
-        
-        if df.empty:
-            out = {"status":"ok","exec_id":exec_id,"symbol":symbol,"server_time":int(time.time()*1000),"hash":"0"*8,"count":0,"new_results":[],"events":[]}
-            return jsonify(out), 200
-
-        # impacto alto/medio y filtro por monedas del símbolo
-        df = df[df["impact"].isin(["High","Medium"])].copy()
-        df = _filter_by_symbol_currencies(df, symbol)
-
-        # snapshot compacto
-        events = [
-            {
-                "date": (row.date.isoformat() if pd.notna(row.date) else None),
-                "currency": getattr(row, "currency", None),
-                "event": getattr(row, "event", None),
-                "impact": getattr(row, "impact", None),
-                "actual": (float(row.actual) if pd.notna(getattr(row, "actual", None)) else None),
-                "estimate": (float(row.estimate) if pd.notna(getattr(row, "estimate", None)) else None),
-                "previous": (float(row.previous) if pd.notna(getattr(row, "previous", None)) else None),
-            }
-            for row in df.itertuples(index=False)
-        ]
-
-        h = _hash_payload(events)
-        key = (exec_id, symbol)
-        _LAST_HASH[key] = h
-
-        # cambios "actual" desde la última vez
-        new_results = _detect_new_results(symbol, df)
-
-        # señales por fila (cuando actual existe)
-        signals = []
-        agg = 0.0
-        for row in df.itertuples(index=False):
-            actual = getattr(row, "actual", None)
-            if pd.notna(actual):
-                sig = evaluar_evento_para_symbol(symbol, {
-                    "date": row.date,
-                    "currency": getattr(row, "currency", None),
-                    "event": getattr(row, "event", None),
-                    "impact": getattr(row, "impact", None),
-                    "actual": actual,
-                    "estimate": getattr(row, "estimate", None),
-                    "previous": getattr(row, "previous", None),
-                })
-                sig_out = {
-                    "date": (row.date.isoformat() if pd.notna(row.date) else None),
-                    "currency": getattr(row, "currency", None),
-                    "event": getattr(row, "event", None),
-                    "impact": getattr(row, "impact", None),
-                    "score": sig["score"],
-                    "direction": sig["direction"],
-                    "reason": sig["reason"],
-                }
-                signals.append(sig_out)
-                agg += float(sig["score"])
-
-        agg_direction = "bullish" if agg > 0.02 else ("bearish" if agg < -0.02 else "neutral")
-
-        # heartbeat opcional
-        try:
-            if db is not None:
-                doc_id = f"{exec_id}__{symbol}"
-                db.collection("monitoreos").document(doc_id).set({
-                    "eventos_hash": h,
-                    "eventos_count": len(events),
-                    "eventos_updated_at": int(time.time()*1000),
-                    "eventos_agg_score": float(agg),
-                    "eventos_agg_direction": agg_direction,
-                }, merge=True)
-        except Exception:
-            pass
-
-        # Si no hay cambios y el front ya tiene el hash → responde vacío
-        if cursor_hash and cursor_hash == h and not new_results:
-            return jsonify({
-                "status":"ok",
-                "exec_id": exec_id,
-                "symbol": symbol,
-                "server_time": int(time.time()*1000),
-                "hash": h,
-                "count": len(events),
-                "new_results": [],
-                "events": [],
-                "signals": [],
-                "agg_score": float(agg),
-                "agg_direction": agg_direction,
-            }), 200
-
-        return jsonify({
-            "status":"ok",
-            "exec_id": exec_id,
-            "symbol": symbol,
-            "server_time": int(time.time()*1000),
-            "hash": h,
-            "count": len(events),
-            "new_results": new_results,
-            "events": events,
-            "signals": signals,
-            "agg_score": float(agg),
-            "agg_direction": agg_direction,
-        }), 200
-
-    except Exception as e:
-        logger.exception("Error en /monitoreo/eventos")
-        return jsonify({"status":"error","message":str(e)}), 500
-
-
-
-@webhook_app.route("/monitoreo/incremental", methods=["POST"])
-async def monitoreo_incremental():
-    start = time.time()
-
-    try:
-        body = request.get_json(force=True) or {}
-        user_id  = str(body.get("user_id") or "").strip()
-        exec_id  = str(body.get("exec_id") or "").strip()
-        symbol   = str(body.get("symbol") or "").strip().upper()
-        timeframe = _norm_tf(body.get("timeframe"))
-        last_ts  = body.get("last_ts")
-        persist  = bool(body.get("persist", False))
-
-        if not user_id:
-            return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
-        if not exec_id:
-            return jsonify({"status": "error", "message": "exec_id es obligatorio"}), 400
-        if not symbol or not timeframe:
-            return jsonify({"status": "error", "message": "symbol y timeframe son obligatorios"}), 400
-
-        # Cobro por llamada (cada consulta activo_temporalidad)
-        ok, msg = await _charge_monitoreo_per_call(user_id, origen="app")
-        if not ok:
-            return jsonify({"status":"error","message": msg}), 402
-
-        logging.info(
-            "INC START user=%s exec=%s body=%s",
-            body.get("user_id"), body.get("exec_id"), body,
-        )
-
-        # normalizamos TF para usar en feature-flag
-        tf_api = timeframe
-
-        enabled = True
-        if exec_id:
-            enabled = _tf_is_enabled(exec_id, symbol, tf_api)
-
-        logging.info(
-            "HIST TFCHK sym=%s tf=%s enabled=%s user_id=%s exec_id=%s",
-            symbol, timeframe, enabled, user_id, exec_id,
-        )
-
-        if not enabled:
-            # Endpoint de lectura: no pisamos Firestore (evita que "running" vuelva a "stopped").
-            # Para habilitar una TF, usá tf_states.<tf>.enabled=True o agregala a allowed_timeframes.
-            return jsonify(
-                {
-                    "status": "ok",
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "exec_id": exec_id,
-                    "from_ts": None,
-                    "to_ts": None,
-                    "candles": [],
-                }
-            ), 200
-
-        # ------------------------------------------------------------
-        # 0) Cargar estado base (serie) y refrescar desde GCS si hace falta
-        # ------------------------------------------------------------
-        st: dict = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
-        prev_series_ms = _series_to_ms(st.get("series", []))
-        prev_last = prev_series_ms[-1] if prev_series_ms else None
-
-        age = {
-            "1min": 20,
-            "5min": 60,
-            "15min": 180,
-            "30min": 300,
-            "1hour": 600,
-            "4hour": 900,
-        }.get(timeframe, 300)
-
-        try:
-            await asyncio.to_thread(
-                _maybe_refresh_from_gcs, exec_id, symbol, timeframe, st, age
-            )
-        except Exception:
-            logging.exception("INC %s %s: _maybe_refresh_from_gcs falló", symbol, timeframe)
-
-        try:
-            await asyncio.to_thread(
-                _ensure_stream_initialized, exec_id, symbol, timeframe, st
-            )
-        except Exception:
-            logging.exception("INC %s %s: _ensure_stream_initialized falló", symbol, timeframe)
-
-        # ------------------------------------------------------------
-        # 1) Normalizar last_ts
-        # ------------------------------------------------------------
-        try:
-            last_ts = int(last_ts) if last_ts is not None else None
-        except Exception:
-            last_ts = None
-
-        # ------------------------------------------------------------
-        # 2) Serie base en ms + bucketizada
-        # ------------------------------------------------------------
-        base_ms = _series_to_ms(st.get("series", []) or [])
-        base_ms = _snap_and_dedupe_to_minutes(base_ms, timeframe)
-
-        # 3) Densificar + último tick de quote (SIN backfills ni FMP pesado)
-        try:
-            base_ms = _densify_minutes(base_ms, timeframe)
-        except Exception:
-            logging.exception("INC %s %s: _densify_minutes falló", symbol, timeframe)
-
-        # Aseguramos que st["series"] tenga la serie base antes del tick
-        st["series"] = base_ms
-
-        try:
-            # Firma: _maybe_tick_quote(exec_id, symbol, tf, st)
-            changed_tick = await asyncio.to_thread(
-                _maybe_tick_quote, exec_id, symbol, timeframe, st
-            )
-            if changed_tick:
-                # _maybe_tick_quote modifica st["series"], la volvemos a tomar
-                base_ms = _snap_and_dedupe_to_minutes(
-                    _series_to_ms(st.get("series", [])), timeframe
-                )
-        except Exception:
-            logging.exception("INC %s %s: _maybe_tick_quote falló", symbol, timeframe)
-
-        last_server = base_ms[-1] if base_ms else None
-        last_server_t = int(last_server.get("t")) if last_server and "t" in last_server else None
-
-        # ------------------------------------------------------------
-        # 4) Detectar cambios (nueva vela cerrada o actualización de la última)
-        # ------------------------------------------------------------
-        changed_by_reload = False
-        if (
-            prev_last
-            and last_server
-            and last_server_t
-            and last_server_t > int(prev_last.get("t", 0))
-        ):
-            changed_by_reload = True
-        elif prev_last and last_server:
-            for k in ("o", "h", "l", "c", "v"):
-                try:
-                    if float(last_server.get(k, 0)) != float(prev_last.get(k, 0)):
-                        changed_by_reload = True
-                        break
-                except Exception:
-                    continue
-
-        changed = (
-            changed_by_reload
-            or (not prev_last and bool(last_server))
-            or (
-                prev_last
-                and last_server
-                and last_server_t
-                and last_server_t > int(prev_last.get("t", 0))
-            )
-        )
-
-        # ------------------------------------------------------------
-        # 5) Calcular incremental a devolver
-        #    - Si last_ts es None → devolvemos TODA la serie (seed)
-        #    - Si hay velas nuevas (t > last_ts) → devolvemos sólo esas
-        #    - Si no hay velas nuevas pero cambió la última → devolvemos sólo la última
-        # ------------------------------------------------------------
-        EPS = 1
-        if last_ts is None:
-            inc = base_ms
-        elif last_server_t is not None and last_server_t > last_ts + EPS:
-            inc = [c for c in base_ms if int(c.get("t", 0)) > last_ts]
-        else:
-            inc = (
-                [last_server]
-                if (changed and last_server_t and last_server_t >= (last_ts or 0) - EPS)
-                else []
-            )
-
-        logging.info(
-            "INC %s %s last_ts=%s last_server_t=%s changed=%s -> inc_len=%d",
-            symbol,
-            timeframe,
-            last_ts,
-            last_server_t,
-            changed,
-            len(inc),
-        )
-
-        # ------------------------------------------------------------
-        # 6) Persistencia ligera en GCS
-        #    Persistimos sólo cuando hay nueva vela cerrada o el cliente lo pide.
-        # ------------------------------------------------------------
-        new_bucket_started = bool(
-            prev_last
-            and last_server
-            and last_server_t
-            and last_server_t > int(prev_last.get("t", 0))
-        )
-
-        if inc:
-            try:
-                with _MON_CACHE_LOCK:
-                    st["dirty"] = True
-            except Exception:
-                # por si _MON_CACHE_LOCK es un dummy en algún entorno
-                st["dirty"] = True
-
-        if new_bucket_started or persist:
-            try:
-                await asyncio.to_thread(
-                    _persist_if_needed, exec_id, symbol, timeframe, True
-                )
-            except Exception:
-                logging.exception(
-                    "INC %s %s: _persist_if_needed falló", symbol, timeframe
-                )
-
-        # ------------------------------------------------------------
-        # 7) Heartbeat / monitoreo en Firestore
-        # ------------------------------------------------------------
-        now_ms = int(time.time() * 1000)
-        last_served_ts = inc[-1]["t"] if inc else last_ts
-
-        try:
-            await asyncio.to_thread(
-                fs_touch_monitoreo,
-                exec_id,
-                symbol,
-                {
-                    "estado": "running",
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "user_id": user_id,
-                    "tf_states": {
-                        timeframe: {
-                            "estado": "running",
-                            "last_ts": last_served_ts,
-                            "count_served": len(inc),
-                            "updated_at": now_ms,
-                        }
-                    },
-                },
-            )
-        except Exception:
-            logging.exception("INC %s %s: fs_touch_monitoreo falló", symbol, timeframe)
-
-        # ------------------------------------------------------------
-        # 8) Log final + respuesta
-        # ------------------------------------------------------------
-        if last_ts is None:
-            inc_ms = base_ms
-        else:
-            inc_ms = [b for b in base_ms if int(b.get("t", 0)) > last_ts]
-
-        logging.info(
-            "INC RESP sym=%s tf=%s candles=%d from_ts=%s to_ts=%s",
-            symbol,
-            timeframe,
-            len(inc_ms),
-            inc_ms[0]["t"] if inc_ms else None,
-            inc_ms[-1]["t"] if inc_ms else None,
-        )
-        logging.info(
-            "INC DONE sym=%s tf=%s candles=%d dur=%.3fs",
-            symbol,
-            timeframe,
-            len(inc),
-            time.time() - start,
-        )
-
-        return jsonify(
-            {
-                "status": "ok",
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "exec_id": exec_id,
-                "from_ts": inc[0]["t"] if inc else last_ts,
-                "to_ts": inc[-1]["t"] if inc else last_ts,
-                "candles": inc,
-            }
-        ), 200
-
-    except Exception as e:
-        logging.exception(
-            "Error en /monitoreo/incremental (dur=%.3fs)",
-            time.time() - start,
-        )
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-
-@webhook_app.route("/monitoreo/describe", methods=["GET"])
-def monitoreo_describe():
-    exec_id = request.args.get("exec_id","").strip()
-    symbol  = request.args.get("symbol","").strip().upper()
-    if not exec_id or not symbol:
-        return jsonify({"status":"error","message":"exec_id y symbol son obligatorios"}), 400
-    doc = db.collection("monitoreos").document(f"{exec_id}__{symbol}").get()
-    data = doc.to_dict() or {}
-    return jsonify({"status":"ok","doc": data}), 200
-
-
-
-@webhook_app.route("/monitoreo/resume", methods=["GET"])
-async def monitoreo_resume():
-    """
-    GET /monitoreo/resume?symbol=BTCUSD&timeframe=1min&exec_id=xxxx
-    Respuesta: { status, symbol, timeframe, exec_id, last_ts (ms), count, source }
-    """
-    limit = 600
-    from_ts = None
-    to_ts = None
-    persist = False
-    fill_gaps = False
-    force_api = False
-    max_minutes_per_call = 10_000
-    try:
-        symbol = str((request.args.get("symbol") or "")).strip().upper()
-        timeframe = _norm_tf(request.args.get("timeframe"))
-        exec_id = str((request.args.get("exec_id") or "")).strip()
-        if not symbol or not timeframe or not exec_id:
-            return jsonify({"status":"error","message":"symbol, timeframe y exec_id son obligatorios"}), 400
-
-        def _arg_bool(v) -> bool:
-            return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-        limit = request.args.get("limit", 600)
-        from_ts = request.args.get("from_ts", None)
-        to_ts = request.args.get("to_ts", None)
-        persist = _arg_bool(request.args.get("persist", False))
-
-        fill_gaps = _arg_bool(request.args.get("fill_gaps", False))
-        force_api = _arg_bool(request.args.get("force_api", False))
-        try:
-            max_minutes_per_call = int(request.args.get("max_minutes_per_call") or 10_000)
-        except Exception:
-            max_minutes_per_call = 10_000
-
-        st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
-        series_ms = _series_to_ms(st.get("series", []))
-
-
-        # --- Gapfill / force fetch (bajo demanda) ---
-        gapfill_meta = {"requested": bool(force_api or fill_gaps), "force_api": bool(force_api), "fill_gaps": bool(fill_gaps), "fetched": 0, "added": 0}
-        if force_api or fill_gaps:
-            try:
-                tfms = _tf_ms(timeframe)
-                if tfms:
-                    # ventana por defecto: últimas N velas cerradas
-                    try:
-                        _limit_i = int(limit) if limit is not None else 600
-                    except Exception:
-                        _limit_i = 600
-                    if _limit_i <= 0:
-                        _limit_i = 600
-
-                    closed_end = _current_closed_bucket_start(timeframe) - tfms
-
-                    # normaliza from/to (ms) si vienen; si no, deriva desde el límite
-                    _from_in = from_ts
-                    _to_in   = to_ts
-                    try:
-                        _from_in = int(_from_in) if _from_in is not None else None
-                    except Exception:
-                        _from_in = None
-                    try:
-                        _to_in = int(_to_in) if _to_in is not None else None
-                    except Exception:
-                        _to_in = None
-
-                    from_eff = _from_in if _from_in is not None else (closed_end - (_limit_i - 1) * tfms)
-                    to_eff   = _to_in   if _to_in   is not None else closed_end
-
-                    # acota a velas cerradas
-                    to_eff = min(to_eff, closed_end)
-                    if from_eff > to_eff:
-                        from_eff, to_eff = to_eff, from_eff
-
-                    # Trae un poco más allá del último bucket para no quedar corto por inclusividad
-                    fetch_to = min(to_eff + tfms, closed_end + tfms)
-
-                    rng = await asyncio.to_thread(_fetch_historical_range, symbol, timeframe, from_eff, fetch_to)
-                    gapfill_meta["fetched"] = len(rng or [])
-
-                    if rng:
-                        added = merge_bars_series(series_ms, rng, timeframe)
-                        if added:
-                            gapfill_meta["added"] += int(added)
-                            series_ms[:] = _snap_and_dedupe_to_minutes(series_ms, timeframe)
-
-                            with _MON_CACHE_LOCK:
-                                st["series"] = series_ms
-                                if persist:
-                                    st["dirty"] = True
-
-                    # Relleno interno (puede hacer varias llamadas pequeñas). Permitimos 1m/5m solo aquí.
-                    if fill_gaps:
-                        added2 = await asyncio.to_thread(
-                            _backfill_internal_gaps,
-                            series_ms,
-                            symbol,
-                            timeframe,
-                            exec_id,
-                            max_minutes_per_call,
-                            True,  # allow_small_tf
-                        )
-                        if added2:
-                            gapfill_meta["added"] += int(added2)
-                            series_ms[:] = _snap_and_dedupe_to_minutes(series_ms, timeframe)
-                            with _MON_CACHE_LOCK:
-                                st["series"] = series_ms
-                                if persist:
-                                    st["dirty"] = True
-
-            except Exception:
-                logging.exception("Gapfill/force_api falló en /monitoreo/history")
-        last_ts = series_ms[-1]["t"] if series_ms else None
-        # Nota: /resume es de lectura; no cambiamos 'estado' para no pisar running/stopped.
-        await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "last_resume_at_ms": int(time.time() * 1000),
-        })
-
-        return jsonify({
-            "status":"ok",
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "exec_id": exec_id,
-            "last_ts": last_ts,
-            "count": len(series_ms),
-            "source": st.get("source","unknown"),
-        }), 200
-    except Exception as e:
-        logging.exception("Error en /monitoreo/resume")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-
-@webhook_app.route("/monitoreo/history", methods=["POST"])
-async def monitoreo_history():
-    """
-    POST /monitoreo/history
-    Body {
-      user_id: str,
-      exec_id: str,
-      symbol: str,
-      timeframe: "1min"|"5min"|...|"1hour",
-      limit?: int = 600,
-      from_ts?: int (ms),
-      to_ts?: int (ms),
-      persist?: bool
-    }
-    Respuesta: {
-      status, symbol, timeframe, exec_id,
-      from_ts, to_ts, count, candles, persisted_path?
-    }
-    """
-    try:
-        body = request.get_json(force=True) or {}
-
-        user_id   = str(body.get("user_id") or "").strip()
-        exec_id   = str(body.get("exec_id") or "").strip()
-        symbol    = str(body.get("symbol")  or "").strip().upper()
-        timeframe = _norm_tf(body.get("timeframe"))
-
-        limit     = body.get("limit", 600)
-        from_ts   = body.get("from_ts", None)   # epoch ms
-        to_ts     = body.get("to_ts", None)     # epoch ms
-        persist   = bool(body.get("persist", False))
-
-        fill_gaps = bool(body.get("fill_gaps", False))
-        force_api = bool(body.get("force_api", False))
-        try:
-            max_minutes_per_call = int(body.get("max_minutes_per_call") or 10_000)
-        except Exception:
-            max_minutes_per_call = 10_000
-
-        if not user_id:
-            return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
-        if not exec_id:
-            return jsonify({"status": "error", "message": "exec_id es obligatorio"}), 400
-        if not symbol or not timeframe:
-            return jsonify({"status": "error", "message": "symbol y timeframe son obligatorios"}), 400
-        # timeframe ya está normalizado por _norm_tf(...)
-        tf_api = timeframe
-
-        enabled = True
-        if exec_id:
-            enabled = _tf_is_enabled(exec_id, symbol, tf_api)
-        
-        logging.info(
-            "HIST TFCHK sym=%s tf=%s enabled=%s user_id=%s exec_id=%s",
-            symbol, tf_api, enabled, user_id, exec_id,
-        )
-
-        if not enabled:
-            # Endpoint de lectura: no pisamos Firestore acá.
-            return jsonify(
-                {
-                    "status": "ok",
-                    "symbol": symbol,
-                    "timeframe": tf_api,
-                    "exec_id": exec_id,
-                    "from_ts": None,
-                    "to_ts": None,
-                    "candles": [],
-                }
-            ), 200
-
-        # Cobro por llamada (cada consulta activo_temporalidad)
-        ok, msg = await _charge_monitoreo_per_call(user_id, origen="app")
-        if not ok:
-            return jsonify({"status":"error","message": msg}), 402
-
-        try:
-            limit = int(limit)
-        except Exception:
-            limit = 600
-        limit = max(1, min(limit, 5000))
-
-        # Carga cache y normaliza a ms
-        st = await asyncio.to_thread(_load_cache, exec_id, symbol, timeframe)
-
-        # TTL de refresco desde GCS por TF
-        age_map = {
-            "1min": 300,    # ya lo tratamos especial
-            "5min": 120,    # antes 60
-            "15min": 300,   # antes 120
-            "30min": 600,   # antes 240
-            "1hour": 1200,  # antes 600
-            "4hour": 2400,  # antes 1200
-        }
-        age = age_map.get(timeframe, 60)
-
-        # Para 1min: NO refrescamos desde GCS en cada history si ya hay serie en memoria.
-        # Para el resto de TF, o si aún no hay datos, sí refrescamos normalmente.
-        if timeframe not in ("1min", "1m") or not st.get("series"):
-            await asyncio.to_thread(
-                _maybe_refresh_from_gcs,
-                exec_id,
-                symbol,
-                timeframe,
-                st,
-                age,
-            )
-
-        # Normaliza a ms DESPUÉS del posible refresh
-        series_ms = _series_to_ms(st.get("series", []))
-
-        # --- Gapfill / force fetch (bajo demanda) ---
-        gapfill_meta = {"requested": bool(force_api or fill_gaps), "force_api": bool(force_api), "fill_gaps": bool(fill_gaps), "fetched": 0, "added": 0}
-        if force_api or fill_gaps:
-            try:
-                tfms = _tf_ms(timeframe)
-                if tfms:
-                    try:
-                        _limit_i = int(limit) if limit is not None else 600
-                    except Exception:
-                        _limit_i = 600
-                    if _limit_i <= 0:
-                        _limit_i = 600
-
-                    closed_end = _current_closed_bucket_start(timeframe) - tfms
-
-                    _from_in = from_ts
-                    _to_in   = to_ts
-                    try:
-                        _from_in = int(_from_in) if _from_in is not None else None
-                    except Exception:
-                        _from_in = None
-                    try:
-                        _to_in = int(_to_in) if _to_in is not None else None
-                    except Exception:
-                        _to_in = None
-
-                    from_eff = _from_in if _from_in is not None else (closed_end - (_limit_i - 1) * tfms)
-                    to_eff   = _to_in   if _to_in   is not None else closed_end
-
-                    to_eff = min(to_eff, closed_end)
-                    if from_eff > to_eff:
-                        from_eff, to_eff = to_eff, from_eff
-
-                    fetch_to = min(to_eff + tfms, closed_end + tfms)
-
-                    rng = await asyncio.to_thread(_fetch_historical_range, symbol, timeframe, from_eff, fetch_to)
-                    gapfill_meta["fetched"] = len(rng or [])
-
-                    if rng:
-                        added = merge_bars_series(series_ms, rng, timeframe)
-                        if added:
-                            gapfill_meta["added"] += int(added)
-                            series_ms[:] = _snap_and_dedupe_to_minutes(series_ms, timeframe)
-                            with _MON_CACHE_LOCK:
-                                st["series"] = series_ms
-                                if persist:
-                                    st["dirty"] = True
-
-                    if fill_gaps:
-                        added2 = await asyncio.to_thread(
-                            _backfill_internal_gaps,
-                            series_ms,
-                            symbol,
-                            timeframe,
-                            exec_id,
-                            max_minutes_per_call,
-                            True,
-                        )
-                        if added2:
-                            gapfill_meta["added"] += int(added2)
-                            series_ms[:] = _snap_and_dedupe_to_minutes(series_ms, timeframe)
-                            with _MON_CACHE_LOCK:
-                                st["series"] = series_ms
-                                if persist:
-                                    st["dirty"] = True
-
-            except Exception:
-                logging.exception("Gapfill/force_api falló en /monitoreo/history")
-
-
-
-
-        # Filtrado por ventana (en ms si viene)
-        if from_ts is not None:
-            try: from_ts = int(from_ts)
-            except Exception: from_ts = None
-        if to_ts is not None:
-            try: to_ts = int(to_ts)
-            except Exception: to_ts = None
-
-        if from_ts is not None or to_ts is not None:
-            lo = float("-inf") if from_ts is None else from_ts
-            hi = float("inf")  if to_ts   is None else to_ts
-            filt = [c for c in series_ms if lo <= c["t"] <= hi]
-        else:
-            filt = series_ms
-
-        # Aplica límite (últimas N) preservando orden ascendente
-        if limit and len(filt) > limit:
-            filt = filt[-limit:]
-
-        from_out = filt[0]["t"] if filt else from_ts
-        to_out   = filt[-1]["t"] if filt else to_ts
-
-        # Persistencia opcional
-        persisted = None
-        if persist:
-            with _MON_CACHE_LOCK:
-                st["dirty"] = True
-            persisted = await asyncio.to_thread(_persist_if_needed, exec_id, symbol, timeframe, True)
-
-        # Heartbeat
-        await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, {
-            "estado": "running",
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "user_id": user_id,
-            "count_served": len(filt),
-            "last_ts_served": (filt[-1]["t"] if filt else None),
-        })
-
-        resp = {
-            "status": "ok",
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "exec_id": exec_id,
-            "from_ts": from_out,
-            "to_ts": to_out,
-            "count": len(filt),
-            "candles": filt,
-            "gapfill": (gapfill_meta if "gapfill_meta" in locals() else None),
-        }
-        if persisted:
-            resp["persisted_path"] = f"gs://{BUCKET_NAME}/{persisted}"
-        return jsonify(resp), 200
-
-    except Exception as e:
-        logging.exception("Error en /monitoreo/history")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@webhook_app.route('/analisis/ejecutar', methods=['POST'])
-#@profile
-async def ejecutar_analisis_desde_app():
-    chat_id_local = None
-    acquired_lock = False
-    lock_id = None
-    try:
-        # --- lee el payload primero ---
-        data = request.json or {}
-        user_id = str(data.get("user_id") or "").strip()
-        chat_id = str(data.get("chat_id") or "").strip()
-        chat_id_local = chat_id
-
-        if not user_id:
-            return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
-
-        activo = data.get("activo")
-        if activo is None:
-            return jsonify({"status": "error", "message": "Falta 'activo'"}), 400
-
-        origen = (data.get("origen") or "app").lower()
-
-        # Estimar transacciones requeridas reales (activo x temporalidades)
-        n_transacciones_req = 1
-        try:
-            raw_cfg = None
-            if isinstance(data.get("setup"), dict):
-                raw_cfg = data["setup"]
-            elif isinstance(data.get("operatoria"), dict):
-                op = data["operatoria"]
-                raw_cfg = op.get("config", op)
-            op_cfg_est = normalize_operatoria_payload(raw_cfg) if raw_cfg else None
-            tfs_est = (op_cfg_est or {}).get("tfs") or temporalidades
-
-            await asyncio.to_thread(_ensure_globals_loaded)
-            activos_filtrados_est = await asyncio.to_thread(filtrar_activos_por_moneda, activos, activo)
-            n_transacciones_req = max(1, len(list(activos_filtrados_est or [])) * len(list(tfs_est or [])))
-        except Exception as _e:
-            logger.debug(f"[analisis/ejecutar] No se pudo estimar n_transacciones, fallback=1: {_e}")
-            n_transacciones_req = 1
-
-        # --- validar suscripción ---
-        kwargs = {"user_id": user_id} if user_id else {"chat_id": chat_id}
-        estado_sub = await estado_suscripcion(
-            **kwargs,
-            numero_transacciones=n_transacciones_req,
-            origen=origen,
-        )
-        # Diferenciar entre suscripción inactiva y transacciones insuficientes
-        if not es_administrador(user_id or chat_id):
-            if estado_sub == "transacciones_insuficientes":
-                return jsonify({
-                    "status": "error", 
-                    "code": "INSUFFICIENT_TRANSACTIONS",
-                    "message": "No cuenta con la cuota de transacciones requerida. Por favor, adquiere un paquete."
-                }), 402
-            elif estado_sub != "activa":
-                return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
-
-        # --- lock distribuido por usuario (multi-pod) ---
-        lock_id = uuid.uuid4().hex
-        lock_ttl = compute_lock_ttl(1)
-        acquired_lock = await asyncio.to_thread(
-            acquire_user_lock,
-            user_id=user_id,
-            chat_id=chat_id or None,
-            lock_id=lock_id,
-            ttl_seconds=lock_ttl,
-        )
-        if not acquired_lock:
-            return jsonify({"status": "busy", "message": "Ya tienes un análisis en ejecución."}), 409
-
-        await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id, estado="ocupado")
-
-        # 1) Primero intenta con la clave de APP (user_id)
-        opciones_usuario = await obtener_opciones_usuario(user_id, origen="app")
-
-        # 2) Si no hay nada y existe un chat_id, intenta espejo con semántica de bot
-        if (not opciones_usuario) and chat_id:
-            try:
-                opciones_usuario = await obtener_opciones_usuario(chat_id, origen="telegram")
-            except Exception:
-                opciones_usuario = opciones_usuario or []
-
-        # 3) Admin por cualquiera de las dos claves
-        is_admin = es_administrador(user_id) or (chat_id and es_administrador(chat_id))
-
-        if (not is_admin) and not any(
-            o in (opciones_usuario or []) for o in ("analisis basico", "analisis premium", "analisis avanzado")
-        ):
-            return jsonify({"status": "error", "message": "No tienes permisos para esta operación"}), 403
-
-        # 4) config enviada por la app (setup/operatoria)
-        raw_cfg = None
-        if isinstance(data.get("setup"), dict):
-            raw_cfg = data["setup"]
-        elif isinstance(data.get("operatoria"), dict):
-            op = data["operatoria"]
-            raw_cfg = op.get("config", op)
-        op_cfg = normalize_operatoria_payload(raw_cfg) if raw_cfg else None
-
-        # 5) crear ejecución (guarda ambos IDs; chat_id puede venir vacío)
-        exec_id = await asyncio.to_thread(
-            fs_crear_ejecucion,
-            user_id=user_id,
-            chat_id=chat_id or None,
-            activos_solicitados=[activo],
-            origen="app",
-            opciones_usuario=opciones_usuario,
-        )
-
-        my_worker_addr = os.getenv("WORKER_ADDR") 
-        await asyncio.to_thread(
-            fs_marcar_worker,
-            exec_id,
-            estado="running",
-            worker_addr=os.getenv("WORKER_ADDR"),  # ej. "10.8.0.2:8103"
-            detalles_worker={
-                "pid": os.getpid(),
-                "host": socket.gethostname(),
-                "image": os.getenv("DOCKER_IMAGE", "markettool:latest"),
-            },
-        )
-
-        # 6) dummy context/update para reusar el pipeline
-        dummy_update = type("DummyUpdate", (), {
-            "effective_chat": type("DummyChat", (), {"id": chat_id})(),
-            "callback_query": None,
-            "effective_user": type("DummyUser", (), {"first_name": "AppUser", "id": chat_id})()
-        })()
-        dummy_context = type("DummyContext", (), {"bot": application.bot})()
-
-        # 7) cargar CFG + TZ desde user_ids/user_config.current (con caché TTL)
-        # OPTIMIZACION: Config loader con 10min TTL para reducir Firestore reads
-        def _load_user_config(uid):
-            user_ref = db.collection('user_ids').document(uid)
-            cfg_ref  = user_ref.collection('user_config').document('current')
-            doc_user, doc_cfg = list(db.get_all([user_ref, cfg_ref]))
-            tz_name = (doc_user.to_dict() or {}).get('timezone') or 'UTC'
-            cfg = (doc_cfg.to_dict() or {})
-            return {"config": cfg, "timezone": tz_name}
-        
-        cached_data = _USER_CONFIG_CACHE.get_or_load(user_id, _load_user_config)
-        cfg = cached_data.get("config", {})
-        tz_name = cached_data.get("timezone", "UTC")
-
-        global timezone_country, timezone_name
-        timezone_name = tz_name
-        try:
-            timezone_country = pytz.timezone(tz_name)
-        except pytz.UnknownTimeZoneError:
-            timezone_country = pytz.UTC
-            timezone_name = 'UTC'
-
-        # 8) ejecutar
-
-        async def _runner():
-            try:
-                # ✅ NUEVO: Registrar en Firestore para rastreo multi-pod
-                await _EXECUTION_TRACKER.register(exec_id, user_id or chat_id, "analisis_simbolo")
-                
-                urls_local = await ejecutar_recurrente(
-                    dummy_context, dummy_update,
-                    activo, chat_id, opciones_usuario,
-                    user_id=user_id, origen="app",
-                    exec_id=exec_id, operatoria_cfg=op_cfg, cfg=cfg
-                )
-
-                # No sobreescribir estados terminales (p. ej. saldo_insuficiente -> fallido)
-                try:
-                    _snap = await asyncio.to_thread(db.collection("ejecuciones").document(exec_id).get)
-                    _curr = _snap.to_dict() if _snap and _snap.exists else {}
-                    _estado_curr = str((_curr or {}).get("estado") or "").lower()
-                    _resumen_curr = (_curr or {}).get("resumen") or {}
-                    _error_curr = str(
-                        (_resumen_curr or {}).get("error")
-                        or (_curr or {}).get("error")
-                        or (_curr or {}).get("message")
-                        or ""
-                    ).strip()
-
-                    if _estado_curr in {"fallido", "failed", "stopped", "detenido", "cancelado", "canceled"} or _error_curr:
-                        tracker_status = "cancelled" if _estado_curr in {"stopped", "detenido", "cancelado", "canceled"} else "failed"
-                        await _EXECUTION_TRACKER.complete(exec_id, tracker_status)
-                        return urls_local
-                except Exception:
-                    pass
-
-                # fin normal
-                await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "completado", {"urls": urls_local})
-                await _EXECUTION_TRACKER.complete(exec_id, "completed")
-                return urls_local
-            except asyncio.CancelledError:
-                # cancelación solicitada
-                await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "stopped", {"detalle": "detenido_por_usuario"})
-                await _EXECUTION_TRACKER.complete(exec_id, "cancelled")
-                raise
-            except Exception as e:
-                # error real
-                await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "fallido", {"error": str(e)})
-                await _EXECUTION_TRACKER.complete(exec_id, "failed")
-                raise
-            finally:
-                RUNNING.pop(exec_id, None)
-
-        task = asyncio.create_task(_runner())
-        RUNNING[exec_id] = task
-
-        # Heartbeat en background con revisión de cancelación cross-pod
-        async def _hb():
-            try:
-                while not task.done():
-                    await asyncio.sleep(8)
-                    await asyncio.to_thread(fs_heartbeat, exec_id)
-                    
-                    # ✅ NUEVO: Revisar si otro pod solicitó cancelación
-                    if await _EXECUTION_TRACKER.should_cancel(exec_id):
-                        logger.warning(f"[ExecutionTracker] Cancelación solicitada para {exec_id}")
-                        task.cancel()
-                        break
-            except Exception:
-                pass
-        asyncio.create_task(_hb())
-
-        resp = jsonify({"status": "accepted", "exec_id": exec_id})
-        status_code = 202
-        return resp, status_code
-        
-        #urls = await task
-        #return jsonify({
-        #    "status": "ok",
-        #    "exec_id": exec_id,
-        #    "message": f"Análisis ejecutado para {activo}",
-        #    "download_urls": _solo_strings_urls(urls),
-        #}), 200
-
-    except Exception as e:
-        logger.error(f"Error en /analisis/ejecutar: {e}")
-        logging.exception("Error en /analisis/ejecutar")
-        try:
-            if 'exec_id' in locals():
-                await asyncio.to_thread(fs_finalizar_ejecucion, exec_id, "fallido", {"error": str(e)})
-        except Exception:
-            pass
-        return jsonify({"status": "error", "message": str(e)}), 500
-    finally:
-        try:
-            await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id_local, estado="disponible")
-            if lock_id:
-                await asyncio.to_thread(
-                    release_user_lock,
-                    user_id=user_id,
-                    chat_id=chat_id_local or None,
-                    lock_id=lock_id,
-                )
-            if chat_id_local:
-                clear_current_request_cfg(chat_id_local)
-        except Exception:
-            pass
-        # ocupado_lock no se usa en este endpoint (lock distribuido por usuario)
-
-
-@webhook_app.route('/analisis/resultados', methods=['GET'])
-def obtener_resultados_analisis():
-    """
-    GET /analisis/resultados?exec_id=xxx&mode=core|extended|full
-    Retorna los resultados del análisis con campos filtrados según modo.
+from markettool.interfaces.api.analisis_routes import register_analisis_routes
+from markettool.interfaces.api.monitoreo_routes import register_monitoreo_routes
+from markettool.interfaces.api.webhook_routes import register_webhook_routes
+
+
+def _set_timezone_state(tz_name, tz_value):
+    global timezone_country, timezone_name
+    timezone_name = tz_name
+    timezone_country = tz_value
+
+
+register_webhook_routes(
+    webhook_app,
+    application=application,
+    update_cls=Update,
+    logger=logger,
+)
+
+register_monitoreo_routes(
+    webhook_app,
+    logger=logger,
+    db=db,
+    charge_monitoreo_per_call=_charge_monitoreo_per_call,
+    fetch_events_for=_fetch_events_for,
+    filter_by_symbol_currencies=_filter_by_symbol_currencies,
+    hash_payload=_hash_payload,
+    last_hash_ref=_LAST_HASH,
+    detect_new_results=_detect_new_results,
+    evaluar_evento_para_symbol=evaluar_evento_para_symbol,
+    norm_tf=_norm_tf,
+    tf_is_enabled=_tf_is_enabled,
+    load_cache=_load_cache,
+    series_to_ms=_series_to_ms,
+    snap_and_dedupe_to_minutes=_snap_and_dedupe_to_minutes,
+    densify_minutes=_densify_minutes,
+    maybe_tick_quote=_maybe_tick_quote,
+    persist_if_needed=_persist_if_needed,
+    mon_cache_lock=_MON_CACHE_LOCK,
+    maybe_refresh_from_gcs=_maybe_refresh_from_gcs,
+    ensure_stream_initialized=_ensure_stream_initialized,
+    fs_touch_monitoreo=fs_touch_monitoreo,
+    tf_ms=_tf_ms,
+    current_closed_bucket_start=_current_closed_bucket_start,
+    fetch_historical_range=_fetch_historical_range,
+    merge_bars_series=merge_bars_series,
+    backfill_internal_gaps=_backfill_internal_gaps,
+    bucket_name=BUCKET_NAME,
+)
+
+register_analisis_routes(
+    webhook_app,
+    application=application,
+    db=db,
+    logger=logger,
+    running_tasks=RUNNING,
+    execution_tracker=_EXECUTION_TRACKER,
+    estado_suscripcion=estado_suscripcion,
+    es_administrador=es_administrador,
+    normalize_operatoria_payload=normalize_operatoria_payload,
+    temporalidades=temporalidades,
+    ensure_globals_loaded=_ensure_globals_loaded,
+    filtrar_activos_por_moneda=filtrar_activos_por_moneda,
+    activos_ref=activos,
+    compute_lock_ttl=compute_lock_ttl,
+    acquire_user_lock=acquire_user_lock,
+    release_user_lock=release_user_lock,
+    mark_user_state=mark_user_state,
+    obtener_opciones_usuario=obtener_opciones_usuario,
+    fs_crear_ejecucion=fs_crear_ejecucion,
+    fs_marcar_worker=fs_marcar_worker,
+    fs_finalizar_ejecucion=fs_finalizar_ejecucion,
+    fs_heartbeat=fs_heartbeat,
+    user_config_cache=_USER_CONFIG_CACHE,
+    pytz_module=pytz,
+    set_timezone_state=_set_timezone_state,
+    clear_current_request_cfg=clear_current_request_cfg,
+    ocupado_lock=ocupado_lock,
+    es_grafico_de_velas=es_grafico_de_velas,
+    analizar_con_yolo=analizar_con_yolo,
+    descontar_transaccion=descontar_transaccion,
+    stop_events_ref=STOP_EVENTS,
+    stop_events_lock=STOP_EVENTS_LOCK,
+    optimize_records_for_upload=_optimize_records_for_upload,
+    ejecutar_recurrente=ejecutar_recurrente,
+)
     
-    Modes:
-    - "core" (default): solo campos para frontend (DetalleEjecucion, Monitoreo) 
-    - "extended": core + técnica/Monte Carlo detallada
-    - "full": todos los campos (no recomendado)
-    """
-    try:
-        exec_id = request.args.get("exec_id", "").strip()
-        mode = request.args.get("mode", "core").strip().lower()
-        
-        if not exec_id:
-            return jsonify({"status": "error", "message": "exec_id es obligatorio"}), 400
-        
-        if mode not in ("core", "extended", "full"):
-            mode = "core"
-        
-        # Busca archivos_generados con este exec_id
-        docs = list(db.collection("archivos_generados")
-                   .where("exec_id", "==", exec_id)
-                   .stream())
-        
-        if not docs:
-            return jsonify({"status": "error", "message": f"No results for exec_id={exec_id}"}), 404
-        
-        result = {
-            "status": "ok",
-            "exec_id": exec_id,
-            "mode": mode,
-            "files": []
-        }
-        
-        for doc in docs:
-            data = doc.to_dict() or {}
-            nombre = data.get("metadata", {}).get("nombre") or data.get("gcs_path", "")
-            
-            # Filtra por tipo de archivo (solo JSONs de análisis)
-            if not nombre or not nombre.endswith(".json"):
-                continue
-            if "_ordenados" not in nombre and "_oportunidades" not in nombre:
-                continue
-            
-            file_info = {
-                "id": doc.id,
-                "nombre": nombre,
-                "gcs_path": data.get("gcs_path"),
-                "tipo": data.get("tipo"),
-                "created_at": data.get("created_at"),
-            }
-            
-            # Intenta descargar y filtrar si es posible
-            try:
-                signed_url = data.get("metadata", {}).get("signed_url") or data.get("gcs_path")
-                if signed_url:
-                    # Fetch JSON desde GCS
-                    import requests
-                    resp = requests.get(signed_url, timeout=10)
-                    if resp.status_code == 200:
-                        raw_records = resp.json() if isinstance(resp.json(), list) else [resp.json()]
-                        # Aplica filtering
-                        filtered_records = _optimize_records_for_upload(raw_records, upload_mode=mode)
-                        file_info["records_count"] = len(filtered_records)
-                        file_info["size_est_kb"] = len(json.dumps(filtered_records)) / 1024
-                        # Incluye primeras 5 records como preview
-                        file_info["preview"] = filtered_records[:5] if filtered_records else []
-            except Exception as e:
-                logger.debug(f"[resultados] No se pudo procesar {nombre}: {e}")
-                file_info["error"] = str(e)
-            
-            result["files"].append(file_info)
-        
-        return jsonify(result), 200
-    
-    except Exception as e:
-        logger.exception("Error en /analisis/resultados")
-        return jsonify({"status": "error", "message": str(e)}), 500
+# Legacy health routes registration (now handled by bootstrap.py Phase 8)
+# from markettool.interfaces.api.health_routes import register_health_routes
+# register_health_routes(
+#     webhook_app,
+#     warmup_start_ref=lambda: _warmup_start_time,
+#     warmup_end_ref=lambda: _warmup_end_time,
+#     levels_hits_ref=lambda: _niveles_cache_hits,
+#     levels_misses_ref=lambda: _niveles_cache_misses,
+#     atr_hits_ref=lambda: _atr_cache_hits,
+#     atr_misses_ref=lambda: _atr_cache_misses,
+#     app_config=APP_CONFIG,
+# )
+
+from markettool.interfaces.api.cache_routes import register_cache_routes
+
+register_cache_routes(
+    webhook_app,
+    indicators_cache=_INDICATORS_CACHE,
+    cache_enabled=_INDICATORS_CACHE_ENABLED,
+    ttl_hours=_INDICATORS_CACHE_TTL_HOURS,
+    force_recalc=_INDICATORS_FORCE_RECALC,
+)
 
 
-@webhook_app.route('/analisis/stop', methods=['POST'])
-async def detener_analisis_desde_app():
-    try:
-        body = request.get_json(force=True) or {}
-        exec_id = str(body.get("exec_id") or "").strip()
-        if not exec_id:
-            return jsonify({"status":"error","message":"exec_id es obligatorio"}), 400
-
-        # Debe llegar enroutado al nodo correcto por NGINX (?target=IP:PUERTO)
-        task = RUNNING.get(exec_id)
-        if not task:
-            # idempotencia: si ya no existe, mira en DB el estado
-            doc = db.collection("ejecuciones").document(exec_id).get()
-            estado = (doc.to_dict() or {}).get("estado")
-            if estado in {"stopped","completed","fallido"}:
-                return jsonify({"status":"ok","exec_id":exec_id,"already":estado}), 200
-            return jsonify({"status":"error","message":"exec_id no encontrado en este worker"}), 404
-
-        # 1) marca intención de stop (NO toques worker_addr aquí)
-        await asyncio.to_thread(
-            fs_marcar_worker,
-            exec_id,
-            estado="stop_requested",
-            detalles_worker={
-                "stop_requested_at": int(time.time()),
-                "stop_origin": "user/app",  # o "system/timeout", etc.
-            },
-        )
-
-        # cancelar
-        task.cancel()
-        try:
-            await task     # esperar cleanup del runner
-        except asyncio.CancelledError:
-            pass
-
-        # 3) marca estado final
-        await asyncio.to_thread(
-            fs_marcar_worker,
-            exec_id,
-            estado="stopped",
-            detalles_worker={
-                "stopped_at": int(time.time()),
-                "stopped_by": "user/app",
-            },
-        )
-
-        return jsonify({"status":"ok","exec_id":exec_id,"stopped":True}), 200
-
-    except Exception as e:
-        logging.exception("Error en /analisis/stop")
-        return jsonify({"status":"error","message":str(e)}), 500
-
-
-def _get_stop_evt(exec_id: str) -> threading.Event:
-    with STOP_EVENTS_LOCK:
-        return STOP_EVENTS.setdefault(exec_id, threading.Event())
-
-def _release_stop_evt(exec_id: str):
-    with STOP_EVENTS_LOCK:
-        STOP_EVENTS.pop(exec_id, None)
-
-class StopRequested(Exception):
-    pass
-
-@webhook_app.route('/analisis/imagen', methods=['POST'])
-async def subir_imagen_y_analizar():
-    ruta_local = None
-    ruta_salida = None
-    acquired_lock = False
-    exec_id = None
-    user_id = None
-    chat_id = None
-
-    try:
-        form = request.form or {}
-        j = request.get_json(silent=True) or {}
-        user_id = str(form.get("user_id") or j.get("user_id") or "").strip()
-        chat_id = str(form.get("chat_id") or j.get("chat_id") or "").strip()
-
-        if not user_id:
-            return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
-        if "imagen" not in request.files:
-            return jsonify({"status": "error", "message": "Falta archivo 'imagen'"}), 400
-
-        if ocupado_lock.locked():
-            return "Estoy ocupado", 503
-        await asyncio.to_thread(ocupado_lock.acquire)
-        acquired_lock = True
-
-        estado_sub = await estado_suscripcion(user_id=user_id, numero_transacciones=1, origen="app")
-        if not es_administrador(user_id or chat_id):
-            if estado_sub == "transacciones_insuficientes":
-                return jsonify({
-                    "status": "error",
-                    "code": "INSUFFICIENT_TRANSACTIONS",
-                    "message": "No cuenta con la cuota de transacciones requerida. Por favor, adquiere un paquete."
-                }), 402
-            elif estado_sub != "activa":
-                return jsonify({"status": "error", "message": "Suscripción inactiva o insuficiente"}), 403
-
-        await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id, estado="ocupado")
-
-        exec_id = (form.get("exec_id") or j.get("exec_id") or uuid.uuid4().hex)
-        os.makedirs("imagenes", exist_ok=True)
-        os.makedirs("procesadas", exist_ok=True)
-
-        imagen = request.files["imagen"]
-        ruta_local = os.path.join("imagenes", f"{exec_id}.jpg")
-        await asyncio.to_thread(imagen.save, ruta_local)
-
-        ts = int(time.time())
-        db.collection("ejecuciones").document(exec_id).set({
-            "estado": "running",
-            "tipo": "analisis_imagen",
-            "user_id": user_id,
-            "created_at": ts,
-            "updated_at": ts
-        }, merge=True)
-
-        await asyncio.to_thread(
-            fs_marcar_worker,
-            exec_id,
-            estado="running",
-            worker_addr=os.getenv("WORKER_ADDR"),
-            detalles_worker={"pid": os.getpid(), "tipo": "imagen", "origen": "app"},
-        )
-
-        stop_evt = _get_stop_evt(exec_id)
-        RUNNING[exec_id] = asyncio.current_task()
-        
-        # ✅ NUEVO: Registrar en tracker distribuido
-        await _EXECUTION_TRACKER.register(exec_id, user_id or chat_id, "analisis_grafico")
-
-        try:
-            mark_user_state(user_id=user_id, estado="esperando_grafico_ia")
-        except Exception:
-            pass
-
-        es_chart = await asyncio.to_thread(es_grafico_de_velas, ruta_local)
-        if not es_chart:
-            await asyncio.to_thread(fs_marcar_worker, exec_id, estado="fallido")
-            db.collection("ejecuciones").document(exec_id).set({
-                "estado": "fallido",
-                "resumen": {"message": "❌ No parece ser un gráfico de velas"},
-                "updated_at": int(time.time())
-            }, merge=True)
-            return jsonify({"status": "error", "message": "❌ No parece ser un gráfico de velas"}), 400
-
-        include_tech = es_administrador(user_id or chat_id)
-
-        # --- análisis en hilo ---
-        try:
-            res = await asyncio.to_thread(
-                analizar_con_yolo,
-                ruta_local,
-                stop_cb=stop_evt.is_set,
-                include_tech=include_tech,
-                user_id=user_id,
-            )
-        except TypeError:
-            # compat por si tu build en prod aún no trae estos args
-            res = await asyncio.to_thread(analizar_con_yolo, ruta_local)
-
-        # --- soporte retorno (2 o 3) ---
-        entradas_payload = {}
-        if isinstance(res, tuple) and len(res) == 3:
-            ruta_salida, texto_resultado, entradas_payload = res
-        elif isinstance(res, tuple) and len(res) == 2:
-            ruta_salida, texto_resultado = res
-            entradas_payload = {}
-        else:
-            raise ValueError(f"analizar_con_yolo devolvió formato inesperado: {type(res)} / {res}")
-
-        if stop_evt.is_set():
-            raise asyncio.CancelledError()
-
-        if not ruta_salida or not os.path.exists(ruta_salida):
-            await asyncio.to_thread(fs_marcar_worker, exec_id, estado="fallido")
-            db.collection("ejecuciones").document(exec_id).set({
-                "estado": "fallido",
-                "resumen": {"message": "No se generó imagen procesada"},
-                "updated_at": int(time.time())
-            }, merge=True)
-            return jsonify({"status": "error", "message": "No se generó imagen procesada"}), 500
-
-        with open(ruta_salida, "rb") as f:
-            img_base64 = base64.b64encode(f.read()).decode("utf-8")
-
-        try:
-            if not es_administrador(user_id or chat_id):
-                success, mensaje = await descontar_transaccion(user_id, 1)
-                if not success:
-                    db.collection("ejecuciones").document(exec_id).set({"billing_warn": mensaje}, merge=True)
-        except Exception as cobro_e:
-            logger.warning(f"[IA] Error en cobro: {cobro_e}")
-
-        await asyncio.to_thread(fs_marcar_worker, exec_id, estado="completed")
-
-        resumen = {
-            "message": texto_resultado,
-            "imagen_base64": img_base64,
-            "entradas": entradas_payload or {},
-        }
-
-        db.collection("ejecuciones").document(exec_id).set({
-            "estado": "completed",
-            "resumen": resumen,
-            "updated_at": int(time.time())
-        }, merge=True)
-
-        return jsonify({
-            "status": "ok",
-            "exec_id": exec_id,
-            "message": texto_resultado,
-            "imagen_base64": img_base64,
-            "entradas": entradas_payload or {},
-        }), 200
-
-    except asyncio.CancelledError:
-        await asyncio.to_thread(fs_marcar_worker, exec_id, estado="stopped")
-        db.collection("ejecuciones").document(exec_id).set({
-            "estado": "stopped", "updated_at": int(time.time())
-        }, merge=True)
-        return jsonify({"status": "stopped", "exec_id": exec_id}), 200
-
-    except Exception as e:
-        logger.exception("❌ Error en /analisis/imagen")
-        if exec_id:
-            try:
-                await asyncio.to_thread(fs_marcar_worker, exec_id, estado="fallido", detalles_worker={"error": str(e)})
-                db.collection("ejecuciones").document(exec_id).set({
-                    "estado": "fallido", "error": str(e), "updated_at": int(time.time())
-                }, merge=True)
-            except Exception:
-                pass
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    finally:
-        RUNNING.pop(exec_id, None)
-        _release_stop_evt(exec_id)
-        try:
-            await asyncio.to_thread(mark_user_state, user_id=user_id or chat_id, estado="disponible")
-        except Exception:
-            pass
-        try:
-            if ruta_local and os.path.exists(ruta_local): os.remove(ruta_local)
-            if ruta_salida and os.path.exists(ruta_salida): os.remove(ruta_salida)
-        except Exception:
-            pass
-        if acquired_lock and ocupado_lock.locked():
-            try: ocupado_lock.release()
-            except Exception:
-                pass
-
-
-# Ruta para el webhook
-@webhook_app.route('/webhook', methods=['POST'])
-#@profile
-async def webhook():
-    try:
-        payload = request.get_json()
-        logger.info(f"Payload recibido: {payload}")
-        update = Update.de_json(payload, application.bot)
-        await application.process_update(update)
-        return jsonify({"status": "ok"})
-    except Exception as e:
-        logger.info(f"Error procesando webhook: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-    
-@webhook_app.route('/health', methods=['GET'])
-#@profile
-def health():
-    return {"status": "ok", "instance": socket.gethostname()}
-    
-@webhook_app.route('/healthz', methods=['GET'])
-#@profile
-def health_check():
-    return jsonify({"status": "ok"}), 200
-
-@webhook_app.route('/cache-status', methods=['GET'])
-#@profile
-def cache_status():
-    """Endpoint para verificar el estado del caché y el warmup progress."""
-    warmup_status = "not started"
-    warmup_time_taken = None
-    
-    if _warmup_start_time is not None:
-        if _warmup_end_time is not None:
-            warmup_status = "completed"
-            warmup_time_taken = _warmup_end_time - _warmup_start_time
-        else:
-            warmup_status = "in progress"
-            warmup_time_taken = time.time() - _warmup_start_time
-    
-    return jsonify({
-        "status": "ok",
-        "instance": socket.gethostname(),
-        "warmup": {
-            "status": warmup_status,
-            "start_time": _warmup_start_time,
-            "end_time": _warmup_end_time,
-            "elapsed_seconds": warmup_time_taken,
-        },
-        "cache_stats": {
-            "niveles_hits": _niveles_cache_hits,
-            "niveles_misses": _niveles_cache_misses,
-            "niveles_hit_rate": round(100 * _niveles_cache_hits / max(1, _niveles_cache_hits + _niveles_cache_misses), 1),
-            "atr_hits": _atr_cache_hits,
-            "atr_misses": _atr_cache_misses,
-            "atr_hit_rate": round(100 * _atr_cache_hits / max(1, _atr_cache_hits + _atr_cache_misses), 1),
-        },
-        "warmup_config": {
-            "enabled": APP_CONFIG.cache_warmup_enabled,
-            "blocking_startup": APP_CONFIG.cache_warmup_blocking_startup,
-            "leader_only": APP_CONFIG.cache_warmup_leader_only,
-            "concurrency": APP_CONFIG.cache_warmup_concurrency,
-            "max_ram_percent": APP_CONFIG.cache_warmup_max_ram_percent,
-        }
-    }), 200
-
-@webhook_app.route('/', methods=['GET'])
-#@profile
-def index():
-    return "El bot está funcionando", 200
-
-
-# ======================================================================
-# INDICATORS CACHE API ENDPOINTS
-# ======================================================================
-
-@webhook_app.route('/api/cache/invalidate', methods=['POST'])
-def api_cache_invalidate():
-    """
-    Invalida caché de indicadores para un activo/temporalidad.
-    
-    Body JSON:
-        {
-            "symbol": "EURUSD",
-            "timeframe": "1day"
-        }
-    
-    Returns:
-        {"status": "ok", "message": "Cache invalidated"}
-    """
-    try:
-        data = request.get_json()
-        symbol = data.get('symbol')
-        timeframe = data.get('timeframe')
-        
-        if not symbol or not timeframe:
-            return jsonify({"error": "Missing symbol or timeframe"}), 400
-        
-        _INDICATORS_CACHE.invalidate(symbol, timeframe)
-        
-        return jsonify({
-            "status": "ok",
-            "message": f"Cache invalidated for {symbol}/{timeframe}"
-        }), 200
-    
-    except Exception as e:
-        logger.error(f"[API] Cache invalidate error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@webhook_app.route('/api/cache/stats', methods=['GET'])
-def api_cache_stats():
-    """
-    Obtiene estadísticas del caché de indicadores.
-    
-    Returns:
-        {
-            "enabled": true,
-            "memory_cache_size": 42,
-            "ttl_hours": 4,
-            "cached_symbols": ["EURUSD__1day", "GBPUSD__4hour", ...]
-        }
-    """
-    try:
-        cached_keys = list(_INDICATORS_CACHE._memory_cache.keys())
-        
-        return jsonify({
-            "enabled": _INDICATORS_CACHE_ENABLED,
-            "memory_cache_size": len(cached_keys),
-            "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
-            "force_recalc": _INDICATORS_FORCE_RECALC,
-            "cached_symbols": cached_keys
-        }), 200
-    
-    except Exception as e:
-        logger.error(f"[API] Cache stats error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@webhook_app.route('/api/cache/clear', methods=['POST'])
-def api_cache_clear():
-    """
-    Limpia todo el caché de memoria (NO elimina de GCS).
-    
-    Returns:
-        {"status": "ok", "cleared_items": 42}
-    """
-    try:
-        count = len(_INDICATORS_CACHE._memory_cache)
-        _INDICATORS_CACHE._memory_cache.clear()
-        _INDICATORS_CACHE._memory_cache_ttl.clear()
-        
-        return jsonify({
-            "status": "ok",
-            "cleared_items": count,
-            "message": "Memory cache cleared (GCS data preserved)"
-        }), 200
-    
-    except Exception as e:
-        logger.error(f"[API] Cache clear error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@webhook_app.route('/api/cache/metadata', methods=['GET'])
-def api_cache_metadata():
-    """
-    Obtiene metadata de indicadores desde Firestore.
-    
-    Query params:
-        ?symbol=EURUSD&timeframe=1day
-    
-    Returns:
-        Metadata del caché si existe, o null
-    """
-    try:
-        symbol = request.args.get('symbol')
-        timeframe = request.args.get('timeframe')
-        
-        if not symbol or not timeframe:
-            return jsonify({"error": "Missing symbol or timeframe parameters"}), 400
-        
-        # Obtener metadata desde Firestore
-        if _INDICATORS_CACHE.db:
-            doc_id = _INDICATORS_CACHE._metadata_doc_id(symbol, timeframe)
-            doc = _INDICATORS_CACHE.db.collection("indicators_metadata").document(doc_id).get()
-            
-            if doc.exists:
-                metadata = doc.to_dict()
-                # Convertir timestamps a ISO strings
-                if 'last_update_utc' in metadata:
-                    metadata['last_update_utc'] = metadata['last_update_utc'].isoformat()
-                
-                return jsonify({
-                    "exists": True,
-                    "metadata": metadata
-                }), 200
-            else:
-                return jsonify({
-                    "exists": False,
-                    "message": f"No metadata found for {symbol}/{timeframe}"
-                }), 404
-        else:
-            return jsonify({"error": "Firestore not available"}), 503
-    
-    except Exception as e:
-        logger.error(f"[API] Cache metadata error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-# Ruta de prueba
+# Main entry point moved to markettool/bootstrap.py
+# This module (MarketTool.py) is now imported by bootstrap.py which handles initialization
+# To run the application, use: python -m markettool.bootstrap
 if __name__ == "__main__":
-    logger.info("Inicializando el bot...")
-    
-    try:
-        # Crear un bucle de eventos para manejar la inicialización
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(initialize_bot())
-        
-        logger.info("Inicialización completada. Ejecutando el servidor...")
-        # Ejecutar el servidor
-        webhook_url = os.environ.get("WEBHOOK_URL")
-        port = int(os.environ.get("PUERTO", 8080))
-        logger.info(f"WEBHOOK_URL = {webhook_url}, PUERTO={port}")
-        if webhook_url:
-            uvicorn.run(
-                asgi_app, 
-                host="0.0.0.0", 
-                port=port, 
-                log_level="info", 
-                lifespan="off",
-                log_config=LOGGING_CONFIG, 
-                timeout_keep_alive=900,  # Espera hasta 5 minutos en keep-alive
-                timeout_graceful_shutdown=900
-                )
-            logger.info("Webhook con Server Web configurado...")
-        
-    except Exception as e:
-       logger.info(f"Error en la aplicación principal: {e}")
-    except KeyboardInterrupt:
-       logger.info("Programa detenido manualmente.")
-    finally:
-        # Cancelar todas las tareas pendientes
-        pending = asyncio.all_tasks(loop)
-        for task in pending:
-            task.cancel()
-        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        loop.run_until_complete(loop.shutdown_asyncgens())  # Cerrar generadores asíncronos
-        loop.close()  # Cerrar el bucle de eventos
-        logger.info("Bucle de eventos cerrado correctamente.")
+    # Only import here to avoid circular dependencies
+    from markettool.bootstrap import main
+    main()
+

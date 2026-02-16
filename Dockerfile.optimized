@@ -1,0 +1,136 @@
+# ====================================
+# MarketTool - Multi-Stage Production Dockerfile
+# Phase 8: Optimized for size and security
+# ====================================
+
+# ====================================
+# Stage 1: Builder
+# ====================================
+FROM python:3.12-slim AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy and install Python dependencies
+COPY requirements.txt .
+
+# Install dependencies to a specific directory (for copying to final stage)
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    python -m pip install --no-cache-dir --prefix=/install \
+        torch==2.2.2+cu121 \
+        torchvision==0.17.2+cu121 \
+        torchaudio==2.2.2 \
+        --extra-index-url https://download.pytorch.org/whl/cu121 && \
+    python -m pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ====================================
+# Stage 2: Runtime
+# ====================================
+FROM python:3.12-slim AS runtime
+
+# Install runtime dependencies only (no build tools)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgl1 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN groupadd -r markettool && useradd -r -g markettool markettool
+
+WORKDIR /app
+
+# Copy Python dependencies from builder
+COPY --from=builder /install /usr/local
+
+# 🚫 PASO 1: Copiar modelos PRIMERO
+COPY --chown=markettool:markettool patrones.pt ruido.pt ./
+
+# 🚫 PASO 2: Crear directorios y configuración YOLO
+RUN mkdir -p \
+    /app/models/torch \
+    /app/models/easyocr \
+    /app/models/yolo \
+    /home/markettool/.ultralytics \
+    && chown -R markettool:markettool /app /home/markettool
+
+# Copy YOLO config
+COPY --chown=markettool:markettool .ultralytics.yaml /home/markettool/.ultralytics/settings.yaml
+
+# 🚫 PASO 3: Environment variables OFFLINE
+ENV TORCH_HOME=/app/models/torch \
+    EASY_OCR_MODEL_DIR=/app/models/easyocr \
+    YOLO_CACHE_DIR=/app/models/yolo \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
+# 🚫 PASO 4: Copy application code
+COPY --chown=markettool:markettool . .
+
+# 🚫 PASO 5: Validate models are present
+RUN [ -f /app/patrones.pt ] && [ -f /app/ruido.pt ] && \
+    ls -lh /app/*.pt && \
+    echo "✅ Models present" || \
+    (echo "❌ Models missing" && exit 1)
+
+# ====================================
+# Production Environment Configuration
+# ====================================
+EXPOSE 8080
+
+# Core Python settings
+ENV PORT=8080 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONOPTIMIZE=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONHASHSEED=random
+
+# Memory optimization
+ENV MALLOC_TRIM_THRESHOLD_=100000 \
+    MALLOC_MMAP_THRESHOLD_=100000 \
+    PYTHONMALLOC=pymalloc
+
+# Thread safety & process management
+ENV ANALYSIS_PRED_USE_PROCESS=true \
+    GRPC_PYTHON_BUILD_WITH_CYTHON=false \
+    GRPC_WORKER_THREADS=1
+
+# Cache & performance settings
+ENV CACHE_WARMUP_CONCURRENCY=16 \
+    ANALYSIS_PER_SYMBOL_CONCURRENCY=8 \
+    INDICATORS_CACHE_ENABLED=true \
+    INDICATORS_CACHE_TTL_HOURS=4
+
+# Application metadata (for health checks)
+ENV APP_VERSION=2.0.0-phase8 \
+    ENVIRONMENT=production
+
+# Health check configuration
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -fsS http://localhost:8080/healthz || exit 1
+
+# Switch to non-root user
+USER markettool
+
+# Start application
+CMD ["python", "-m", "markettool.bootstrap"]
+
+# ====================================
+# Build Information
+# ====================================
+LABEL maintainer="MarketTool Team" \
+      version="2.0.0-phase8" \
+      description="MarketTool Trading Bot with Hexagonal Architecture" \
+      org.opencontainers.image.title="MarketTool" \
+      org.opencontainers.image.description="Production-ready trading bot with AI pattern recognition" \
+      org.opencontainers.image.version="2.0.0-phase8"

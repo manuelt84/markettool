@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: markettool-config
+  namespace: trading
+data:
+  # Basic Config
+  PORT: "8080"
+  PUERTO: "8080"
+  FMP_PLAN: "premium"
+  
+  # Cache Configuration
+  CACHE_TTL_CONFIG: "600"
+  CACHE_TTL_HISTORICOS: "1800"
+  CACHE_MAX_SIZE_HISTORICOS: "100"
+  
+  # Cache Warmup
+  CACHE_WARMUP_ENABLED: "true"
+  CACHE_WARMUP_BLOCKING_STARTUP: "false"
+  CACHE_WARMUP_INTERVAL_MINUTES: "120"
+  CACHE_WARMUP_MAX_RAM_PERCENT: "90"
+  CACHE_WARMUP_CONCURRENCY: "8"
+  CACHE_WARMUP_LEADER_ONLY: "false"
+  
+  # GCS Configuration
+  GCS_ENABLED: "true"
+  GCS_BUCKET_NAME: "markettool_bucket"
+  UPLOAD_SEM: "60"                        # Max concurrent uploads to GCS
+  GCP_UPLOAD_MODE: "core"                 # "core" (small) | "extended" (medium) | "full" (all)
+  
+  # Entries/Signals - Quality Over Quantity (v3.1)
+  ENTRADA_MAX_CANDIDATES: "10"            # Max entry points per asset/TF (was 40)
+  ENTRADA_MIN_RRR: "2.0"                  # Minimum Risk/Reward Ratio (was 1.5)
+  ENTRADA_ENABLE_LADDERS: "false"         # Disable ladder entries (noise)
+  ENTRADA_ENABLE_RETEST: "false"          # Disable breakout-retest
+  ENTRADA_ENABLE_RANGE_REVERT: "true"     # Keep range mean-reversion
+  
+  # HTTP Configuration
+  HTTP_TIMEOUT: "10"
+  HTTP_RETRIES: "3"
+  HTTP_BACKOFF: "1.8"
+  
+  # News & Events Cache
+  NEWS_CACHE_TTL_SECONDS: "300"
+  ECONOMIC_EVENTS_CACHE_TTL: "3600"
+  ECON_CHUNK_DAYS: "31"
+  
+  # Parallel Analysis Engine Configuration (Updated)
+  ANALYSIS_MAX_WORKERS: "160"
+  ANALYSIS_PRED_WORKERS: "8"
+  ANALYSIS_ANALYSIS_WORKERS: "32"
+  
+  # Level 1: Multi-Asset Concurrency
+  PARALLEL_MAX_CONCURRENT_ASSETS: "18"
+  PARALLEL_BATCH_SIZE_ASSETS: "16"
+  
+  # Level 2: Multi-TimeFrame Fanout
+  PARALLEL_TIMEFRAME_FANOUT: "7"
+  
+  # Timeouts
+  PARALLEL_GLOBAL_TIMEOUT: "300"
+  PARALLEL_TIMEOUT_BATCH: "120"
+  PARALLEL_TIMEOUT_ASSET: "50"
+  PARALLEL_TIMEOUT_TF: "10"
+  PARALLEL_TIMEOUT_PREDICTION_ARIMA: "7"
+  PARALLEL_TIMEOUT_PREDICTION_MC: "3"
+  
+  # Memory Management
+  PARALLEL_RAM_PERCENT_LIMIT: "80"
+  
+  # Gunicorn Workers
+  GUNICORN_CMD_ARGS: "--workers=2 --threads=2 --timeout=120"

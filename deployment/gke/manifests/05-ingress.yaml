@@ -1,0 +1,71 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: markettool-ingress
+  namespace: trading
+  labels:
+    app: markettool
+  annotations:
+    kubernetes.io/ingress.class: gce
+    kubernetes.io/ingress.global-static-ip-name: markettool-ip
+    networking.gke.io/managed-certificates: markettool-cert
+    networking.gke.io/v1beta1.FrontendConfig: markettool-frontend-config
+spec:
+  rules:
+  - host: trading.libertex.dev
+    http:
+      paths:
+      - path: /*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: markettool
+            port:
+              number: 80
+  - host: api.trading.libertex.dev
+    http:
+      paths:
+      - path: /*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: markettool
+            port:
+              number: 80
+---
+apiVersion: cloud.google.com/v1
+kind: ManagedCertificate
+metadata:
+  name: markettool-cert
+  namespace: trading
+spec:
+  domains:
+  - trading.libertex.dev
+  - api.trading.libertex.dev
+---
+apiVersion: cloud.google.com/v1
+kind: FrontendConfig
+metadata:
+  name: markettool-frontend-config
+  namespace: trading
+spec:
+  redirectToHttps:
+    enabled: true
+    responseCodeName: "301"
+  securityPolicy: markettool-security-policy
+---
+apiVersion: compute.cnrm.cloud.google.com/v1beta1
+kind: ComputeSecurityPolicy
+metadata:
+  name: markettool-security-policy
+  namespace: trading
+spec:
+  rules:
+  - priority: "1000"
+    description: "Allow all traffic"
+    match:
+      versionedExpr: "CURRENT"
+      matcherOptions:
+        srcIpRanges:
+        - "*"
+    action: "allow"

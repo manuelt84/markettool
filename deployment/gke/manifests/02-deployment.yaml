@@ -1,0 +1,164 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: markettool
+  namespace: trading
+  labels:
+    app: markettool
+    version: v1
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: markettool
+  template:
+    metadata:
+      labels:
+        app: markettool
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: markettool
+      terminationGracePeriodSeconds: 30
+      
+      # Pod Affinity for high availability
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - markettool
+              topologyKey: kubernetes.io/hostname
+        
+        # Node Affinity for specific pool
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - trading-pool
+      
+      initContainers:
+      - name: init-wait-secrets
+        image: busybox:1.35
+        command: ['sh', '-c', 'until [ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]; do echo waiting for service account; sleep 2; done']
+      
+      containers:
+      - name: markettool
+        image: southamerica-west1-docker.pkg.dev/trading-449607/trading-repo/markettool:latest
+        imagePullPolicy: Always
+        
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        
+        # Environment variables from ConfigMap
+        envFrom:
+        - configMapRef:
+            name: markettool-config
+        
+        # Sensitive environment variables from Secrets
+        env:
+        - name: TELEGRAM_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: markettool-secrets
+              key: telegram-bot-token
+        - name: FMP_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: markettool-secrets
+              key: fmp-api-key
+        - name: WEBHOOK_URL
+          valueFrom:
+            configMapKeyRef:
+              name: markettool-config
+              key: WEBHOOK_URL
+        - name: GOOGLE_APPLICATION_CREDENTIALS
+          value: trading-firestore.json
+        
+        # Resource limits and requests
+        resources:
+          requests:
+            cpu: 800m
+            memory: 2500Mi
+          limits:
+            cpu: 1200m
+            memory: 3500Mi
+        
+        # Liveness probe
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        
+        # Readiness probe
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        
+        # Volume mounts
+        volumeMounts:
+        - name: gcp-key-volume
+          mountPath: /var/secrets/google
+          readOnly: true
+        - name: cache-volume
+          mountPath: /app/cache
+        - name: historicos-volume
+          mountPath: /app/historicos
+        
+        # Security context
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+      
+      # Volumes
+      volumes:
+      - name: gcp-key-volume
+        secret:
+          secretName: gcp-service-account-key
+      - name: cache-volume
+        emptyDir:
+          sizeLimit: 2Gi
+      - name: historicos-volume
+        emptyDir:
+          sizeLimit: 5Gi
+      
+      # DNS policy
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
