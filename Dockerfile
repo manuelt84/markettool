@@ -24,6 +24,23 @@ RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN python -m pip install --no-cache-dir torch==2.2.2+cu121 torchvision==0.17.2+cu121 torchaudio==2.2.2 --extra-index-url https://download.pytorch.org/whl/cu121
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
+# 🚫 PASO 4b: Pre-descargar modelos de easyocr en BUILD TIME (no en runtime)
+# Esto evita bloqueos de startup descargando 200MB+ de modelos
+RUN python -c "
+import os
+os.environ['EASY_OCR_MODEL_DIR'] = '/app/models/easyocr'
+try:
+    import easyocr
+    print('[BuildTime] Downloading easyocr English model...')
+    reader = easyocr.Reader(['en'], gpu=False, model_storage_directory='/app/models/easyocr')
+    print('[BuildTime] ✅ easyocr model downloaded successfully')
+except Exception as e:
+    print(f'[BuildTime] ⚠️ easyocr download failed (non-blocking): {e}')
+" || true
+
+# Verificar que los modelos se descargaron
+RUN ls -lh /app/models/easyocr/ || echo "ℹ️  easyocr models not yet present (will download on first use)"
+
 # Install Playwright browsers at build time so runtime doesn't need downloads
 RUN python -m playwright install --with-deps
 

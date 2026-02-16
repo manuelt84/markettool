@@ -1676,11 +1676,19 @@ def get_easyocr_reader(prefer_gpu: bool = True):
         _reader = _try_init(False)
         return _reader
 
-# ✅ LAZY LOADING: EasyOCR se inicializa solo cuando se usa por primera vez
-# Esto evita descargar modelos en el startup bloqueante 
-# (los modelos son ~200MB y pueden tardar minutos en descargar)
-logger.info("[EasyOCR] Lazy loading habilitado - modelos se descargarán en primer uso")
-reader = None  # Se inicializa a demanda en la primera llamada a get_easyocr_reader() 
+# ✅ Eager initialization de EasyOCR (ahora rápido porque modelos están en imagen Docker)
+# Pre-descarga en build time elimina delays de startup (fue el problema original)
+# Modelos ~200MB ya están en /app/models/easyocr/ desde la imagen Docker
+try:
+    reader = get_easyocr_reader(prefer_gpu=True)
+    if reader:
+        logger.info("[EasyOCR] ✅ Inicialización exitosa (modelos from Docker image)")
+    else:
+        logger.warning("[EasyOCR] Reader initialization returned None (OCR disabled)")
+except Exception as e:
+    logger.warning(f"[EasyOCR] No se pudo inicializar EasyOCR en startup: {e}")
+    logger.warning("[EasyOCR] El sistema operará sin OCR. La funcionalidad OCR no estará disponible.")
+    reader = None 
 
 
 #@profile
