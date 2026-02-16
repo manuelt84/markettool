@@ -57,6 +57,7 @@ from telegram.ext import ApplicationBuilder, Application, CallbackQueryHandler, 
 from telegram.helpers import escape_markdown
 from textblob import TextBlob
 from textwrap import wrap
+import threading
 from threading import Lock
 try:
     from ultralytics import YOLO  # pyright: ignore[reportMissingImports]
