@@ -1156,6 +1156,7 @@ DIRECCION_USDT_TRC20 = 'TNYdZMs5eGYcwdY8vEAe59utu2RYhdyquh' #UNSTOPPABLE
 
 # Memoria temporal para las noticias (defaultdict para auto-inicializar símbolos)
 cache_noticias = defaultdict(pd.DataFrame)  # Diccionario donde la clave es el símbolo
+cache_noticias_lock = threading.Lock()  # 🔒 CRITICAL: Protect concurrent dict access
 cache_historicos = {}
 ultima_actualizacion_historicos = {}
 
@@ -4252,14 +4253,16 @@ def return_state(
         pass
 
     # 2) Memoria por UUID
-    if uuid in user_states and "estado" in user_states[uuid]:
-        return str(user_states[uuid]["estado"])
+    # FIXED: Protect user_states access with lock to prevent TOCTOU race
+    with user_states_lock:
+        if uuid in user_states and "estado" in user_states[uuid]:
+            return str(user_states[uuid]["estado"])
 
-    # 3) Memoria por claves “crudas” (compat)
-    if chat_id is not None and str(chat_id) in user_states and "estado" in user_states[str(chat_id)]:
-        return str(user_states[str(chat_id)]["estado"])
-    if user_id is not None and str(user_id) in user_states and "estado" in user_states[str(user_id)]:
-        return str(user_states[str(user_id)]["estado"])
+        # 3) Memoria por claves "crudas" (compat)
+        if chat_id is not None and str(chat_id) in user_states and "estado" in user_states[str(chat_id)]:
+            return str(user_states[str(chat_id)]["estado"])
+        if user_id is not None and str(user_id) in user_states and "estado" in user_states[str(user_id)]:
+            return str(user_states[str(user_id)]["estado"])
 
     return default
 
@@ -4323,16 +4326,13 @@ def detectar_categoria(event):
 async def cargar_admin_ids():
     """Carga los chat_ids desde Firestore o devuelve una lista vacía si no hay datos."""
     try:
-        # Obtén la referencia a la colección "admin_ids"
-        collection_ref = db.collection("admin_ids")
+        # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread to prevent event loop blocking
+        def _sync_load_admin_ids():
+            collection_ref = db.collection("admin_ids")
+            docs = collection_ref.stream()
+            return [doc.to_dict().get("chat_id") for doc in docs if doc.exists]
         
-        # Consulta todos los documentos de la colección
-        docs = collection_ref.stream()
-
-        # Extraer los chat_ids desde los documentos
-        admin_ids = [doc.to_dict().get("chat_id") for doc in docs if doc.exists]
-        
-        # Devuelve la lista de chat_ids
+        admin_ids = await asyncio.to_thread(_sync_load_admin_ids)
         return admin_ids
     except Exception as e:
         print(f"Error al cargar admin_ids desde Firestore: {e}")
@@ -4343,18 +4343,16 @@ async def cargar_admin_ids():
 async def cargar_chat_ids():
     """Carga los chat_ids desde Firestore o devuelve un diccionario vacío si no hay datos."""
     try:
-        # Obtén la referencia a la colección "chat_ids"
-        collection_ref = db.collection("chat_ids")
+        # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread to prevent event loop blocking
+        def _sync_load_chat_ids():
+            collection_ref = db.collection("chat_ids")
+            docs = collection_ref.stream()
+            return {
+                doc.id: doc.to_dict()
+                for doc in docs if doc.exists
+            }
         
-        # Consulta todos los documentos de la colección
-        docs = collection_ref.stream()
-
-        # Cargar los datos en un diccionario
-        chat_ids = {
-            doc.id: doc.to_dict()
-            for doc in docs if doc.exists
-        }
-        
+        chat_ids = await asyncio.to_thread(_sync_load_chat_ids)
         return chat_ids
     except Exception as e:
         print(f"Error al cargar chat_ids desde Firestore: {e}")
@@ -4453,13 +4451,13 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
     Obtiene noticias del mercado Forex para un símbolo dado.
     Utiliza caché en memoria y actualiza con los datos más recientes de la API.
     """
-    global cache_noticias
-    # Verificar si el símbolo ya está en el caché
-    if symbol not in cache_noticias:
-        cache_noticias[symbol] = pd.DataFrame()
-
-    # Obtener el caché actual
-    df_cache = cache_noticias[symbol]
+    global cache_noticias, cache_noticias_lock
+    # 🔒 Verificar si el símbolo ya está en el caché (con lock to prevent TOCTOU)
+    with cache_noticias_lock:
+        if symbol not in cache_noticias:
+            cache_noticias[symbol] = pd.DataFrame()
+        # Obtener el caché actual
+        df_cache = cache_noticias[symbol].copy()
 
     # Determinar la última fecha registrada en el caché
     if not df_cache.empty:
@@ -4529,15 +4527,17 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
                     # Actualizar el caché combinando con los datos nuevos
                     df_cache = pd.concat([df_cache, df_nuevas]).drop_duplicates(subset='title').sort_values('publishedDate')
 
-                    # Actualizar el caché global
-                    cache_noticias[symbol] = df_cache
+                    # 🔒 Actualizar el caché global con lock
+                    with cache_noticias_lock:
+                        cache_noticias[symbol] = df_cache
                 else:
                     logger.info(f"No se encontraron noticias nuevas para {symbol}.")
             else:
                 logger.info(f"Error al consultar la API de noticias para {symbol}. Código de respuesta: {response.status_code}")
 
-            # Retornar el caché actualizado
-            return cache_noticias[symbol]
+            # 🔒 Retornar el caché actualizado (with lock)
+            with cache_noticias_lock:
+                return cache_noticias[symbol].copy()
         except requests.exceptions.RequestException as e:
             logger.info(f"Error de conexión: {e}")
             reintento += 1
@@ -6459,11 +6459,13 @@ class UserStateCache:
                     logger.warning(f"[UserStateCache] Error reading Firestore: {e}")
             
             # Fallback: memoria local (original dict)
-            if uuid in user_states:
-                data = user_states[uuid]
-                self._local_cache[uuid] = (now, data)
-                logger.debug(f"[UserStateCache] Hit (memory fallback): {uuid}")
-                return data
+            # FIXED: Protect user_states read with lock to prevent race condition
+            with user_states_lock:
+                if uuid in user_states:
+                    data = user_states[uuid].copy()
+                    self._local_cache[uuid] = (now, data)
+                    logger.debug(f"[UserStateCache] Hit (memory fallback): {uuid}")
+                    return data
             
             # Default state
             default = {"estado": "disponible", "updated_at": datetime.now(timezone.utc).isoformat()}
@@ -14704,13 +14706,14 @@ async def procesar_resultado(
     nombre_archivo          = generar_nombre_archivo(moneda_filtro)
     nombre_archivo_filtrado = generar_nombre_archivo(moneda_filtro, filtro=True)
 
-    # Asegurar llaves en user_states
-    user_states.setdefault(user_chat_id, {})
-    if "lock" not in user_states[user_chat_id]:
-        user_states[user_chat_id]["lock"] = asyncio.Lock()
-        user_states[user_chat_id]["lock_holder"] = None
-    for k in ("archivos_enviados","imagenes_oportunidades_enviadas","imagenes_eventos_enviadas"):
-        user_states[user_chat_id].setdefault(k, False)
+    # Asegurar llaves en user_states (FIXED: use lock to prevent TOCTOU)
+    with user_states_lock:
+        user_states.setdefault(user_chat_id, {})
+        if "lock" not in user_states[user_chat_id]:
+            user_states[user_chat_id]["lock"] = asyncio.Lock()
+            user_states[user_chat_id]["lock_holder"] = None
+        for k in ("archivos_enviados","imagenes_oportunidades_enviadas","imagenes_eventos_enviadas"):
+            user_states[user_chat_id].setdefault(k, False)
 
     async with user_states[user_chat_id]["lock"]:
         user_states[user_chat_id]["lock_holder"] = asyncio.current_task()
@@ -15170,13 +15173,14 @@ async def manejar_respuesta_fechas(update: Update, context: ContextTypes.DEFAULT
         try:
             await update.message.reply_text("Empezamos a obtener la información, espera un momento por favor.")
 
-            # Estructura de estado segura
-            state = user_states.setdefault(uid_chat, {})
-            state.setdefault("estado", "disponible")
-            state.setdefault("links_enviados", False)
-            state.setdefault("imagenes_enviadas", False)
-            state.setdefault("lock", asyncio.Lock())
-            state.setdefault("lock_holder", None)
+            # Estructura de estado segura (FIXED: use lock to prevent TOCTOU)
+            with user_states_lock:
+                state = user_states.setdefault(uid_chat, {})
+                state.setdefault("estado", "disponible")
+                state.setdefault("links_enviados", False)
+                state.setdefault("imagenes_enviadas", False)
+                state.setdefault("lock", asyncio.Lock())
+                state.setdefault("lock_holder", None)
             state["fecha_inicio"] = None
             state["fecha_fin"] = None
 
