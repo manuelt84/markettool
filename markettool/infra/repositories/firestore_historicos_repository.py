@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -89,7 +89,7 @@ class FirestoreHistoricosRepository(HistoricosRepository):
                 "first_timestamp": historico.first_timestamp.isoformat() if historico.first_timestamp else None,
                 "last_timestamp": historico.last_timestamp.isoformat() if historico.last_timestamp else None,
                 "source": historico.source,
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             
             key = f"{historico.symbol}_{historico.timeframe}"

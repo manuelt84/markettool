@@ -87,9 +87,21 @@ class FMPClient:
         interval = normalize_tf(interval)
         assert interval in {"1min", "5min", "15min", "30min", "1hour", "4hour"}
         fmt = "%Y-%m-%d %H:%M:%S"
+        
+        # ✅ FIX: Convert UTC timestamps to FMP's expected timezone (America/New_York)
+        # FMP API expects timestamps in ET/NY time, not UTC
+        try:
+            ny_tz = pytz.timezone(self.intraday_source_tz)
+        except Exception:
+            ny_tz = pytz.timezone("America/New_York")
+        
+        # Convert UTC to NY timezone
+        from_ny = from_utc.astimezone(ny_tz) if from_utc.tzinfo else ny_tz.localize(from_utc)
+        to_ny = to_utc.astimezone(ny_tz) if to_utc.tzinfo else ny_tz.localize(to_utc)
+        
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{interval}/{symbol}"
-        self._log.info("[FMP] Historical Intraday %s", url)
-        r = self._get(url, {"from": from_utc.strftime(fmt), "to": to_utc.strftime(fmt)}, symbol=symbol)
+        self._log.info("[FMP] Historical Intraday %s from=%s to=%s (NY time)", url, from_ny.strftime(fmt), to_ny.strftime(fmt))
+        r = self._get(url, {"from": from_ny.strftime(fmt), "to": to_ny.strftime(fmt)}, symbol=symbol)
         if r.status_code != 200:
             return pd.DataFrame()
         data = r.json() or []

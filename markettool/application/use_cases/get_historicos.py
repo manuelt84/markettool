@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from markettool.core.models.historico import Historico
@@ -112,7 +112,7 @@ class GetHistoricosUseCase:
         Returns:
             Resampled Historico
         """
-        start_date = datetime.utcnow() - timedelta(days=days_back)
+        start_date = datetime.now(timezone.utc) - timedelta(days=days_back)
         
         historico = await self.execute(
             symbol=symbol,
