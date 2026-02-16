@@ -944,10 +944,9 @@ class HistoryManager:
         tf = normalize_tf(tf)
         cache_df = load_cached_history(symbol, tf)
 
-        # --- FILTRO DE ACTIVOS VÁLIDOS ---
-        if not hasattr(self, '_valid_symbols'):
+        # --- Cache de activos válidos (cargado una sola vez por HistoryManager) ---
+        if not hasattr(self, '_valid_symbols_cache'):
             try:
-                db = firestore.Client()
                 activos = set()
                 # 1. config/activos (campo 'symbols')
                 activos_docs = db.collection('config').document('activos').get()
@@ -961,12 +960,12 @@ class HistoryManager:
                     for arr in categorias_data.values():
                         if isinstance(arr, list):
                             activos.update(arr)
-                # 3. lists (campo 'symbol')
-                # OMITIDO: No se toma en cuenta la colección 'lists' por tamaño y performance
-                cat_words = {k.strip().upper() for k in categorias_data.keys() if isinstance(k, str) and k.strip()}
-                cat_words.update({"TODOS", "ALL"})
-            except Exception:
-                pass
+                # Cache el resultado PERMANENTEMENTE
+                self._valid_symbols_cache = activos
+                logger.debug(f"[HistoryManager] Loaded {len(activos)} valid symbols from Firestore")
+            except Exception as e:
+                logger.debug(f"[HistoryManager] Failed to load valid symbols: {e}")
+                self._valid_symbols_cache = set()
         
         now = utc_now()
         allow_refresh = cfg.allow_refresh
