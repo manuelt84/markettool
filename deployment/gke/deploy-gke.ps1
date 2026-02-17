@@ -93,7 +93,6 @@ Get-Content $ENV_FILE | Where-Object { $_ -match "^[A-Z_]+=.+" } | ForEach-Objec
 
 $TELEGRAM_BOT_TOKEN = $envVars["TELEGRAM_BOT_TOKEN"]
 $FMP_API_KEY = $envVars["FMP_API_KEY"]
-$WEBHOOK_URL = $envVars["WEBHOOK_URL"]
 
 if (-not $TELEGRAM_BOT_TOKEN -or -not $FMP_API_KEY) {
     Write-Error-Custom "Credenciales incompletas en .env"

@@ -49,7 +49,7 @@ Write-Host ""
 Write-Host "🔄 Reiniciando contenedores para aplicar cambios..."
 Write-Host ""
 
-cd c:\projects\localNginx_Balancer\maquina-a_test
+Set-Location c:\projects\localNginx_Balancer\maquina-a_test
 docker-compose restart app1 app2
 
 Write-Host ""

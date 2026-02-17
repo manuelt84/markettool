@@ -78,7 +78,7 @@ function Resolve-DockerContainer {
     return $candidates[0]
 }
 
-function Snapshot-LocalCacheFromDocker {
+function Export-LocalCacheFromDocker {
     param(
         [string]$DockerContainerArg,
         [string]$TimestampArg,
@@ -209,11 +209,11 @@ if ($doLocalCache) {
     if ($Runtime -eq "docker") {
         Write-Host "[0/6] Runtime: Docker"
         Test-DockerConnection
-        $archiveLocal = Snapshot-LocalCacheFromDocker -DockerContainerArg $DockerContainer -TimestampArg $timestamp -SnapshotLocalDirArg $snapshotLocalDir
+        $archiveLocal = Export-LocalCacheFromDocker -DockerContainerArg $DockerContainer -TimestampArg $timestamp -SnapshotLocalDirArg $snapshotLocalDir
     } else {
         Write-Host "[0/6] Runtime: Auto (Docker)"
         Test-DockerConnection
-        $archiveLocal = Snapshot-LocalCacheFromDocker -DockerContainerArg $DockerContainer -TimestampArg $timestamp -SnapshotLocalDirArg $snapshotLocalDir
+        $archiveLocal = Export-LocalCacheFromDocker -DockerContainerArg $DockerContainer -TimestampArg $timestamp -SnapshotLocalDirArg $snapshotLocalDir
     }
 
     if (-not $archiveLocal) {
