@@ -7,7 +7,7 @@ MarketTool tiene **DOS sistemas de predicción ARIMA** con **DOS conjuntos de ti
 | Sistema | Archivo Principal | Config Timeout | Status | Usado |
 |---------|------------------|-----------------|--------|-------|
 | **Legacy** | `MarketTool.py` | `ARIMA_TIMEOUT` (45s) | ✅ Activo | ✅ SÍ |
-| **New (ParallelAnalysisEngine)** | `markettool/bootstrap.py` | `PARALLEL_TIMEOUT_PREDICTION_ARIMA` (7s) | ✅ Activo | ⚠️ Creado pero no invocado |
+| **New (ParallelAnalysisEngine)** | `markettool/bootstrap.py` | `PARALLEL_TIMEOUT_PREDICTION_ARIMA` (15s) | ✅ Activo | ⚠️ Creado pero no invocado |
 
 ---
 
@@ -72,11 +72,11 @@ MarketTool.py → procesar_simbolo_temporalidad()
 ### Configuración
 ```env
 # Variables en .env
-PARALLEL_TIMEOUT_PREDICTION_ARIMA=7  # segundos para ARIMA individual
+PARALLEL_TIMEOUT_PREDICTION_ARIMA=15  # segundos para ARIMA individual
 PARALLEL_TIMEOUT_PREDICTION_MC=3     # segundos para Monte Carlo individual
 
 # Lectura en bootstrap.py
-timeout_prediction_arima=int(os.environ.get("PARALLEL_TIMEOUT_PREDICTION_ARIMA", "7"))
+timeout_prediction_arima=int(os.environ.get("PARALLEL_TIMEOUT_PREDICTION_ARIMA", "15"))
 timeout_prediction_mc=int(os.environ.get("PARALLEL_TIMEOUT_PREDICTION_MC", "3"))
 
 # Almacenadas en AnalysisConfig
@@ -94,7 +94,7 @@ PARALLEL_GLOBAL_TIMEOUT=300                 # 5 min total
 PARALLEL_TIMEOUT_BATCH=120                  # 2 min por batch
 PARALLEL_TIMEOUT_ASSET=50                   # 50s por activo
 PARALLEL_TIMEOUT_TF=10                      # 10s por timeframe
-PARALLEL_TIMEOUT_PREDICTION_ARIMA=7         # ← Para predicción ARIMA individual
+PARALLEL_TIMEOUT_PREDICTION_ARIMA=15        # ← Para predicción ARIMA individual (balance)
 PARALLEL_TIMEOUT_PREDICTION_MC=3            # ← Para Monte Carlo individual
 ```
 
@@ -217,10 +217,10 @@ ARIMA_TIMEOUT=45             # Suficiente con fallback
 PARALLEL_TIMEOUT_TF=10       # Fallback seguro para ParallelAnalysisEngine
 ```
 
-### Si Quieres Máximo Paralelismo (Futuro)
+### Si Quieres Máximo Paralelismo
 ```env
-# Habilitar ParallelAnalysisEngine con:
-PARALLEL_TIMEOUT_PREDICTION_ARIMA=7   # Para Nivel 3
+# ParallelAnalysisEngine con valores óptimos:
+PARALLEL_TIMEOUT_PREDICTION_ARIMA=15  # Para Nivel 3 - balance óptimo
 PARALLEL_TIMEOUT_PREDICTION_MC=3      # Para Nivel 3
 PARALLEL_MAX_CONCURRENT_ASSETS=18     # Máximo permitido
 ```
@@ -276,7 +276,7 @@ PARALLEL_GLOBAL_TIMEOUT=300                 # Total
 PARALLEL_TIMEOUT_BATCH=120                  # Por batch
 PARALLEL_TIMEOUT_ASSET=50                   # Por activo
 PARALLEL_TIMEOUT_TF=10                      # Por timeframe (ACTUALMENTE EN USAR)
-PARALLEL_TIMEOUT_PREDICTION_ARIMA=7         # Individual ARIMA (no usado)
+PARALLEL_TIMEOUT_PREDICTION_ARIMA=15        # Individual ARIMA (balance óptimo)
 PARALLEL_TIMEOUT_PREDICTION_MC=3            # Individual MC (no usado)
 ```
 
@@ -284,7 +284,7 @@ PARALLEL_TIMEOUT_PREDICTION_MC=3            # Individual MC (no usado)
 
 ## 📈 Performance Impact
 
-### Si aumentas PARALLEL_TIMEOUT_PREDICTION_ARIMA: 7→15
+### Si aumentas PARALLEL_TIMEOUT_PREDICTION_ARIMA: 15→30
 - ✅ Más tiempo para ARIMA complejo
 - ❌ Análisis más lento
 - ❌ Resultado llega más tarde
