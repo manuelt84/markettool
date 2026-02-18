@@ -19211,14 +19211,35 @@ def _load_cache(exec_id: str, symbol: str, tf: str) -> dict:
         if key in _MON_CACHE:
             return _MON_CACHE[key]
 
-    # 1) intenta stream primero
+    # 0) NUEVO: intenta Firestore primero (datos en tiempo real de runTicker)
+    try:
+        doc_id = f"{exec_id}__{ (symbol or '').upper()}"
+        firestore_doc = db.collection("monitoreos").document(doc_id).get()
+        if firestore_doc.exists:
+            firestore_data = firestore_doc.to_dict() or {}
+            # Buscar candles/series para ese timeframe en Firestore
+            tf_states = firestore_data.get("tf_states", {})
+            tf_key = str(tf).lower().replace(" ", "")
+            if tf_key in tf_states:
+                tf_state = tf_states[tf_key]
+                candles = tf_state.get("candles", [])
+                if candles:
+                    # Convertir a formato esperado
+                    data = {"series": candles, "source": "firestore"}
+                    with _MON_CACHE_LOCK:
+                        _MON_CACHE[key] = data
+                    return data
+    except Exception as e:
+        logger.debug(f"[_load_cache] Firestore read error {symbol}/{tf}: {e}")
+
+    # 1) Intenta stream desde GCS
     stream_path = _gcs_stream_path(exec_id, symbol, tf)
     if _gcs_exists(stream_path):
         raw = _gcs_read_json(stream_path) or {"series": []}
         data = _coerce_series_container(raw)
         data["source"] = "stream"
     else:
-        # 2) si no hay stream, cae a enriched
+        # 2) Si no hay stream, cae a enriched
         enriched_path = _gcs_enriched_path(exec_id, symbol, tf)
         if _gcs_exists(enriched_path):
             raw = _gcs_read_json(enriched_path) or {"series": []}

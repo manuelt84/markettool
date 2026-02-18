@@ -934,3 +934,111 @@ def register_monitoreo_routes(
         except Exception as exc:
             logging.exception("Error en /monitoreo/history")
             return jsonify({"status": "error", "message": str(exc)}), 500
+
+    @app.route("/monitoreo/incremental", methods=["POST"])
+    async def monitoreo_incremental():
+        """
+        POST /monitoreo/incremental
+        Body:
+          {
+            "user_id": "...",
+            "exec_id": "...",
+            "symbol": "EURUSD",
+            "timeframe": "5min",
+            "last_ts": 1708000000000,  # timestamp en ms del último candle recibido (null en primera carga)
+            "persist": false
+          }
+        
+        Retorna candles DESPUÉS de last_ts.
+        Si last_ts es null/undefined (primera carga), retorna histórico completo.
+        """
+        try:
+            body = request.get_json(force=True) or {}
+
+            user_id = str(body.get("user_id") or "").strip()
+            exec_id = str(body.get("exec_id") or "").strip()
+            symbol = str(body.get("symbol") or "").strip().upper()
+            timeframe = norm_tf(body.get("timeframe"))
+            last_ts = body.get("last_ts")  # timestamp en ms
+            persist = bool(body.get("persist", False))
+
+            if not user_id:
+                return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
+            if not symbol or not timeframe:
+                return jsonify({"status": "error", "message": "symbol y timeframe son obligatorios"}), 400
+
+            tf_api = timeframe
+            enabled = True
+            if exec_id:
+                enabled = tf_is_enabled(exec_id, symbol, tf_api)
+
+            if not enabled:
+                return jsonify({"status": "ok", "symbol": symbol, "timeframe": tf_api, "exec_id": exec_id, "candles": []}), 200
+
+            ok, msg = await charge_monitoreo_per_call(user_id, origen="app")
+            if not ok:
+                return jsonify({"status": "error", "message": msg}), 402
+
+            # Cargar el cache actual
+            st = await asyncio.to_thread(load_cache, exec_id, symbol, timeframe)
+            series_ms = series_to_ms(st.get("series", []))
+
+            # Si cache está vacío Y es primera carga (last_ts = None), fetch histórico completo
+            if not series_ms and last_ts is None:
+                logging.info(f"[INCREMENTAL] {symbol}/{timeframe}: cache empty, fetching historical data")
+                age_map = {"1min": 300, "5min": 120, "15min": 300, "30min": 600, "1hour": 1200, "4hour": 2400}
+                age = age_map.get(timeframe, 60)
+                # Refrescar desde GCS y FMP
+                await asyncio.to_thread(maybe_refresh_from_gcs, exec_id, symbol, timeframe, st, age)
+                series_ms = series_to_ms(st.get("series", []))
+
+            # Filtrar solo candles después de last_ts
+            if last_ts is not None:
+                try:
+                    last_ts_num = int(last_ts)
+                    filt = [c for c in series_ms if c.get("t", 0) > last_ts_num]
+                except (ValueError, TypeError):
+                    filt = series_ms
+            else:
+                # Primera carga: retornar últimos 600 candles
+                filt = series_ms[-600:] if series_ms else []
+
+            # Convertir candles a formato esperado por frontend
+            candles_out = []
+            for candle in filt:
+                candles_out.append({
+                    "t": candle.get("t"),
+                    "o": candle.get("o"),
+                    "h": candle.get("h"),
+                    "l": candle.get("l"),
+                    "c": candle.get("c"),
+                    "v": candle.get("v"),
+                })
+
+            # Persistir si es necesario
+            if persist and filt:
+                persisted = await asyncio.to_thread(persist_if_needed, exec_id, symbol, timeframe, True)
+            else:
+                persisted = None
+
+            # Touch monitoreo document
+            await asyncio.to_thread(
+                fs_touch_monitoreo, exec_id, symbol,
+                {"estado": "running", "symbol": symbol, "timeframe": timeframe, "user_id": user_id}
+            )
+
+            resp = {
+                "status": "ok",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "exec_id": exec_id,
+                "count": len(candles_out),
+                "candles": candles_out,
+            }
+            if persisted:
+                resp["persisted_path"] = f"gs://{bucket_name}/{persisted}"
+            return jsonify(resp), 200
+
+        except Exception as exc:
+            logging.exception("Error en /monitoreo/incremental")
+            return jsonify({"status": "error", "message": str(exc)}), 500
