@@ -279,6 +279,57 @@ SYNC_TTL     = {
     "4hour": 900,  # antes 1200
 }
 
+# ========================================================================================
+# ⚙️  ARIMA CONFIGURATION (3 modes: unlimited, aggressive, standard)
+# ========================================================================================
+# 📋 MODES:
+#   1. 'standard' (DEFAULT): Balance óptimo - datos recientes, sin timeout
+#      - NGUSD-30min: 1200 barras = 3.6 semanas → ~5-10s de ARIMA
+#      - Ideal para mayoría de usuarios. Timeout: 45s (nunca se alcanza)
+#
+#   2. 'aggressive': Más historia → Detecta tendencias más largas
+#      - NGUSD-30min: 5000 barras = 15 semanas (~3.5 meses)
+#      - Saca activos distintos en ranking (más ponderados con tendencias largas)
+#      - Trade-off: Tarda ~20-30s, puede perder precisión de corto plazo
+#
+#   3. 'unlimited': MÁXIMA historia sin límite
+#      - NGUSD-30min: 10000+ barras = 30+ semanas → Muy lento
+#      - Timeout CRÍTICO: puede fallar con timeout
+#      - Use solo para backtesting/análisis offline
+#
+# 🔄 FALLBACK: Si ARIMA timeout → Usa predicción simple (media móvil)
+#    Nunca falla completamente, siempre hay respuesta
+# ========================================================================================
+ARIMA_MODES = {
+    'unlimited': {
+        '1min': 2000, '5min': 5000, '15min': 8000,
+        '30min': 10000, '1hour': 8000, '4hour': 5000,
+        '1day': 2500, '1week': 1500
+    },
+    'aggressive': {
+        '1min': 1000, '5min': 3000, '15min': 4000,
+        '30min': 5000, '1hour': 4000, '4hour': 2000,
+        '1day': 1500, '1week': 800
+    },
+    'standard': {
+        '1min': 480, '5min': 1000, '15min': 1200,
+        '30min': 1200, '1hour': 1000, '4hour': 800,
+        '1day': 500, '1week': 300
+    }
+}
+
+# 🔧 CAMBIAR CONFIGURACIÓN AQUÍ (o usar env vars):
+#    export ARIMA_MODE='standard'|'aggressive'|'unlimited'
+#    export ARIMA_TIMEOUT='45'  (segundos)
+ARIMA_ACTIVE_MODE = os.environ.get('ARIMA_MODE', 'standard')
+ARIMA_TIMEOUT_SECONDS = int(os.environ.get('ARIMA_TIMEOUT', '45'))
+
+if ARIMA_ACTIVE_MODE not in ARIMA_MODES:
+    logger.warning(f"ARIMA_MODE '{ARIMA_ACTIVE_MODE}' no válido. Usando 'standard'.")
+    ARIMA_ACTIVE_MODE = 'standard'
+
+logger.info(f"✅ ARIMA configurado: modo={ARIMA_ACTIVE_MODE}, timeout={ARIMA_TIMEOUT_SECONDS}s, fallback=SimpleMA")
+
 _LAST_QUOTE_TICK: Dict[tuple, float] = {}  # (exec_id, symbol, tf) -> epoch_s
 _LAST_SYNC: Dict[tuple, float] = {}
 
@@ -10637,20 +10688,10 @@ def predecir_arima(df, temporalidad, symbol, steps=5):
             return result
         return None
 
-    # ✅ OPTIMIZACIÓN 2: Limitar a últimas N barras (dinámico por temporalidad)
-    # Balance: suficientes datos para ARIMA (regla: 200+ observaciones) + tiempo ~5-10s
-    # Cálculo: barras = período_deseado / duración_barra
-    limites_por_tf = {
-        '1min': 480,      # 8 horas de trading (corto, mercado intraday rápido)
-        '5min': 1000,     # 5 días (una semana de datos es mucha variedad)
-        '15min': 1200,    # 15 días (3 semanas de contexto)
-        '30min': 1200,    # 3.6 semanas (mes de datos)
-        '1hour': 1000,    # 6 semanas (~1.5 meses)
-        '4hour': 800,     # 3.2 meses (trimestre)
-        '1day': 500,      # ~500 días bursátiles (~2 años)
-        '1week': 300      # ~6 años de historia
-    }
-    max_barras = limites_por_tf.get(temporalidad, 1000)
+    # ✅ OPTIMIZACIÓN 2: Limitar a últimas N barras (dinámico por temporalidad y modo ARIMA)
+    # 3 modos disponibles: unlimited (máxima historia), aggressive (más datos), standard (balanceado)
+    limites_por_tf = ARIMA_MODES.get(ARIMA_ACTIVE_MODE, ARIMA_MODES['standard'])
+    max_barras = limites_por_tf.get(temporalidad, limites_por_tf.get('1hour', 1000))
     if len(df) > max_barras:
         df = df.iloc[-max_barras:].copy()
         logger.debug(f"[ARIMA OPTIMIZE] {symbol}-{temporalidad}: Limitado a {max_barras} barras ({len(df)} originales)")
@@ -12529,7 +12570,7 @@ def calcular_entradas(
                 future_mm = pred_exec.submit(predecir_media_movil, df, window)
                 future_mc = pred_exec.submit(_wrapper_simulacion_monte_carlo, df, tf)
                 
-                predicciones_arima = future_arima.result(timeout=30)
+                predicciones_arima = future_arima.result(timeout=ARIMA_TIMEOUT_SECONDS)
                 predicciones_media_movil = future_mm.result(timeout=30)
                 prob_alza, prob_baja = future_mc.result(timeout=30)
             else:
@@ -12541,13 +12582,22 @@ def calcular_entradas(
             probabilidad_alza = prob_alza if prob_alza is not None else 50
             probabilidad_baja = prob_baja if prob_baja is not None else 50
         except Exception as e:
-            logger.warning(f"Error en predicciones paralelas para {symbol}-{tf}: {e}. Fallback a secuencial.", exc_info=True)
-            # Fallback a ejecución secuencial
-            predicciones_arima = predecir_arima(df, tf, symbol)
-            predicciones_media_movil = predecir_media_movil(df, window)
-            probabilidad_alza, probabilidad_baja = simulacion_monte_carlo(
-                df, tf, num_simulaciones=50, num_dias=5, seed=42
-            )
+            logger.warning(f"Error en predicciones paralelas para {symbol}-{tf}: {type(e).__name__}: {e}. Fallback a predicción simple.", exc_info=True)
+            # ✅ FALLBACK: Predicción simple (media móvil) en lugar de ARIMA
+            try:
+                predicciones_arima = predecir_media_movil(df, window)  # Fallback: usar MM simple
+            except:
+                predicciones_arima = None
+            try:
+                predicciones_media_movil = predecir_media_movil(df, window)
+            except:
+                predicciones_media_movil = None
+            try:
+                probabilidad_alza, probabilidad_baja = simulacion_monte_carlo(
+                    df, tf, num_simulaciones=50, num_dias=5, seed=42
+                )
+            except:
+                probabilidad_alza, probabilidad_baja = 50, 50
 
         # --- Soportes/Resistencias dinámicos (CON CACHE) ---
         cache_key = _get_niveles_cache_key(symbol, tf, len(df), precio_actual)
