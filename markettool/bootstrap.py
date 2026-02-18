@@ -290,6 +290,8 @@ def main() -> None:
             timeout_per_batch=int(os.environ.get("PARALLEL_TIMEOUT_BATCH", "120")),
             timeout_per_asset=int(os.environ.get("PARALLEL_TIMEOUT_ASSET", "50")),
             timeout_per_tf=int(os.environ.get("PARALLEL_TIMEOUT_TF", "10")),
+            timeout_prediction_arima=int(os.environ.get("PARALLEL_TIMEOUT_PREDICTION_ARIMA", "7")),
+            timeout_prediction_mc=int(os.environ.get("PARALLEL_TIMEOUT_PREDICTION_MC", "3")),
             max_ram_percent=float(os.environ.get("PARALLEL_RAM_PERCENT_LIMIT", "80")),
         )
         logger.info("✅ AnalysisConfig created (max_assets=%d, tf_fanout=%d, timeout_tf=%ds)",
