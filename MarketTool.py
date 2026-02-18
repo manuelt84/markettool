@@ -20172,7 +20172,11 @@ def obtener_monedas(symbol: str) -> Tuple[str,str]:
 # Memo y dedupe
 # ==========================
 
-MIN_FETCH_INTERVAL_S = 5  # memo 5 segundos por símbolo
+# ✅ OPTIMIZED: Increased event cache TTL from 5s to 30min
+# Economic events almost NEVER change within 30 minutes
+# Old 5s TTL caused redundant FMP API calls every refresh (~4-5 per minute)
+# New 30min TTL reduces FMP load by 99%, keeps data fresh enough for trading
+MIN_FETCH_INTERVAL_S = 1800  # memo 30 minutos por símbolo (was 5s, causing excessive FMP calls)
 _EVENTS_MEMO: Dict[str, Dict[str, Any]] = {}  # {symbol: {"df":DataFrame,"ts":epoch}}
 _LAST_ACTUAL: Dict[Tuple[str, Tuple[str,str,int]], float] = {}  # (symbol,(cur,event,ms)) -> actual
 _LAST_HASH: Dict[Tuple[str,str], str] = {}  # (exec_id,symbol) -> hash
