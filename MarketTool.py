@@ -18869,30 +18869,44 @@ def _download_json_from_gcs(path: str) -> Any:
 
 
 def _persist_if_needed(exec_id: str, symbol: str, timeframe: str, force: bool = False) -> Optional[str]:
-    client = storage.Client()
-    key = (exec_id, symbol.upper(), timeframe)
-    with _MON_CACHE_LOCK:
-        state = _MON_CACHE.get(key)
-        if not state:
-            return None
-        if not state.get("dirty") and not force:
-            return None
-        path = _gcs_stream_path(exec_id, symbol, timeframe)
-        payload = json.dumps(state["series"], ensure_ascii=False).encode("utf-8")
-        bucket = client.bucket(BUCKET_NAME)
-        blob = bucket.blob(path)
-        blob.upload_from_string(payload, content_type="application/json")
-        blob.reload()
-        state["dirty"] = False
-        # >>> reflejar metadata para que _maybe_refresh_from_gcs no re-baje de inmediato
-        state["gcs_path"] = path
-        try:
-            state["gcs_generation"] = blob.generation
-            state["gcs_updated"] = blob.updated.timestamp() if blob.updated else time.time()
-        except Exception:
-            state["gcs_updated"] = time.time()
-        state["ts_loaded"] = time.time()
-        return path
+    try:
+        client = storage.Client()
+        key = (exec_id, symbol.upper(), timeframe)
+        with _MON_CACHE_LOCK:
+            state = _MON_CACHE.get(key)
+            if not state:
+                logging.warning(f"PERSIST: Cache miss for {key}")
+                return None
+            if not state.get("dirty") and not force:
+                logging.debug(f"PERSIST: Not dirty and not forced for {key}")
+                return None
+            
+            series_count = len(state.get("series", []))
+            path = _gcs_stream_path(exec_id, symbol, timeframe)
+            logging.info(f"PERSIST START: {key} -> {path} ({series_count} candles, force={force})")
+            
+            payload = json.dumps(state["series"], ensure_ascii=False).encode("utf-8")
+            bucket = client.bucket(BUCKET_NAME)
+            blob = bucket.blob(path)
+            
+            blob.upload_from_string(payload, content_type="application/json")
+            blob.reload()
+            
+            state["dirty"] = False
+            # >>> reflejar metadata para que _maybe_refresh_from_gcs no re-baje de inmediato
+            state["gcs_path"] = path
+            try:
+                state["gcs_generation"] = blob.generation
+                state["gcs_updated"] = blob.updated.timestamp() if blob.updated else time.time()
+            except Exception:
+                state["gcs_updated"] = time.time()
+            state["ts_loaded"] = time.time()
+            
+            logging.info(f"PERSIST SUCCESS: {key} uploaded to gs://{BUCKET_NAME}/{path} ({series_count} candles)")
+            return path
+    except Exception as e:
+        logging.exception(f"PERSIST ERROR: Failed to persist {exec_id}/{symbol}/{timeframe}: {e}")
+        return None
 
 
 

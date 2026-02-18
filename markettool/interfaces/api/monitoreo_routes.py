@@ -862,6 +862,14 @@ def register_monitoreo_routes(
                 except Exception:
                     logging.exception("Gapfill/force_api fallo en /monitoreo/history")
 
+            # 🔧 IMPORTANT: Sync series_ms back to st before persisting
+            # (especially when force_api/fill_gaps are false, which is the case for seed loading on higher TFs)
+            with mon_cache_lock:
+                st["series"] = series_ms
+                if persist:
+                    st["dirty"] = True
+                    logging.info("HIST PERSIST FLAGGED sym=%s tf=%s", symbol, timeframe)
+
             if from_ts is not None:
                 try:
                     from_ts = int(from_ts)
