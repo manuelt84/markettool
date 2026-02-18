@@ -20172,11 +20172,11 @@ def obtener_monedas(symbol: str) -> Tuple[str,str]:
 # Memo y dedupe
 # ==========================
 
-# ✅ OPTIMIZED: Increased event cache TTL from 5s to 30min
-# Economic events almost NEVER change within 30 minutes
-# Old 5s TTL caused redundant FMP API calls every refresh (~4-5 per minute)
-# New 30min TTL reduces FMP load by 99%, keeps data fresh enough for trading
-MIN_FETCH_INTERVAL_S = 1800  # memo 30 minutos por símbolo (was 5s, causing excessive FMP calls)
+# ✅ ADAPTIVE CACHE: Smart TTL based on event urgency/recency
+# - Upcoming events (<30 min without "actual"): 30-60s (might publish soon)
+# - Recent events (<2h with "actual"): 3-5 min
+# - Future events (>2h) or old: 30 min
+# This maintains reactivity for critical events while reducing API load
 _EVENTS_MEMO: Dict[str, Dict[str, Any]] = {}  # {symbol: {"df":DataFrame,"ts":epoch}}
 _LAST_ACTUAL: Dict[Tuple[str, Tuple[str,str,int]], float] = {}  # (symbol,(cur,event,ms)) -> actual
 _LAST_HASH: Dict[Tuple[str,str], str] = {}  # (exec_id,symbol) -> hash
@@ -20188,6 +20188,49 @@ def _event_row_key(row: pd.Series) -> Tuple[str,str,int]:
     date     = pd.to_datetime(row.get("date"), errors="coerce", utc=True)
     ms = int(date.value//1_000_000) if not pd.isna(date) else 0
     return (currency, event, ms)
+
+def _calculate_adaptive_ttl(df: pd.DataFrame, now: datetime) -> float:
+    """
+    Calcula TTL en segundos basado en urgencia/recencia de eventos.
+    Monitoreo reactivo necesita detectar valores 'actual' apenas se publican.
+    """
+    if df.empty:
+        return 300.0  # 5 min para DataFrame vacío
+    
+    upcoming_urgent = []   # eventos próximos sin "actual" (pueden publicarse pronto)
+    recent_resolved = []   # eventos recientes con "actual"
+    
+    for _, row in df.iterrows():
+        event_date = pd.to_datetime(row.get("date"), errors="coerce", utc=True)
+        if pd.isna(event_date):
+            continue
+            
+        actual = row.get("actual")
+        time_delta_s = (event_date - now).total_seconds()
+        
+        # Evento próximo (<30 min) sin "actual" - CRÍTICO
+        if -300 < time_delta_s < 1800 and pd.isna(actual):
+            upcoming_urgent.append(time_delta_s)
+        
+        # Evento reciente (<2h) con "actual" - puede actualizarse
+        if -7200 < time_delta_s < 300 and pd.notna(actual):
+            recent_resolved.append(time_delta_s)
+    
+    # Lógica de TTL estratificado
+    if upcoming_urgent:
+        min_delta = min(upcoming_urgent)
+        if min_delta < 180:      # <3 min
+            return 30.0          # 30 segundos - muy urgente
+        elif min_delta < 600:    # <10 min
+            return 60.0          # 1 minuto - urgente
+        else:
+            return 180.0         # 3 minutos - próximo
+    
+    if recent_resolved:
+        return 300.0             # 5 minutos - reciente con actual
+    
+    # Solo eventos futuros lejanos (>30min) o muy pasados (>2h)
+    return 1800.0                # 30 minutos - estable
 
 TZ_NY = ZoneInfo("America/New_York")
 def _trading_now_utc() -> datetime:
@@ -20227,7 +20270,10 @@ def _trading_now_utc() -> datetime:
 def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) -> pd.DataFrame:
     """
     Obtiene eventos en ventana [now - hours_back, now + minutes_fwd] normalizados.
-    Aplica memoización de 5s por símbolo para soportar polling de 1s.
+    Aplica memoización ADAPTATIVA por urgencia de eventos:
+    - Eventos próximos sin "actual": 30-60s
+    - Eventos recientes con "actual": 3-5min
+    - Eventos futuros/antiguos: 30min
     """
 
     t0 = time.time()
@@ -20238,25 +20284,39 @@ def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) ->
     b = now + timedelta(minutes=int(minutes_fwd))
 
     memo = _EVENTS_MEMO.get(symbol)
-    if memo and (time.time() - memo.get("ts", 0) < MIN_FETCH_INTERVAL_S):
-        df = memo["df"].copy()
-    else:
-        df = obtener_eventos_guardados_o_futuros(
-            _iso(a),
-            _iso(b),
-            grace_minutes=0,
-        )
-        if df is None or df.empty:
-            df = pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
-        # normaliza tipos
-        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-        for c in ["actual","estimate","previous"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["impact"] = df["impact"].astype(str).str.capitalize()
-        df = df.sort_values("date", ascending=True).reset_index(drop=True)
-        _EVENTS_MEMO[symbol] = {"df": df.copy(), "ts": time.time()}
-
-        logger.info("[eventos] _fetch_events_for %s tardó %.3fs", symbol, time.time() - t0)
+    
+    # Verificar cache con TTL adaptativo
+    if memo:
+        df_cached = memo.get("df")
+        cache_age = time.time() - memo.get("ts", 0)
+        ttl = _calculate_adaptive_ttl(df_cached, now)
+        
+        if cache_age < ttl:
+            logger.info("[eventos] Cache HIT %s age=%.1fs ttl=%.1fs", symbol, cache_age, ttl)
+            return df_cached.copy()
+        else:
+            logger.info("[eventos] Cache EXPIRED %s age=%.1fs ttl=%.1fs", symbol, cache_age, ttl)
+    
+    # Cache miss o expirado - fetch nuevo
+    df = obtener_eventos_guardados_o_futuros(
+        _iso(a),
+        _iso(b),
+        grace_minutes=0,
+    )
+    if df is None or df.empty:
+        df = pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
+    # normaliza tipos
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+    for c in ["actual","estimate","previous"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["impact"] = df["impact"].astype(str).str.capitalize()
+    df = df.sort_values("date", ascending=True).reset_index(drop=True)
+    
+    # Guardar en cache con nuevo TTL
+    _EVENTS_MEMO[symbol] = {"df": df.copy(), "ts": time.time()}
+    
+    new_ttl = _calculate_adaptive_ttl(df, now)
+    logger.info("[eventos] _fetch_events_for %s tardó %.3fs - nuevo TTL: %.1fs", symbol, time.time() - t0, new_ttl)
 
     return df
 

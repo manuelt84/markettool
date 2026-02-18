@@ -78,6 +78,41 @@ def register_monitoreo_routes(
             if not ok:
                 return jsonify({"status": "error", "message": msg}), 402
 
+            # ✅ OPTIMIZATION: Check last_hash_ref before expensive fetch+processing
+            # If cursor_hash matches and we have cached hash, return early with empty events
+            key = (exec_id, symbol)
+            cached_hash = last_hash_ref.get(key)
+            
+            if cursor_hash and cached_hash and cursor_hash == cached_hash:
+                logger.info("[monitoreo/eventos] cursor_hash match %s - checking for new_results", symbol)
+                # Still need to check for new_results (requires lightweight fetch with adaptive cache)
+                df_check = fetch_events_for(symbol, hours_back=hours_back, minutes_fwd=minutes_fwd)
+                new_results_check = detect_new_results(symbol, df_check) if not df_check.empty else []
+                
+                if not new_results_check:
+                    # No changes - return early without processing
+                    logger.info("[monitoreo/eventos] No new_results - returning empty response")
+                    return (
+                        jsonify(
+                            {
+                                "status": "ok",
+                                "exec_id": exec_id,
+                                "symbol": symbol,
+                                "server_time": int(time.time() * 1000),
+                                "hash": cached_hash,
+                                "count": 0,
+                                "new_results": [],
+                                "events": [],
+                                "signals": [],
+                                "agg_score": 0.0,
+                                "agg_direction": "neutral",
+                            }
+                        ),
+                        200,
+                    )
+                # If there ARE new_results, continue with full processing below
+                logger.info("[monitoreo/eventos] Hash match but new_results found - processing")
+
             logger.info(
                 "Llamando fetch_events_for(%s, hb=%s, mf=%s)",
                 symbol,
