@@ -1760,6 +1760,13 @@ _warmup_lock = threading.Lock()
 # Check if we should skip warmup (useful in multi-worker containers)
 _SKIP_EASYOCR_WARMUP = os.getenv("SKIP_EASYOCR_WARMUP", "0") == "1"
 
+def _is_process_pool_worker() -> bool:
+    """
+    Detecta si este proceso es un worker de ProcessPoolExecutor.
+    Los workers tienen __mp_main__ en sys.modules (multiprocessing spawn)
+    """
+    return "__mp_main__" in sys.modules
+
 def _ocr_warmup_background():
     """Descarga modelos de easyocr en background para evitar delays de la primera llamada."""
     try:
@@ -1768,6 +1775,12 @@ def _ocr_warmup_background():
         logger.info("[EasyOCR-Warmup] ✅ Modelos descargados")
     except Exception as e:
         logger.warning(f"[EasyOCR-Warmup] Error al descargar: {e} (no blockeante, se reintentará en uso)")
+
+# AUTO-SKIP warmup in ProcessPool workers (they don't use OCR)
+_is_worker = _is_process_pool_worker()
+if _is_worker:
+    logger.info("[EasyOCR-Warmup] Skipped in ProcessPool worker (OCR not used here)")
+    _SKIP_EASYOCR_WARMUP = True
 
 # Spawn background task para warmup (SINGLETON: solo una vez por proceso)
 # SKIP if SKIP_EASYOCR_WARMUP=1 (useful for multi-worker or when container handles warmup)
