@@ -1575,15 +1575,17 @@ def _sweep_stuck_user_states_once():
             
             return pending
         
-        # Execute with timeout (30 seconds): Firestore usually responds in <5s
+        # Execute with timeout (60 seconds): Firestore usually responds in <5s
+        # Increased from 30s to 60s to handle normal load spikes without skipping sweeps
+        # Previous timeout (30s) was causing watchdog to skip on concurrent traffic
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_load_and_sweep)
             try:
-                pending = future.result(timeout=30)
+                pending = future.result(timeout=60)
                 logger.debug(f"[watchdog] cleaned {pending} stuck user states")
             except FutureTimeoutError:
-                logger.error("[watchdog] Firestore timeout after 30s - skipping this sweep")
+                logger.error("[watchdog] Firestore timeout after 60s - skipping this sweep")
                 future.cancel()
 
     except Exception as e:
@@ -1744,12 +1746,19 @@ def get_easyocr_reader(prefer_gpu: bool = True):
 # - Modelos se descargan en paralelo en background
 # - Cuando se usan, probablemente ya estén listos
 # - SINGLETON: Solo un thread de warmup por proceso (no por worker)
+# 
+# ⚠️MULTI-WORKER NOTE: In containerized environments with gunicorn (multiple workers),
+#    each worker process loads this module separately → multiple warmup threads downloading ~120MB
+#    Solution: Set SKIP_EASYOCR_WARMUP=1 if container orchestrator handles warmup separately
 logger.info("[EasyOCR] Lazy loading con background warmup habilitado")
 reader = None  # Se inicializa a demanda, pero se descarga en background
 
 # Singleton para evitar múltiples warmup threads
 _warmup_started = False
 _warmup_lock = threading.Lock()
+
+# Check if we should skip warmup (useful in multi-worker containers)
+_SKIP_EASYOCR_WARMUP = os.getenv("SKIP_EASYOCR_WARMUP", "0") == "1"
 
 def _ocr_warmup_background():
     """Descarga modelos de easyocr en background para evitar delays de la primera llamada."""
@@ -1761,18 +1770,22 @@ def _ocr_warmup_background():
         logger.warning(f"[EasyOCR-Warmup] Error al descargar: {e} (no blockeante, se reintentará en uso)")
 
 # Spawn background task para warmup (SINGLETON: solo una vez por proceso)
-with _warmup_lock:
-    if not _warmup_started:
-        _warmup_started = True
-        try:
-            warmup_thread = threading.Thread(target=_ocr_warmup_background, daemon=True, name="easyocr-warmup")
-            warmup_thread.start()
-            logger.debug("[EasyOCR-Warmup] Daemon thread iniciado")
-        except Exception as e:
-            logger.debug(f"[EasyOCR-Warmup] No se pudo iniciar warmup: {e}")
-            _warmup_started = False  # Reset para permitir reintento
-    else:
-        logger.debug("[EasyOCR-Warmup] Thread ya iniciado (singleton protegido)") 
+# SKIP if SKIP_EASYOCR_WARMUP=1 (useful for multi-worker or when container handles warmup)
+if not _SKIP_EASYOCR_WARMUP:
+    with _warmup_lock:
+        if not _warmup_started:
+            _warmup_started = True
+            try:
+                warmup_thread = threading.Thread(target=_ocr_warmup_background, daemon=True, name="easyocr-warmup")
+                warmup_thread.start()
+                logger.debug("[EasyOCR-Warmup] Daemon thread iniciado")
+            except Exception as e:
+                logger.debug(f"[EasyOCR-Warmup] No se pudo iniciar warmup: {e}")
+                _warmup_started = False  # Reset para permitir reintento
+        else:
+            logger.debug("[EasyOCR-Warmup] Thread ya iniciado (singleton protegido)")
+else:
+    logger.info("[EasyOCR-Warmup] Skipped per SKIP_EASYOCR_WARMUP=1 (models will be loaded on-demand)") 
 
 
 #@profile
