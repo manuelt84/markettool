@@ -5063,6 +5063,8 @@ _LAZY_HIST_LOADER = LazyHistoricosLoader(
 _GCS_CLIENT = None
 _GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
 _GCS_ENABLED = os.environ.get("GCS_ENABLED", "true").lower() == "true"
+_GCS_BACKUP_THROTTLE_SECONDS = 300  # 5 minutos entre backups del mismo symbol/tf
+_last_gcs_backup_time = {}  # {(symbol, tf): timestamp}
 
 def _get_gcs_bucket():
     """Inicializa lazy el cliente de GCS."""
@@ -8756,9 +8758,17 @@ def obtener_datos_con_hilos(
 
         df_out = df_historico.sort_index()
         
-        # ✅ PERSIST TO GCS AFTER COLD START (like indicators_cache.save)
-        # Ensures next analysis call will load from cache, not FMP again
-        if cold_start:
+        # ✅ PERSIST TO GCS AFTER SUCCESSFUL FETCH (with throttling)
+        # Backup strategy:
+        # - ALWAYS backup on cold_start (initial fetch)
+        # - For subsequent fetches: only backup if >5min since last backup (avoid excessive writes)
+        backup_key = (symbol, tf)
+        last_backup = _last_gcs_backup_time.get(backup_key, 0)
+        now_ts = datetime.now(UTC).timestamp()
+        time_since_last_backup = now_ts - last_backup
+        should_backup = cold_start or (time_since_last_backup > _GCS_BACKUP_THROTTLE_SECONDS)
+        
+        if should_backup:
             try:
                 # Save to GCS (up to 1000 rows) + local + Firestore metadata
                 success = save_to_gcs(symbol, tf, df_out)
@@ -8770,10 +8780,14 @@ def obtener_datos_con_hilos(
                     gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
                     rows_to_persist = min(1000, len(df_out))
                     set_historicos_metadata(symbol, tf, gcs_path, rows_to_persist, ttl_seconds=1800)
-                    logging.info("[ANALYSIS] GCS persisted (cold start): %s-%s → %d rows", symbol, tf, len(df_out))
+                    _last_gcs_backup_time[backup_key] = now_ts
+                    reason = "cold_start" if cold_start else f"periodic (last={int(time_since_last_backup)}s ago)"
+                    logging.info("[HIST][GCS_BACKUP] %s-%s → %d rows (%s)", symbol, tf, len(df_out), reason)
             except Exception as e:
-                logger.warning(f"[ANALYSIS] Failed to persist {symbol}/{tf} to GCS after cold start: {e}")
+                logger.warning(f"[HIST][GCS_BACKUP] Failed to persist {symbol}/{tf}: {e}")
                 # Don't fail analysis, just log the issue
+        else:
+            logger.debug(f"[HIST][GCS_BACKUP] Skipped {symbol}/{tf} (last backup {int(time_since_last_backup)}s ago < {_GCS_BACKUP_THROTTLE_SECONDS}s throttle)")
 
         # 4) recorte final si bars es numérico (solo si NO estamos preservando serie completa)
         if (not persist_full_series) and (not force_full_history) and (not cold_start) and isinstance(bars, int) and bars > 0 and len(df_out) > bars:
