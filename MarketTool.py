@@ -19232,26 +19232,14 @@ def _load_cache(exec_id: str, symbol: str, tf: str) -> dict:
     except Exception as e:
         logger.debug(f"[_load_cache] Firestore read error {symbol}/{tf}: {e}")
 
-    # 1) Intenta stream desde GCS
-    stream_path = _gcs_stream_path(exec_id, symbol, tf)
-    if _gcs_exists(stream_path):
-        raw = _gcs_read_json(stream_path) or {"series": []}
+    # Layer 1: GCS enriched (FALLBACK - stream removed, no longer maintained)
+    enriched_path = _gcs_enriched_path(exec_id, symbol, tf)
+    if _gcs_exists(enriched_path):
+        raw = _gcs_read_json(enriched_path) or {"series": []}
         data = _coerce_series_container(raw)
-        data["source"] = "stream"
+        data["source"] = "enriched"
     else:
-        # 2) Si no hay stream, cae a enriched
-        enriched_path = _gcs_enriched_path(exec_id, symbol, tf)
-        if _gcs_exists(enriched_path):
-            raw = _gcs_read_json(enriched_path) or {"series": []}
-            data = _coerce_series_container(raw)
-            data["source"] = "enriched"
-            # Promueve enriched->stream una única vez (para que el resto ya use stream)
-            try:
-                _ensure_stream_initialized(exec_id, symbol, tf, data)
-            except Exception:
-                pass
-        else:
-            data = {"series": [], "source": "empty"}
+        data = {"series": [], "source": "empty"}
 
     with _MON_CACHE_LOCK:
         _MON_CACHE[key] = data
@@ -19581,10 +19569,8 @@ def _gcs_enriched_path(exec_id: str, symbol: str, tf: str) -> str:
     # gs://markettool_bucket/analisis/exec/{exec_id}/{SYMBOL}_{TF}_enriched.json
     return f"analisis/exec/{exec_id}/{symbol}_{tf}_enriched.json"
 
-def _gcs_stream_path(exec_id: str, symbol: str, tf: str) -> str:
-    return f"analisis/stream/{exec_id}/{symbol}_{tf}.json"
 
-# ---------- IO ----------
+#----------IO----------
 def _gcs_exists(path: str) -> bool:
     return gcs_blob_exists(BUCKET_NAME, path)  # usa tu helper real
 
@@ -19593,25 +19579,6 @@ def _gcs_read_json(path: str) -> dict:
 
 def _gcs_write_json(path: str, obj: dict):
     write_json_to_gcs(BUCKET_NAME, path, obj)  # usa tu helper real
-
-
-def _ensure_stream_initialized(exec_id: str, symbol: str, tf: str, st: dict):
-    """
-    Si NO existe stream, intenta copiar enriched -> stream UNA sola vez.
-    'st' es el state in-memory (series ya cargada); si viene vacío, lee enriched y lo copia.
-    """
-    stream_path = _gcs_stream_path(exec_id, symbol, tf)
-    if _gcs_exists(stream_path):
-        return  # ya existe
-
-    enriched_path = _gcs_enriched_path(exec_id, symbol, tf)
-    if not _gcs_exists(enriched_path):
-        # no hay enriched, no podemos inicializar (lo dejará vacío)
-        return
-
-    data = st if st and isinstance(st, dict) else {"series": []}
-    series = data.get("series") if isinstance(data.get("series"), list) else []
-    _gcs_write_json(stream_path, series)  # << stream guarda SOLO la lista
 
 
 def _parse_monitor_stale_bars_policy() -> dict[str, int]:
