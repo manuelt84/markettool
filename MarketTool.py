@@ -10612,8 +10612,14 @@ def detectar_patrones_confirmados_velas(df: pd.DataFrame, window: int = 10):
 # Función para predicción con ARIMA
 #@profile
 def predecir_arima(df, temporalidad, symbol, steps=5):
-    # Cachear predicciones ARIMA por símbolo/TF para evitar recalcular
-    cache_key = f"{symbol}_{temporalidad}_{len(df)}"
+    # ✅ OPTIMIZACIÓN 2: Cachear por (símbolo, TF, último close) en lugar de len(df)
+    # Esto evita cachear datos que solo varían por tamaño
+    try:
+        last_close = float(df['close'].iloc[-1]) if len(df) > 0 else None
+        cache_key = f"{symbol}_{temporalidad}_{last_close}"
+    except:
+        cache_key = f"{symbol}_{temporalidad}"
+    
     if hasattr(predecir_arima, '_cache'):
         cached = predecir_arima._cache.get(cache_key)
         if cached is not None:
@@ -10630,6 +10636,24 @@ def predecir_arima(df, temporalidad, symbol, steps=5):
             predecir_arima._cache[cache_key] = result
             return result
         return None
+
+    # ✅ OPTIMIZACIÓN 2: Limitar a últimas N barras (dinámico por temporalidad)
+    # Balance: suficientes datos para ARIMA (regla: 200+ observaciones) + tiempo ~5-10s
+    # Cálculo: barras = período_deseado / duración_barra
+    limites_por_tf = {
+        '1min': 480,      # 8 horas de trading (corto, mercado intraday rápido)
+        '5min': 1000,     # 5 días (una semana de datos es mucha variedad)
+        '15min': 1200,    # 15 días (3 semanas de contexto)
+        '30min': 1200,    # 3.6 semanas (mes de datos)
+        '1hour': 1000,    # 6 semanas (~1.5 meses)
+        '4hour': 800,     # 3.2 meses (trimestre)
+        '1day': 500,      # ~500 días bursátiles (~2 años)
+        '1week': 300      # ~6 años de historia
+    }
+    max_barras = limites_por_tf.get(temporalidad, 1000)
+    if len(df) > max_barras:
+        df = df.iloc[-max_barras:].copy()
+        logger.debug(f"[ARIMA OPTIMIZE] {symbol}-{temporalidad}: Limitado a {max_barras} barras ({len(df)} originales)")
 
     # Mapeo actualizado de temporalidades
     mapeo_temporalidades = {
@@ -10663,8 +10687,9 @@ def predecir_arima(df, temporalidad, symbol, steps=5):
     # Eliminar valores NaN
     series = df['close'].dropna()
 
-    # Convertir columnas de tipo object a tipos numéricos
-    df = df.infer_objects(copy=False)
+    # ✅ OPTIMIZACIÓN 2: Skipear infer_objects si ya está correcto
+    if not all(df.dtypes[col] in [np.float64, np.float32, int, np.int64] for col in df.columns if col != 'close'):
+        df = df.infer_objects(copy=False)
 
     # Convertir el índice a datetime y eliminar duplicados
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -10727,9 +10752,9 @@ def predecir_arima(df, temporalidad, symbol, steps=5):
         # Cachear resultado exitoso
         predecir_arima._cache[cache_key] = result
         
-        # Limpiar cache si crece mucho (mantener últimos 100)
-        if len(predecir_arima._cache) > 100:
-            keys_to_remove = list(predecir_arima._cache.keys())[:50]
+        # ✅ OPTIMIZACIÓN 2: Caché más agresivo (guardar últimos 200)
+        if len(predecir_arima._cache) > 200:
+            keys_to_remove = list(predecir_arima._cache.keys())[:100]
             for k in keys_to_remove:
                 predecir_arima._cache.pop(k, None)
         
