@@ -26,6 +26,67 @@ logger = logging.getLogger("MarketTool")
 APP_CONFIG = load_config()
 
 
+# ✅ TTL POLICY BY TIMEFRAME - Ensures fresh data based on update frequency
+# For high-frequency TFs (1m, 5m), use aggressive cache expiration
+# For lower-frequency TFs (1h, 1d), use longer cache TTL
+_TTL_BY_TIMEFRAME = {
+    # Intraday (minute/hour - must refresh frequently)
+    "1min":     300,      # 5 minutes   - 1m bars change every minute, cache max 5 min old
+    "5min":     600,      # 10 minutes  - 5m bars update every 5 min, cache max 10 min old
+    "15min":    900,      # 15 minutes  - 15m bars update every 15 min, cache max 15 min old
+    "30min":    1800,     # 30 minutes  - 30m bars update every 30 min
+    "1hour":    3600,     # 1 hour      - hourly bars update every hour
+    "4hour":    7200,     # 2 hours     - 4h bars update every 4 hours, cache max 2 hours old
+    
+    # Daily and above (can use longer cache)
+    "1day":     86400,    # 1 day       - daily bars update once per day
+    "1week":    604800,   # 1 week      - weekly bars update once per week
+    "1month":   2592000,  # 30 days     - monthly bars update once per month
+    
+    # Fallback for unknown TF - use conservative 30 minutes
+    "_default": 1800,
+}
+
+def _get_ttl_for_timeframe(tf: str) -> int:
+    """Get the maximum cache TTL in seconds for a given timeframe.
+    
+    Args:
+        tf: Timeframe string (e.g., "1min", "5min", "1hour", "1day")
+        
+    Returns:
+        TTL in seconds
+    """
+    # Normalize timeframe (handle variants)
+    tf_norm = tf.lower().strip()
+    # Try exact match first
+    if tf_norm in _TTL_BY_TIMEFRAME:
+        return _TTL_BY_TIMEFRAME[tf_norm]
+    
+    # Try partial matches for common variants
+    if "1m" in tf_norm:
+        return _TTL_BY_TIMEFRAME["1min"]
+    if "5m" in tf_norm:
+        return _TTL_BY_TIMEFRAME["5min"]
+    if "15m" in tf_norm:
+        return _TTL_BY_TIMEFRAME["15min"]
+    if "30m" in tf_norm:
+        return _TTL_BY_TIMEFRAME["30min"]
+    if ("1h" in tf_norm or "60" in tf_norm) and "4h" not in tf_norm:
+        return _TTL_BY_TIMEFRAME["1hour"]
+    if "4h" in tf_norm:
+        return _TTL_BY_TIMEFRAME["4hour"]
+    if "1d" in tf_norm or "daily" in tf_norm:
+        return _TTL_BY_TIMEFRAME["1day"]
+    if "1w" in tf_norm or "weekly" in tf_norm:
+        return _TTL_BY_TIMEFRAME["1week"]
+    if "1mon" in tf_norm or "monthly" in tf_norm:
+        return _TTL_BY_TIMEFRAME["1month"]
+    
+    # Default for unknown
+    logger.debug("[Cache] Unknown timeframe %s, using default TTL=%ds", tf, _TTL_BY_TIMEFRAME["_default"])
+    return _TTL_BY_TIMEFRAME["_default"]
+
+
 def safe_op(default=None, log: logging.Logger | None = None):
     log = log or logger
     def _decorator(fn):
@@ -178,7 +239,7 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     # Opcion 3: Firestore metadata
     try:
         metadata = get_historicos_metadata(symbol, tf)
-        if metadata is not None and not is_metadata_stale(metadata):
+        if metadata is not None and not is_metadata_stale(metadata, tf):
             logger.debug("[load_cached] Firestore metadata valid: %s/%s", symbol, tf)
             try:
                 df = load_from_gcs(symbol, tf)
@@ -613,13 +674,33 @@ def set_historicos_metadata(symbol: str, tf: str, gcs_path: str, rows_count: int
         return False
 
 
-def is_metadata_stale(metadata: Dict[str, Any]) -> bool:
+def is_metadata_stale(metadata: Dict[str, Any], tf: str = "1day") -> bool:
+    """
+    Check if cached metadata is stale based on timeframe-specific TTL.
+    
+    Different timeframes have different update frequencies:
+    - 1m: must be <5 min old (updates every minute)
+    - 1h: can be <1 hour old (updates every hour)
+    - 1d: can be <24 hours old (updates daily)
+    
+    Args:
+        metadata: Firestore metadata dict with 'last_update_utc'
+        tf: Timeframe for TTL lookup (e.g., "1min", "1hour", "1day")
+        
+    Returns:
+        True if metadata is stale (expired), False if fresh
+    """
     if not metadata:
         return True
 
     try:
         last_update = metadata.get("last_update_utc")
-        ttl_seconds = metadata.get("ttl_seconds", 1800)
+        
+        # ✅ NEW: Use timeframe-specific TTL instead of fixed 1800s
+        ttl_seconds = _get_ttl_for_timeframe(tf)
+        
+        # Fallback to metadata's own TTL if specified (for backwards compatibility)
+        ttl_seconds = metadata.get("ttl_seconds", ttl_seconds)
 
         if last_update is None:
             return True
@@ -633,7 +714,12 @@ def is_metadata_stale(metadata: Dict[str, Any]) -> bool:
             return True
 
         age_seconds = (datetime.now(timezone.utc).replace(tzinfo=timezone.utc) - last_update).total_seconds()
-        return age_seconds > ttl_seconds
+        is_stale = age_seconds > ttl_seconds
+        
+        if is_stale:
+            logger.debug("[Cache] Metadata stale: %s age=%.0fs > ttl=%ds", tf, age_seconds, ttl_seconds)
+        
+        return is_stale
 
     except Exception as exc:
         logger.debug("[Firestore] Error checking staleness: %s", exc)
