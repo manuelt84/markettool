@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
+import time
 import uvicorn
 from uvicorn.config import LOGGING_CONFIG
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
@@ -31,6 +33,80 @@ from markettool.core.shutdown import setup_graceful_shutdown, register_shutdown_
 from markettool.interfaces.api.health import register_health_routes, get_health_checker
 
 logger = logging.getLogger(__name__)
+
+
+def _warmup_processpool():
+    """Pre-spawn ProcessPool workers with dummy task to avoid cold start."""
+    try:
+        t0 = time.time()
+        from markettool.domain.analysis.parallel_engine import _get_or_create_executor
+        
+        # Dummy task para forzar spawn de workers
+        def _dummy_task():
+            import numpy as np
+            return np.arange(10).sum()
+        
+        # Crear executors (esto triggerea spawn)
+        prediccion_executor = _get_or_create_executor("prediccion")
+        
+        # Submit dummy tasks para 2 de 4 workers (no todos - ahorro RAM)
+        futures = [prediccion_executor.submit(_dummy_task) for _ in range(2)]
+        
+        # No esperar - daemon thread
+        logger.info(f"[Warmup] ProcessPool workers pre-spawned in {(time.time()-t0)*1000:.1f}ms")
+    except Exception as e:
+        logger.warning(f"[Warmup] ProcessPool warmup failed (non-critical): {e}")
+
+
+def _warmup_pandas_numpy():
+    """Pre-warmup pandas/numpy to avoid cold start on first analysis."""
+    try:
+        t0 = time.time()
+        import pandas as pd
+        import numpy as np
+        
+        # Dummy DataFrame para warmup de operaciones comunes
+        df_dummy = pd.DataFrame({
+            'Activo': ['EURUSD'] * 100,
+            'Ponderacion': np.random.rand(100),
+            'Precio': np.random.rand(100) * 1.2,
+        })
+        
+        # Warmup de operaciones críticas
+        _ = df_dummy.to_dict('records')  # to_dict warmup
+        _ = df_dummy.sort_values('Ponderacion')  # sort warmup
+        _ = df_dummy['Ponderacion'] * 2.0  # vectorización warmup
+        _ = df_dummy.head(5).to_dict('records')  # combinado
+        
+        logger.info(f"[Warmup] Pandas/NumPy warmup completed in {(time.time()-t0)*1000:.1f}ms")
+    except Exception as e:
+        logger.warning(f"[Warmup] Pandas warmup failed (non-critical): {e}")
+
+
+def _warmup_firestore():
+    """Pre-warm Firestore connection pool."""
+    try:
+        from MarketTool import db
+        if db:
+            # Dummy read to establish connection
+            _ = db.collection("_warmup").document("init").get()
+            logger.info("[Warmup] Firestore connection pool established")
+    except Exception as e:
+        logger.debug(f"[Warmup] Firestore warmup (non-critical): {e}")
+
+
+def _launch_performance_warmups():
+    """Launch all performance warmups in background daemon threads."""
+    warmup_threads = [
+        threading.Thread(target=_warmup_processpool, daemon=True, name="warmup-processpool"),
+        threading.Thread(target=_warmup_pandas_numpy, daemon=True, name="warmup-pandas"),
+        threading.Thread(target=_warmup_firestore, daemon=True, name="warmup-firestore"),
+    ]
+    
+    for thread in warmup_threads:
+        thread.start()
+    
+    logger.info(f"[Warmup] Launched {len(warmup_threads)} warmup threads in background")
 
 
 def main() -> None:
@@ -231,6 +307,11 @@ def main() -> None:
             )
         )
         logger.info("✅ Bot initialization complete")
+        
+        # Phase 9: Performance warmups (background threads)
+        logger.info("Step 7/7: Starting performance warmup threads...")
+        _launch_performance_warmups()
+        logger.info("✅ Performance warmups launched in background")
         
         # Phase 8: Mark service as READY
         health_checker = get_health_checker()
