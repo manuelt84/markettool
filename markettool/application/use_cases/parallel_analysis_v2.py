@@ -1,24 +1,29 @@
 """
-🚀 PARALLEL ANALYSIS ENGINE v2 - Máximo paralelismo con LegacyAdapter
-=====================================================================
+🚀 PARALLEL ANALYSIS ENGINE v2 - 100% Standalone (No Legacy)
+=============================================================
 
 Esta es la versión COMPLETA y FUNCIONAL de ParallelAnalysisEngine que:
 
-1. **Reutiliza todo el código legacy** de MarketTool.py mediante LegacyMarketToolAdapter
+1. **Implementación 100% standalone** sin dependencias de MarketTool.py
+   - ARIMA con statsmodels
+   - Indicadores técnicos (RSI, MACD, Bollinger, SMA)
+   - Detección de patrones de velas
+   - Monte Carlo simulation
+
 2. **Implementa 3 niveles de paralelismo**:
    - Nivel 1: Multi-Asset (18 activos simultáneos)
    - Nivel 2: Multi-Timeframe (7 TF paralelos por activo)
    - Nivel 3: Entry Calculation (ARIMA + Patrones + MC en paralelo)
 
-3. **Garantiza timeouts** a 3 niveles sin conflictos:
+3. **Garantiza timeouts** a 3 niveles:
    - Global: 300s
    - Asset: 50s
-   - TF: 10s  ← Más corto que legacy (45s), pero fallback a Media Móvil en adapter
-   - ARIMA: 15s (enforcement en adapter.predict_arima_safe())
+   - TF: 10s (hardcap)
+   - ARIMA: 15s (con fallback a simple MA)
 
 4. **Performance esperado**:
-   - 50 activos × 7 TF: ~2-3 minutos (vs. 233 minutos legacy secuencial)
-   - 100x más rápido
+   - 50 activos × 7 TF: ~2-3 minutos
+   - 100x más rápido que sequential
 """
 
 import asyncio
@@ -33,7 +38,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 
-from markettool.application.adapters import get_adapter, LegacyMarketToolAdapter
+from markettool.application.adapters import get_analyzer, StandaloneAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -114,18 +119,15 @@ class ParallelAnalysisEngine:
         self.prediction_executor = prediction_executor
         self.analysis_executor = analysis_executor
         
-        # Adapter para llamadas a legacy
-        self.adapter: LegacyMarketToolAdapter = get_adapter(
-            timeout_arima=self.config.timeout_prediction_arima,
-            timeout_general=self.config.timeout_per_tf
-        )
+        # Analyzer standalone (sin legacy)
+        self.analyzer: StandaloneAnalyzer = get_analyzer()
         
         # Semáforos para limitar concurrencia por nivel
         self.asset_sem = asyncio.Semaphore(self.config.max_concurrent_assets)
         self.tf_sem = asyncio.Semaphore(self.config.timeframe_fan_out)
         
         logger.info(
-            f"[ParallelAnalysisEngine] ✅ Inicializado con adapter, "
+            f"[ParallelAnalysisEngine] ✅ Inicializado (100% standalone), "
             f"semáforos: assets={self.config.max_concurrent_assets}, "
             f"tfs={self.config.timeframe_fan_out}"
         )
@@ -398,25 +400,23 @@ class ParallelAnalysisEngine:
         
         # TAREA 1: Indicadores técnicos
         async def _get_indicators():
-            return await self.adapter.compute_indicators_fast(df, tf)
+            return self.analyzer.compute_all_indicators(df)
         
         # TAREA 2: Patrones YOLO
         async def _get_patterns():
-            return await self.adapter.detect_candle_patterns(df, symbol, tf)
+            return self.analyzer.detect_candle_patterns(df)
         
-        # TAREA 3: Predicción ARIMA (con timeout enforcement en adapter)
+        # TAREA 3: Predicción ARIMA (con timeout enforcement en analyzer)
         async def _get_arima_prediction():
-            return await self.adapter.predict_arima_safe(df, tf, symbol, steps=5)
+            return await self.analyzer.predict_arima_async(df, timeframe=tf, symbol=symbol, steps=5)
         
         # TAREA 4: Monte Carlo
         async def _get_monte_carlo():
-            return await self.adapter.generate_monte_carlo_scenarios(
-                df, symbol, tf, num_scenarios=100, num_days=5
-            )
+            return self.analyzer.monte_carlo_forecast(df, num_simulations=100, num_days=5)
         
         # Ejecutar TODO en paralelo (no más de timeout_per_tf segundos)
         try:
-            indicators, patterns, arima_pred, mc_scenarios = await asyncio.wait_for(
+            indicators, patterns, arima_pred, mc_forecast = await asyncio.wait_for(
                 asyncio.gather(
                     _get_indicators(),
                     _get_patterns(),
@@ -431,23 +431,21 @@ class ParallelAnalysisEngine:
             logger.warning(
                 f"[TF] Timeout {symbol}/{tf} después de {self.config.timeout_per_tf}s"
             )
-            # Fallback: usa adapter para síntesis rápida
+            # Fallback: usa analyzer para síntesis rápida
             indicators = None
             patterns = []
             arima_pred = None
-            mc_scenarios = None
+            mc_forecast = None
         
         # SÍNTESIS final
-        signal = await self.adapter.synthesize_signal(
-            symbol=symbol,
-            tf=tf,
+        signal = await self.analyzer.synthesize_signal(
             df=df,
+            symbol=symbol,
+            timeframe=tf,
+            arima_forecast=arima_pred,
             indicators=indicators,
             patterns=patterns or [],
-            arima_pred=arima_pred,
-            mc_scenarios=mc_scenarios,
-            historical_entries=None,  # TODO: si necesitas entradas recientes
-            cfg=cfg
+            mc_forecast=mc_forecast
         )
         
         return signal

@@ -1,19 +1,21 @@
 """
-Application-level adapters for bridging different components.
+Application-level adapters for standalone analysis (100% no legacy).
 
-This package contains adapters that facilitate integration between:
-- ParallelAnalysisEngine (new architecture)
-- MarketTool.py (legacy functions)
-- Bootstrap/configuration components
+This package contains adapters for:
+- Technical analysis (ARIMA, indicators, patterns, Monte Carlo)
+- Risk management (ATR, support/resistance)
+- Signal synthesis
 
 Exports:
-    get_adapter: Get singleton instance of LegacyMarketToolAdapter
-    LegacyMarketToolAdapter: Main adapter class
+    get_analyzer: Get singleton instance of StandaloneAnalyzer
+    StandaloneAnalyzer: Main analyzer class
+    Signal: Signal dataclass
 """
 
-from .legacy_adapter import LegacyMarketToolAdapter, get_adapter
+from .standalone_analyzer import StandaloneAnalyzer, get_analyzer, Signal
 
 __all__ = [
-    'LegacyMarketToolAdapter',
-    'get_adapter',
+    'StandaloneAnalyzer',
+    'get_analyzer',
+    'Signal',
 ]
