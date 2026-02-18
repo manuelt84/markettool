@@ -30,10 +30,8 @@ def register_monitoreo_routes(
     snap_and_dedupe_to_minutes,
     densify_minutes,
     maybe_tick_quote,
-    persist_if_needed,
     mon_cache_lock,
     maybe_refresh_from_gcs,
-    ensure_stream_initialized,
     fs_touch_monitoreo,
     tf_ms,
     current_closed_bucket_start,
@@ -320,14 +318,9 @@ def register_monitoreo_routes(
                     "INC %s %s: maybe_refresh_from_gcs fallo", symbol, timeframe
                 )
 
-            try:
-                await asyncio.to_thread(
-                    ensure_stream_initialized, exec_id, symbol, timeframe, st
-                )
-            except Exception:
-                logging.exception(
-                    "INC %s %s: ensure_stream_initialized fallo", symbol, timeframe
-                )
+            # NOTE: ensure_stream_initialized removed - no longer maintains GCS stream
+            # All real-time data flows through Firestore
+
 
             try:
                 last_ts = int(last_ts) if last_ts is not None else None
@@ -430,15 +423,9 @@ def register_monitoreo_routes(
                 except Exception:
                     st["dirty"] = True
 
-            if new_bucket_started or persist:
-                try:
-                    await asyncio.to_thread(
-                        persist_if_needed, exec_id, symbol, timeframe, True
-                    )
-                except Exception:
-                    logging.exception(
-                        "INC %s %s: persist_if_needed fallo", symbol, timeframe
-                    )
+            # NOTE: persist_if_needed removed - no longer writes to GCS stream
+            # All real-time data flows through Firestore (written by runTicker on frontend)
+
 
             now_ms = int(time.time() * 1000)
             last_served_ts = inc[-1]["t"] if inc else last_ts
@@ -894,13 +881,8 @@ def register_monitoreo_routes(
             from_out = filt[0]["t"] if filt else from_ts
             to_out = filt[-1]["t"] if filt else to_ts
 
-            persisted = None
-            if persist:
-                with mon_cache_lock:
-                    st["dirty"] = True
-                persisted = await asyncio.to_thread(
-                    persist_if_needed, exec_id, symbol, timeframe, True
-                )
+            # NOTE: persist_if_needed removed - all real-time data flows through Firestore
+
 
             await asyncio.to_thread(
                 fs_touch_monitoreo,
@@ -927,8 +909,7 @@ def register_monitoreo_routes(
                 "candles": filt,
                 "gapfill": (gapfill_meta if "gapfill_meta" in locals() else None),
             }
-            if persisted:
-                resp["persisted_path"] = f"gs://{bucket_name}/{persisted}"
+            # Removed: persisted_path response (no longer persisting to GCS stream)
             return jsonify(resp), 200
 
         except Exception as exc:
@@ -1015,11 +996,7 @@ def register_monitoreo_routes(
                     "v": candle.get("v"),
                 })
 
-            # Persistir si es necesario
-            if persist and filt:
-                persisted = await asyncio.to_thread(persist_if_needed, exec_id, symbol, timeframe, True)
-            else:
-                persisted = None
+            # NOTE: persist_if_needed removed - all real-time data flows through Firestore
 
             # Touch monitoreo document
             await asyncio.to_thread(
