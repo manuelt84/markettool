@@ -5333,6 +5333,23 @@ _INDICATORS_FORCE_RECALC = os.environ.get("INDICATORS_FORCE_RECALC", "false").lo
 _INDICATORS_MEMORY_CACHE_SIZE = int(os.environ.get("INDICATORS_MEMORY_CACHE_SIZE", "10"))  # LRU moderado
 _INDICATORS_LOCK_TIMEOUT_SEC = int(os.environ.get("INDICATORS_LOCK_TIMEOUT_SEC", "180"))  # 3 min
 
+# ✅ TF-Aware freshness thresholds for indicators cache (like historicos)
+INDICATORS_FRESHNESS_THRESHOLDS = {
+    "1min": 5 * 60,           # 5 min: Scalping needs fresh indicators
+    "5min": 10 * 60,          # 10 min
+    "15min": 30 * 60,         # 30 min
+    "30min": 60 * 60,         # 1 hour
+    "1hour": 2 * 3600,        # 2 hours
+    "4hour": 4 * 3600,        # 4 hours
+    "1day": 12 * 3600,        # 12 hours
+    "1week": 24 * 3600,       # 24 hours
+}
+
+def _get_indicators_freshness_max(tf: str) -> int:
+    """Get indicators freshness threshold for timeframe (in seconds)."""
+    tf_norm = normalize_tf(tf)
+    return INDICATORS_FRESHNESS_THRESHOLDS.get(tf_norm, 3600)  # Default 1h if unknown
+
 
 def hash_dataframe(df: pd.DataFrame) -> str:
     """
@@ -5475,9 +5492,44 @@ class IndicatorsCache:
         safe_symbol = str(symbol).upper().replace("/", "_")
         safe_tf = normalize_tf(tf).replace("/", "_")
         return os.path.join(self._local_dir, f"{safe_symbol}__{safe_tf}.json")
+    
+    def _get_last_update_from_gcs(self, symbol: str, tf: str) -> Optional[datetime]:
+        """✅ GCS Peek: Get last_update_utc WITHOUT loading full indicators dict.
+        Fast metadata check for incremental fetch strategy.
+        
+        Returns:
+            datetime of last update, or None if GCS empty/unreachable
+        """
+        try:
+            if self.bucket is None:
+                return None
+            
+            gcs_path = self._gcs_path(symbol, tf)
+            blob = self.bucket.blob(gcs_path)
+            
+            if not blob.exists():
+                logger.debug(f"[IndicatorsCache] GCS peek: not found {symbol}/{tf}")
+                return None
+            
+            # Load and parse just to get metadata (lightweight compared to full indicators)
+            data = json.loads(blob.download_as_text())
+            if "metadata" not in data:
+                return None
+            
+            last_update_raw = data["metadata"].get("last_update_utc")
+            if not last_update_raw:
+                return None
+            
+            last_update = datetime.fromisoformat(str(last_update_raw).replace('Z', '+00:00'))
+            age_hours = (datetime.now(UTC).replace(tzinfo=timezone.utc) - last_update).total_seconds() / 3600
+            logger.debug(f"[IndicatorsCache] GCS peek: {symbol}/{tf} age={age_hours:.1f}h")
+            return last_update
+        except Exception as e:
+            logger.debug(f"[IndicatorsCache] GCS peek failed {symbol}/{tf}: {e}")
+            return None
 
     def _load_local(self, symbol: str, tf: str) -> Optional[dict]:
-        """Carga desde disco local del pod (best-effort)."""
+        """Carga desde disco local del pod con TF-aware freshness check."""
         try:
             local_path = self._local_path(symbol, tf)
             if not os.path.exists(local_path):
@@ -5496,12 +5548,16 @@ class IndicatorsCache:
                 return None
 
             last_update = datetime.fromisoformat(str(last_update_raw).replace('Z', '+00:00'))
-            age_hours = (datetime.now(UTC).replace(tzinfo=timezone.utc) - last_update).total_seconds() / 3600
-            if age_hours > _INDICATORS_CACHE_TTL_HOURS:
-                logger.info(f"[IndicatorsCache] Local stale (age={age_hours:.1f}h): {symbol}/{tf}")
+            age_seconds = (datetime.now(UTC).replace(tzinfo=timezone.utc) - last_update).total_seconds()
+            age_hours = age_seconds / 3600
+            
+            # ✅ NEW: TF-aware freshness check (not global TTL)
+            max_age_seconds = _get_indicators_freshness_max(tf)
+            if age_seconds > max_age_seconds:
+                logger.debug(f"[IndicatorsCache] Local stale for {symbol}/{tf}: {age_seconds:.0f}s > {max_age_seconds}s threshold")
                 return None
 
-            logger.debug(f"[IndicatorsCache] Local hit: {symbol}/{tf} (age={age_hours:.1f}h)")
+            logger.debug(f"[IndicatorsCache] Local hit (FRESH): {symbol}/{tf} (age={age_hours:.1f}h)")
             return data
         except Exception as e:
             logger.debug(f"[IndicatorsCache] Local load error {symbol}/{tf}: {e}")
@@ -5554,13 +5610,14 @@ class IndicatorsCache:
     
     def load(self, symbol: str, tf: str) -> Optional[dict]:
         """
-        Carga indicadores cacheados desde GCS (multi-pod aware).
+        Carga indicadores cacheados con TF-aware freshness cascade.
         
         Flow:
         1. Check memory cache (LRU pequeño, <100ms)
-        2. Check local pod cache (fast warm-start)
-        3. Check GCS (source of truth compartido, 100-300ms)
-        4. Validate TTL
+        2. Check local pod cache with TF-aware freshness
+        3. If local old, peek GCS freshness (fast metadata check)
+        4. Load from GCS if fresh (source of truth)
+        5. Validate TF-specific TTL
         
         Returns:
             dict con estructura:
@@ -5578,11 +5635,20 @@ class IndicatorsCache:
         if mem_data is not None:
             return mem_data
 
-        # 2. Check local pod cache
+        # 2. Check local pod cache with TF-aware freshness
         local_data = self._load_local(symbol, tf)
         if local_data is not None:
             self._memory_put(symbol, tf, local_data)
             return local_data
+        
+        # 2.5) Local is stale or missing - peek GCS for freshness without full load
+        gcs_last_update = self._get_last_update_from_gcs(symbol, tf)
+        max_age_seconds = _get_indicators_freshness_max(tf)
+        if gcs_last_update is not None:
+            age_seconds = (datetime.now(UTC).replace(tzinfo=timezone.utc) - gcs_last_update).total_seconds()
+            if age_seconds > max_age_seconds:
+                logger.info(f"[IndicatorsCache] GCS also stale: {symbol}/{tf} ({age_seconds:.0f}s > {max_age_seconds}s threshold)")
+                return None
         
         # 3. Load from GCS (source of truth para multi-pod)
         try:
@@ -5604,20 +5670,22 @@ class IndicatorsCache:
                 logger.warning(f"[IndicatorsCache] Invalid structure: {symbol}/{tf}")
                 return None
             
-            # Validar TTL
+            # Validar TF-aware freshness
             metadata = data["metadata"]
             last_update = datetime.fromisoformat(metadata["last_update_utc"].replace('Z', '+00:00'))
-            age_hours = (datetime.now(UTC).replace(tzinfo=timezone.utc) - last_update).total_seconds() / 3600
+            age_seconds = (datetime.now(UTC).replace(tzinfo=timezone.utc) - last_update).total_seconds()
+            age_hours = age_seconds / 3600
+            max_age_seconds = _get_indicators_freshness_max(tf)
             
-            if age_hours > _INDICATORS_CACHE_TTL_HOURS:
-                logger.info(f"[IndicatorsCache] Stale (age={age_hours:.1f}h): {symbol}/{tf}")
+            if age_seconds > max_age_seconds:
+                logger.info(f"[IndicatorsCache] Stale (age={age_hours:.1f}h > {max_age_seconds}s): {symbol}/{tf}")
                 return None
             
             # Cache en memoria LRU
             self._memory_put(symbol, tf, data)
             self._save_local(symbol, tf, data)
             
-            logger.info(f"[IndicatorsCache] GCS hit: {symbol}/{tf} (age={age_hours:.1f}h, rows={metadata.get('rows_count')}, pod={self._pod_id})")
+            logger.info(f"[IndicatorsCache] GCS hit (FRESH): {symbol}/{tf} (age={age_hours:.1f}h, rows={metadata.get('rows_count')}, pod={self._pod_id})")
             return data
         
         except Exception as e:
