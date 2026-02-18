@@ -19088,6 +19088,48 @@ async def procesar_envio_mensaje(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
+    if return_state(chat_id=user_chat_id) == "en ejecución":
+        await context.bot.send_message(
+            chat_id=user_chat_id,
+            text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
+        )
+        return
+
+    destinatarios = query.data.replace("mensaje_", "")
+
+    # Si elige "usuario_especifico", pedimos que ingrese el ID manualmente
+    if destinatarios == "usuario_especifico":
+        # Guardar estado temporal en Firestore para esperar el ID manualmente
+        mark_user_state(user_id=user_chat_id, estado="esperando_id_usuario", extra={"destinatarios": destinatarios})
+        await query.edit_message_text("🔢 Por favor, ingresa el ID del usuario al que deseas enviar el mensaje:")
+        return  # No continuamos hasta recibir el ID
+
+    # Guardar estado y destinatarios en Firestore para envío masivo
+    mark_user_state(user_id=user_chat_id, estado="modo_envio_mensaje", extra={"destinatarios": destinatarios})
+    await query.edit_message_text("✍️ Envía el mensaje o archivo que deseas compartir.")
+
+
+#@profile
+async def enviar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra opciones para seleccionar destinatarios del mensaje."""
+    user_id = str(update.effective_user.id)
+
+    if not es_administrador(user_id):
+        await update.message.reply_text("🚫 No tienes permisos para usar este comando.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("🟢 Todos los usuarios", callback_data="mensaje_todos")],
+        [InlineKeyboardButton("🔵 Solo suscriptores activos", callback_data="mensaje_suscriptores_activos")],
+        [InlineKeyboardButton("🟠 Solo suscriptores inactivos", callback_data="mensaje_suscriptores_inactivos")],
+        [InlineKeyboardButton("🟣 Usuario específico", callback_data="mensaje_usuario_especifico")], 
+        [InlineKeyboardButton("❌ Cancelar", callback_data="cancelar_envio_mensaje")]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("📢 ¿A quién deseas enviar el mensaje?", reply_markup=reply_markup)
+
+
 # ==================== PHASE 7: ASYNC REFACTORING ====================
 # Hexagonal architecture async helpers for CalculateEntriesUseCase
 
@@ -19264,48 +19306,6 @@ def _adapt_hexagonal_to_legacy(hex_result: dict, df: pd.DataFrame, temporalidad:
 
 
 # ==================== END PHASE 7 ====================
-
-
-    if return_state(chat_id=user_chat_id) == "en ejecución":
-        await context.bot.send_message(
-            chat_id=user_chat_id,
-            text="Ya tienes un análisis en ejecución. Por favor, espera a que termine."
-        )
-        return
-
-    destinatarios = query.data.replace("mensaje_", "")
-
-    # Si elige "usuario_especifico", pedimos que ingrese el ID manualmente
-    if destinatarios == "usuario_especifico":
-        # Guardar estado temporal en Firestore para esperar el ID manualmente
-        mark_user_state(user_id=user_chat_id, estado="esperando_id_usuario", extra={"destinatarios": destinatarios})
-        await query.edit_message_text("🔢 Por favor, ingresa el ID del usuario al que deseas enviar el mensaje:")
-        return  # No continuamos hasta recibir el ID
-
-    # Guardar estado y destinatarios en Firestore para envío masivo
-    mark_user_state(user_id=user_chat_id, estado="modo_envio_mensaje", extra={"destinatarios": destinatarios})
-    await query.edit_message_text("✍️ Envía el mensaje o archivo que deseas compartir.")
-
-
-#@profile
-async def enviar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra opciones para seleccionar destinatarios del mensaje."""
-    user_id = str(update.effective_user.id)
-
-    if not es_administrador(user_id):
-        await update.message.reply_text("🚫 No tienes permisos para usar este comando.")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("🟢 Todos los usuarios", callback_data="mensaje_todos")],
-        [InlineKeyboardButton("🔵 Solo suscriptores activos", callback_data="mensaje_suscriptores_activos")],
-        [InlineKeyboardButton("🟠 Solo suscriptores inactivos", callback_data="mensaje_suscriptores_inactivos")],
-        [InlineKeyboardButton("🟣 Usuario específico", callback_data="mensaje_usuario_especifico")], 
-        [InlineKeyboardButton("❌ Cancelar", callback_data="cancelar_envio_mensaje")]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("📢 ¿A quién deseas enviar el mensaje?", reply_markup=reply_markup)
 
 
 # Crear la aplicación del bot de Telegram con timeouts aumentados
