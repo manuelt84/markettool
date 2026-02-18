@@ -95,12 +95,47 @@ def _warmup_firestore():
         logger.debug(f"[Warmup] Firestore warmup (non-critical): {e}")
 
 
+def _warmup_caches_principales():
+    """Pre-populate caches for most traded assets to avoid cold start."""
+    try:
+        t0 = time.time()
+        
+        # Import functions that naturally populate caches
+        from MarketTool import obtener_datos_con_hilos, calcular_indicadores
+        
+        # Warmup SOLO activos muy principales (ultra-reducido para no bloquear startup)
+        main_assets = ['EURUSD', 'BTCUSD']
+        main_timeframes = ['1hour', '1day']
+        
+        warmed_count = 0
+        for symbol in main_assets:
+            for tf in main_timeframes:
+                try:
+                    # Fetch históricos (popula cache de históricos, niveles, ATR)
+                    df = obtener_datos_con_hilos(symbol, tf, bars=500)
+                    if df is not None and not df.empty:
+                        # Calcular indicadores (popula cache de indicadores)
+                        _ = calcular_indicadores(df, tf)
+                        warmed_count += 1
+                except Exception as e:
+                    logger.debug(f"[Warmup] Failed to warm {symbol}/{tf}: {e}")
+                    
+                # Yield para no bloquear event loop
+                time.sleep(0.01)
+        
+        elapsed = (time.time() - t0) * 1000
+        logger.info(f"[Warmup] Caches principales pre-poblados ({warmed_count}/{len(main_assets)*len(main_timeframes)} exitosos) en {elapsed:.1f}ms")
+    except Exception as e:
+        logger.warning(f"[Warmup] Cache warmup failed (non-critical): {e}")
+
+
 def _launch_performance_warmups():
     """Launch all performance warmups in background daemon threads."""
     warmup_threads = [
         threading.Thread(target=_warmup_processpool, daemon=True, name="warmup-processpool"),
         threading.Thread(target=_warmup_pandas_numpy, daemon=True, name="warmup-pandas"),
         threading.Thread(target=_warmup_firestore, daemon=True, name="warmup-firestore"),
+        threading.Thread(target=_warmup_caches_principales, daemon=True, name="warmup-caches"),
     ]
     
     for thread in warmup_threads:

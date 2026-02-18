@@ -12516,7 +12516,7 @@ def calcular_entradas(
             probabilidad_alza = prob_alza if prob_alza is not None else 50
             probabilidad_baja = prob_baja if prob_baja is not None else 50
         except Exception as e:
-            logger.info(f"Error en predicciones para {symbol}-{tf}: {e}. Usando secuencial.")
+            logger.warning(f"Error en predicciones paralelas para {symbol}-{tf}: {e}. Fallback a secuencial.", exc_info=True)
             # Fallback a ejecución secuencial
             predicciones_arima = predecir_arima(df, tf, symbol)
             predicciones_media_movil = predecir_media_movil(df, window)
