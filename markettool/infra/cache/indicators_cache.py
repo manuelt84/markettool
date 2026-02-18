@@ -263,6 +263,7 @@ class IndicatorsCache:
         df_historicos: pd.DataFrame,
         calc_duration_ms: float = 0,
         analysis_audit: dict | None = None,
+        last_calc_index: int | None = None,
     ) -> None:
         if not self._enabled:
             return
@@ -281,6 +282,9 @@ class IndicatorsCache:
                     "last_data_mismatch_at": audit.get("last_data_mismatch_at"),
                 }
 
+                # 📌 NEW: Track exact index where calculation ended (for incremental detection)
+                final_calc_index = last_calc_index if last_calc_index is not None else len(df_historicos) - 1
+                
                 payload = {
                     "metadata": {
                         "symbol": symbol.upper(),
@@ -288,6 +292,7 @@ class IndicatorsCache:
                         "last_update_utc": now_utc.isoformat(),
                         "data_hash": data_hash,
                         "rows_count": len(df_historicos),
+                        "last_calc_index": final_calc_index,
                         "calc_duration_ms": calc_duration_ms,
                         "indicators_list": list(indicators.keys()),
                         "analysis_audit": payload_audit,
@@ -315,6 +320,7 @@ class IndicatorsCache:
                         "last_update_utc": now_utc,
                         "data_hash": data_hash,
                         "rows_count": len(df_historicos),
+                        "last_calc_index": final_calc_index,
                         "indicators_list": list(indicators.keys()),
                         "calc_duration_ms": calc_duration_ms,
                         "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
@@ -443,6 +449,41 @@ class IndicatorsCache:
         except Exception as exc:
             logger.debug("[IndicatorsCache] Lock release error %s/%s: %s", symbol, tf, exc)
 
+    def get_calc_start_index(self, symbol: str, tf: str) -> int:
+        """📌 NEW: Get the index from where incremental calc should start.
+        
+        Returns:
+            Index of first row to recalculate (0 = full recalc, N = start from row N)
+            Considers last_calc_index from cache metadata
+        """
+        try:
+            cached = self.load(symbol, tf)
+            if cached is None:
+                return 0  # No cache, start from beginning
+            
+            metadata = cached.get("metadata", {})
+            last_calc_index = metadata.get("last_calc_index", -1)
+            rows_count = metadata.get("rows_count", 0)
+            
+            if last_calc_index < 0:
+                return 0  # Invalid metadata, full recalc
+            
+            if last_calc_index >= rows_count - 1:
+                return rows_count  # Already calculated all rows, nothing to do
+            
+            # Start from next row after last calculated
+            # Apply window context for indicator dependencies
+            if self._window_func:
+                tf_norm = normalize_tf(tf)
+                window = self._window_func(tf_norm)
+                context_start = max(0, last_calc_index - window)
+                return context_start
+            else:
+                return max(0, last_calc_index - 5)  # Default small context buffer
+        except Exception as e:
+            logger.debug(f"[IndicatorsCache] Error getting calc start index {symbol}/{tf}: {e}")
+            return 0
+    
     def _wait_for_lock_release(self, symbol: str, tf: str, max_wait_sec: int = 30) -> bool:
         if self.db is None:
             return False
@@ -679,6 +720,7 @@ class IndicatorsCache:
                         "last_incremental_at": datetime.now(UTC).replace(tzinfo=timezone.utc).isoformat(),
                         "last_incremental_bars": 0,
                     },
+                    last_calc_index=current_rows - 1,  # 📌 Track exact calc endpoint
                 )
 
                 return df_result, {
@@ -771,6 +813,7 @@ class IndicatorsCache:
                         "last_incremental_at": datetime.now(UTC).replace(tzinfo=timezone.utc).isoformat(),
                         "last_incremental_bars": int(new_bars),
                     },
+                    last_calc_index=current_rows - 1,  # 📌 Track exact calc endpoint
                 )
 
                 return df_result, {
@@ -813,6 +856,7 @@ class IndicatorsCache:
                     "last_mode": "data_mismatch",
                     "last_data_mismatch_at": datetime.now(UTC).replace(tzinfo=timezone.utc).isoformat(),
                 },
+                last_calc_index=len(df_historicos) - 1,  # 📌 Track exact calc endpoint
             )
 
             return df_result, {
