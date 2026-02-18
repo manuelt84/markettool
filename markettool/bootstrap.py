@@ -217,9 +217,6 @@ def main() -> None:
         # Import legacy components from MarketTool.py
         logger.info("Loading legacy MarketTool modules...")
         from MarketTool import (
-            asgi_app,
-            webhook_app,  # Need Flask app for health routes
-            application,
             cargar_datos_subscription_user,
             cargar_datos_subscription_type,
             cargar_chat_ids,
@@ -233,9 +230,12 @@ def main() -> None:
             scheduler,
             _POD_COORDINATOR,
             logger as market_tool_logger,
-            # Optional Firestore, GCS, Telegram clients
-            db as firestore_db,
-            storage_client,  # GCS client (renamed to avoid conflict with module)
+            # Lazy-loaded services (initialized on-demand):
+            get_firestore_db,
+            get_gcs_client,
+            get_telegram_application,
+            get_webhook_app,
+            get_asgi_app,
             # Cache metrics for health monitoring
             _warmup_start_time,
             _warmup_end_time,
@@ -315,7 +315,7 @@ def main() -> None:
         # Phase 8: Register Health Check Routes
         logger.info("Step 4/6: Registering health check endpoints...")
         register_health_routes(
-            webhook_app,  # Use Flask app directly (asgi_app is WsgiToAsgi wrapper)
+            get_webhook_app(),  # Use Flask app directly (asgi_app is WsgiToAsgi wrapper)
             warmup_start_ref=lambda: _warmup_start_time,
             warmup_end_ref=lambda: _warmup_end_time,
             levels_hits_ref=lambda: _niveles_cache_hits,
@@ -329,10 +329,10 @@ def main() -> None:
         # Create DI container with all port adapters
         logger.info("Step 5/6: Setting up dependency injection container...")
         container = DIContainer.create_default(
-            firestore_db=firestore_db,
-            gcs_client=storage_client,
+            firestore_db=get_firestore_db(),
+            gcs_client=get_gcs_client(),
             fmp_client=fmp,
-            telegram_app=application,
+            telegram_app=get_telegram_application(),
             default_chat_id=None,  # Would come from config
             logger=market_tool_logger,
         )
@@ -340,15 +340,16 @@ def main() -> None:
         
         # Register all API routes with dependency injection
         logger.info("Registering hexagonal architecture routes...")
-        register_all_routes(webhook_app, container, logger=market_tool_logger)
+        register_all_routes(get_webhook_app(), container, logger=market_tool_logger)
         logger.info("✅ Hexagonal routes registered")
         
         # Register shutdown callbacks
         async def shutdown_telegram_bot():
             """Shutdown Telegram bot gracefully."""
             logger.info("Shutting down Telegram bot...")
-            if application:
-                await application.shutdown()
+            app = get_telegram_application()
+            if app:
+                await app.shutdown()
                 logger.info("✅ Telegram bot shutdown complete")
         
         register_shutdown_callback(shutdown_telegram_bot)
@@ -357,7 +358,7 @@ def main() -> None:
         logger.info("Step 6/6: Initializing Telegram bot...")
         loop.run_until_complete(
             initialize_bot_async(
-                application,
+                get_telegram_application(),
                 container=container,
                 logger=market_tool_logger,
                 cargar_datos_subscription_user=cargar_datos_subscription_user,
@@ -399,7 +400,7 @@ def main() -> None:
         if webhook_url:
             logger.info("Starting uvicorn server...")
             uvicorn.run(
-                asgi_app,
+                get_asgi_app(),
                 host="0.0.0.0",
                 port=port,
                 log_level="info",

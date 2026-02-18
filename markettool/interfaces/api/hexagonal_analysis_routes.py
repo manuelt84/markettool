@@ -332,7 +332,7 @@ def calculate_entry_signals():
         config = data.get('config', {})
         
         # Use sync wrapper to call async use case from sync context
-        from ..../../MarketTool import calcular_entradas_sync_wrapper
+        from MarketTool import calcular_entradas_sync_wrapper
         
         result = calcular_entradas_sync_wrapper(
             df, df_eventos, symbol, timeframe,

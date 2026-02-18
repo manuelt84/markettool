@@ -1364,9 +1364,32 @@ API_KEY = (os.environ.get("FMP_API_KEY") or "").strip()
 if not API_KEY:
     raise RuntimeError("Falta FMP_API_KEY en el entorno/.env. Usa --env .env o define la variable antes de ejecutar.")
 
-# Firestore and GCS clients (public exports for bootstrap.py and hexagonal architecture)
-db = firestore.Client()
-storage_client = storage.Client()  # GCS client instance (keep 'storage' module for other uses)
+# Firestore and GCS clients (lazy initialization to avoid early credential checks)
+# These are initialized on-demand, not at import time
+_db = None
+_storage_client = None
+
+def get_firestore_db():
+    """Lazy-load Firestore client on first use."""
+    global _db
+    if _db is None:
+        try:
+            _db = firestore.Client()
+        except Exception as e:
+            logger.error(f"Failed to initialize Firestore: {e}")
+            raise
+    return _db
+
+def get_gcs_client():
+    """Lazy-load GCS client on first use."""
+    global _storage_client
+    if _storage_client is None:
+        try:
+            _storage_client = storage.Client()
+        except Exception as e:
+            logger.error(f"Failed to initialize GCS: {e}")
+            raise
+    return _storage_client
 
 # NOTE: Don't modify LOGGING_CONFIG here - it would add duplicate handlers
 # The root logger is already configured at line 182
@@ -1375,9 +1398,42 @@ storage_client = storage.Client()  # GCS client instance (keep 'storage' module 
 #sys.stdout = log_file
 #sys.stderr = log_file
 
-# Cargar el diccionario desde el archivo JSON
-with open('palabras_clave_categoria.json', 'r', encoding='utf-8') as file:
-    palabras_clave_categoria = json.load(file)
+# Lazy load of keyword categories file
+_palabras_clave_categoria = None
+
+def _get_palabras_clave_categoria():
+    """Lazy-load keyword categories from JSON file."""
+    global _palabras_clave_categoria
+    if _palabras_clave_categoria is None:
+        try:
+            # Try different possible locations
+            locations = [
+                'palabras_clave_categoria.json',
+                'data/palabras_clave_categoria.json',
+                './data/palabras_clave_categoria.json',
+            ]
+            loaded = False
+            for path in locations:
+                try:
+                    with open(path, 'r', encoding='utf-8') as file:
+                        _palabras_clave_categoria = json.load(file)
+                        logger.debug(f"Loaded palabras_clave_categoria from {path}")
+                        loaded = True
+                        break
+                except FileNotFoundError:
+                    continue
+            
+            if not loaded:
+                logger.warning(
+                    f"palabras_clave_categoria.json not found in any location: {locations}. "
+                    f"Using empty dict as fallback."
+                )
+                _palabras_clave_categoria = {}
+        except Exception as e:
+            logger.error(f"Failed to load palabras_clave_categoria: {e}")
+            _palabras_clave_categoria = {}
+    
+    return _palabras_clave_categoria
 
 patrones_alcistas = [
     'Martillo', 'Martillo Invertido', 'Envolvente Alcista',
@@ -19310,61 +19366,136 @@ def _adapt_hexagonal_to_legacy(hex_result: dict, df: pd.DataFrame, temporalidad:
 
 # Crear la aplicación del bot de Telegram con timeouts aumentados
 # Solución para telegram.error.TimedOut: httpcore.ConnectTimeout en redes lentas
-telegram_request = HTTPXRequest(
-    connect_timeout=30.0,  # Time to establish connection (default: 5.0)
-    read_timeout=30.0,     # Time to read response (default: 5.0)
-    write_timeout=30.0,    # Time to send request (default: 5.0)
-    pool_timeout=10.0,     # Time to get connection from pool (default: 1.0)
-)
-application = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).request(telegram_request).build()
+# NOTE: Application initialization is deferred to avoid requiring TELEGRAM_BOT_TOKEN at import time
+# This allows bootstrap.py to control when and how the bot is initialized
+_application = None
+_telegram_request = None
 
-# Configurar manejadores
-application.add_handler(CommandHandler('start', start))
-application.add_handler(CommandHandler("trader_menu", trader_menu))
-application.add_handler(CommandHandler("analizar_simbolo", analizar_simbolo))
-application.add_handler(CommandHandler("stop", stop))
-application.add_handler(CommandHandler("eventos_futuros", manejar_fecha_eventos))
-application.add_handler(CommandHandler("noticias_user", manejar_fecha_noticias_user))
-application.add_handler(CommandHandler("noticias_admin", manejar_fecha_noticias_admin))
-application.add_handler(CommandHandler("noticias_general", obtener_noticias_generales))
-application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, manejar_respuesta_fechas))
-application.add_handler(CommandHandler("reset_menu", comando_reset_menu))
-application.add_handler(CallbackQueryHandler(menu, pattern=r"^\d+_menu"))
-application.add_handler(CallbackQueryHandler(seleccionar_par, pattern=r"^\d+_par_"))
-application.add_handler(CommandHandler("set_timezone", menu_zonas_horarias))
-application.add_handler(CallbackQueryHandler(seleccionar_zona_horaria, pattern=r"^\d+_timezone_"))
-application.add_handler(CommandHandler("ia_grafico", manejar_ia_grafico))
-
-# Comandos de administrador
-application.add_handler(CommandHandler("agregar_suscripcion", agregar_suscripcion))
-application.add_handler(CommandHandler("eliminar_suscripcion", eliminar_suscripcion))
-application.add_handler(CommandHandler("listar_suscripciones", listar_suscripciones))
-
-# Comandos generales
-application.add_handler(CommandHandler("verificar_suscripcion", verificar_suscripcion))
-application.add_handler(CommandHandler("menu_suscripciones", mostrar_menu_suscripciones))
-application.add_handler(CallbackQueryHandler(procesar_seleccion_suscripcion, pattern=r"^\d+_pagar_"))
-application.add_handler(CallbackQueryHandler(seleccionar_suscripcion, pattern=r"^\d+_suscripcion_"))
-application.add_handler(CallbackQueryHandler(cancelar_suscripcion, pattern=r"^\d+_suscripciones_cancelar$"))
-application.add_handler(CallbackQueryHandler(cancelar_zonas_horarias, pattern=r"^\d+_zonas_horarias_cancelar$"))
-application.add_handler(CommandHandler("verificar_pago", verificar_pago))
-application.add_handler(CommandHandler("listar_pagos", listar_pagos))
-application.add_handler(CommandHandler("enviar_mensaje", enviar_mensaje))
-application.add_handler(CallbackQueryHandler(procesar_envio_mensaje, pattern="^mensaje_"))
-application.add_handler(CallbackQueryHandler(confirmar_envio, pattern="^confirmar_envio$"))
-application.add_handler(CallbackQueryHandler(cancelar_envio_mensaje, pattern="^cancelar_envio_mensaje$"))
-application.add_handler(CommandHandler("descargar_manual", descargar_manual))
-
-webhook_app = Flask(__name__)
-# Convierte la aplicación Flask a ASGI
-asgi_app = WsgiToAsgi(webhook_app)
+def get_telegram_application():
+    """Lazy-load Telegram application on first use."""
+    global _application, _telegram_request
+    
+    if _application is None:
+        try:
+            # Only initialize if token is available
+            token = os.environ.get("TELEGRAM_BOT_TOKEN")
+            if not token:
+                logger.warning(
+                    "TELEGRAM_BOT_TOKEN not present - bot will be initialized by bootstrap.py if available"
+                )
+                return None
+            
+            _telegram_request = HTTPXRequest(
+                connect_timeout=30.0,
+                read_timeout=30.0,
+                write_timeout=30.0,
+                pool_timeout=10.0,
+            )
+            _application = Application.builder().token(token).request(_telegram_request).build()
+            logger.info("Telegram bot application created")
+            
+            # Register all handlers
+            _register_telegram_handlers(_application)
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Telegram application: {e}")
+            _application = None
+    
+    return _application
 
 
-from markettool.interfaces.api.pod_routes import register_pod_routes
-from markettool.interfaces.api.execution_routes import register_execution_routes
+def _register_telegram_handlers(app):
+    """Register command and message handlers for Telegram bot."""
+    if app is None:
+        logger.warning("Cannot register handlers: application is None")
+        return
+    
+    try:
+        # Configurar manejadores
+        app.add_handler(CommandHandler('start', start))
+        app.add_handler(CommandHandler("trader_menu", trader_menu))
+        app.add_handler(CommandHandler("analizar_simbolo", analizar_simbolo))
+        app.add_handler(CommandHandler("stop", stop))
+        app.add_handler(CommandHandler("eventos_futuros", manejar_fecha_eventos))
+        app.add_handler(CommandHandler("noticias_user", manejar_fecha_noticias_user))
+        app.add_handler(CommandHandler("noticias_admin", manejar_fecha_noticias_admin))
+        app.add_handler(CommandHandler("noticias_general", obtener_noticias_generales))
+        app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, manejar_respuesta_fechas))
+        app.add_handler(CommandHandler("reset_menu", comando_reset_menu))
+        app.add_handler(CallbackQueryHandler(menu, pattern=r"^\d+_menu"))
+        app.add_handler(CallbackQueryHandler(seleccionar_par, pattern=r"^\d+_par_"))
+        app.add_handler(CommandHandler("set_timezone", menu_zonas_horarias))
+        app.add_handler(CallbackQueryHandler(seleccionar_zona_horaria, pattern=r"^\d+_timezone_"))
+        app.add_handler(CommandHandler("ia_grafico", manejar_ia_grafico))
 
-register_pod_routes(webhook_app, _POD_COORDINATOR)
-register_execution_routes(webhook_app, _EXECUTION_TRACKER, RUNNING, logger)
+        # Comandos de administrador
+        app.add_handler(CommandHandler("agregar_suscripcion", agregar_suscripcion))
+        app.add_handler(CommandHandler("eliminar_suscripcion", eliminar_suscripcion))
+        app.add_handler(CommandHandler("listar_suscripciones", listar_suscripciones))
+
+        # Comandos generales
+        app.add_handler(CommandHandler("verificar_suscripcion", verificar_suscripcion))
+        app.add_handler(CommandHandler("menu_suscripciones", mostrar_menu_suscripciones))
+        app.add_handler(CallbackQueryHandler(procesar_seleccion_suscripcion, pattern=r"^\d+_pagar_"))
+        app.add_handler(CallbackQueryHandler(seleccionar_suscripcion, pattern=r"^\d+_suscripcion_"))
+        app.add_handler(CallbackQueryHandler(cancelar_suscripcion, pattern=r"^\d+_suscripciones_cancelar$"))
+        app.add_handler(CallbackQueryHandler(cancelar_zonas_horarias, pattern=r"^\d+_zonas_horarias_cancelar$"))
+        app.add_handler(CommandHandler("verificar_pago", verificar_pago))
+        app.add_handler(CommandHandler("listar_pagos", listar_pagos))
+        app.add_handler(CommandHandler("enviar_mensaje", enviar_mensaje))
+        app.add_handler(CallbackQueryHandler(procesar_envio_mensaje, pattern="^mensaje_"))
+        app.add_handler(CallbackQueryHandler(confirmar_envio, pattern="^confirmar_envio$"))
+        app.add_handler(CallbackQueryHandler(cancelar_envio_mensaje, pattern="^cancelar_envio_mensaje$"))
+        app.add_handler(CommandHandler("descargar_manual", descargar_manual))
+        logger.info("Telegram bot handlers registered successfully")
+    except Exception as e:
+        logger.error(f"Error registering Telegram handlers: {e}")
+
+
+# Flask and ASGI app initialization (deferred to avoid early import issues)
+_webhook_app = None
+_asgi_app = None
+_routes_registered = False
+
+def get_webhook_app():
+    """Lazy-load Flask webhook app and register all routes."""
+    global _webhook_app, _routes_registered
+    if _webhook_app is None:
+        _webhook_app = Flask(__name__)
+    
+    # Register routes once after app creation
+    if not _routes_registered:
+        try:
+            from markettool.interfaces.api.pod_routes import register_pod_routes
+            from markettool.interfaces.api.execution_routes import register_execution_routes
+            register_pod_routes(_webhook_app, _POD_COORDINATOR)
+            register_execution_routes(_webhook_app, _EXECUTION_TRACKER, RUNNING, logger)
+            _routes_registered = True
+            logger.debug("Webhook routes (pod, execution) registered")
+        except Exception as e:
+            logger.warning(f"Error registering webhook routes: {e}")
+    
+    return _webhook_app
+
+def get_asgi_app():
+    """Lazy-load ASGI app wrapping Flask."""
+    global _asgi_app
+    if _asgi_app is None:
+        _asgi_app = WsgiToAsgi(get_webhook_app())
+    return _asgi_app
+
+# For backward compatibility, provide module-level access (will be lazy-loaded)
+webhook_app = None
+asgi_app = None
+
+
+# Pod and execution routes are registered lazily when webhook_app is first accessed
+# See get_webhook_app() function above for route registration logic
+# The imports below are commented out since they're now lazy-loaded
+# from markettool.interfaces.api.pod_routes import register_pod_routes
+# from markettool.interfaces.api.execution_routes import register_execution_routes
+# register_pod_routes(webhook_app, _POD_COORDINATOR)
+# register_execution_routes(webhook_app, _EXECUTION_TRACKER, RUNNING, logger)
 
 
 #@profile
@@ -21010,78 +21141,25 @@ def _set_timezone_state(tz_name, tz_value):
     timezone_country = tz_value
 
 
-register_webhook_routes(
-    webhook_app,
-    application=application,
-    update_cls=Update,
-    logger=logger,
-)
+# Route registration for webhook_app moved to:
+# 1. pod_routes & execution_routes: Registered lazily in get_webhook_app()
+# 2. webhook_routes, monitoreo_routes, analisis_routes, cache_routes: Registered by bootstrap.py
+#
+# The following registrations are commented out to avoid early initialization of
+# lazy-loaded variables (application, db, etc.). Bootstrap.py handles these registrations
+# after all services are properly initialized.
+#
+# from markettool.interfaces.api.webhook_routes import register_webhook_routes
+# from markettool.interfaces.api.monitoreo_routes import register_monitoreo_routes
+# from markettool.interfaces.api.analisis_routes import register_analisis_routes
+# from markettool.interfaces.api.cache_routes import register_cache_routes
+#
+# register_webhook_routes(webhook_app, application=application, ...)
+# register_monitoreo_routes(webhook_app, logger=logger, db=db, ...)
+# register_analisis_routes(webhook_app, application=application, db=db, ...)
+# register_cache_routes(webhook_app, indicators_cache=_INDICATORS_CACHE, ...)
 
-register_monitoreo_routes(
-    webhook_app,
-    logger=logger,
-    db=db,
-    charge_monitoreo_per_call=_charge_monitoreo_per_call,
-    fetch_events_for=_fetch_events_for,
-    filter_by_symbol_currencies=_filter_by_symbol_currencies,
-    hash_payload=_hash_payload,
-    last_hash_ref=_LAST_HASH,
-    detect_new_results=_detect_new_results,
-    evaluar_evento_para_symbol=evaluar_evento_para_symbol,
-    norm_tf=_norm_tf,
-    tf_is_enabled=_tf_is_enabled,
-    load_cache=_load_cache,
-    series_to_ms=_series_to_ms,
-    snap_and_dedupe_to_minutes=_snap_and_dedupe_to_minutes,
-    densify_minutes=_densify_minutes,
-    maybe_tick_quote=_maybe_tick_quote,
-    mon_cache_lock=_MON_CACHE_LOCK,
-    maybe_refresh_from_gcs=_maybe_refresh_from_gcs,
-    fs_touch_monitoreo=fs_touch_monitoreo,
-    tf_ms=_tf_ms,
-    current_closed_bucket_start=_current_closed_bucket_start,
-    fetch_historical_range=_fetch_historical_range,
-    merge_bars_series=merge_bars_series,
-    backfill_internal_gaps=_backfill_internal_gaps,
-    bucket_name=BUCKET_NAME,
-)
 
-register_analisis_routes(
-    webhook_app,
-    application=application,
-    db=db,
-    logger=logger,
-    running_tasks=RUNNING,
-    execution_tracker=_EXECUTION_TRACKER,
-    estado_suscripcion=estado_suscripcion,
-    es_administrador=es_administrador,
-    normalize_operatoria_payload=normalize_operatoria_payload,
-    temporalidades=temporalidades,
-    ensure_globals_loaded=_ensure_globals_loaded,
-    filtrar_activos_por_moneda=filtrar_activos_por_moneda,
-    activos_ref=activos,
-    compute_lock_ttl=compute_lock_ttl,
-    acquire_user_lock=acquire_user_lock,
-    release_user_lock=release_user_lock,
-    mark_user_state=mark_user_state,
-    obtener_opciones_usuario=obtener_opciones_usuario,
-    fs_crear_ejecucion=fs_crear_ejecucion,
-    fs_marcar_worker=fs_marcar_worker,
-    fs_finalizar_ejecucion=fs_finalizar_ejecucion,
-    fs_heartbeat=fs_heartbeat,
-    user_config_cache=_USER_CONFIG_CACHE,
-    pytz_module=pytz,
-    set_timezone_state=_set_timezone_state,
-    clear_current_request_cfg=clear_current_request_cfg,
-    ocupado_lock=ocupado_lock,
-    es_grafico_de_velas=es_grafico_de_velas,
-    analizar_con_yolo=analizar_con_yolo,
-    descontar_transaccion=descontar_transaccion,
-    stop_events_ref=STOP_EVENTS,
-    stop_events_lock=STOP_EVENTS_LOCK,
-    optimize_records_for_upload=_optimize_records_for_upload,
-    ejecutar_recurrente=ejecutar_recurrente,
-)
     
 # Legacy health routes registration (now handled by bootstrap.py Phase 8)
 # from markettool.interfaces.api.health_routes import register_health_routes
@@ -21096,20 +21174,33 @@ register_analisis_routes(
 #     app_config=APP_CONFIG,
 # )
 
-from markettool.interfaces.api.cache_routes import register_cache_routes
-
-register_cache_routes(
-    webhook_app,
-    indicators_cache=_INDICATORS_CACHE,
-    cache_enabled=_INDICATORS_CACHE_ENABLED,
-    ttl_hours=_INDICATORS_CACHE_TTL_HOURS,
-    force_recalc=_INDICATORS_FORCE_RECALC,
-)
+# Legacy cache routes registration (now handled by bootstrap.py)
+# from markettool.interfaces.api.cache_routes import register_cache_routes
+# register_cache_routes(webhook_app, indicators_cache=_INDICATORS_CACHE, ...)
 
 
 # Main entry point moved to markettool/bootstrap.py
 # This module (MarketTool.py) is now imported by bootstrap.py which handles initialization
 # To run the application, use: python -m markettool.bootstrap
+
+# Module-level __getattr__ for lazy initialization of Firestore/GCS clients
+# This allows "from MarketTool import db" to work, but db is only initialized when accessed
+def __getattr__(name: str):
+    """Lazy-load external service clients and resources on first use."""
+    if name == 'db':
+        return get_firestore_db()
+    elif name == 'storage_client':
+        return get_gcs_client()
+    elif name == 'palabras_clave_categoria':
+        return _get_palabras_clave_categoria()
+    elif name == 'application':
+        return get_telegram_application()
+    elif name == 'webhook_app':
+        return get_webhook_app()
+    elif name == 'asgi_app':
+        return get_asgi_app()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
 if __name__ == "__main__":
     # Only import here to avoid circular dependencies
     from markettool.bootstrap import main
