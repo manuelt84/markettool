@@ -8422,6 +8422,25 @@ def obtener_datos_con_hilos(
             return pd.DataFrame()
 
         df_out = df_historico.sort_index()
+        
+        # ✅ PERSIST TO GCS AFTER COLD START (like indicators_cache.save)
+        # Ensures next analysis call will load from cache, not FMP again
+        if cold_start:
+            try:
+                # Save to GCS (up to 1000 rows) + local + Firestore metadata
+                success = save_to_gcs(symbol, tf, df_out)
+                if success:
+                    _save_local_history_df(symbol, tf, df_out)
+                    # Update Firestore metadata so other pods know data is fresh
+                    safe_sym = _safe_symbol_for_filename(symbol)
+                    safe_tf = normalize_tf(tf)
+                    gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
+                    rows_to_persist = min(1000, len(df_out))
+                    set_historicos_metadata(symbol, tf, gcs_path, rows_to_persist, ttl_seconds=1800)
+                    logging.info("[ANALYSIS] GCS persisted (cold start): %s-%s → %d rows", symbol, tf, len(df_out))
+            except Exception as e:
+                logger.warning(f"[ANALYSIS] Failed to persist {symbol}/{tf} to GCS after cold start: {e}")
+                # Don't fail analysis, just log the issue
 
         # 4) recorte final si bars es numérico (solo si NO estamos preservando serie completa)
         if (not persist_full_series) and (not force_full_history) and (not cold_start) and isinstance(bars, int) and bars > 0 and len(df_out) > bars:
