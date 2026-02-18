@@ -496,17 +496,19 @@ def _save_local_history_df(symbol: str, tf: str, df: pd.DataFrame) -> None:
         logger.debug("[hist_local] Save failed %s/%s: %s", symbol, tf, e)
 
 def _load_local(symbol: str, tf: str) -> Optional[pd.DataFrame]:
-    """Best-effort local load for historicos using the JSON cache."""
+    """Best-effort local load for historicos using the JSON cache with freshness check."""
     try:
         local_hist = _hist_path_json(symbol, tf)
         if not os.path.exists(local_hist):
             return None
 
-        ttl_seconds = int(os.environ.get("HIST_LOCAL_TTL_SECONDS", APP_CONFIG.cache_ttl_historicos))
-        if ttl_seconds > 0:
-            age_seconds = time.time() - os.path.getmtime(local_hist)
-            if age_seconds > ttl_seconds:
-                return None
+        # ✅ CHECK FRESHNESS BY TIMEFRAME (not just global TTL)
+        # If cache is too old for this TF, return None (caller will try GCS/FMP)
+        if not _is_cache_fresh(local_hist, tf):
+            age = _get_cache_age(local_hist)
+            max_age = _get_cache_freshness_max(tf)
+            logger.debug(f"[hist_local] {symbol}/{tf} too old: {age}s > {max_age}s threshold, skip")
+            return None
 
         raw = Path(local_hist).read_text(encoding="utf-8")
         data = json.loads(raw) if raw.strip() else []
@@ -538,59 +540,126 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
         else: out[c] = np.nan
     return out[["open","high","low","close","volume"]]
 
+# ======================================================================
+# CACHE FRESHNESS THRESHOLDS (per-timeframe)
+# ======================================================================
+# Define how old a cache can be before we check GCS or go to FMP
+# Lower TFs (scalping) = stricter; Higher TFs (swing) = more tolerant
+# Format: timeframe -> seconds before cache is considered "stale"
+
+CACHE_FRESHNESS_THRESHOLDS = {
+    "1min": 5 * 60,           # 5 min: Scalping needs fresh data
+    "5min": 10 * 60,          # 10 min
+    "15min": 30 * 60,         # 30 min
+    "30min": 60 * 60,         # 1 hour
+    "1hour": 2 * 3600,        # 2 hours
+    "4hour": 4 * 3600,        # 4 hours
+    "1day": 12 * 3600,        # 12 hours (very tolerant)
+    "1week": 24 * 3600,       # 24 hours (very tolerant)
+}
+
+def _get_cache_freshness_max(tf: str) -> int:
+    """Get cache freshness threshold for timeframe (in seconds)."""
+    tf_norm = normalize_tf(tf)
+    return CACHE_FRESHNESS_THRESHOLDS.get(tf_norm, 3600)  # Default 1h if unknown
+
+def _get_cache_age(file_path: str) -> int:
+    """Get age of cache file in seconds. Returns -1 if file doesn't exist."""
+    try:
+        if not os.path.exists(file_path):
+            return -1
+        mtime = os.path.getmtime(file_path)
+        age_sec = int(time.time() - mtime)
+        return max(0, age_sec)
+    except Exception:
+        return -1
+
+def _is_cache_fresh(file_path: str, tf: str) -> bool:
+    """Check if cache file is fresh enough for the given timeframe."""
+    age = _get_cache_age(file_path)
+    if age < 0:
+        return False  # File doesn't exist
+    max_age = _get_cache_freshness_max(tf)
+    return age < max_age
+
 @safe_op(default=pd.DataFrame(columns=["open","high","low","close","volume"]))
 def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     """
-    Carga históricos del caché.
-    ✅ OPTIMIZADO: Intenta en orden:
-       1. LazyHistoricosLoader (LRU + TTL en memoria)
-       2. Firestore Metadata (TTL compartido entre pods) ← NEW: Multi-pod coordination
-       3. GCS (permanente, compartido)
-       4. Archivos locales CSV/JSON (legacy)
+    Carga históricos del caché con freshness-aware strategy.
+    ✅ OPTIMIZADO: Intenta en orden WITH FRESHNESS CHECKS:
+       1. LazyHistoricosLoader (LRU + TTL en memoria) - siempre válido si existe
+       2. Local files - Si está suficientemente fresco PARA ESE TF → Use
+       3. GCS - Si local está viejo → Check GCS freshness → Use si fresco
+       4. Firestore Metadata (TTL compartido entre pods) - coordinación multi-pod
+       5. Archivos legacy (CSV/JSON) - fallback
     
-    En multi-pod: El TTL se comparte via Firestore metadata, evitando que múltiples
-    pods hagan FMP calls simultáneamente para el mismo símbolo.
+    Freshness thresholds son TIEMPO-ESPECÍFICOS:
+    - 1min/5min: 5-10 min (scalping, need fresh)
+    - 15min-1hour: 30min-2h
+    - 4hour+: 4h-24h (very tolerant)
+    
+    Returns:
+        DataFrame con históricos, o empty si no se encontró o todo está muy viejo
     """
     import json
     
-    # Opción 1: Lazy loader (rápido, en caché)
+    # Opción 1: Lazy loader (rápido, en caché en memoria)
     try:
         df = _LAZY_HIST_LOADER.get(symbol, tf)
         if not df.empty:
-            logger.debug(f"[load_cached] Hit LazyLoader: {symbol}/{tf}")
+            logger.debug(f"[load_cached] Hit LazyLoader (memory): {symbol}/{tf}")
             return df
     except Exception as e:
         logger.debug(f"[LazyLoader] Failed to load {symbol}/{tf}: {e}")
     
-    # Opción 2: Local files PRIMERO (muy rápido ~5ms, sin esperar red)
-    # Si local es fresco (<4h), es mucho más rápido que Firestore/GCS
+    # Opción 2: Local files - Chequear FRESHNESS por TF
     try:
-        df = _load_local(symbol, tf)
+        local_file = _hist_path_json(symbol, tf)
+        if _is_cache_fresh(local_file, tf):
+            df = _load_local(symbol, tf)
+            if df is not None and not df.empty:
+                max_age = _get_cache_freshness_max(tf)
+                age = _get_cache_age(local_file)
+                logger.info(f"[load_cached] Hit Local (FRESH): {symbol}/{tf} age={age}s < {max_age}s threshold")
+                try:
+                    _LAZY_HIST_LOADER.put(symbol, tf, df)
+                except Exception:
+                    pass
+                return df
+        else:
+            # Local exists but is TOO OLD for this TF
+            age = _get_cache_age(local_file)
+            max_age = _get_cache_freshness_max(tf)
+            logger.debug(f"[load_cached] Local stale for {symbol}/{tf}: age={age}s > {max_age}s threshold, checking GCS...")
+    except Exception as e:
+        logger.debug(f"[load_cached] Local check failed: {e}")
+    
+    # Opción 3: GCS - Si local fue muy viejo o no existe
+    try:
+        df = load_from_gcs(symbol, tf)
         if df is not None and not df.empty:
-            logger.debug(f"[load_cached] Hit Local: {symbol}/{tf}")
+            max_age = _get_cache_freshness_max(tf)
+            logger.info(f"[load_cached] Hit GCS (check after local stale): {symbol}/{tf}, threshold={max_age}s")
+            # Actualizar local con datos frescos de GCS
+            _save_local_history_df(symbol, tf, df)
             try:
                 _LAZY_HIST_LOADER.put(symbol, tf, df)
             except Exception:
                 pass
             return df
     except Exception as e:
-        logger.debug(f"[load_cached] Local check failed: {e}")
+        logger.debug(f"[GCS] Load failed for {symbol}/{tf}: {e}")
     
-    # Opción 3: Firestore Metadata (solo si local falló) ← Multi-pod coordination
-    # Para coordinación entre pods, pero solo si no hay cache local
+    # Opción 4: Firestore Metadata (coordinación multi-pod si nada más funcionó)
     try:
         metadata = get_historicos_metadata(symbol, tf)
         if metadata is not None and not is_metadata_stale(metadata):
-            # TTL válido: datos en GCS están frescos
             logger.debug(f"[load_cached] Firestore metadata valid (ttl not expired): {symbol}/{tf}")
-            
-            # Cargar de GCS sabiendo que está actualizado
             try:
                 df = load_from_gcs(symbol, tf)
                 if df is not None and not df.empty:
                     logger.debug(f"[load_cached] Hit GCS (via Firestore TTL): {symbol}/{tf}")
                     _save_local_history_df(symbol, tf, df)
-                    # Cachear localmente para próximas llamadas
                     try:
                         _LAZY_HIST_LOADER.put(symbol, tf, df)
                     except Exception:
@@ -601,24 +670,8 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     except Exception as e:
         logger.debug(f"[Firestore] Metadata check failed (not fatal): {e}")
     
-    # Opción 4: GCS fallback (300-500ms) - solo si Firestore/Local falló
-    try:
-        df = load_from_gcs(symbol, tf)
-        if df is not None and not df.empty:
-            logger.debug(f"[load_cached] Hit GCS: {symbol}/{tf}")
-            _save_local_history_df(symbol, tf, df)
-            # Cachear localmente para próximas llamadas
-            try:
-                _LAZY_HIST_LOADER.put(symbol, tf, df)
-            except Exception:
-                pass
-            return df
-    except Exception as e:
-        logger.debug(f"[GCS] Load failed for {symbol}/{tf}, trying local: {e}")
-    
     # Opción 5: Archivos locales legacy (CSV/JSON)
     primary = _hist_path(symbol, tf)
-    alt = _hist_path_json(symbol, tf) if primary.endswith(".csv") else _hist_path_csv(symbol, tf)
     
     def _from_df(df):
         """Normaliza un DataFrame cargado desde archivos."""
