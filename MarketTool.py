@@ -1160,7 +1160,7 @@ except Exception:
 timezone_country = pytz.UTC
 
 # 📝 LOCAL MEMORY CACHE (per-pod, ephemeral - lost on pod restart)
-# Stores per-user session state: estado, par_seleccionado, cache_realtime, soportes_resistencias_cache
+# Stores per-user session state: estado, par_seleccionado, cache_realtime
 # ⚠️ NOT PERSISTENT: Use Firestore 'user_states' collection for persistent storage
 # ✅ THREAD-SAFE: Protected by user_states_lock
 user_states = {}
@@ -1258,7 +1258,6 @@ subscriptions_type = {}
 admin_ids = {}
 
 # ✅ FIX: Use RLock (Reentrant Lock) to allow same thread to acquire lock multiple times
-# This prevents deadlocks when functions call each other (e.g., limpiar_soportes_resistencias_cache -> mark_user_state)
 user_states_lock = threading.RLock()  # Reentrant: safe for nested lock acquisitions
 matplotlib_lock = threading.Lock()
 
@@ -4263,7 +4262,7 @@ def mark_user_state(
         st = user_states.setdefault(uuid, {})
         st["estado"] = estado
         # copia campos útiles si vinieron en extra
-        for k in ("par_seleccionado", "soportes_resistencias_cache", "cache_realtime", "moneda_filtro", "exec_id"):
+        for k in ("par_seleccionado", "cache_realtime", "moneda_filtro", "exec_id"):
             if k in (extra or {}):
                 st[k] = (extra or {})[k]
         user_states[uuid] = st
@@ -11011,6 +11010,12 @@ _niveles_cache_hits = 0
 _niveles_cache_misses = 0
 _NIVELES_CACHE_LOCK = threading.Lock()
 
+# Cache global de niveles unificados cross-timeframe (compartido por todos los usuarios en el pod)
+# Estructura: {symbol: {soportes: [floats], resistencias: [floats], timestamp: datetime}}
+_niveles_unificados_cache = {}
+_niveles_unificados_lock = threading.Lock()
+_niveles_unificados_ttl = 3600  # 1 hora de vigencia
+
 # Cache global para ATR (evita recalcular)
 # Estructura: {"symbol|tf|df_len": {"atr": float, "timestamp": ...}}
 _atr_cache = {}
@@ -11268,30 +11273,34 @@ def contar_toques(nivel, precios, umbral=0.01):
     return sum(abs(precios - nivel) / nivel <= umbral)
 
 #@profile
-def unificar_niveles(cache, symbol):
-    # Verificar si el símbolo existe en el caché
-    if symbol not in cache:
-        raise KeyError(f"El símbolo {symbol} no existe en el caché.")
+def unificar_niveles(symbol):
+    """
+    Retorna niveles de soportes y resistencias unificados de todas las temporalidades para un símbolo.
+    Lee del cache global _niveles_unificados_cache.
     
-    # Inicializar conjuntos para evitar duplicados
-    soportes_unificados = set()
-    resistencias_unificadas = set()
-    
-    # Recorrer cada temporalidad del símbolo
-    for temporalidad, datos in cache[symbol].items():
-        if isinstance(datos, dict):  # Asegurarse de que contiene soportes/resistencias
-            soportes = datos.get('soportes', [])
-            resistencias = datos.get('resistencias', [])
+    Returns:
+        dict: {"soportes": [floats], "resistencias": [floats]}
+    """
+    with _niveles_unificados_lock:
+        # Retornar copia para evitar mutaciones externas
+        if symbol in _niveles_unificados_cache:
+            entry = _niveles_unificados_cache[symbol]
+            now = datetime.now(UTC)
+            age = (now - entry['timestamp']).total_seconds()
             
-            # Agregar soportes y resistencias al conjunto
-            soportes_unificados.update(soportes)
-            resistencias_unificadas.update(resistencias)
-    
-    # Asignar los niveles unificados al símbolo en el caché
-    cache[symbol]['soportes'] = sorted(soportes_unificados)
-    cache[symbol]['resistencias'] = sorted(resistencias_unificadas)
-    
-    return cache
+            # Si TTL vencido, limpiar cache viejo
+            if age > _niveles_unificados_ttl:
+                logger.info(f"[CACHE] Niveles unificados de {symbol} vencidos (age={age/60:.1f}min), limpiando")
+                _niveles_unificados_cache.pop(symbol, None)
+                return {"soportes": [], "resistencias": []}
+            
+            return {
+                "soportes": sorted(entry.get('soportes', [])),
+                "resistencias": sorted(entry.get('resistencias', []))
+            }
+        else:
+            # No existe en cache, retornar vacío
+            return {"soportes": [], "resistencias": []}
 
 #@profile
 def eliminar_niveles_redundantes(niveles, tolerancia):
@@ -11386,10 +11395,24 @@ def detectar_rango_zigzag(
     }
 
 #@profile
-def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soportes_resistencias_cache, symbol, temporalidad_actual, umbral_atr=2.0, max_niveles=5):
-
-    if symbol not in soportes_resistencias_cache or temporalidad_actual not in soportes_resistencias_cache[symbol]:
-        raise KeyError(f"El símbolo {symbol} o la temporalidad {temporalidad_actual} no se encuentran en el caché.")
+def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol, temporalidad_actual, umbral_atr=2.0, max_niveles=5):
+    """
+    Obtiene niveles clave de soportes y resistencias combinando:
+    - Niveles dinámicos calculados para la temporalidad actual
+    - Niveles unificados cross-timeframe del cache global
+    
+    Args:
+        df: DataFrame con OHLCV
+        soportes_dinamicos: Soportes calculados para la temporalidad actual
+        resistencias_dinamicas: Resistencias calculadas para la temporalidad actual
+        symbol: Símbolo del activo (ej: 'EURUSD')
+        temporalidad_actual: Timeframe actual (ej: '1min')
+        umbral_atr: Múltiplo del ATR para filtro de cercanía
+        max_niveles: Máximo número de niveles a retornar por tipo
+    
+    Returns:
+        dict: Niveles clave confirmados con toques
+    """
 
     #@profile
     def procesar_niveles_importantes(niveles):
@@ -11416,9 +11439,10 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, soport
     soportes = sorted(set(soportes_dinamicos), reverse=True)
     resistencias = sorted(set(resistencias_dinamicas))
 
-    cache_actualizado = unificar_niveles(soportes_resistencias_cache, symbol)
-    soportes_cache = sorted(cache_actualizado[symbol]['soportes'], reverse=True)
-    resistencias_cache = sorted(cache_actualizado[symbol]['resistencias'])
+    # Obtener niveles unificados del cache global
+    niveles_unificados = unificar_niveles(symbol)
+    soportes_cache = sorted(niveles_unificados['soportes'], reverse=True)
+    resistencias_cache = sorted(niveles_unificados['resistencias'])
 
     if not soportes:
         logger.info(f"Advertencia: No se encontraron soportes para {symbol} en {temporalidad_actual}.")
@@ -12366,12 +12390,9 @@ def calcular_entradas(
     *,
     calc_windows: dict[str, int] | None = None,
     cfg: dict | None = None,
-):
+):  
     salida = {}
     try:
-        estado_usuario = obtener_estado_usuario(user_chat_id)
-        soportes_resistencias_cache = estado_usuario["soportes_resistencias_cache"]
-
         tf = _tf_backend(temporalidad)
         window = min(definir_window(tf, overrides=calc_windows), len(df))
         precio_actual = df["close"].iloc[-1]
@@ -12517,24 +12538,25 @@ def calcular_entradas(
             # Almacenar en cache
             _cache_niveles(cache_key, soportes_dinamicos, resistencias_dinamicas)
 
-        if symbol not in soportes_resistencias_cache:
-            soportes_resistencias_cache[symbol] = {}
-
-        if tf not in soportes_resistencias_cache[symbol]:
-            soportes_resistencias_cache[symbol][tf] = {
-                "soportes": soportes_dinamicos,
-                "resistencias": resistencias_dinamicas,
-            }
-        else:
-            s = soportes_resistencias_cache[symbol][tf]
-            s["soportes"] = list(set(s["soportes"] + soportes_dinamicos))
-            s["resistencias"] = list(set(s["resistencias"] + resistencias_dinamicas))
+        # ✅ Actualizar cache global de niveles unificados (cross-timeframe)
+        with _niveles_unificados_lock:
+            if symbol not in _niveles_unificados_cache:
+                _niveles_unificados_cache[symbol] = {
+                    "soportes": set(soportes_dinamicos),
+                    "resistencias": set(resistencias_dinamicas),
+                    "timestamp": datetime.now(UTC)
+                }
+            else:
+                entry = _niveles_unificados_cache[symbol]
+                # Combinar niveles existentes con nuevos
+                entry["soportes"].update(soportes_dinamicos)
+                entry["resistencias"].update(resistencias_dinamicas)
+                entry["timestamp"] = datetime.now(UTC)  # Renovar TTL
 
         niveles_clave = obtener_niveles_clave(
             df,
             soportes_dinamicos,
             resistencias_dinamicas,
-            soportes_resistencias_cache,
             symbol,
             tf,
             umbral_atr=2.0,
@@ -15367,7 +15389,7 @@ def _solo_strings_urls(items: list[Any]) -> list[str]:
 def obtener_estado_usuario(user_chat_id):
     with user_states_lock:  # ✅ FIX: Protect against concurrent access
         if user_chat_id not in user_states:
-            user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}, "soportes_resistencias_cache": {}}
+            user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}}
         return user_states[user_chat_id].copy()  # ✅ Return copy to prevent external mutations
 
 # Función para actualizar el estado de un usuario
@@ -15376,11 +15398,9 @@ def obtener_estado_usuario(user_chat_id):
 def actualizar_estado_usuario(user_chat_id, estado, par_seleccionado=None):
     with user_states_lock:  # ✅ FIX: Protect against concurrent modifications
         if user_chat_id not in user_states:
-            user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}, "soportes_resistencias_cache": {}}
+            user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}}
         user_states[user_chat_id]["estado"] = estado
         user_states[user_chat_id]["par_seleccionado"] = par_seleccionado
-        # Cache local/temporal (se pierde si el pod se reinicia)
-        user_states[user_chat_id]["soportes_resistencias_cache"] = {}
 
 #@profile
 def limpiar_estado_usuario(user_chat_id):
@@ -15391,27 +15411,8 @@ def limpiar_estado_usuario(user_chat_id):
             # Cache local/temporal en memoria (no persistido)
             user_states[user_chat_id]["cache_realtime"] = {}
 
-#@profile
-def limpiar_soportes_resistencias_cache(user_chat_id):
-    # Actualizar memoria local bajo lock
-    with user_states_lock:  # ✅ FIX: Protect against concurrent modifications
-        if user_chat_id in user_states:
-            user_states[user_chat_id]["soportes_resistencias_cache"] = {}
-            logger.info(f"[LOCAL CACHE] Cache temporal de soportes/resistencias reseteado para usuario {user_chat_id} en este pod.")
-        else:
-            # Si no hay estado, inicialízalo como disponible
-            user_states[user_chat_id] = {
-            "estado": "disponible",
-            "soportes_resistencias_cache": {}
-        }
-            logger.info(f"[Init] Estado inicializado para usuario {user_chat_id}.")
-    
-    # Actualizar estado remoto (Firestore) FUERA del lock para evitar bloqueos prolongados
-    try:
-        # ¡Ojo! Este es un chat_id, por eso usamos chat_id=... (no user_id)
-        mark_user_state(chat_id=user_chat_id, estado="disponible")
-    except Exception as e:
-        logger.warning(f"[limpiar_soportes_resistencias_cache] Error al marcar estado en Firestore: {e}")
+# ⚠️ ELIMINADO: limpiar_soportes_resistencias_cache() - Cache ahora es global por pod (_niveles_unificados_cache)
+# No se resetea por usuario, solo por TTL (1 hora)
 
 # ----------------- Comandos / Flujos Telegram -----------------
 #@profile
@@ -16588,7 +16589,6 @@ async def ejecutar_recurrente(
 
     if user_chat_id:
         try:
-            limpiar_soportes_resistencias_cache(user_chat_id)
             estado_usuario = obtener_estado_usuario(user_chat_id)
             estado_usuario["cache_realtime"] = {}
         except Exception as e:
