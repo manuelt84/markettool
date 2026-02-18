@@ -13979,6 +13979,67 @@ async def ejecutar_analisis_con_hilos(
                 )
             return result
 
+    # --- PRE-FETCH HISTÓRICOS (Optimización Cold Start) ---
+    # ✅ OPTIMIZATION: Pre-fetch todos los históricos en paralelo ANTES de análisis
+    # Beneficio: En cold start, descarga batch de GCS es 3-5x más rápida que descarga individual dentro de cada análisis
+    # Estrategia: Si detectamos cache mayormente vacío → pre-fetch agresivo, si no → skip
+    prefetch_enabled = str(os.getenv("ANALYSIS_PREFETCH_HISTORICOS", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    if prefetch_enabled and total_tasks > 10:  # Solo para análisis grandes (>10 tasks)
+        t_prefetch_start = time.time()
+        
+        # Sample 5 random (symbol, tf) combos to check cache hit rate
+        import random
+        sample_combos = random.sample(
+            [(s, tf) for s in activos_filtrados for tf in temps],
+            min(5, total_tasks)
+        )
+        sample_hits = sum(
+            1 for s, tf in sample_combos 
+            if not (load_cached_history(s, tf) is None or load_cached_history(s, tf).empty)
+        )
+        cache_hit_rate = sample_hits / len(sample_combos) if sample_combos else 1.0
+        
+        # Si cache hit rate < 50% → hacer pre-fetch agresivo
+        if cache_hit_rate < 0.5:
+            logger.info(
+                f"[Prefetch] Cache hit rate bajo ({cache_hit_rate:.1%}), "
+                f"pre-fetching {total_tasks} históricos en paralelo..."
+            )
+            
+            async def _prefetch_one(symbol, tf):
+                """Pre-fetch un histórico sin procesar."""
+                try:
+                    # Usar obtener_datos_con_hilos que popula todos los caches automáticamente
+                    await asyncio.to_thread(obtener_datos_con_hilos, symbol, tf, bars=None)
+                except Exception as e:
+                    logger.debug(f"[Prefetch] Error {symbol}/{tf}: {e}")
+            
+            # Lanzar pre-fetch en paralelo con semáforo limitado (max 20 simultáneos para no saturar GCS)
+            prefetch_sem = asyncio.Semaphore(min(20, total_tasks))
+            
+            async def _bounded_prefetch(symbol, tf):
+                async with prefetch_sem:
+                    await _prefetch_one(symbol, tf)
+            
+            prefetch_tasks = [
+                asyncio.create_task(_bounded_prefetch(s, tf))
+                for s in activos_filtrados
+                for tf in temps
+            ]
+            
+            await asyncio.gather(*prefetch_tasks, return_exceptions=True)
+            
+            t_prefetch_elapsed = time.time() - t_prefetch_start
+            logger.info(
+                f"[Prefetch] ✅ Completado en {t_prefetch_elapsed:.1f}s "
+                f"({total_tasks/t_prefetch_elapsed:.1f} fetches/s)"
+            )
+        else:
+            logger.info(
+                f"[Prefetch] Cache hit rate alto ({cache_hit_rate:.1%}), "
+                f"skip pre-fetch (usando cache existente)"
+            )
+
     # --- Análisis principal (PARALELIZACIÓN OPTIMIZADA) ---
     # Opción 2: asyncio.gather() con return_exceptions=True
     # Beneficio: Procesa todos los resultados, capturando excepciones sin perder contexto
