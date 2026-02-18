@@ -5421,224 +5421,307 @@ def merge_indicators_incremental(cached: dict, new: dict, split_index: int, wind
     return merged
 
 
-class IndicatorsCache:
-    """
-    Sistema de caché inteligente para indicadores técnicos - MULTI-POD OPTIMIZED.
-    
-    Arquitectura stateless:
-    - GCS: única fuente de verdad (compartido entre todos los pods)
-    - Firestore: metadata + distributed lock (coordinación entre pods)
-    - Disco local del pod: backup/warm-start rápido (best-effort)
-    - Memory cache: LRU(5) solo para hit rate dentro de sesión (bajo consumo RAM)
-    - Lock distribuido: previene cálculos duplicados entre pods
-    
-    Features:
-    - Pods completamente stateless (bajo consumo de RAM)
-    - Coordinación automática entre pods via Firestore
-    - Activos dinámicos soportados (FMP on-demand)
-    - Cálculo incremental (solo velas nuevas + window context)
-    - Validación por hash (detecta cambios en datos)
-    
-    Performance esperado:
-    - Cold start (sin caché): mismo tiempo que antes (~30 min para 50 activos)
-    - Warm hit (GCS): 100-300ms por activo (sin cálculo)
-    - Incremental (nuevas velas): 2-3 min (solo recalcula últimas velas)
-    - Multi-pod: pod que llegue primero calcula, resto espera y usa resultado
-    """
-    
-    def __init__(self, bucket_name: str = None):
-        self.bucket_name = bucket_name or _GCS_BUCKET_NAME
-        self._bucket = None
-        self._db = None
-        self._lock = threading.Lock()
-        self._pod_id = socket.gethostname()  # Identificador único del pod
-        
-        # Memory cache LRU PEQUEÑO (solo 5 items para hit rate en sesión)
-        from collections import OrderedDict
-        self._memory_cache = OrderedDict()  # LRU: {key: (data, timestamp)}
-        self._memory_cache_max = _INDICATORS_MEMORY_CACHE_SIZE
-        self._memory_cache_ttl_sec = 300  # 5 min en memoria
-        self._local_dir = os.environ.get("INDICATORS_DIR", "indicators")
-        
-        self._enabled = _INDICATORS_CACHE_ENABLED
-        
-        logger.info(f"[IndicatorsCache] Initialized (pod={self._pod_id}, enabled={self._enabled}, ttl={_INDICATORS_CACHE_TTL_HOURS}h, mem_lru={self._memory_cache_max}, local_dir={self._local_dir})")
-    
-    @property
-    def bucket(self):
-        if self._bucket is None and self._enabled:
-            try:
-                self._bucket = storage.Client().bucket(self.bucket_name)
-            except Exception as e:
-                logger.warning(f"[IndicatorsCache] GCS not available: {e}")
-        return self._bucket
-    
-    @property
-    def db(self):
-        if self._db is None and self._enabled:
-            self._db = _get_firestore_client()
-        return self._db
-    
-    def _gcs_path(self, symbol: str, tf: str) -> str:
-        """Genera path en GCS para indicadores."""
-        return f"indicators/{symbol.upper()}__{normalize_tf(tf)}.json"
-    
-    def _metadata_doc_id(self, symbol: str, tf: str) -> str:
-        """Genera doc ID para Firestore metadata."""
-        return f"{symbol.upper()}__{normalize_tf(tf)}"
+# ======================================================================
+# Indicators cache overrides (module extraction)
+# ======================================================================
+from markettool.infra.cache.indicators_cache import (
+    IndicatorsCache as _IndicatorsCache,
+    hash_dataframe as _hash_dataframe,
+    merge_indicators_incremental as _merge_indicators_incremental,
+    _INDICATORS_CACHE_ENABLED as _IC_ENABLED,
+    _INDICATORS_CACHE_TTL_HOURS as _IC_TTL_HOURS,
+    _INDICATORS_FORCE_RECALC as _IC_FORCE_RECALC,
+    _INDICATORS_MEMORY_CACHE_SIZE as _IC_MEM_SIZE,
+    _INDICATORS_LOCK_TIMEOUT_SEC as _IC_LOCK_TIMEOUT,
+)
 
-    def _local_path(self, symbol: str, tf: str) -> str:
-        """Path local dentro del pod para cache de indicadores."""
-        safe_symbol = str(symbol).upper().replace("/", "_")
-        safe_tf = normalize_tf(tf).replace("/", "_")
-        return os.path.join(self._local_dir, f"{safe_symbol}__{safe_tf}.json")
+IndicatorsCache = _IndicatorsCache
+hash_dataframe = _hash_dataframe
+merge_indicators_incremental = _merge_indicators_incremental
+_INDICATORS_CACHE_ENABLED = _IC_ENABLED
+_INDICATORS_CACHE_TTL_HOURS = _IC_TTL_HOURS
+_INDICATORS_FORCE_RECALC = _IC_FORCE_RECALC
+_INDICATORS_MEMORY_CACHE_SIZE = _IC_MEM_SIZE
+_INDICATORS_LOCK_TIMEOUT_SEC = _IC_LOCK_TIMEOUT
+_INDICATORS_CACHE = IndicatorsCache(window_func=definir_window)
+
+
+# ============================================================================
+# POD LEADER COORDINATOR - Multi-Pod Coordination for Scheduled Tasks
+# ============================================================================
+
+class PodLeaderCoordinator:
+    """
+    Coordina procesos periódicos en entorno multi-pod.
     
-    def _get_last_update_from_gcs(self, symbol: str, tf: str) -> Optional[datetime]:
-        """✅ GCS Peek: Get last_update_utc WITHOUT loading full indicators dict.
-        Fast metadata check for incremental fetch strategy.
+    ✅ Solo el pod LÍDER ejecuta tareas programadas (ej: actualizar menús Telegram)
+    ✅ Evita solicitudes duplicadas a APIs externas
+    ✅ Failover automático si el líder cae
+    ✅ Heartbeat cada 60 segundos
+    ✅ TTL de 3 minutos (si líder no envía heartbeat, es reemplazado)
+    
+    Firestore Document: system/scheduler_leader
+    {
+        "pod_id": "markettool-7d8f9-abc12",
+        "heartbeat_utc": "2026-02-11T15:30:00Z",
+        "elected_at_utc": "2026-02-11T15:00:00Z",
+        "ttl_seconds": 180
+    }
+    """
+    
+    def __init__(self):
+        import socket
+        self.pod_id = socket.gethostname()
+        self.firestore_enabled = os.environ.get("FIRESTORE_ENABLED", "false").lower() == "true"
+        self.db = firestore.Client() if self.firestore_enabled else None
+        self.leader_doc_path = "system/scheduler_leader"
+        self.ttl_seconds = int(os.environ.get("LEADER_TTL_SECONDS", "180"))  # 3 min
+        self.heartbeat_interval = int(os.environ.get("LEADER_HEARTBEAT_SECONDS", "60"))  # 1 min
+        self.is_leader = False
+        self.heartbeat_task = None
+        self.last_check = 0
+        self.check_cooldown = 30  # Re-check leadership cada 30 seg si no es líder
+        
+        logger.info(f"[PodCoordinator] Initialized pod_id={self.pod_id}, firestore_enabled={self.firestore_enabled}")
+    
+    def _is_firestore_available(self) -> bool:
+        """Check if Firestore is enabled and available."""
+        return self.firestore_enabled and self.db is not None
+    
+    async def try_become_leader(self) -> bool:
+        """
+        Intenta convertirse en líder del cluster.
         
         Returns:
-            datetime of last update, or None if GCS empty/unreachable
+            bool: True si este pod es el líder, False de lo contrario
         """
+        if not self._is_firestore_available():
+            # Sin Firestore, cada pod es su propio líder (fallback a comportamiento original)
+            logger.warning("[PodCoordinator] Firestore disabled. Pod operates independently.")
+            self.is_leader = True
+            return True
+        
         try:
-            if self.bucket is None:
-                return None
+            doc_ref = self.db.document(self.leader_doc_path)
+            doc = doc_ref.get()
+            now_utc = datetime.now(timezone.utc)
             
-            gcs_path = self._gcs_path(symbol, tf)
-            blob = self.bucket.blob(gcs_path)
+            if not doc.exists:
+                # No hay líder, tomar el control
+                doc_ref.set({
+                    "pod_id": self.pod_id,
+                    "heartbeat_utc": now_utc.isoformat(),
+                    "elected_at_utc": now_utc.isoformat(),
+                    "ttl_seconds": self.ttl_seconds
+                })
+                self.is_leader = True
+                logger.info(f"[PodCoordinator] ✅ Elected as LEADER (no previous leader)")
+                return True
             
-            if not blob.exists():
-                logger.debug(f"[IndicatorsCache] GCS peek: not found {symbol}/{tf}")
-                return None
+            # Verificar si el líder actual está vivo
+            data = doc.to_dict()
+            current_leader = data.get("pod_id")
+            last_heartbeat_str = data.get("heartbeat_utc")
             
-            # Load and parse just to get metadata (lightweight compared to full indicators)
-            data = json.loads(blob.download_as_text())
-            if "metadata" not in data:
-                return None
+            if not last_heartbeat_str:
+                # Documento corrupto, tomar control
+                doc_ref.set({
+                    "pod_id": self.pod_id,
+                    "heartbeat_utc": now_utc.isoformat(),
+                    "elected_at_utc": now_utc.isoformat(),
+                    "ttl_seconds": self.ttl_seconds
+                })
+                self.is_leader = True
+                logger.info(f"[PodCoordinator] ✅ Elected as LEADER (corrupted document)")
+                return True
             
-            last_update_raw = data["metadata"].get("last_update_utc")
-            if not last_update_raw:
-                return None
+            # Parse heartbeat timestamp
+            last_heartbeat = datetime.fromisoformat(last_heartbeat_str.replace('Z', '+00:00'))
+            elapsed = (now_utc - last_heartbeat).total_seconds()
             
-            last_update = datetime.fromisoformat(str(last_update_raw).replace('Z', '+00:00'))
-            age_hours = (datetime.now(UTC).replace(tzinfo=timezone.utc) - last_update).total_seconds() / 3600
-            logger.debug(f"[IndicatorsCache] GCS peek: {symbol}/{tf} age={age_hours:.1f}h")
-            return last_update
-        except Exception as e:
-            logger.debug(f"[IndicatorsCache] GCS peek failed {symbol}/{tf}: {e}")
-            return None
-
-    def _load_local(self, symbol: str, tf: str) -> Optional[dict]:
-        """Carga desde disco local del pod con TF-aware freshness check."""
-        try:
-            local_path = self._local_path(symbol, tf)
-            if not os.path.exists(local_path):
-                return None
-
-            with open(local_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            if "metadata" not in data or "indicators" not in data:
-                logger.warning(f"[IndicatorsCache] Local invalid structure: {symbol}/{tf}")
-                return None
-
-            metadata = data["metadata"]
-            last_update_raw = metadata.get("last_update_utc")
-            if not last_update_raw:
-                return None
-
-            last_update = datetime.fromisoformat(str(last_update_raw).replace('Z', '+00:00'))
-            age_seconds = (datetime.now(UTC).replace(tzinfo=timezone.utc) - last_update).total_seconds()
-            age_hours = age_seconds / 3600
+            if current_leader == self.pod_id:
+                # Ya soy el líder, actualizar heartbeat
+                doc_ref.update({
+                    "heartbeat_utc": now_utc.isoformat()
+                })
+                self.is_leader = True
+                logger.debug(f"[PodCoordinator] ✅ Still LEADER (heartbeat updated)")
+                return True
             
-            # ✅ NEW: TF-aware freshness check (not global TTL)
-            max_age_seconds = _get_indicators_freshness_max(tf)
-            if age_seconds > max_age_seconds:
-                logger.debug(f"[IndicatorsCache] Local stale for {symbol}/{tf}: {age_seconds:.0f}s > {max_age_seconds}s threshold")
-                return None
-
-            logger.debug(f"[IndicatorsCache] Local hit (FRESH): {symbol}/{tf} (age={age_hours:.1f}h)")
-            return data
-        except Exception as e:
-            logger.debug(f"[IndicatorsCache] Local load error {symbol}/{tf}: {e}")
-            return None
-
-    def _save_local(self, symbol: str, tf: str, payload: dict):
-        """Guarda en disco local del pod (best-effort)."""
-        try:
-            os.makedirs(self._local_dir, exist_ok=True)
-            local_path = self._local_path(symbol, tf)
-            with open(local_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, default=str)
-        except Exception as e:
-            logger.debug(f"[IndicatorsCache] Local save error {symbol}/{tf}: {e}")
-    
-    def _memory_get(self, symbol: str, tf: str) -> Optional[dict]:
-        """Get from LRU memory cache (stateless, muy pequeño)."""
-        cache_key = f"{symbol}_{tf}"
-        if cache_key in self._memory_cache:
-            data, timestamp = self._memory_cache[cache_key]
-            age = time.time() - timestamp
-            
-            if age < self._memory_cache_ttl_sec:
-                # Move to end (LRU: most recent)
-                self._memory_cache.move_to_end(cache_key)
-                logger.debug(f"[IndicatorsCache] Memory hit: {symbol}/{tf} (age={age:.0f}s)")
-                return data
+            # Otro pod es líder
+            if elapsed > self.ttl_seconds:
+                # Líder anterior murió (no envió heartbeat), tomar control
+                doc_ref.set({
+                    "pod_id": self.pod_id,
+                    "heartbeat_utc": now_utc.isoformat(),
+                    "elected_at_utc": now_utc.isoformat(),
+                    "ttl_seconds": self.ttl_seconds,
+                    "previous_leader": current_leader,
+                    "takeover_reason": f"Leader timeout after {elapsed:.0f}s"
+                })
+                self.is_leader = True
+                logger.warning(f"[PodCoordinator] ⚠️ TAKEOVER: Previous leader '{current_leader}' timeout ({elapsed:.0f}s > {self.ttl_seconds}s)")
+                return True
             else:
-                # Expired: remove
-                del self._memory_cache[cache_key]
+                # Líder está vivo
+                if time.time() - self.last_check > self.check_cooldown:
+                    logger.info(f"[PodCoordinator] ❌ NOT leader. Current leader: '{current_leader}' (last heartbeat {elapsed:.0f}s ago)")
+                    self.last_check = time.time()
+                self.is_leader = False
+                return False
         
-        return None
+        except Exception as e:
+            logger.error(f"[PodCoordinator] Error in leader election: {e}")
+            # En caso de error, no ejecutar tareas (fail-safe)
+            self.is_leader = False
+            return False
     
-    def _memory_put(self, symbol: str, tf: str, data: dict):
-        """Put in LRU memory cache (auto-evict oldest if full)."""
-        cache_key = f"{symbol}_{tf}"
-        
-        # Remove if exists (to re-add at end)
-        if cache_key in self._memory_cache:
-            del self._memory_cache[cache_key]
-        
-        # Add at end (most recent)
-        self._memory_cache[cache_key] = (data, time.time())
-        
-        # Evict oldest if over limit (FIFO/LRU)
-        while len(self._memory_cache) > self._memory_cache_max:
-            oldest_key = next(iter(self._memory_cache))  # First item (oldest)
-            del self._memory_cache[oldest_key]
-            logger.debug(f"[IndicatorsCache] Evicted from memory: {oldest_key}")
-    
-    def load(self, symbol: str, tf: str) -> Optional[dict]:
+    async def start_heartbeat(self, loop=None):
         """
-        Carga indicadores cacheados con TF-aware freshness cascade.
+        Inicia el heartbeat periódico si este pod es líder.
         
-        Flow:
-        1. Check memory cache (LRU pequeño, <100ms)
-        2. Check local pod cache with TF-aware freshness
-        3. If local old, peek GCS freshness (fast metadata check)
-        4. Load from GCS if fresh (source of truth)
-        5. Validate TF-specific TTL
+        Args:
+            loop: asyncio event loop (opcional)
+        """
+        if not self._is_firestore_available():
+            return
+        
+        async def heartbeat_worker():
+            while True:
+                try:
+                    await asyncio.sleep(self.heartbeat_interval)
+                    
+                    if self.is_leader:
+                        # Actualizar heartbeat en Firestore
+                        doc_ref = self.db.document(self.leader_doc_path)
+                        now_utc = datetime.now(timezone.utc)
+                        doc_ref.update({
+                            "heartbeat_utc": now_utc.isoformat()
+                        })
+                        logger.debug(f"[PodCoordinator] 💓 Heartbeat sent")
+                    else:
+                        # No soy líder, intentar convertirme si el líder murió
+                        await self.try_become_leader()
+                
+                except Exception as e:
+                    logger.error(f"[PodCoordinator] Heartbeat error: {e}")
+        
+        # Iniciar tarea de heartbeat
+        if loop:
+            self.heartbeat_task = loop.create_task(heartbeat_worker())
+        else:
+            self.heartbeat_task = asyncio.create_task(heartbeat_worker())
+        
+        logger.info(f"[PodCoordinator] Heartbeat started (interval={self.heartbeat_interval}s)")
+    
+    def should_run_scheduled_task(self, task_name: str) -> bool:
+        """
+        Verifica si este pod debe ejecutar una tarea programada.
+        
+        Args:
+            task_name: Nombre de la tarea (ej: "actualizar_menus")
         
         Returns:
-            dict con estructura:
-            {
-                "metadata": {...},
-                "indicators": {...}
-            }
-            None si no existe o está inválido
+            bool: True si debe ejecutar, False de lo contrario
         """
-        if not self._enabled:
-            return None
+        if not self._is_firestore_available():
+            # Sin Firestore, cada pod ejecuta sus propias tareas (fallback)
+            return True
         
-        # 1. Check memory cache first (muy rápido)
-        mem_data = self._memory_get(symbol, tf)
-        if mem_data is not None:
-            return mem_data
+        if self.is_leader:
+            logger.debug(f"[PodCoordinator] ✅ Executing '{task_name}' (I am leader)")
+            return True
+        else:
+            logger.debug(f"[PodCoordinator] ⏭️ Skipping '{task_name}' (not leader)")
+            return False
+    
+    async def release_leadership(self):
+        """
+        Libera el liderazgo (útil en shutdown graceful).
+        """
+        if not self._is_firestore_available() or not self.is_leader:
+            return
+        
+        try:
+            doc_ref = self.db.document(self.leader_doc_path)
+            doc_ref.delete()
+            logger.info(f"[PodCoordinator] Leadership released by pod {self.pod_id}")
+            self.is_leader = False
+        except Exception as e:
+            logger.error(f"[PodCoordinator] Error releasing leadership: {e}")
+        
+        # Cancelar heartbeat task
+        if self.heartbeat_task:
+            self.heartbeat_task.cancel()
 
-        # 2. Check local pod cache with TF-aware freshness
-        local_data = self._load_local(symbol, tf)
-        if local_data is not None:
-            self._memory_put(symbol, tf, local_data)
+
+# Instancia global del coordinador de pods
+_POD_COORDINATOR = PodLeaderCoordinator()
+
+
+# ============================================================================
+# DISTRIBUTED COORDINATION FRAMEWORK - Multi-Pod Shared State
+# ============================================================================
+
+class UserStateCache:
+    """
+    Caché distribuido de estado de usuario.
+    
+    ✅ Lee desde Firestore (source of truth)
+    ✅ Cachea localmente con TTL de 10 segundos
+    ✅ Fallback a memoria si Firestore no disponible
+    """
+    
+    def __init__(self, ttl_seconds: int = 10):
+        self.ttl_seconds = ttl_seconds
+        self.firestore_enabled = os.environ.get("FIRESTORE_ENABLED", "false").lower() == "true"
+        self.db = firestore.Client() if self.firestore_enabled else None
+        self._local_cache: Dict[str, tuple] = {}  # {uuid: (timestamp, data)}
+        self._lock = asyncio.Lock()
+    
+    async def get(self, uuid: str) -> dict:
+        """Obtiene estado del usuario con caché TTL."""
+        async with self._lock:
+            now = time.time()
+            
+            # Check caché local
+            if uuid in self._local_cache:
+                cached_at, data = self._local_cache[uuid]
+                if (now - cached_at) < self.ttl_seconds:
+                    logger.debug(f"[UserStateCache] Hit (local): {uuid}")
+                    return data
+            
+            # Check Firestore (source of truth)
+            if not self.firestore_enabled or not self.db:
+                return {}  # Fallback: empty state
+            
+            try:
+                doc = self.db.collection("user_state").document(uuid).get()
+                if doc.exists:
+                    data = doc.to_dict()
+                    # Cache localmente
+                    self._local_cache[uuid] = (time.time(), data)
+                    logger.debug(f"[UserStateCache] Hit (Firestore): {uuid}")
+                    return data
+                else:
+                    return {}
+            except Exception as e:
+                logger.warning(f"[UserStateCache] Get error: {e}")
+                return {}
+    
+    async def set(self, uuid: str, data: dict):
+        """Actualiza estado del usuario."""
+        async with self._lock:
+            # Update local cache
+            self._local_cache[uuid] = (time.time(), data)
+            
+            # Update Firestore
+            if self.firestore_enabled and self.db:
+                try:
+                    self.db.collection("user_state").document(uuid).set(data, merge=True)
+                    logger.debug(f"[UserStateCache] Set: {uuid}")
+                except Exception as e:
+                    logger.warning(f"[UserStateCache] Set error: {e}")
             return local_data
         
         # 2.5) Local is stale or missing - peek GCS for freshness without full load
