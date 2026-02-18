@@ -8514,21 +8514,20 @@ def obtener_datos_con_hilos(
         # 3) histórico: descarga desde FMP con soporte para incremental fetch
         # Si from_timestamp_override está definido, HistoryManager solo fetch esa delta
         if from_timestamp_override is not None:
-            # Build HistoryConfig with from_timestamp for incremental fetch
+            # ✅ Direct access to _HIST.get() with from_timestamp override
             hist_cfg = _HistoryConfig(
                 bars=bars_effective,
                 append_realtime=True,
                 allow_refresh=True,
                 from_timestamp=from_timestamp_override
             )
-            df_historico = obtener_datos_historicos(symbol, tf, bars=bars_effective, 
-                                                      append_realtime=True, allow_refresh=True,
-                                                      fmp_window=None)  # Will use from_timestamp internally
-            # NOTE: Workaround - pass via HistoryManager directly if available
             try:
                 df_historico = _HIST.get(symbol, tf, cfg=hist_cfg)
-            except Exception:
-                # Fallback to regular call if direct access fails
+                if df_historico is None or df_historico.empty:
+                    logger.warning(f"[HIST] INCREMENTAL fetch returned empty for {symbol}/{tf}, falling back to full")
+                    df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars_effective)
+            except Exception as e:
+                logger.warning(f"[HIST] Direct incremental fetch failed ({e}), falling back to regular", exc_info=True)
                 df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars_effective)
         else:
             df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars_effective)
