@@ -96,18 +96,41 @@ def _warmup_firestore():
 
 
 def _warmup_caches_principales():
-    """Pre-populate caches for most traded assets to avoid cold start."""
+    """
+    Pre-populate caches for most traded assets to avoid cold start.
+    ✅ EXPANDED: Cubre principales majors, cruces, crypto y commodities.
+    """
     try:
         t0 = time.time()
         
         # Import functions that naturally populate caches
         from MarketTool import obtener_datos_con_hilos, calcular_indicadores
         
-        # Warmup SOLO activos muy principales (ultra-reducido para no bloquear startup)
-        main_assets = ['EURUSD', 'BTCUSD']
+        # ✅ EXPANDED WARMUP: Activos más líquidos y frecuentemente analizados
+        # Categorías:
+        # - Majors (7): EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD, NZDUSD
+        # - Cruces (3): EURGBP, EURJPY, GBPJPY
+        # - Crypto (2): BTCUSD, ETHUSD
+        # - Commodities (1): XAUUSD (oro)
+        # Total: 13 activos × 2 timeframes = 26 combinaciones
+        main_assets = [
+            # Forex Majors (más volumen y liquidez)
+            'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
+            # Cruces importantes
+            'EURGBP', 'EURJPY', 'GBPJPY',
+            # Crypto
+            'BTCUSD', 'ETHUSD',
+            # Commodities
+            'XAUUSD'
+        ]
+        
+        # Timeframes estratégicos: 1hour (swing) y 1day (tendencia)
         main_timeframes = ['1hour', '1day']
         
         warmed_count = 0
+        failed_count = 0
+        total_combos = len(main_assets) * len(main_timeframes)
+        
         for symbol in main_assets:
             for tf in main_timeframes:
                 try:
@@ -115,16 +138,22 @@ def _warmup_caches_principales():
                     df = obtener_datos_con_hilos(symbol, tf, bars=500)
                     if df is not None and not df.empty:
                         # Calcular indicadores (popula cache de indicadores)
-                        _ = calcular_indicadores(df, tf)
+                        _ = calcular_indicadores(df, tf, symbol=symbol)
                         warmed_count += 1
+                    else:
+                        failed_count += 1
                 except Exception as e:
                     logger.debug(f"[Warmup] Failed to warm {symbol}/{tf}: {e}")
+                    failed_count += 1
                     
                 # Yield para no bloquear event loop
                 time.sleep(0.01)
         
         elapsed = (time.time() - t0) * 1000
-        logger.info(f"[Warmup] Caches principales pre-poblados ({warmed_count}/{len(main_assets)*len(main_timeframes)} exitosos) en {elapsed:.1f}ms")
+        logger.info(
+            f"[Warmup] Caches principales pre-poblados: {warmed_count}/{total_combos} exitosos "
+            f"({failed_count} fallos) en {elapsed:.1f}ms"
+        )
     except Exception as e:
         logger.warning(f"[Warmup] Cache warmup failed (non-critical): {e}")
 
