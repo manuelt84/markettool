@@ -37,6 +37,7 @@ class HistoryConfig:
     append_realtime: bool = True
     allow_refresh: bool = True
     fmp_window: Optional[int] = None
+    from_timestamp: Optional[datetime] = None  # ✅ NEW: Override default from_dt for incremental fetch
 
 
 # --------------------------- Historical merge helpers ---------------------------
@@ -200,7 +201,16 @@ class HistoryManager:
             return pd.DataFrame()
 
         now = utc_now()
-        if cache_df.empty:
+        
+        # ✅ NEW: If from_timestamp is explicitly provided, use it (incremental fetch override)
+        if cfg.from_timestamp is not None:
+            from_dt = cfg.from_timestamp
+            if from_dt.tzinfo is None or from_dt.tzinfo == pytz.UTC:
+                from_dt = from_dt if from_dt.tzinfo else pytz.UTC.localize(from_dt)
+            else:
+                from_dt = from_dt.astimezone(pytz.UTC)
+            logger.info(f"[HIST] Incremental fetch override: from_timestamp={from_dt} for {symbol}/{tf}")
+        elif cache_df.empty:
             from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
         else:
             try:

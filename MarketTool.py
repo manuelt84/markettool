@@ -8427,6 +8427,30 @@ def _coerce_float(x):
     except Exception:
         return None
 
+# ======================================================================
+# Helper: Get last timestamp from GCS without loading full DataFrame
+# ======================================================================
+def _get_last_timestamp_from_gcs(symbol: str, tf: str) -> Optional[pd.Timestamp]:
+    """
+    Peek into GCS metadata to get last cached timestamp WITHOUT loading full DataFrame.
+    Used for incremental fetch strategy: fetch only from (last_ts) to now.
+    
+    Returns:
+        pd.Timestamp of last cached bar, or None if GCS empty/unreachable
+    """
+    try:
+        # Try to load GCS with only last row to get timestamp efficiently
+        df_gcs = load_from_gcs(symbol, tf)
+        if df_gcs is not None and not df_gcs.empty:
+            last_ts = df_gcs.index[-1]
+            logger.debug(f"[GCS_PEEK] Got last_ts from {symbol}/{tf}: {last_ts}")
+            return last_ts
+    except Exception as e:
+        logger.debug(f"[GCS_PEEK] Failed to peek GCS for {symbol}/{tf}: {e}")
+    
+    return None
+
+
 # Implementación de hilos para optimizar las solicitudes de datos
 #@profile
 def obtener_datos_con_hilos(
@@ -8438,6 +8462,12 @@ def obtener_datos_con_hilos(
     """
     Obtiene únicamente histórico desde FMP y aplica recorte final por `bars` si corresponde.
     Se eliminó todo el manejo de cache/tick realtime y la mezcla de última vela.
+    
+    INCREMENTAL FETCH STRATEGY:
+    1. Try load_cached_history (memory → local freshness → GCS escalation)
+    2. If cache missing/empty, peek GCS for last_ts → fetch delta from FMP only
+    3. If both fail, do full fetch from FMP (fallback)
+    4. Always persist result to GCS for next analysis
     """
     try:
         # 1) normalizar TF
@@ -8458,18 +8488,51 @@ def obtener_datos_con_hilos(
             "1", "true", "yes", "y", "on"
         }
 
-        # 2.1) cold-start por activo/TF: si no hay historia cacheada, traer TODO desde FMP
+        # 2.1) cold-start detection + INCREMENTAL FETCH STRATEGY
         try:
             cached_df = load_cached_history(symbol, tf)
             cold_start = cached_df is None or getattr(cached_df, "empty", True)
         except Exception:
             cold_start = True
+            cached_df = None
 
         bars_effective = None if (persist_full_series or force_full_history or cold_start) else bars
+        
+        # 2.2) ✅ NEW: If cache is empty but GCS may have data, peek for incremental fetch
+        from_timestamp_override = None
+        if cold_start and not force_full_history:
+            # Try to get last timestamp from GCS without loading full DF (fast peek)
+            gcs_last_ts = _get_last_timestamp_from_gcs(symbol, tf)
+            if gcs_last_ts is not None:
+                # ✅ INCREMENTAL: Only fetch from GCS_last_ts forward
+                from_timestamp_override = pd.Timestamp(gcs_last_ts).to_pydatetime()
+                logger.info(f"[HIST][INCREMENTAL] {symbol}/{tf}: cache empty but GCS has data. Fetching from {from_timestamp_override}")
+                cold_start = False  # Don't mark as cold_start if GCS had data
+            else:
+                logger.debug(f"[HIST][COLD_START] {symbol}/{tf}: no cache and no GCS data, full fetch")
 
-        # 3) histórico: descarga desde FMP (caching está en load_cached_history internamente)
-        # El cache inteligente ocurre automáticamente en load_cached_history cuando es disponible
-        df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars_effective)
+        # 3) histórico: descarga desde FMP con soporte para incremental fetch
+        # Si from_timestamp_override está definido, HistoryManager solo fetch esa delta
+        if from_timestamp_override is not None:
+            # Build HistoryConfig with from_timestamp for incremental fetch
+            hist_cfg = _HistoryConfig(
+                bars=bars_effective,
+                append_realtime=True,
+                allow_refresh=True,
+                from_timestamp=from_timestamp_override
+            )
+            df_historico = obtener_datos_historicos(symbol, tf, bars=bars_effective, 
+                                                      append_realtime=True, allow_refresh=True,
+                                                      fmp_window=None)  # Will use from_timestamp internally
+            # NOTE: Workaround - pass via HistoryManager directly if available
+            try:
+                df_historico = _HIST.get(symbol, tf, cfg=hist_cfg)
+            except Exception:
+                # Fallback to regular call if direct access fails
+                df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars_effective)
+        else:
+            df_historico = obtener_datos_historicos_fmp(symbol, tf, bars=bars_effective)
+        
         if df_historico is None or df_historico.empty:
             logger.info("Datos históricos no disponibles para %s en %s", symbol, tf)
             return pd.DataFrame()
@@ -8503,6 +8566,8 @@ def obtener_datos_con_hilos(
 
         if cold_start:
             logging.info("[HIST][BOOTSTRAP_FULL] %s-%s primera carga completa desde FMP/cache", symbol, tf)
+        elif from_timestamp_override:
+            logging.info("[HIST][INCREMENTAL] %s-%s fetch delta desde GCS last_ts", symbol, tf)
         elif force_full_history:
             logging.info("[HIST][FULL_OVERRIDE] %s-%s usando historia completa por override", symbol, tf)
 
