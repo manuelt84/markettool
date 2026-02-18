@@ -1652,9 +1652,12 @@ def _sweep_stuck_user_states_once():
         # FIXED: Wrap Firestore .stream() with timeout using ThreadPoolExecutor
         # If Firestore is slow/down, don't block the watchdog indefinitely
         def _load_and_sweep():
+            # Use lazy-loaded Firestore client
+            firestore_db = get_firestore_db()
+            
             # No filtramos por campo de tiempo porque puede variar el tipo; filtramos en cliente.
-            docs = db.collection("user_states").stream()
-            batch = db.batch()
+            docs = firestore_db.collection("user_states").stream()
+            batch = firestore_db.batch()
             pending = 0
 
             for doc in docs:
@@ -1686,7 +1689,7 @@ def _sweep_stuck_user_states_once():
                     # evita batches gigantes
                     if pending % 400 == 0:
                         batch.commit()
-                        batch = db.batch()
+                        batch = firestore_db.batch()
 
             if pending:
                 batch.commit()
