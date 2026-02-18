@@ -48,15 +48,17 @@ marketTool/
 │   ├── download_easyocr_models.py
 │   └── run_tests.py            # Test runner
 │
-├── DOCUMENTATION/              # Complete documentation
-│   ├── FINAL_SUMMARY.md        # Project completion summary
-│   ├── PROJECT_STATUS.md       # Current status & metrics
-│   ├── PHASE_8_PRODUCTION_COMPLETE.md
-│   ├── phases/                 # Phase-specific docs
-│   ├── architecture/           # Architectural guides
+├── docs/                       # 📚 Documentation (organized)
+│   ├── INDEX.md                # Master documentation index
+│   ├── architecture/           # System design documents
 │   ├── guides/                 # Setup & usage guides
-│   ├── audits/                 # Performance audits
-│   └── optimization/           # Optimization reports
+│   ├── optimization/           # Performance tuning docs
+│   ├── audits/                 # Analysis & audits
+│   ├── phases/                 # Implementation phases
+│   └── archive/                # Historical documents
+│
+├── deployment/                 # Deployment configurations
+│   └── gke/                    # Google Kubernetes Engine setup
 │
 ├── MarketTool.py               # Legacy monolith (preserved)
 ├── Dockerfile                  # Current production Dockerfile
@@ -117,16 +119,22 @@ curl http://localhost:8080/healthz
 
 ## 📚 Documentation
 
-**Start Here**: [PROJECT_STATUS.md](./PROJECT_STATUS.md) - Complete project overview
+**📍 Start Here**: [docs/INDEX.md](./docs/INDEX.md) - Master documentation index
 
-**By Topic**:
-- 📖 [Architecture Guides](./DOCUMENTATION/architecture/) - System design
-- 🔧 [Setup Guides](./DOCUMENTATION/guides/) - Installation & configuration
-- 📊 [Phase Documentation](./DOCUMENTATION/phases/) - Phase-by-phase progress
-- 🔍 [Performance Audits](./DOCUMENTATION/audits/) - Bottleneck analysis
-- ⚡ [Optimization Reports](./DOCUMENTATION/optimization/) - Performance tuning
+**Quick Access**:
+- 📊 [Project Status](./docs/PROJECT_STATUS.md) - Current status & metrics
+- 🏗️ [Architecture](./docs/architecture/ARQUITECTURA_HEXAGONAL.md) - Hexagonal design
+- 🚀 [Quick Start](./docs/guides/QUICK_START_PERFORMANCE.md) - Setup in 5 minutes
+- ⚡ [Performance Guide](./docs/optimization/OPTIMIZATION_REPORT.md) - Tuning & metrics
+- 🚢 [Deployment](./deployment/gke/README.md) - GKE deployment guide
 
-**Full Index**: [DOCUMENTATION/](./DOCUMENTATION/) directory
+**By Role**:
+- 🧑‍💼 **Product Manager**: [PROJECT_STATUS.md](./docs/PROJECT_STATUS.md), [FINAL_SUMMARY.md](./docs/FINAL_SUMMARY.md)
+- 👨‍💻 **Developer**: [Architecture](./docs/architecture/), [Setup Guides](./docs/guides/)
+- 🔧 **DevOps**: [Deployment](./deployment/gke/), [Validation](./docs/guides/FINAL_VERIFICATION.md)
+- ⚡ **Performance Engineer**: [Optimization](./docs/optimization/), [Audits](./docs/audits/)
+
+**Full Documentation**: Browse [docs/](./docs/) directory
 
 ---
 
