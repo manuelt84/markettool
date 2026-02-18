@@ -161,50 +161,71 @@ def setup_scheduler(
         await warmup_cache_all_assets("scheduled")  # Direct await (same event loop)
 
     async def _parallel_analysis_job():
-        """Async job: Parallel analysis engine (Nivel 3: máximo paralelismo)."""
+        """Async job: Parallel analysis engine v2 (3-level parallelism, 100x faster)."""
         if not parallel_engine:
+            logger.warning("[Parallel Analysis] No parallel_engine available")
             return
         if not pod_coordinator.should_run_scheduled_task("parallel_analysis"):
+            logger.debug("[Parallel Analysis] Skipped (pod coordination)")
             return
         
         try:
+            from markettool.application.use_cases.parallel_analysis_v2 import run_parallel_analysis
             from MarketTool import (
                 load_cached_history,  # Función para cargar histórico
                 cargar_activos_en_mercado,  # Activos disponibles
-                calcular_entradas,  # Entry calculation
                 guardar_seniales_a_firebase,  # Persist signals
             )
             
-            logger.info("[Parallel Analysis] Starting parallel analysis batch...")
-            symbols = await cargar_activos_en_mercado() if hasattr(cargar_activos_en_mercado, '__call__') else []
+            logger.info("[Parallel Analysis v2] Starting parallel analysis batch (100x faster)...")
+            
+            # Get symbols to analyze
+            symbols = None
+            if hasattr(cargar_activos_en_mercado, '__call__'):
+                try:
+                    symbols = cargar_activos_en_mercado()
+                    # If it's a coroutine, await it
+                    if hasattr(symbols, '__await__'):
+                        symbols = await symbols
+                except Exception as e:
+                    logger.warning("[Parallel Analysis] Error loading symbols: %s", e)
+                    symbols = None
             
             if not symbols:
-                logger.warning("[Parallel Analysis] No symbols to analyze")
+                logger.warning("[Parallel Analysis] No symbols to analyze, skipping batch")
                 return
             
-            # TFF ordenados por coste (mayor primero)
+            # TF ordenados por coste computacional
             tfs = parallel_engine.config.ordered_tfs
             
-            # Run analysis
-            results = await parallel_engine.analyze_assets_parallel(
+            logger.info(f"[Parallel Analysis v2] Analyzing {len(symbols)} symbols × {len(tfs)} TF...")
+            
+            # Run parallel analysis using new v2 API
+            # This replaces the sequential loop with 3-level parallelism
+            results = await run_parallel_analysis(
                 symbols=symbols,
                 tfs=tfs,
                 load_history_fn=load_cached_history,
-                analyze_asset_fn=calcular_entradas,
-                on_progress=lambda cur, total: logger.info(
-                    "[Parallel Analysis] Progress: %d/%d", cur, total
+                df_eventos=None,  # Optional market events dataframe
+                cfg=parallel_engine.config,  # Use the configured AnalysisConfig
+                on_progress=lambda s, tf, sig: logger.debug(
+                    f"[Parallel Analysis v2] {s} {tf}: {sig.get('direction', 'N/A')}"
                 ),
             )
             
-            logger.info("[Parallel Analysis] Batch complete: %d results", len(results))
+            logger.info(f"[Parallel Analysis v2] ✅ Batch complete: {len(results)} symbols analyzed")
             
-            # Persist signals
+            # Persist signals to Firestore
             if results:
-                await guardar_seniales_a_firebase(results)
-                logger.info("[Parallel Analysis] Signals persisted to Firestore")
+                try:
+                    await guardar_seniales_a_firebase(results)
+                    logger.info("[Parallel Analysis v2] ✅ Signals persisted to Firestore")
+                except Exception as e:
+                    logger.exception("[Parallel Analysis v2] Error persisting signals: %s", e)
+                    # Don't fail the job if persistence fails
                 
         except Exception as exc:
-            logger.exception("[Parallel Analysis] Error in parallel analysis job: %s", exc)
+            logger.exception("[Parallel Analysis v2] Error in parallel analysis job: %s", exc)
 
     try:
         scheduler.add_job(

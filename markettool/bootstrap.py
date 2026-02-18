@@ -16,10 +16,11 @@ from markettool.core.config import load_config
 from markettool.infra.http.session import build_session
 from markettool.infra.fmp import FMPClient
 
-# Parallel Analysis Engine (Nivel 3: Máximo paralelismo)
-from markettool.application.use_cases.parallel_analysis import (
+# Parallel Analysis Engine v2 (Nivel 3: Máximo paralelismo)
+from markettool.application.use_cases.parallel_analysis_v2 import (
     ParallelAnalysisEngine,
     AnalysisConfig,
+    run_parallel_analysis,
 )
 
 # Interface Layer
@@ -283,16 +284,19 @@ def main() -> None:
         
         logger.info("[Parallel Analysis] Creating AnalysisConfig...")
         analysis_config = AnalysisConfig(
-            max_concurrent_assets=int(os.environ.get("PARALLEL_MAX_CONCURRENT_ASSETS", "16")),
+            max_concurrent_assets=int(os.environ.get("PARALLEL_MAX_CONCURRENT_ASSETS", "18")),
             batch_size_assets=int(os.environ.get("PARALLEL_BATCH_SIZE_ASSETS", "16")),
-            timeframe_fan_out=int(os.environ.get("PARALLEL_TIMEFRAME_FANOUT", "6")),
+            timeframe_fan_out=int(os.environ.get("PARALLEL_TIMEFRAME_FANOUT", "7")),
             global_timeout=int(os.environ.get("PARALLEL_GLOBAL_TIMEOUT", "300")),
             timeout_per_batch=int(os.environ.get("PARALLEL_TIMEOUT_BATCH", "120")),
             timeout_per_asset=int(os.environ.get("PARALLEL_TIMEOUT_ASSET", "50")),
             timeout_per_tf=int(os.environ.get("PARALLEL_TIMEOUT_TF", "10")),
-            timeout_prediction_arima=int(os.environ.get("PARALLEL_TIMEOUT_PREDICTION_ARIMA", "7")),
+            timeout_prediction_arima=int(os.environ.get("PARALLEL_TIMEOUT_PREDICTION_ARIMA", "15")),
             timeout_prediction_mc=int(os.environ.get("PARALLEL_TIMEOUT_PREDICTION_MC", "3")),
             max_ram_percent=float(os.environ.get("PARALLEL_RAM_PERCENT_LIMIT", "80")),
+            indicators_executor=indicators_executor,
+            prediction_executor=prediction_executor,
+            analysis_executor=analysis_executor,
         )
         logger.info("✅ AnalysisConfig created (max_assets=%d, tf_fanout=%d, timeout_tf=%ds)",
                     analysis_config.max_concurrent_assets,
