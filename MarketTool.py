@@ -1160,7 +1160,7 @@ except Exception:
 timezone_country = pytz.UTC
 
 # 📝 LOCAL MEMORY CACHE (per-pod, ephemeral - lost on pod restart)
-# Stores per-user session state: estado, par_seleccionado, cache_realtime
+# Stores per-user session state: estado, par_seleccionado
 # ⚠️ NOT PERSISTENT: Use Firestore 'user_states' collection for persistent storage
 # ✅ THREAD-SAFE: Protected by user_states_lock
 user_states = {}
@@ -4262,7 +4262,7 @@ def mark_user_state(
         st = user_states.setdefault(uuid, {})
         st["estado"] = estado
         # copia campos útiles si vinieron en extra
-        for k in ("par_seleccionado", "cache_realtime", "moneda_filtro", "exec_id"):
+        for k in ("par_seleccionado", "moneda_filtro", "exec_id"):
             if k in (extra or {}):
                 st[k] = (extra or {})[k]
         user_states[uuid] = st
@@ -15389,7 +15389,7 @@ def _solo_strings_urls(items: list[Any]) -> list[str]:
 def obtener_estado_usuario(user_chat_id):
     with user_states_lock:  # ✅ FIX: Protect against concurrent access
         if user_chat_id not in user_states:
-            user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}}
+            user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None}
         return user_states[user_chat_id].copy()  # ✅ Return copy to prevent external mutations
 
 # Función para actualizar el estado de un usuario
@@ -15398,7 +15398,7 @@ def obtener_estado_usuario(user_chat_id):
 def actualizar_estado_usuario(user_chat_id, estado, par_seleccionado=None):
     with user_states_lock:  # ✅ FIX: Protect against concurrent modifications
         if user_chat_id not in user_states:
-            user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None, "cache_realtime": {}}
+            user_states[user_chat_id] = {"estado": "disponible", "par_seleccionado": None}
         user_states[user_chat_id]["estado"] = estado
         user_states[user_chat_id]["par_seleccionado"] = par_seleccionado
 
@@ -15408,8 +15408,6 @@ def limpiar_estado_usuario(user_chat_id):
         if user_chat_id in user_states:
             user_states[user_chat_id]["estado"] = "disponible"
             user_states[user_chat_id]["par_seleccionado"] = None
-            # Cache local/temporal en memoria (no persistido)
-            user_states[user_chat_id]["cache_realtime"] = {}
 
 # ⚠️ ELIMINADO: limpiar_soportes_resistencias_cache() - Cache ahora es global por pod (_niveles_unificados_cache)
 # No se resetea por usuario, solo por TTL (1 hora)
@@ -16589,10 +16587,10 @@ async def ejecutar_recurrente(
 
     if user_chat_id:
         try:
-            estado_usuario = obtener_estado_usuario(user_chat_id)
-            estado_usuario["cache_realtime"] = {}
+            # cache_realtime eliminado - era código legacy sin uso real
+            pass
         except Exception as e:
-            logger.warning(f"No se pudo limpiar/sincronizar cache_realtime: {e}")
+            logger.warning(f"Error en limpieza pre-análisis: {e}")
 
     logger.info(
         f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Ejecutando análisis "
