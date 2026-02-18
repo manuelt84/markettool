@@ -564,18 +564,26 @@ def _get_cache_freshness_max(tf: str) -> int:
     return CACHE_FRESHNESS_THRESHOLDS.get(tf_norm, 3600)  # Default 1h if unknown
 
 def _get_cache_age(file_path: str) -> int:
-    """Get age of cache file in seconds. Returns -1 if file doesn't exist."""
+    """Get age of cache file in seconds. Returns -1 if file doesn't exist.
+    ✅ TIMEZONE-AWARE: Uses datetime.now(UTC) to match GCS timestamps (always UTC).
+    """
     try:
         if not os.path.exists(file_path):
             return -1
         mtime = os.path.getmtime(file_path)
-        age_sec = int(time.time() - mtime)
+        # Convert mtime (EPOCH seconds) to UTC datetime
+        file_time = datetime.fromtimestamp(mtime, tz=UTC)
+        # Calculate age using UTC now (same as GCS storage layer)
+        now_utc = datetime.now(UTC)
+        age_sec = int((now_utc - file_time).total_seconds())
         return max(0, age_sec)
     except Exception:
         return -1
 
 def _is_cache_fresh(file_path: str, tf: str) -> bool:
-    """Check if cache file is fresh enough for the given timeframe."""
+    """Check if cache file is fresh enough for the given timeframe.
+    ✅ TIMEZONE-AWARE: Consistent UTC comparison across all sources.
+    """
     age = _get_cache_age(file_path)
     if age < 0:
         return False  # File doesn't exist
