@@ -436,6 +436,21 @@ class ParallelAnalysisEngine:
             return None
         
         # ---- SÍNTESIS DE SEÑALES ----
+        # Normalize indicators to ensure it's a dict
+        if isinstance(indicators, tuple):
+            indicators = next(
+                (item for item in indicators if isinstance(item, dict)),
+                {},
+            )
+        elif isinstance(indicators, list):
+            indicators = (
+                indicators[0]
+                if indicators and isinstance(indicators[0], dict)
+                else {}
+            )
+        elif not isinstance(indicators, dict):
+            indicators = {}
+        
         signal = self._synthesize_signal(
             symbol, tf, indicators, patterns, predictions, entry_history, df
         )

@@ -35,6 +35,9 @@ RUN python -m playwright install --with-deps
 RUN [ -f /app/patrones.pt ] && [ -f /app/ruido.pt ] && ls -lh /app/*.pt && echo "✅ Models present" || (echo "❌ Models missing" && exit 1)
 
 # PASO 6: Copiar codigo
+# Build arg to invalidate cache when code changes
+ARG CODE_VERSION=latest
+RUN echo "Building with CODE_VERSION=$CODE_VERSION"
 COPY . .
 
 EXPOSE 8080

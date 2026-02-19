@@ -412,7 +412,7 @@ class ParallelAnalysisEngine:
         
         # TAREA 4: Monte Carlo
         async def _get_monte_carlo():
-            return self.analyzer.monte_carlo_forecast(df, num_simulations=100, num_days=5)
+            return self.analyzer.monte_carlo_forecast(df, steps=5, simulations=100)
         
         # Ejecutar TODO en paralelo (no más de timeout_per_tf segundos)
         try:
@@ -436,6 +436,28 @@ class ParallelAnalysisEngine:
             patterns = []
             arima_pred = None
             mc_forecast = None
+
+        if isinstance(indicators, tuple):
+            indicators = next(
+                (item for item in indicators if isinstance(item, dict)),
+                {},
+            )
+        elif isinstance(indicators, list):
+            indicators = (
+                indicators[0]
+                if indicators and isinstance(indicators[0], dict)
+                else {}
+            )
+        elif not isinstance(indicators, dict):
+            indicators = {}
+
+        if mc_forecast is None:
+            current_price = float(df['close'].iloc[-1]) if not df.empty else 0.0
+            mc_forecast = (
+                np.array([current_price]),
+                np.array([current_price]),
+                np.array([current_price]),
+            )
         
         # SÍNTESIS final
         signal = await self.analyzer.synthesize_signal(

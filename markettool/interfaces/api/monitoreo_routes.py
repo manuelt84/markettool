@@ -10,36 +10,36 @@ from typing import Any, Callable, Mapping
 import pandas as pd
 from flask import jsonify, request
 
+from markettool.application.use_cases.legacy import LegacyMonitoreoUseCase
 
-def register_monitoreo_routes(
-    app,
-    *,
-    logger,
-    db,
-    charge_monitoreo_per_call,
-    fetch_events_for,
-    filter_by_symbol_currencies,
-    hash_payload,
-    last_hash_ref: dict,
-    detect_new_results,
-    evaluar_evento_para_symbol,
-    norm_tf,
-    tf_is_enabled,
-    load_cache,
-    series_to_ms,
-    snap_and_dedupe_to_minutes,
-    densify_minutes,
-    maybe_tick_quote,
-    mon_cache_lock,
-    maybe_refresh_from_gcs,
-    fs_touch_monitoreo,
-    tf_ms,
-    current_closed_bucket_start,
-    fetch_historical_range,
-    merge_bars_series,
-    backfill_internal_gaps,
-    bucket_name: str,
-) -> None:
+
+def register_monitoreo_routes(app, *, services) -> None:
+    use_case = LegacyMonitoreoUseCase(services)
+    logger = services.logger
+    db = services.db
+    charge_monitoreo_per_call = services.charge_monitoreo_per_call
+    fetch_events_for = services.fetch_events_for
+    filter_by_symbol_currencies = services.filter_by_symbol_currencies
+    hash_payload = services.hash_payload
+    last_hash_ref = services.last_hash_ref
+    detect_new_results = services.detect_new_results
+    evaluar_evento_para_symbol = services.evaluar_evento_para_symbol
+    norm_tf = services.norm_tf
+    tf_is_enabled = services.tf_is_enabled
+    load_cache = services.load_cache
+    series_to_ms = services.series_to_ms
+    snap_and_dedupe_to_minutes = services.snap_and_dedupe_to_minutes
+    densify_minutes = services.densify_minutes
+    maybe_tick_quote = services.maybe_tick_quote
+    mon_cache_lock = services.mon_cache_lock
+    maybe_refresh_from_gcs = services.maybe_refresh_from_gcs
+    fs_touch_monitoreo = services.fs_touch_monitoreo
+    tf_ms = services.tf_ms
+    current_closed_bucket_start = services.current_closed_bucket_start
+    fetch_historical_range = services.fetch_historical_range
+    merge_bars_series = services.merge_bars_series
+    backfill_internal_gaps = services.backfill_internal_gaps
+    bucket_name = services.bucket_name
     @app.route("/monitoreo/eventos", methods=["POST"])
     async def monitoreo_eventos():
         """
@@ -54,214 +54,8 @@ def register_monitoreo_routes(
             "cursor_hash": "..."    # opcional: hash del ultimo snapshot recibido por el front
           }
         """
-        try:
-            body = request.get_json(force=True) or {}
-            user_id = str(body.get("user_id") or "").strip()
-            exec_id = str(body.get("exec_id") or "").strip()
-            symbol = str(body.get("symbol") or "").strip().upper()
-            hours_back = int(body.get("hours_back", 6))
-            minutes_fwd = int(body.get("minutes_fwd", 5))
-            cursor_hash = str(body.get("cursor_hash") or "").strip()
-
-            if not user_id or not exec_id or not symbol:
-                return (
-                    jsonify(
-                        {
-                            "status": "error",
-                            "message": "user_id, exec_id y symbol son obligatorios",
-                        }
-                    ),
-                    400,
-                )
-
-            ok, msg = await charge_monitoreo_per_call(user_id, origen="app")
-            if not ok:
-                return jsonify({"status": "error", "message": msg}), 402
-
-            # ✅ OPTIMIZATION: Check last_hash_ref before expensive fetch+processing
-            # If cursor_hash matches and we have cached hash, return early with empty events
-            key = (exec_id, symbol)
-            cached_hash = last_hash_ref.get(key)
-            
-            if cursor_hash and cached_hash and cursor_hash == cached_hash:
-                logger.info("[monitoreo/eventos] cursor_hash match %s - checking for new_results", symbol)
-                # Still need to check for new_results (requires lightweight fetch with adaptive cache)
-                df_check = fetch_events_for(symbol, hours_back=hours_back, minutes_fwd=minutes_fwd)
-                new_results_check = detect_new_results(symbol, df_check) if not df_check.empty else []
-                
-                if not new_results_check:
-                    # No changes - return early without processing
-                    logger.info("[monitoreo/eventos] No new_results - returning empty response")
-                    return (
-                        jsonify(
-                            {
-                                "status": "ok",
-                                "exec_id": exec_id,
-                                "symbol": symbol,
-                                "server_time": int(time.time() * 1000),
-                                "hash": cached_hash,
-                                "count": 0,
-                                "new_results": [],
-                                "events": [],
-                                "signals": [],
-                                "agg_score": 0.0,
-                                "agg_direction": "neutral",
-                            }
-                        ),
-                        200,
-                    )
-                # If there ARE new_results, continue with full processing below
-                logger.info("[monitoreo/eventos] Hash match but new_results found - processing")
-
-            logger.info(
-                "Llamando fetch_events_for(%s, hb=%s, mf=%s)",
-                symbol,
-                hours_back,
-                minutes_fwd,
-            )
-            df = fetch_events_for(symbol, hours_back=hours_back, minutes_fwd=minutes_fwd)
-            logger.info("fetch_events_for termino")
-
-            if df.empty:
-                out = {
-                    "status": "ok",
-                    "exec_id": exec_id,
-                    "symbol": symbol,
-                    "server_time": int(time.time() * 1000),
-                    "hash": "0" * 8,
-                    "count": 0,
-                    "new_results": [],
-                    "events": [],
-                }
-                return jsonify(out), 200
-
-            df = df[df["impact"].isin(["High", "Medium"])].copy()
-            df = filter_by_symbol_currencies(df, symbol)
-
-            events = [
-                {
-                    "date": (row.date.isoformat() if pd.notna(row.date) else None),
-                    "currency": getattr(row, "currency", None),
-                    "event": getattr(row, "event", None),
-                    "impact": getattr(row, "impact", None),
-                    "actual": (
-                        float(row.actual)
-                        if pd.notna(getattr(row, "actual", None))
-                        else None
-                    ),
-                    "estimate": (
-                        float(row.estimate)
-                        if pd.notna(getattr(row, "estimate", None))
-                        else None
-                    ),
-                    "previous": (
-                        float(row.previous)
-                        if pd.notna(getattr(row, "previous", None))
-                        else None
-                    ),
-                }
-                for row in df.itertuples(index=False)
-            ]
-
-            payload_hash = hash_payload(events)
-            key = (exec_id, symbol)
-            last_hash_ref[key] = payload_hash
-
-            new_results = detect_new_results(symbol, df)
-
-            signals = []
-            agg = 0.0
-            for row in df.itertuples(index=False):
-                actual = getattr(row, "actual", None)
-                if pd.notna(actual):
-                    sig = evaluar_evento_para_symbol(
-                        symbol,
-                        {
-                            "date": row.date,
-                            "currency": getattr(row, "currency", None),
-                            "event": getattr(row, "event", None),
-                            "impact": getattr(row, "impact", None),
-                            "actual": actual,
-                            "estimate": getattr(row, "estimate", None),
-                            "previous": getattr(row, "previous", None),
-                        },
-                    )
-                    sig_out = {
-                        "date": (
-                            row.date.isoformat() if pd.notna(row.date) else None
-                        ),
-                        "currency": getattr(row, "currency", None),
-                        "event": getattr(row, "event", None),
-                        "impact": getattr(row, "impact", None),
-                        "score": sig["score"],
-                        "direction": sig["direction"],
-                        "reason": sig["reason"],
-                    }
-                    signals.append(sig_out)
-                    agg += float(sig["score"])
-
-            agg_direction = (
-                "bullish" if agg > 0.02 else ("bearish" if agg < -0.02 else "neutral")
-            )
-
-            try:
-                if db is not None:
-                    doc_id = f"{exec_id}__{symbol}"
-                    db.collection("monitoreos").document(doc_id).set(
-                        {
-                            "eventos_hash": payload_hash,
-                            "eventos_count": len(events),
-                            "eventos_updated_at": int(time.time() * 1000),
-                            "eventos_agg_score": float(agg),
-                            "eventos_agg_direction": agg_direction,
-                        },
-                        merge=True,
-                    )
-            except Exception:
-                pass
-
-            if cursor_hash and cursor_hash == payload_hash and not new_results:
-                return (
-                    jsonify(
-                        {
-                            "status": "ok",
-                            "exec_id": exec_id,
-                            "symbol": symbol,
-                            "server_time": int(time.time() * 1000),
-                            "hash": payload_hash,
-                            "count": len(events),
-                            "new_results": [],
-                            "events": [],
-                            "signals": [],
-                            "agg_score": float(agg),
-                            "agg_direction": agg_direction,
-                        }
-                    ),
-                    200,
-                )
-
-            return (
-                jsonify(
-                    {
-                        "status": "ok",
-                        "exec_id": exec_id,
-                        "symbol": symbol,
-                        "server_time": int(time.time() * 1000),
-                        "hash": payload_hash,
-                        "count": len(events),
-                        "new_results": new_results,
-                        "events": events,
-                        "signals": signals,
-                        "agg_score": float(agg),
-                        "agg_direction": agg_direction,
-                    }
-                ),
-                200,
-            )
-
-        except Exception as exc:
-            logger.exception("Error en /monitoreo/eventos")
-            return jsonify({"status": "error", "message": str(exc)}), 500
+        payload, status = await use_case.eventos(request.get_json(force=True) or {})
+        return jsonify(payload), status
 
     @app.route("/monitoreo/incremental", methods=["POST"])
     async def monitoreo_incremental():

@@ -135,7 +135,27 @@ class CalculateEntriesUseCase:
         """Perform complete technical analysis."""
         try:
             # Compute all indicators
-            indicators = self.analyzer.compute_all_indicators(df)
+            indicators_raw = self.analyzer.compute_all_indicators(df)
+            if isinstance(indicators_raw, tuple):
+                indicators = next(
+                    (item for item in indicators_raw if isinstance(item, dict)),
+                    {},
+                )
+            elif isinstance(indicators_raw, list):
+                indicators = (
+                    indicators_raw[0]
+                    if indicators_raw and isinstance(indicators_raw[0], dict)
+                    else {}
+                )
+            else:
+                indicators = indicators_raw if isinstance(indicators_raw, dict) else {}
+                
+            if not isinstance(indicators, dict):
+                self.logger.warning(
+                    "Technical analysis indicators not dict: %s",
+                    type(indicators_raw).__name__,
+                )
+                indicators = {}
             
             # Detect patterns
             patterns = self.analyzer.detect_candle_patterns(df)
@@ -147,10 +167,23 @@ class CalculateEntriesUseCase:
             
             # Monte Carlo
             mc_median, mc_upper, mc_lower = self.analyzer.monte_carlo_forecast(
-                df, num_simulations=100, num_days=5
+                df, steps=5, simulations=100
             )
             
             current_price = float(df['close'].iloc[-1])
+            
+            # Normalize indicators to dict if needed
+            if not isinstance(indicators, dict):
+                if isinstance(indicators, tuple):
+                    indicators = next(
+                        (item for item in indicators if isinstance(item, dict)),
+                        {}
+                    )
+                elif isinstance(indicators, list):
+                    indicators = indicators[0] if indicators and isinstance(indicators[0], dict) else {}
+                else:
+                    self.logger.warning(f"Indicators invalid type in _analyze_technical: {type(indicators)}")
+                    indicators = {}
             
             return {
                 'indicators': indicators,
@@ -283,12 +316,18 @@ class CalculateEntriesUseCase:
         
         # Synthesize signal using StandaloneAnalyzer
         try:
+            # Ensure indicators are a dict before passing to synthesize_signal
+            indicators_for_signal = technical.get('indicators', {})
+            if not isinstance(indicators_for_signal, dict):
+                self.logger.warning(f"Indicators not dict before synthesize_signal: {type(indicators_for_signal)}")
+                indicators_for_signal = {}
+            
             signal = await self.analyzer.synthesize_signal(
                 df=df,
                 symbol='UNKNOWN',
                 timeframe='1day',
                 arima_forecast=technical.get('arima', {}),
-                indicators=technical.get('indicators', {}),
+                indicators=indicators_for_signal,
                 patterns=technical.get('patterns', []),
                 mc_forecast=(
                     technical['monte_carlo'].get('median'),

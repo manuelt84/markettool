@@ -23,7 +23,7 @@ from typing import Dict, Optional, Tuple, Any, List
 from dataclasses import dataclass
 from functools import lru_cache
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Análisis técnico
 import warnings
@@ -304,8 +304,11 @@ class StandaloneAnalyzer:
             return divergences
         
         # Calculate indicators
-        macd_data = self.compute_macd(df)
+        macd_result = self.compute_macd(df)  # Returns (macd_line, signal_line, histogram) tuple
         rsi = self.compute_rsi(df)
+        
+        # Extract histogram from tuple (third element)
+        macd_hist = macd_result[2] if isinstance(macd_result, tuple) and len(macd_result) >= 3 else 0
         
         # Get recent values for comparison
         closes = df['close'].values
@@ -314,13 +317,11 @@ class StandaloneAnalyzer:
         if len(closes) >= 2:
             # MACD bullish divergence: price makes lower low, MACD makes higher low
             if closes[-1] < closes[-2]:
-                macd_hist = macd_data.get('histogram', 0)
                 if macd_hist > 0:  # Simplified: if histogram positive while price down
                     divergences['macd_bull'] = True
             
             # MACD bearish divergence: price makes higher high, MACD makes lower high
             if closes[-1] > closes[-2]:
-                macd_hist = macd_data.get('histogram', 0)
                 if macd_hist < 0:  # Simplified: if histogram negative while price up
                     divergences['macd_bear'] = True
             
@@ -341,12 +342,23 @@ class StandaloneAnalyzer:
         """
         Compute all technical indicators.
         
-        Returns dict with all indicator values
+        Returns dict with all indicator values (properly structured)
         """
+        macd_line, macd_signal, macd_hist = self.compute_macd(df)
+        bb_upper, bb_middle, bb_lower = self.compute_bollinger_bands(df)
+        
         indicators = {
             'RSI': self.compute_rsi(df),
-            'MACD': self.compute_macd(df),
-            'Bollinger': self.compute_bollinger_bands(df),
+            'MACD': {
+                'macd_line': macd_line,
+                'signal_line': macd_signal,
+                'histogram': macd_hist
+            },
+            'Bollinger': {
+                'upper': bb_upper,
+                'middle': bb_middle,
+                'lower': bb_lower
+            },
             'SMA20': self.compute_sma(df, 20),
             'SMA50': self.compute_sma(df, 50),
             'ATR': self.compute_atr(df),
@@ -519,6 +531,18 @@ class StandaloneAnalyzer:
     
     def _score_indicators(self, indicators: Dict[str, Any]) -> float:
         """Score the technical indicators."""
+        # Defensive: ensure indicators is a dict
+        if not isinstance(indicators, dict):
+            if isinstance(indicators, tuple):
+                indicators = next(
+                    (item for item in indicators if isinstance(item, dict)),
+                    {}
+                )
+            elif isinstance(indicators, list):
+                indicators = indicators[0] if indicators and isinstance(indicators[0], dict) else {}
+            else:
+                indicators = {}
+        
         if not indicators:
             return 0.5
         
@@ -540,15 +564,15 @@ class StandaloneAnalyzer:
         else:
             score = 0.4
         
-        # MACD
+        # MACD - now structured as dict
         macd_data = indicators.get('MACD', {})
         if isinstance(macd_data, dict):
             histogram = macd_data.get('histogram', 0)
         else:
-            # Backward compatibility with old format (macd, signal, histogram)
+            # Backward compatibility: if still a tuple, extract third element
             try:
-                _, _, histogram = macd_data
-            except:
+                histogram = macd_data[2] if len(macd_data) >= 3 else 0
+            except (TypeError, IndexError):
                 histogram = 0
         
         if histogram > 0:

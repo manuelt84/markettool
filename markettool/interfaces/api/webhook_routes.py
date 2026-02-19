@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from flask import jsonify, request
 
+from markettool.application.use_cases.legacy import LegacyWebhookUseCase
 
-def register_webhook_routes(app, *, application, update_cls, logger) -> None:
+
+def register_webhook_routes(app, *, services) -> None:
+    use_case = LegacyWebhookUseCase(services)
+    logger = services.logger
     @app.errorhandler(404)
     def _not_found(_exc):
         return jsonify({"status": "error", "message": "not found"}), 404
@@ -16,12 +20,5 @@ def register_webhook_routes(app, *, application, update_cls, logger) -> None:
 
     @app.route("/webhook", methods=["POST"])
     async def webhook():
-        try:
-            payload = request.get_json()
-            logger.info("Payload recibido: %s", payload)
-            update = update_cls.de_json(payload, application.bot)
-            await application.process_update(update)
-            return jsonify({"status": "ok"})
-        except Exception as exc:
-            logger.info("Error procesando webhook: %s", exc)
-            return jsonify({"status": "error", "message": str(exc)}), 500
+        payload, status = await use_case.handle(request.get_json())
+        return jsonify(payload), status

@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # Load MarketTool
 logger.info("Cargando MarketTool...")
-from MarketTool import calcular_entradas
+from MarketTool import calcular_entradas_sync_wrapper
 
 
 def create_test_df_with_missing_indicators(symbol="AAPL", tf="1min"):
@@ -64,15 +64,18 @@ async def test_calcular_entradas_with_missing_indicators():
         logger.info(f"  - Últimos RSI: {df['RSI'].iloc[-1]}")
         logger.info(f"  - Últimos %K: {df['%K'].iloc[-1]}")
         
-        # Llamar a calcular_entradas
-        logger.info("Llamando a calcular_entradas...")
-        result = calcular_entradas(
+        # Llamar a calcular_entradas_sync_wrapper
+        logger.info("Llamando a calcular_entradas_sync_wrapper...")
+        df_eventos = pd.DataFrame()
+        result = calcular_entradas_sync_wrapper(
+            df,
+            df_eventos,
             symbol="AAPL",
-            tf="1min",
-            df=df,
+            temporalidad="1min",
+            user_chat_id="test",
         )
         
-        logger.info(f"✅ calcular_entradas completado exitosamente")
+        logger.info(f"✅ calcular_entradas_sync_wrapper completado exitosamente")
         logger.info(f"  - Resultado: {result}")
         logger.info(f"  - Tipo: {type(result)}")
         

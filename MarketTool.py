@@ -1380,6 +1380,23 @@ def get_firestore_db():
             raise
     return _db
 
+
+class _LazyFirestoreProxy:
+    """Lazy proxy for Firestore client used by legacy functions."""
+
+    def __getattr__(self, name):
+        return getattr(get_firestore_db(), name)
+
+    def __bool__(self):
+        try:
+            return get_firestore_db() is not None
+        except Exception:
+            return False
+
+
+# Legacy code references module-level `db`; keep it lazy without NameError.
+db = _LazyFirestoreProxy()
+
 def get_gcs_client():
     """Lazy-load GCS client on first use."""
     global _storage_client
@@ -4113,7 +4130,7 @@ def analizar_con_yolo(ruta_imagen: str, stop_cb=None, include_tech: bool=False, 
         texto_resultado = (
             f"Señal + Contexto\n"
             f"Patrones: {top_txt}\n"
-            f"Confluencia: {con.get('label','—')} ({int(float(con.get('score',0))*100)}%)"
+            f"Confluencia: {con.get('label','-')} ({int(float(con.get('score',0))*100)}%)"
         )
     else:
         texto_resultado = "Señal + Contexto\n❌ No se detectaron patrones con el filtro estricto."
@@ -4639,7 +4656,8 @@ async def cargar_admin_ids():
         try:
             # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread to prevent event loop blocking
             def _sync_load_admin_ids():
-                collection_ref = db.collection("admin_ids")
+                firestore_db = get_firestore_db()
+                collection_ref = firestore_db.collection("admin_ids")
                 docs = collection_ref.stream()
                 return [doc.to_dict().get("chat_id") for doc in docs if doc.exists]
             
@@ -4666,7 +4684,8 @@ async def cargar_chat_ids():
         try:
             # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread to prevent event loop blocking
             def _sync_load_chat_ids():
-                collection_ref = db.collection("chat_ids")
+                firestore_db = get_firestore_db()
+                collection_ref = firestore_db.collection("chat_ids")
                 docs = collection_ref.stream()
                 return {
                     doc.id: doc.to_dict()
@@ -5179,8 +5198,9 @@ _LAZY_HIST_LOADER = LazyHistoricosLoader(
 _GCS_CLIENT = None
 _GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
 _GCS_ENABLED = os.environ.get("GCS_ENABLED", "true").lower() == "true"
-_GCS_BACKUP_THROTTLE_SECONDS = 300  # 5 minutos entre backups del mismo symbol/tf
+_GCS_BACKUP_THROTTLE_SECONDS = 600  # ✅ Increased from 300s (5min) to 600s (10min) - lazy-load optimization
 _last_gcs_backup_time = {}  # {(symbol, tf): timestamp}
+_last_gcs_backup_hash = {}  # {(symbol, tf): data_hash} - detect delta changes
 
 def _get_gcs_bucket():
     """Inicializa lazy el cliente de GCS."""
@@ -5513,7 +5533,7 @@ EOD_RESAMPLE_RULE = _EOD_RESAMPLE_RULE
 # ======================================================================
 
 _INDICATORS_CACHE_ENABLED = os.environ.get("INDICATORS_CACHE_ENABLED", "true").lower() == "true"
-_INDICATORS_CACHE_TTL_HOURS = int(os.environ.get("INDICATORS_CACHE_TTL_HOURS", "8"))
+_INDICATORS_CACHE_TTL_HOURS = int(os.environ.get("INDICATORS_CACHE_TTL_HOURS", "24"))  # ✅ Increased from 8h to 24h for better cache hit
 _INDICATORS_FORCE_RECALC = os.environ.get("INDICATORS_FORCE_RECALC", "false").lower() == "true"
 _INDICATORS_MEMORY_CACHE_SIZE = int(os.environ.get("INDICATORS_MEMORY_CACHE_SIZE", "10"))  # LRU moderado
 _INDICATORS_LOCK_TIMEOUT_SEC = int(os.environ.get("INDICATORS_LOCK_TIMEOUT_SEC", "180"))  # 3 min
@@ -8886,19 +8906,28 @@ def obtener_datos_con_hilos(
         
         if should_backup:
             try:
-                # Save to GCS (up to 1000 rows) + local + Firestore metadata
-                success = save_to_gcs(symbol, tf, df_out)
-                if success:
-                    _save_local_history_df(symbol, tf, df_out)
-                    # Update Firestore metadata so other pods know data is fresh
-                    safe_sym = _safe_symbol_for_filename(symbol)
-                    safe_tf = normalize_tf(tf)
-                    gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
-                    rows_to_persist = min(1000, len(df_out))
-                    set_historicos_metadata(symbol, tf, gcs_path, rows_to_persist, ttl_seconds=1800)
-                    _last_gcs_backup_time[backup_key] = now_ts
-                    reason = "cold_start" if cold_start else f"periodic (last={int(time_since_last_backup)}s ago)"
-                    logging.info("[HIST][GCS_BACKUP] %s-%s → %d rows (%s)", symbol, tf, len(df_out), reason)
+                # ✅ LAZY-LOAD: Only persist if data actually changed (delta detection)
+                current_hash = hash_dataframe(df_out)
+                last_hash = _last_gcs_backup_hash.get(backup_key)
+                
+                if cold_start or last_hash is None or current_hash != last_hash:
+                    # Only save if cold_start or data has delta
+                    success = save_to_gcs(symbol, tf, df_out)
+                    if success:
+                        _save_local_history_df(symbol, tf, df_out)
+                        # Update Firestore metadata so other pods know data is fresh
+                        safe_sym = _safe_symbol_for_filename(symbol)
+                        safe_tf = normalize_tf(tf)
+                        gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
+                        rows_to_persist = min(1000, len(df_out))
+                        set_historicos_metadata(symbol, tf, gcs_path, rows_to_persist, ttl_seconds=1800)
+                        _last_gcs_backup_time[backup_key] = now_ts
+                        _last_gcs_backup_hash[backup_key] = current_hash
+                        reason = "cold_start" if cold_start else f"periodic (delta detected, last={int(time_since_last_backup)}s ago)"
+                        logging.info("[HIST][GCS_BACKUP] %s-%s → %d rows (%s)", symbol, tf, len(df_out), reason)
+                else:
+                    # Data hasn't changed, skip GCS save
+                    logger.info(f"[HIST][GCS_BACKUP] Skipped {symbol}/{tf} (no delta, hash unchanged)")
             except Exception as e:
                 logger.warning(f"[HIST][GCS_BACKUP] Failed to persist {symbol}/{tf}: {e}")
                 # Don't fail analysis, just log the issue
@@ -9280,6 +9309,9 @@ def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] =
     ultima_fila = df.iloc[-1]
     penultima_fila = df.iloc[-2]
     probabilidad_tecnica = 50.0
+    
+    # 🐛 DEBUG: Log de valores de indicadores
+    logger.info(f"[DEBUG-PT] {symbol}-{temporalidad}: MACD={ultima_fila.get('macd'):.4f}, Signal={ultima_fila.get('signal'):.4f}, RSI={ultima_fila.get('rsi'):.2f}, Stoch=%K={ultima_fila.get('%K'):.2f}")
 
     # Soportes / resistencias: reutilizar niveles precomputados si están disponibles
     soporte_nivel_1 = None
@@ -11558,6 +11590,7 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
     Returns:
         dict: Niveles clave confirmados con toques
     """
+    logger.info(f"[TRACE] obtener_niveles_clave START: {symbol}/{temporalidad_actual}")
 
     #@profile
     def procesar_niveles_importantes(niveles):
@@ -11673,9 +11706,9 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
     soportes_confirmados_orden = sorted(list(soportes_rebote), reverse=True)
     resistencias_confirmadas_orden = sorted(list(resistencias_rebote))
 
-    # Inicializar valores predeterminados como NaN
-    soporte_nivel_2, soporte_nivel_1 = np.nan, np.nan
-    resistencia_nivel_1, resistencia_nivel_2 = np.nan, np.nan
+    # Inicializar valores predeterminados como None
+    soporte_nivel_2, soporte_nivel_1 = None, None
+    resistencia_nivel_1, resistencia_nivel_2 = None, None
 
     # Manejar caso único en soportes
     if len(soportes_cercanos) == 1:
@@ -11695,17 +11728,23 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
           resistencia_nivel_1 = resistencias_cercanas[0]
           resistencia_nivel_2 = resistencias_cercanas[1]
 
-    # ✅ CORREGIDO: Validar que los niveles están bien ordenados y existan
-    # NO anular si el precio está fuera (es válido en breakouts)
-    # Solo anular si los datos no existen o están inválidos
-    if not (pd.notna(soporte_nivel_1) and pd.notna(resistencia_nivel_1)):
-        soporte_nivel_2, soporte_nivel_1 = np.nan, np.nan
-        resistencia_nivel_1, resistencia_nivel_2 = np.nan, np.nan
-    elif pd.notna(soporte_nivel_1) and pd.notna(resistencia_nivel_1):
-        # Validar que están en orden: S1 < R1
-        if soporte_nivel_1 >= resistencia_nivel_1:
-            soporte_nivel_2, soporte_nivel_1 = np.nan, np.nan
-            resistencia_nivel_1, resistencia_nivel_2 = np.nan, np.nan
+    # ✅ CORREGIDO: Validar cada tipo de nivel independientemente
+    # Los soportes y resistencias son válidos aunque solo exista uno de los dos
+    # Solo validar orden interno: S2 < S1 y R1 < R2
+    
+    # Validar soportes
+    if soporte_nivel_1 is not None and soporte_nivel_2 is not None:
+        # Si ambos existen, validar que S2 < S1
+        if soporte_nivel_2 >= soporte_nivel_1:
+            # Orden incorrecto, conservar solo S1
+            soporte_nivel_2 = None
+    
+    # Validar resistencias
+    if resistencia_nivel_1 is not None and resistencia_nivel_2 is not None:
+        # Si ambos existen, validar que R1 < R2
+        if resistencia_nivel_1 >= resistencia_nivel_2:
+            # Orden incorrecto, conservar solo R1
+            resistencia_nivel_2 = None
 
     # ========== SISTEMA DE APALANCAMIENTO MEJORADO ==========
     # ✅ FASE 1: Risk-Based Leverage (con límite de seguridad)
@@ -11763,55 +11802,59 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
         
         return float(leverage_final), float(leverage_calcalc), msg
     
-    # Apalancamiento para compra
-    if soporte_nivel_1 and precio_actual > soporte_nivel_1:
-        apalancamiento_compra_nivel_1, apalancamiento_compra_nivel_1_teorico, msg_1 = calcular_apalancamiento_seguro(
-            precio_actual, soporte_nivel_1, MAX_RISK_PER_TRADE, MAX_LEVERAGE
-        )
-        apalancamiento_compra_nivel_1 = int(apalancamiento_compra_nivel_1)
-        apalancamiento_compra_nivel_1_teorico = int(apalancamiento_compra_nivel_1_teorico)
-        if msg_1:
-            logger.info(f"[Niveles S1] {msg_1}")
-    else:
-        apalancamiento_compra_nivel_1 = 0
-        apalancamiento_compra_nivel_1_teorico = 0
+    def _fmt_apal(v):
+        return f"{v}x" if v is not None else "None"
+
+    # BATCH OPTIMIZATION: Calculate all 4 leverage levels at once
+    logger.info(f"[DEBUG-APAL] {symbol}: S1={soporte_nivel_1}, S2={soporte_nivel_2}, R1={resistencia_nivel_1}, R2={resistencia_nivel_2}, precio={precio_actual}")
     
-    if soporte_nivel_2 and precio_actual > soporte_nivel_2:
-        apalancamiento_compra_nivel_2, apalancamiento_compra_nivel_2_teorico, msg_2 = calcular_apalancamiento_seguro(
-            precio_actual, soporte_nivel_2, MAX_RISK_PER_TRADE, MAX_LEVERAGE
-        )
-        apalancamiento_compra_nivel_2 = int(apalancamiento_compra_nivel_2)
-        apalancamiento_compra_nivel_2_teorico = int(apalancamiento_compra_nivel_2_teorico)
-        if msg_2:
-            logger.info(f"[Niveles S2] {msg_2}")
-    else:
-        apalancamiento_compra_nivel_2 = 0
-        apalancamiento_compra_nivel_2_teorico = 0
+    # Initialize all leverage vars
+    apalancamiento_compra_nivel_1 = apalancamiento_compra_nivel_1_teorico = None
+    apalancamiento_compra_nivel_2 = apalancamiento_compra_nivel_2_teorico = None
+    apalancamiento_venta_nivel_1 = apalancamiento_venta_nivel_1_teorico = None
+    apalancamiento_venta_nivel_2 = apalancamiento_venta_nivel_2_teorico = None
     
-    # Apalancamiento para venta (proceso inverso)
-    if resistencia_nivel_1 and precio_actual < resistencia_nivel_1:
-        apalancamiento_venta_nivel_1, apalancamiento_venta_nivel_1_teorico, msg_3 = calcular_apalancamiento_seguro(
-            precio_actual, resistencia_nivel_1, MAX_RISK_PER_TRADE, MAX_LEVERAGE
-        )
-        apalancamiento_venta_nivel_1 = int(apalancamiento_venta_nivel_1)
-        apalancamiento_venta_nivel_1_teorico = int(apalancamiento_venta_nivel_1_teorico)
-        if msg_3:
-            logger.info(f"[Niveles R1] {msg_3}")
-    else:
-        apalancamiento_venta_nivel_1 = 0
-        apalancamiento_venta_nivel_1_teorico = 0
+    msgs_apal = []  # Collect warning messages
     
-    if resistencia_nivel_2 and precio_actual < resistencia_nivel_2:
-        apalancamiento_venta_nivel_2, apalancamiento_venta_nivel_2_teorico, msg_4 = calcular_apalancamiento_seguro(
-            precio_actual, resistencia_nivel_2, MAX_RISK_PER_TRADE, MAX_LEVERAGE
-        )
-        apalancamiento_venta_nivel_2 = int(apalancamiento_venta_nivel_2)
-        apalancamiento_venta_nivel_2_teorico = int(apalancamiento_venta_nivel_2_teorico)
-        if msg_4:
-            logger.info(f"[Niveles R2] {msg_4}")
-    else:
-        apalancamiento_venta_nivel_2 = 0
-        apalancamiento_venta_nivel_2_teorico = 0
+    # BATCH: Process all 4 leverage calculations
+    for nivel_name, nivel_value, calc_type in [
+        ("S1", soporte_nivel_1, "compra"),
+        ("S2", soporte_nivel_2, "compra"),
+        ("R1", resistencia_nivel_1, "venta"),
+        ("R2", resistencia_nivel_2, "venta"),
+    ]:
+        if nivel_value is not None:
+            apal, apal_teorico, msg = calcular_apalancamiento_seguro(
+                precio_actual, nivel_value, MAX_RISK_PER_TRADE, MAX_LEVERAGE
+            )
+            apal = int(apal) if apal > 0 else None
+            apal_teorico = int(apal_teorico) if apal_teorico > 0 else None
+            
+            # Store in appropriate variable
+            if nivel_name == "S1" and calc_type == "compra":
+                apalancamiento_compra_nivel_1, apalancamiento_compra_nivel_1_teorico = apal, apal_teorico
+            elif nivel_name == "S2" and calc_type == "compra":
+                apalancamiento_compra_nivel_2, apalancamiento_compra_nivel_2_teorico = apal, apal_teorico
+            elif nivel_name == "R1" and calc_type == "venta":
+                apalancamiento_venta_nivel_1, apalancamiento_venta_nivel_1_teorico = apal, apal_teorico
+            elif nivel_name == "R2" and calc_type == "venta":
+                apalancamiento_venta_nivel_2, apalancamiento_venta_nivel_2_teorico = apal, apal_teorico
+            
+            # Collect warning messages
+            if msg:
+                msgs_apal.append(f"[Niveles {nivel_name}] {msg}")
+    
+    # Log batch results in single consolidated message
+    logger.info(
+        f"[DEBUG-APAL] {symbol}: Apal S1={_fmt_apal(apalancamiento_compra_nivel_1)}({_fmt_apal(apalancamiento_compra_nivel_1_teorico)}), "
+        f"S2={_fmt_apal(apalancamiento_compra_nivel_2)}, "
+        f"R1={_fmt_apal(apalancamiento_venta_nivel_1)}({_fmt_apal(apalancamiento_venta_nivel_1_teorico)}), "
+        f"R2={_fmt_apal(apalancamiento_venta_nivel_2)}"
+    )
+    
+    # Log any warning messages
+    for msg in msgs_apal:
+        logger.info(msg)
     
     multiplicador = {
         "apalancamiento_compra_nivel_1": apalancamiento_compra_nivel_1,
@@ -12274,8 +12317,9 @@ def generar_entradas_multiples(
     rango_dinamico = (en_rango or {}).get("rango_dinamico") or (None, None)
     rango_low, rango_high = rango_dinamico
 
+    # ✅ VALIDACIÓN: Neutral+indefinida genera en AMBOS lados (long y short), no solo long
     sesgo_long = (tipo_operacion in señales_compra) or (tipo_operacion == "Neutral" and estructura in ("alcista", "indefinida"))
-    sesgo_short = (tipo_operacion in señales_venta)  or (tipo_operacion == "Neutral" and estructura == "bajista")
+    sesgo_short = (tipo_operacion in señales_venta) or (tipo_operacion == "Neutral" and estructura in ("bajista", "indefinida"))  # ✅ FIXED: ahora incluye "indefinida"
 
     logger.debug(f"sesgo_long={sesgo_long}, sesgo_short={sesgo_short}, min_rrr={min_rrr}")
 
@@ -12526,464 +12570,6 @@ def generar_entradas_multiples(
 
 # Función para calcular puntos de entrada ajustando las probabilidades
 #@profile
-def calcular_entradas(
-    df,
-    df_eventos,
-    symbol: str,
-    temporalidad: str,
-    user_chat_id: str,
-    *,
-    calc_windows: dict[str, int] | None = None,
-    cfg: dict | None = None,
-):  
-    salida = {}
-    try:
-        tf = _tf_backend(temporalidad)
-        window = min(definir_window(tf, overrides=calc_windows), len(df))
-        precio_actual = df["close"].iloc[-1]
-
-        # --- PARALELIZACIÓN DE OPERACIONES COSTOSAS ---
-        # Ejecutar en paralelo: patrones, rango, técnica, fundamental
-        _inner_exec = _ANALYSIS_INNER_EXECUTOR
-        if _inner_exec is None:
-            _inner_exec = ThreadPoolExecutor(max_workers=1)
-
-        future_patrones = _inner_exec.submit(detectar_patrones_confirmados_velas, df, window)
-        future_rango = _inner_exec.submit(
-            lambda: detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
-        )
-        future_tecnica = _inner_exec.submit(analisis_tecnico_detallado, df, tf, window, cfg)
-    
-        # ✅ FIX: Convert UTC to NY timezone for fundamental analysis consistency
-        now_utc = datetime.now(timezone.utc)
-        ny_tz = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)  # "America/New_York"
-        now_ny = now_utc.astimezone(ny_tz)
-        fecha_inicio = (now_ny - timedelta(days=7)).strftime("%Y-%m-%d")
-        fecha_fin = now_ny.strftime("%Y-%m-%d")
-        future_fundamental = _inner_exec.submit(
-            ajustar_probabilidad_fundamental,
-            50, df_eventos, symbol, tf, fecha_inicio, fecha_fin, cfg, True  # return_meta=True
-        )
-    
-        # Recoger resultados
-        try:
-            resultados = future_patrones.result(timeout=15)  # ✅ FIX: Add timeout to prevent hangs
-            patrones_detectados = {}
-            for _, _, nombre in resultados:
-                patrones_detectados[nombre] = True
-        except TimeoutError:
-            logger.warning(f"[TIMEOUT] Pattern detection timeout for {symbol}-{tf}")
-            patrones_detectados = {}
-        except Exception as e:
-            logger.info(f"Error detectando patrones para {symbol}-{tf}: {e}")
-            patrones_detectados = {}
-    
-        try:
-            en_rango = future_rango.result(timeout=15)  # ✅ FIX: Add timeout
-        except TimeoutError:
-            logger.warning(f"[TIMEOUT] Range detection timeout for {symbol}-{tf}")
-            en_rango = {
-                "es_rango_repetitivo": False,
-                "estructura_tendencia": "indefinida",
-                "rebotes": [],
-                "rango_dinamico": [None, None],
-            }
-        except Exception:
-            en_rango = {
-                "es_rango_repetitivo": False,
-                "estructura_tendencia": "indefinida",
-                "rebotes": [],
-                "rango_dinamico": [None, None],
-            }
-    
-        try:
-            tecnica_meta = future_tecnica.result(timeout=15)  # ✅ FIX: Add timeout
-        except TimeoutError:
-            logger.warning(f"[TIMEOUT] Technical analysis timeout for {symbol}-{tf}")
-            tecnica_meta = None
-        except Exception as e:
-            logger.info(f"Error en análisis técnico para {symbol}-{tf}: {e}")
-            tecnica_meta = None
-    
-        try:
-            prob_funda_out = future_fundamental.result(timeout=15)  # ✅ FIX: Add timeout
-            if isinstance(prob_funda_out, tuple):
-                prob_funda, fundamental_meta = prob_funda_out
-            else:
-                prob_funda, fundamental_meta = prob_funda_out, None
-            probabilidad_fundamental = round(prob_funda if prob_funda is not None else 50, 2)
-        except Exception as e:
-            logger.info(f"Error en análisis fundamental para {symbol}-{tf}: {e}")
-            probabilidad_fundamental = 50.0
-            fundamental_meta = None
-
-        if _inner_exec is not _ANALYSIS_INNER_EXECUTOR:
-            _inner_exec.shutdown(wait=False)
-
-        # --- Predicciones/MC (PARALELIZADAS para mejor rendimiento) ---
-        try:
-            # ✅ OPTIMIZACIÓN: Usar ThreadPoolExecutor directamente en lugar de asyncio.run() anidado
-            # asyncio.run() es muy costoso cuando se invoca 56×8 veces (activos × temporalidades)
-            pred_exec = _ANALYSIS_PRED_EXECUTOR
-            if pred_exec is None:
-                # Fallback: usar INNER_EXECUTOR
-                pred_exec = _inner_exec
-            
-            if pred_exec is not None:
-                # Usar executor para paralelizar ARIMA, Media Móvil y Monte Carlo
-                future_arima = pred_exec.submit(predecir_arima, df, tf, symbol)
-                future_mm = pred_exec.submit(predecir_media_movil, df, window)
-                future_mc = pred_exec.submit(_wrapper_simulacion_monte_carlo, df, tf)
-                
-                predicciones_arima = future_arima.result(timeout=ARIMA_TIMEOUT_SECONDS)
-                predicciones_media_movil = future_mm.result(timeout=30)
-                prob_alza, prob_baja = future_mc.result(timeout=30)
-            else:
-                # No hay executor, secuencial
-                predicciones_arima = predecir_arima(df, tf, symbol)
-                predicciones_media_movil = predecir_media_movil(df, window)
-                prob_alza, prob_baja = simulacion_monte_carlo(df, tf, num_simulaciones=50, num_dias=5, seed=42)
-            
-            probabilidad_alza = prob_alza if prob_alza is not None else 50
-            probabilidad_baja = prob_baja if prob_baja is not None else 50
-        except Exception as e:
-            logger.warning(f"Error en predicciones paralelas para {symbol}-{tf}: {type(e).__name__}: {e}. Fallback a predicción simple.", exc_info=True)
-            # ✅ FALLBACK: Predicción simple (media móvil) en lugar de ARIMA
-            try:
-                predicciones_arima = predecir_media_movil(df, window)  # Fallback: usar MM simple
-            except:
-                predicciones_arima = None
-            try:
-                predicciones_media_movil = predecir_media_movil(df, window)
-            except:
-                predicciones_media_movil = None
-            try:
-                probabilidad_alza, probabilidad_baja = simulacion_monte_carlo(
-                    df, tf, num_simulaciones=50, num_dias=5, seed=42
-                )
-            except:
-                probabilidad_alza, probabilidad_baja = 50, 50
-
-        # --- Soportes/Resistencias dinámicos (CON CACHE) ---
-        cache_key = _get_niveles_cache_key(symbol, tf, len(df), precio_actual)
-        soportes_cached, resistencias_cached = _get_cached_niveles(cache_key)
-        
-        if soportes_cached is not None and resistencias_cached is not None:
-            # Usar niveles del cache
-            soportes_dinamicos = soportes_cached
-            resistencias_dinamicas = resistencias_cached
-        else:
-            # Calcular niveles (costoso)
-            df, soportes_dinamicos, resistencias_dinamicas = ajustar_window_dinamico_optimizado(
-                df,
-                symbol,
-                tf,
-                precio_actual,
-                calc_windows=calc_windows,
-                max_incremento=5,
-                min_factor=2,
-                max_factor=8,
-                min_levels=2,
-            )
-            
-            soportes_dinamicos = _clean_levels(soportes_dinamicos)
-            resistencias_dinamicas = _clean_levels(resistencias_dinamicas)
-            
-            # Almacenar en cache
-            _cache_niveles(cache_key, soportes_dinamicos, resistencias_dinamicas)
-
-        # ✅ Actualizar cache global de niveles unificados (cross-timeframe)
-        with _niveles_unificados_lock:
-            if symbol not in _niveles_unificados_cache:
-                _niveles_unificados_cache[symbol] = {
-                    "soportes": set(soportes_dinamicos),
-                    "resistencias": set(resistencias_dinamicas),
-                    "timestamp": datetime.now(UTC)
-                }
-            else:
-                entry = _niveles_unificados_cache[symbol]
-                # Combinar niveles existentes con nuevos
-                entry["soportes"].update(soportes_dinamicos)
-                entry["resistencias"].update(resistencias_dinamicas)
-                entry["timestamp"] = datetime.now(UTC)  # Renovar TTL
-
-        niveles_clave = obtener_niveles_clave(
-            df,
-            soportes_dinamicos,
-            resistencias_dinamicas,
-            symbol,
-            tf,
-            umbral_atr=2.0,
-            max_niveles=2,
-        )
-
-        ATR = _tofloat(df["ATR"].iloc[-1]) if "ATR" in df.columns else None
-        atr_missing = not (ATR and _finite(ATR) and ATR > 0)
-        if atr_missing:
-            # Fallback ATR if indicator is missing/NaN on the last row.
-            ATR = _atr14(df)
-            if not (ATR and _finite(ATR) and ATR > 0):
-                ATR = float(df["close"].iloc[-1]) * 0.002
-            logger.info(f"[ATR] Fallback usado para {symbol}/{tf}: ATR={ATR}")
-
-        # --- Prob. técnica (ya calculamos tecnica_meta y fundamental_meta en paralelo) ---
-        probabilidad_tecnica = round(ajustar_probabilidad_tecnica(
-            df, tf, window, cfg, niveles=niveles_clave, symbol=symbol
-        ), 2)
-
-        # --- Prob. general (con pesos desde cfg.general) ---
-        probabilidad_general = calcular_probabilidad_general(
-            probabilidad_tecnica, probabilidad_fundamental, cfg
-        )
-        probabilidad_general = round(probabilidad_general if probabilidad_general is not None else 50, 2)
-
-        # --- Zona no trading (condicionada por cfg.entrada.verificar_zona_no_trading) ---
-        verificar_znt = True
-        try:
-            verificar_znt = bool((cfg or {}).get("entrada", {}).get("verificar_zona_no_trading", True))
-        except Exception:
-            verificar_znt = True
-
-        zona_no_trading = verificar_zona_no_trading(df, window) if verificar_znt else False
-        zona_no_trading_evento = bool(isinstance(fundamental_meta, dict) and fundamental_meta.get("blackout") is True)
-        zona_no_trading = bool(zona_no_trading) or zona_no_trading_evento
-
-        zona_sobreventa = verificar_zona_sobreventa(df, window)
-        zona_sobrecompra = verificar_zona_sobrecompra(df, window)
-
-        # --- Tipo de operación ---
-        tipo_operacion = determinar_tipo_operacion(
-            precio_actual,
-            predicciones_arima[0] if predicciones_arima else None,
-            predicciones_media_movil[0] if predicciones_media_movil else None,
-            probabilidad_alza,
-            probabilidad_baja,
-            patrones_detectados,
-            zona_sobreventa,
-            zona_sobrecompra,
-            probabilidad_general,
-            zona_no_trading,
-        )
-
-        try:
-            confluencia = evaluar_confluencia_trade(
-                symbol=symbol,
-                temporalidad=tf,
-                tipo_operacion=tipo_operacion,
-                precio_actual=precio_actual,
-                niveles=niveles_clave,
-                atr=ATR,
-                prob_tecnica=probabilidad_tecnica,
-                prob_fundamental=probabilidad_fundamental,
-                prob_general=probabilidad_general,
-                tecnica_meta=tecnica_meta,
-                fundamental_meta=fundamental_meta,
-                cfg=cfg,
-            )
-        except Exception as _e:
-            confluencia = {
-                'symbol': symbol,
-                'tf': tf,
-                'label': None,
-                'score': None,
-                'warnings': [f'confluencia_error: {_e}'],
-            }
-
-        alertas_mt = []
-        try:
-            if isinstance(confluencia, dict):
-                alertas_mt.extend(list(confluencia.get('warnings') or []))
-        except Exception:
-            pass
-        # Bollinger (último)
-        bollinger_upper = _coerce_float_safe(salida.get("bollinger_upper")) or _coerce_float_safe(
-            last_of(df, "bollinger_upper", default=None)
-        )
-        bollinger_lower = _coerce_float_safe(salida.get("bollinger_lower")) or _coerce_float_safe(
-            last_of(df, "bollinger_lower", default=None)
-        )
-
-        # --- Entradas múltiples ---
-        # 🎯 Lee config desde .env para privilegiar calidad sobre cantidad
-        max_candidates = int(os.environ.get("ENTRADA_MAX_CANDIDATES", "10"))
-        min_rrr = float(os.environ.get("ENTRADA_MIN_RRR", "2.0"))
-        enable_ladders = os.environ.get("ENTRADA_ENABLE_LADDERS", "false").lower() == "true"
-        enable_retest = os.environ.get("ENTRADA_ENABLE_RETEST", "false").lower() == "true"
-        enable_range_revert = os.environ.get("ENTRADA_ENABLE_RANGE_REVERT", "true").lower() == "true"
-        
-        entradas_mult = generar_entradas_multiples(
-            precio_actual=precio_actual,
-            ATR=ATR,
-            niveles=niveles_clave,
-            tipo_operacion=tipo_operacion,
-            en_rango=en_rango,
-            prob_general=probabilidad_general,
-            bollinger_upper=bollinger_upper,
-            bollinger_lower=bollinger_lower,
-            señales_compra=señales_compra,
-            señales_venta=señales_venta,
-            # 🎯 Parámetros de calidad
-            max_candidates=max_candidates,
-            min_rrr=min_rrr,
-            enable_ladder=enable_ladders,
-            enable_breakout_retest=enable_retest,
-            enable_range_mean_revert=enable_range_revert,
-        )
-
-        # Adjuntar metadatos pro a cada entrada (compat UI)
-        try:
-            for _e in (entradas_mult or []):
-                if isinstance(_e, dict):
-                    _m = _e.get('meta')
-                    if not isinstance(_m, dict):
-                        _m = {}
-                        _e['meta'] = _m
-                    if isinstance(tecnica_meta, dict):
-                        _m.setdefault('tecnica', tecnica_meta)
-                    if isinstance(fundamental_meta, dict):
-                        _m.setdefault('fundamental', fundamental_meta)
-                    if isinstance(confluencia, dict):
-                        _m.setdefault('confluencia', confluencia)
-                    if isinstance(alertas_mt, list) and alertas_mt:
-                        _m.setdefault('alertas', alertas_mt)
-        except Exception:
-            pass
-
-        # “legacy” (mejor entrada)
-        best = entradas_mult[0] if entradas_mult else None
-        if best:
-            precio_entrada = best.get("precio_entrada")
-            take_profit = best.get("take_profit")
-            stop_loss = best.get("stop_loss")
-        else:
-            if tipo_operacion in señales_compra or (
-                tipo_operacion == "Neutral" and en_rango["estructura_tendencia"] in ("alcista", "indefinida")
-            ):
-                precio_entrada = (
-                    (niveles_clave["resistencia_nivel_1"] + niveles_clave["soporte_nivel_1"]) / 2
-                    if niveles_clave["resistencia_nivel_1"] and niveles_clave["soporte_nivel_1"]
-                    else precio_actual
-                )
-                take_profit, stop_loss = calc_tp_sl_compra(precio_entrada, ATR)
-                if not (stop_loss and take_profit and (stop_loss < precio_entrada < take_profit)):
-                    logger.warning(
-                        f"Valores incorrectos en {symbol} temporalidad:{tf} (compra): SL={stop_loss}, Entrada={precio_entrada}, TP={take_profit}"
-                    )
-                    stop_loss, take_profit = np.nan, np.nan
-
-            elif tipo_operacion in señales_venta or (
-                tipo_operacion == "Neutral" and en_rango["estructura_tendencia"] == "bajista"
-            ):
-                precio_entrada = (
-                    (niveles_clave["resistencia_nivel_1"] + niveles_clave["soporte_nivel_1"]) / 2
-                    if niveles_clave["resistencia_nivel_1"] and niveles_clave["soporte_nivel_1"]
-                    else precio_actual
-                )
-                take_profit, stop_loss = calc_tp_sl_venta(precio_entrada, ATR)
-                if not (take_profit and stop_loss and (take_profit < precio_entrada < stop_loss)):
-                    logger.warning(
-                        f"Valores incorrectos en {symbol} temporalidad:{tf} (venta): TP={take_profit}, Entrada={precio_entrada}, SL={stop_loss}"
-                    )
-                    stop_loss, take_profit = np.nan, np.nan
-            else:
-                precio_entrada = None
-                take_profit = None
-                stop_loss = None
-
-        # Cercanía a niveles
-        #@profile
-        def esta_cerca(precio, nivel, umbral_cercania=0.01):
-            return False if nivel is None else abs(precio - nivel) / precio <= umbral_cercania
-
-        cerca_de_soporte_resistencia = (
-            "Cerca de Soporte Nivel 2"
-            if esta_cerca(precio_actual, niveles_clave.get("soporte_nivel_2"))
-            else "Cerca de Soporte Nivel 1"
-            if esta_cerca(precio_actual, niveles_clave.get("soporte_nivel_1"))
-            else "Cerca de Resistencia Nivel 1"
-            if esta_cerca(precio_actual, niveles_clave.get("resistencia_nivel_1"))
-            else "Cerca de Resistencia Nivel 2"
-            if esta_cerca(precio_actual, niveles_clave.get("resistencia_nivel_2"))
-            else "No Cerca"
-        )
-
-        # Flag oportunidad (respetando zonas)
-        flag_oportunidad = False
-        if not zona_no_trading:
-            if probabilidad_general > 53 and not zona_sobrecompra:
-                flag_oportunidad = True
-            elif probabilidad_general < 47 and not zona_sobreventa:
-                flag_oportunidad = True
-
-        # Tendencia en tiempo real
-        tendencia_predicha = predecir_tendencia_en_tiempo_real(df, temporalidad)
-
-        salida = {
-            "patrones_detectados": patrones_detectados,
-            "predicciones_arima": predicciones_arima,
-            "predicciones_media_movil": predicciones_media_movil,
-            "probabilidad_alza": probabilidad_alza,
-            "probabilidad_baja": probabilidad_baja,
-            "macd_cruce": df["macd_cruce"].iloc[-1] if "macd_cruce" in df.columns else None,
-            "macd_cerca_de_cruzar": df["macd_cerca_de_cruzar"].iloc[-1] if "macd_cerca_de_cruzar" in df.columns else None,
-            "bollinger_signal": df["bollinger_signal"].iloc[-1] if "bollinger_signal" in df.columns else None,
-            "bollinger_upper": last_of(df, "bollinger_upper", default=None) if "bollinger_upper" in df.columns else None,
-            "bollinger_lower": last_of(df, "bollinger_lower", default=None) if "bollinger_lower" in df.columns else None,
-            "tendencia_predicha": tendencia_predicha,
-            "ultimo_valor": precio_actual,
-            "soporte_nivel_2": niveles_clave.get("soporte_nivel_2"),
-            "soporte_nivel_1": niveles_clave.get("soporte_nivel_1"),
-            "resistencia_nivel_1": niveles_clave.get("resistencia_nivel_1"),
-            "resistencia_nivel_2": niveles_clave.get("resistencia_nivel_2"),
-            "apalancamiento_compra_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_1"),
-            "apalancamiento_compra_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_2"),
-            "apalancamiento_venta_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_1"),
-            "apalancamiento_venta_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_2"),
-            "apalancamiento_compra_nivel_1_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_1_teorico"),
-            "apalancamiento_compra_nivel_2_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_2_teorico"),
-            "apalancamiento_venta_nivel_1_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_1_teorico"),
-            "apalancamiento_venta_nivel_2_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_2_teorico"),
-            "precio_entrada": precio_entrada,
-            "take_profit": take_profit,
-            "stop_loss": stop_loss,
-            "es_rango_repetitivo": en_rango.get("es_rango_repetitivo"),
-            "estructura_tendencia": en_rango.get("estructura_tendencia"),
-            "rebotes": en_rango.get("rebotes"),
-            "rango_dinamico": en_rango.get("rango_dinamico"),
-            "soportes_alcanzados": niveles_clave.get("niveles_importantes_soportes"),
-            "resistencias_alcanzadas": niveles_clave.get("niveles_importantes_resistencias"),
-            "cerca_de_soporte_resistencia": cerca_de_soporte_resistencia,
-            "soportes_importantes_alcanzados": niveles_clave.get("soportes_confirmados_orden"),
-            "resistencias_importantes_alcanzadas": niveles_clave.get("resistencias_confirmadas_orden"),
-            "niveles_confirmados_orden_toques_all": niveles_clave.get("niveles_confirmados_orden_toques_all"),
-            "niveles_confirmados_orden_nivel_all": niveles_clave.get("niveles_confirmados_orden_nivel_all"),
-            "niveles_confirmados_orden_nivel_reduced": niveles_clave.get("niveles_confirmados_orden_nivel_reduced"),
-            "probabilidad_tecnica": probabilidad_tecnica,
-            "probabilidad_fundamental": probabilidad_fundamental,
-            "probabilidad_general": probabilidad_general,
-            "zona_no_trading_evento": zona_no_trading_evento,
-            "alertas": alertas_mt,
-            "tecnica_meta": tecnica_meta,
-            "fundamental_meta": fundamental_meta,
-            "confluencia": confluencia,
-            "tipo_operacion": tipo_operacion,
-            "flag_oportunidad": flag_oportunidad,
-            "zona_no_trading": zona_no_trading,
-            "zona_sobreventa": zona_sobreventa,
-            "zona_sobrecompra": zona_sobrecompra,
-            "entradas": entradas_mult,
-        }
-        return json_safe(salida)
-
-    except Exception as e:
-        logger.exception("calcular_entradas falló: %s", e)
-        if not salida:
-            salida = {}
-        salida.setdefault("entradas_multiples", [])
-        salida.setdefault("entradas", {"lista": []})
-        return json_safe(salida)
-
-
 # Función para generar un archivo con la fecha y hora en el nombre
 #@profile
 def generar_nombre_archivo(moneda_filtro, filtro=False, tipo=None):
@@ -13180,12 +12766,12 @@ def generar_imagen_eventos_oportunidades(
     # 5) Normalización/numérico y relleno
     df = df.replace([np.inf, -np.inf], np.nan)
 
-    # Intentar convertir a numérico Actual/Estimado/Anterior; si falla, quedará NaN -> "—"
+    # Intentar convertir a numérico Actual/Estimado/Anterior; si falla, quedará NaN -> "-"
     for c in ("Actual", "Estimado", "Anterior"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df = df.fillna("—")
+    df = df.fillna("-")
 
     for c in ("Actual", "Estimado", "Anterior"):
         if c in df.columns:
@@ -13895,54 +13481,61 @@ def procesar_simbolo_temporalidad(
     entradas['rechazo'] = motivo_rechazo
     entradas['autorizado'] = es_autorizado_operar
 
-    # Devolver resultados
+    # Devolver resultados (con conversión de None a valores apropiados)
     resultado = {
         "Activo": symbol,
         "Temporalidad": temporalidad,
         "Oportunidad": entradas.get('flag_oportunidad'),
-        "Patrones Detectados": entradas.get('patrones_detectados'),
-        "Tipo de Operacion": entradas.get('tipo_operacion'),
+        "Patrones Detectados": entradas.get('patrones_detectados', ""),
+        "Tipo de Operacion": entradas.get('tipo_operacion', ""),
         "Autorizado Whitelist": es_autorizado_operar,  # ✅ PHASE 3
         "Score Final": score_whitelist,                # ✅ PHASE 3 (Score Final para ranking)
         "Expectativa": expectativa_val,                # ✅ PHASE 3
-        "Motivo Rechazo": motivo_rechazo,              # ✅ PHASE 3
+        "Motivo Rechazo": motivo_rechazo or "",        # ✅ PHASE 3
         "Ultimo Valor": entradas.get('ultimo_valor'),
         "Soporte Nivel 2": entradas.get('soporte_nivel_2'),
         "Soporte Nivel 1": entradas.get('soporte_nivel_1'),
         "Resistencia Nivel 1": entradas.get('resistencia_nivel_1'),
         "Resistencia Nivel 2": entradas.get('resistencia_nivel_2'),
-        "Apalancamiento Compra Nivel 2": entradas.get('apalancamiento_compra_nivel_2'),
-        "Apalancamiento Compra Nivel 1": entradas.get('apalancamiento_compra_nivel_1'),
-        "Apalancamiento Venta Nivel 2": entradas.get('apalancamiento_venta_nivel_2'),
-        "Apalancamiento Venta Nivel 1": entradas.get('apalancamiento_venta_nivel_1'),
+        "Apalancamiento Compra Nivel 2": entradas.get('apalancamiento_compra_nivel_2', ""),
+        "Apalancamiento Compra Nivel 1": entradas.get('apalancamiento_compra_nivel_1', ""),
+        "Apalancamiento Venta Nivel 2": entradas.get('apalancamiento_venta_nivel_2', ""),
+        "Apalancamiento Venta Nivel 1": entradas.get('apalancamiento_venta_nivel_1', ""),
+        "Apalancamiento Compra Nivel 2 Teorico": entradas.get('apalancamiento_compra_nivel_2_teorico', ""),
+        "Apalancamiento Compra Nivel 1 Teorico": entradas.get('apalancamiento_compra_nivel_1_teorico', ""),
+        "Apalancamiento Venta Nivel 2 Teorico": entradas.get('apalancamiento_venta_nivel_2_teorico', ""),
+        "Apalancamiento Venta Nivel 1 Teorico": entradas.get('apalancamiento_venta_nivel_1_teorico', ""),
         "Precio de Entrada": entradas.get('precio_entrada'),
         "Take Profit": entradas.get('take_profit'),
         "Stop Loss": entradas.get('stop_loss'),
-        "Soportes Alcanzados": entradas.get("soportes_alcanzados"),
-        "Resistencias Alcanzadas": entradas.get("resistencias_alcanzadas"),
-        "Cerca de Soporte Resistencia": entradas.get('cerca_de_soporte_resistencia'),
+        "Soportes Alcanzados": entradas.get("soportes_alcanzados", ""),
+        "Resistencias Alcanzadas": entradas.get("resistencias_alcanzadas", ""),
+        "Cerca de Soporte Resistencia": entradas.get('cerca_de_soporte_resistencia', ""),
         "Es Rango Repetitivo": entradas.get("es_rango_repetitivo"),
-        "Estructura Tendencia": entradas.get('estructura_tendencia'),
-        "Rebotes": entradas.get("rebotes"),
-        "Rango Dinamico": entradas.get("rango_dinamico"),
-        "Soportes Importantes Alcanzados": entradas.get("soportes_importantes_alcanzados"),
-        "Resistencias Importantes Alcanzadas": entradas.get("resistencias_importantes_alcanzadas"),
-        **({"Niveles Confirmados (Toques)": entradas.get('niveles_confirmados_orden_toques_all')} if es_administrador(user_chat_id) else {}),
-        "Niveles Confirmados (Nivel)":  entradas.get("niveles_confirmados_orden_nivel_all") if es_administrador(user_chat_id) else entradas.get("niveles_confirmados_orden_nivel_reduced"),
-        "Bollinger Signal": entradas.get('bollinger_signal'),
+        "Estructura Tendencia": entradas.get('estructura_tendencia', ""),
+        "Rebotes": entradas.get("rebotes", ""),
+        "Rango Dinamico": entradas.get("rango_dinamico", ""),
+        "Soportes Importantes Alcanzados": entradas.get("soportes_importantes_alcanzados", ""),
+        "Resistencias Importantes Alcanzadas": entradas.get("resistencias_importantes_alcanzadas", ""),
+        **({"Niveles Confirmados (Toques)": entradas.get('niveles_confirmados_orden_toques_all', "")} if es_administrador(user_chat_id) else {}),
+        "Niveles Confirmados (Nivel)":  entradas.get("niveles_confirmados_orden_nivel_all", "") if es_administrador(user_chat_id) else entradas.get("niveles_confirmados_orden_nivel_reduced", ""),
+        "Bollinger Signal": entradas.get('bollinger_signal', ""),
         "bollinger_upper": entradas.get('bollinger_upper'),
         "bollinger_lower": entradas.get('bollinger_lower'),
-        "MACD Tendencia Predicha": entradas.get('tendencia_predicha'),
-        "Cruce MACD": entradas.get('macd_cruce'),
-        "MACD Cerca": entradas.get('macd_cerca_de_cruzar'),
-        "Zona Sobreventa RSI-Stochastic": entradas.get('zona_sobreventa'),
-        "Zona Sobrecompra RSI-Stochastic": entradas.get('zona_sobrecompra'),
-        "Zona No Trading": entradas.get('zona_no_trading'),
+        "MACD Tendencia Predicha": entradas.get('tendencia_predicha', ""),
+        "Cruce MACD": entradas.get('macd_cruce', ""),
+        "MACD Cerca": entradas.get('macd_cerca_de_cruzar', ""),
+        "Zona Sobreventa RSI-Stochastic": entradas.get('zona_sobreventa', ""),
+        "Zona Sobrecompra RSI-Stochastic": entradas.get('zona_sobrecompra', ""),
+        "Zona No Trading": entradas.get('zona_no_trading', ""),
         "Probabilidad Alza (Montecarlo)": entradas.get('probabilidad_alza'),
         "Probabilidad Baja (Montecarlo)": entradas.get('probabilidad_baja'),
         "Probabilidad Tecnica (%)": entradas.get('probabilidad_tecnica'),
         "Probabilidad Fundamental (%)": entradas.get('probabilidad_fundamental'),
-        "Probabilidad General (%)": entradas.get('probabilidad_general')
+        "Probabilidad General (%)": entradas.get('probabilidad_general'),
+        "Volatilidad": entradas.get('volatilidad'),
+        "Volatilidad Alta": entradas.get('volatilidad_alta'),
+        "Volatilidad Baja": entradas.get('volatilidad_baja'),
     }
 
     # --- Adjuntos internos para subir JSON enriquecido/ohlcv (no se guardan en Firestore) ---
@@ -14475,20 +14068,30 @@ def _is_uploads_enabled(cfg: Optional[dict]) -> bool:
 # Campos "core" para frontend (usados en DetalleEjecucion y Monitoreo)
 _CORE_FIELDS = {
     # Trading Basics
-    'Activo', 'Temporalidad', 'Tipo de Operacion', 'Oportunidad', 
+    'Activo', 'Temporalidad', 'Tipo de Operacion', 'Oportunidad',
     'Zona No Trading', 'entry', 'tp', 'sl', 'stop_loss_pips',
     # Scoring & Weighting
-    'Ponderacion', 'PonderacionIncremental', 'Confianza', 'score_final',
-    'expectativa', 'probabilidad_tecnica', 'probabilidad_fundamental',
-    'autorizado', 'rechazo',
+    'Ponderacion', 'Ponderacion Incremental', 'PonderacionIncremental', 'Confianza',
+    'Score Final', 'score_final', 'Expectativa', 'expectativa',
+    'Autorizado Whitelist', 'autorizado', 'Motivo Rechazo', 'rechazo',
+    'probabilidad_tecnica', 'probabilidad_fundamental',
     # Technical Signals
-    'Cruce MACD', 'Bollinger Signal', 'ultimo',
+    'Cruce MACD', 'Bollinger Signal', 'Ultimo Valor', 'ultimo',
     # Support/Resistance Levels (CRITICAL for DetalleEjecucionScreen)
     'Soportes Alcanzados', 'Resistencias Alcanzadas',
     'Soportes Importantes Alcanzados', 'Resistencias Importantes Alcanzadas',
     'Cerca de Soporte Resistencia', 'Cerca de S/R',
+    'Soporte Nivel 1', 'Soporte Nivel 2', 'Resistencia Nivel 1', 'Resistencia Nivel 2',
     'soporte_nivel_1', 'soporte_nivel_2', 'resistencia_nivel_1', 'resistencia_nivel_2',
+    # Leverage (safe + theoretical)
+    'Apalancamiento Compra Nivel 1', 'Apalancamiento Compra Nivel 2',
+    'Apalancamiento Venta Nivel 1', 'Apalancamiento Venta Nivel 2',
+    'Apalancamiento Compra Nivel 1 Teorico', 'Apalancamiento Compra Nivel 2 Teorico',
+    'Apalancamiento Venta Nivel 1 Teorico', 'Apalancamiento Venta Nivel 2 Teorico',
     'Niveles Confirmados (Toques)', 'Niveles Confirmados (Nivel)',
+    # Meta para Operational Summary
+    'Rebotes', 'Es Rango Repetitivo', 'Rango Dinamico', 'Estructura Tendencia',
+    'Volatilidad', 'Volatilidad Alta', 'Volatilidad Baja',
 }
 
 # Campos "extended" (detalle completo con técnica + Monte Carlo)
@@ -14837,12 +14440,12 @@ async def procesar_resultado(
                         parts.append(f"{_fmt_num(nivel)}×{cnt}")
                     else:
                         parts.append(str(item))
-                return " | ".join(parts) if parts else "—"
+                return " | ".join(parts) if parts else "-"
             if isinstance(v, str):
-                return v if v.strip() else "—"
-            return "—" if v is None else str(v)
+                return v if v.strip() else "-"
+            return "-" if v is None else str(v)
         except Exception:
-            return "—" if v is None else str(v)
+            return "-" if v is None else str(v)
 
     def _fmt_niveles_cell(v):
         # admite lista de niveles, lista de tuplas, dicts, etc.
@@ -14857,12 +14460,12 @@ async def procesar_resultado(
                         parts.append(_fmt_num(item.get("nivel")))
                     else:
                         parts.append(str(item))
-                return " | ".join(parts) if parts else "—"
+                return " | ".join(parts) if parts else "-"
             if isinstance(v, str):
-                return v if v.strip() else "—"
-            return "—" if v is None else str(v)
+                return v if v.strip() else "-"
+            return "-" if v is None else str(v)
         except Exception:
-            return "—" if v is None else str(v)
+            return "-" if v is None else str(v)
 
     if "Niveles Confirmados (Toques)" in df_resultados.columns:
         df_resultados["Niveles Confirmados (Toques)"] = df_resultados["Niveles Confirmados (Toques)"].apply(_fmt_toques_cell)
@@ -14879,8 +14482,8 @@ async def procesar_resultado(
     # Esto permite que el front navegue inmediatamente mientras se calculan ponderaciones
     if can_archive:
         t_preview_start = time.time()
-        # Crear versión preliminar ordenada alfabéticamente (sin ponderaciones todavía)
-        df_prelim = df_resultados.sort_values(by="Activo")
+        # Crear versión preliminar ordenada por Score Final (de whitelist) en lugar de alfabético
+        df_prelim = df_resultados.sort_values(by="Score Final", ascending=False, na_position='last')
         
         cols_ui = [
             "Activo",
@@ -14891,6 +14494,22 @@ async def procesar_resultado(
             "Stop Loss",
             "Autorizado Whitelist",
             "Motivo Rechazo",
+            "Soporte Nivel 1",
+            "Soporte Nivel 2",
+            "Resistencia Nivel 1",
+            "Resistencia Nivel 2",
+            "Apalancamiento Compra Nivel 1",
+            "Apalancamiento Compra Nivel 2",
+            "Apalancamiento Venta Nivel 1",
+            "Apalancamiento Venta Nivel 2",
+            "Apalancamiento Compra Nivel 1 Teorico",
+            "Apalancamiento Compra Nivel 2 Teorico",
+            "Apalancamiento Venta Nivel 1 Teorico",
+            "Apalancamiento Venta Nivel 2 Teorico",
+            "Rebotes",
+            "Es Rango Repetitivo",
+            "Rango Dinamico",
+            "Volatilidad",
         ]
         cols_ui = [c for c in cols_ui if c in df_prelim.columns]
 
@@ -14898,10 +14517,41 @@ async def procesar_resultado(
             df_prelim[cols_ui]
             .head(30)
             .replace([np.inf, -np.inf], np.nan)
-            .where(pd.notnull(df_prelim[cols_ui]), None)
+            .fillna(value=np.nan)  # Keep NaN as NaN for now
             .to_dict("records")
             if cols_ui else []
         )
+        # Convert NaN to None in the dictionaries for JSON serialization
+        ordenados_prelim = [
+            {k: (None if isinstance(v, float) and np.isnan(v) else v) for k, v in rec.items()}
+            for rec in ordenados_prelim
+        ]
+
+        try:
+            sample_prelim = ordenados_prelim[0] if ordenados_prelim else {}
+            logger.info(
+                "[preview payload] early_preview top=%s-%s tipo=%s score=%.1f levels=%s lev_buy=%s lev_sell=%s",
+                sample_prelim.get("Activo"),
+                sample_prelim.get("Temporalidad"),
+                sample_prelim.get("Tipo de Operacion"),
+                sample_prelim.get("Score Final") or 0,
+                {
+                    "S1": sample_prelim.get("Soporte Nivel 1"),
+                    "S2": sample_prelim.get("Soporte Nivel 2"),
+                    "R1": sample_prelim.get("Resistencia Nivel 1"),
+                    "R2": sample_prelim.get("Resistencia Nivel 2"),
+                },
+                {
+                    "N1": sample_prelim.get("Apalancamiento Compra Nivel 1"),
+                    "N2": sample_prelim.get("Apalancamiento Compra Nivel 2"),
+                },
+                {
+                    "N1": sample_prelim.get("Apalancamiento Venta Nivel 1"),
+                    "N2": sample_prelim.get("Apalancamiento Venta Nivel 2"),
+                },
+            )
+        except Exception:
+            pass
 
         top_timeframe_temp = _pick_top_timeframe(ordenados_prelim)
         top_timeframe_by_asset_temp = _pick_top_timeframe_by_asset(ordenados_prelim)
@@ -15020,6 +14670,22 @@ async def procesar_resultado(
             "Stop Loss",
             "Autorizado Whitelist",
             "Motivo Rechazo",
+            "Soporte Nivel 1",
+            "Soporte Nivel 2",
+            "Resistencia Nivel 1",
+            "Resistencia Nivel 2",
+            "Apalancamiento Compra Nivel 1",
+            "Apalancamiento Compra Nivel 2",
+            "Apalancamiento Venta Nivel 1",
+            "Apalancamiento Venta Nivel 2",
+            "Apalancamiento Compra Nivel 1 Teorico",
+            "Apalancamiento Compra Nivel 2 Teorico",
+            "Apalancamiento Venta Nivel 1 Teorico",
+            "Apalancamiento Venta Nivel 2 Teorico",
+            "Rebotes",
+            "Es Rango Repetitivo",
+            "Rango Dinamico",
+            "Volatilidad",
         ]
         cols_ui = [c for c in cols_ui if c in df_resultados_ordenado.columns]
 
@@ -15027,10 +14693,44 @@ async def procesar_resultado(
             df_resultados_ordenado[cols_ui]
             .head(30)
             .replace([np.inf, -np.inf], np.nan)
-            .where(pd.notnull(df_resultados_ordenado[cols_ui]), None)
+            .fillna(value=np.nan)  # Keep NaN as NaN for now
             .to_dict("records")
             if cols_ui else []
         )
+        # Convert NaN to None in the dictionaries for JSON serialization
+        ordenados_top = [
+            {k: (None if isinstance(v, float) and np.isnan(v) else v) for k, v in rec.items()}
+            for rec in ordenados_top
+        ]
+
+        try:
+            sample_final = ordenados_top[0] if ordenados_top else {}
+            logger.info(
+                "[preview payload] final top=%s-%s tipo=%s pond=%.1f score=%.1f levels=%s lev_buy=%s lev_sell=%s",
+                sample_final.get("Activo"),
+                sample_final.get("Temporalidad"),
+                sample_final.get("Tipo de Operacion"),
+                sample_final.get("Ponderacion") or 0,
+                sample_final.get("Score Final") or 0,
+                {
+                    "S1": sample_final.get("Soporte Nivel 1"),
+                    "S2": sample_final.get("Soporte Nivel 2"),
+                    "R1": sample_final.get("Resistencia Nivel 1"),
+                    "R2": sample_final.get("Resistencia Nivel 2"),
+                },
+                {
+                    "N1": sample_final.get("Apalancamiento Compra Nivel 1"),
+                    "N2": sample_final.get("Apalancamiento Compra Nivel 2"),
+                },
+                {
+                    "N1": sample_final.get("Apalancamiento Venta Nivel 1"),
+                    "N2": sample_final.get("Apalancamiento Venta Nivel 2"),
+                },
+            )
+            # Debug: log all keys in sample_final
+            logger.info("[DEBUG final preview] Available keys in ordenados_top[0]: %s", list(sample_final.keys()))
+        except Exception:
+            pass
 
         top_timeframe_final = _pick_top_timeframe(ordenados_top)
         top_timeframe_by_asset_final = _pick_top_timeframe_by_asset(ordenados_top)
@@ -15061,6 +14761,17 @@ async def procesar_resultado(
             "priority_assets": priority_assets,  # ✅ Activos prioritarios para monitoreo
             "ready_for_monitoring": [],  # Se actualizará a medida que se suban
         }
+
+        # ✅ DEBUG: Verificar que ordenados_top[0] tiene niveles antes de sanitizar
+        if ordenados_top:
+            first = ordenados_top[0]
+            logger.info(
+                "[DEBUG ui_resumen] ordenados_top[0] keys=%s S1=%s R1=%s Lev1=%s",
+                list(first.keys())[:15],
+                first.get("Soporte Nivel 1"),
+                first.get("Resistencia Nivel 1"),
+                first.get("Apalancamiento Compra Nivel 1"),
+            )
 
         try:
             logger.info(
@@ -17312,7 +17023,8 @@ async def comando_reset_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 #@profile
 async def cargar_datos_subscription_user():
     try:
-        docs = db.collection("suscripciones_user").stream()
+        firestore_db = get_firestore_db()
+        docs = firestore_db.collection("suscripciones_user").stream()
         out = {}
         for doc in docs:
             if not doc.exists:
@@ -17371,8 +17083,9 @@ async def get_subscription_types_with_refresh() -> dict:
 async def cargar_datos_subscription_type():
     """Carga los datos de tipos de suscripción desde Firestore y los ordena según el tipo (solo para bot o ambos)."""
     try:
+        firestore_db = get_firestore_db()
         # Referencia a la colección "suscripciones_tipo"
-        collection_ref = db.collection("suscripciones_tipo")
+        collection_ref = firestore_db.collection("suscripciones_tipo")
         
         # Consulta todos los documentos
         docs = collection_ref.stream()
@@ -17404,7 +17117,8 @@ async def cargar_datos_subscription_type():
 async def guardar_datos(data: dict):
     """data = {user_id: {...campos...}}"""
     try:
-        batch = db.batch()
+        firestore_db = get_firestore_db()
+        batch = firestore_db.batch()
         for user_id, detalles in data.items():
             # 2.1 upsert suscripción
             doc_ref = _subscription_doc(user_id)
@@ -17413,7 +17127,7 @@ async def guardar_datos(data: dict):
             # 2.2 mantener índice chat_ids si viene telegram_id
             tg = (detalles or {}).get("telegram_id")
             if tg:
-                chat_ref = db.collection("chat_ids").document(str(tg))
+                chat_ref = firestore_db.collection("chat_ids").document(str(tg))
                 batch.set(chat_ref, {"user_id": str(user_id)}, merge=True)
 
         batch.commit()
@@ -19215,9 +18929,11 @@ async def calcular_entradas_async(
     cfg: dict | None = None,
 ) -> dict[str, Any]:
     """
-    Async version of calcular_entradas using hexagonal CalculateEntriesUseCase.
+    Full async version of calcular_entradas with complete feature parity to sync path.
     
-    Phase 7: Full async refactoring with hexagonal architecture.
+    Phase 8: Complete async refactoring with all parallelization, analysis, and entry generation.
+    Includes: patterns, range, technical, fundamental analysis, predictions, S/R calculation,
+    probabilities, zones, confluence, entries, and leverage calculations.
     
     Args:
         df: OHLCV DataFrame
@@ -19229,41 +18945,516 @@ async def calcular_entradas_async(
         cfg: Configuration dict
     
     Returns:
-        Dict with entry signal analysis (compatible with legacy format)
+        Dict with entry signal analysis (complete legacy format)
     """
+    salida = {}
     try:
-        # Get use case instance
-        use_case = _get_calculate_entries_instance()
-        
-        # Normalize timeframe
+        # ===== INITIALIZATION & SETUP =====
         tf = _tf_backend(temporalidad)
+        window = min(definir_window(tf, overrides=calc_windows), len(df))
+        precio_actual = df["close"].iloc[-1]
+        loop = asyncio.get_event_loop()
         
-        # Execute hexagonal use case async
-        hex_result = await use_case.execute(
-            df=df,
-            df_eventos=df_eventos,
-            symbol=symbol,
-            timeframe=tf,
-            user_chat_id=user_chat_id,
-            config=cfg or {}
+        # ===== PARALLELIZATION: async gather for CPU-bound operations =====
+        # Using loop.run_in_executor() for sync-only functions
+        logger.debug(f"[ASYNC-PAR] {symbol}/{tf}: Iniciando paralelización de 4 análisis...")
+        
+        async def _detect_patterns():
+            try:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(None, detectar_patrones_confirmados_velas, df, window),
+                    timeout=15.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[TIMEOUT] Pattern detection timeout for {symbol}-{tf}")
+                return []
+            except Exception as e:
+                logger.info(f"Error detectando patrones para {symbol}-{tf}: {e}")
+                return []
+        
+        async def _detect_range():
+            try:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, 
+                        lambda: detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
+                    ),
+                    timeout=15.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[TIMEOUT] Range detection timeout for {symbol}-{tf}")
+                return {"es_rango_repetitivo": False, "estructura_tendencia": "indefinida", "rebotes": [], "rango_dinamico": [None, None]}
+            except Exception:
+                return {"es_rango_repetitivo": False, "estructura_tendencia": "indefinida", "rebotes": [], "rango_dinamico": [None, None]}
+        
+        async def _analyze_technical():
+            try:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(None, analisis_tecnico_detallado, df, tf, window, cfg),
+                    timeout=15.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"[TIMEOUT] Technical analysis timeout for {symbol}-{tf}")
+                return None
+            except Exception as e:
+                logger.info(f"Error en análisis técnico para {symbol}-{tf}: {e}")
+                return None
+        
+        async def _analyze_fundamental():
+            try:
+                now_utc = datetime.now(timezone.utc)
+                ny_tz = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)
+                now_ny = now_utc.astimezone(ny_tz)
+                fecha_inicio = (now_ny - timedelta(days=7)).strftime("%Y-%m-%d")
+                fecha_fin = now_ny.strftime("%Y-%m-%d")
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        ajustar_probabilidad_fundamental,
+                        50, df_eventos, symbol, tf, fecha_inicio, fecha_fin, cfg, True
+                    ),
+                    timeout=15.0
+                )
+                if isinstance(result, tuple):
+                    return result
+                else:
+                    return (result, None)
+            except Exception as e:
+                logger.info(f"Error en análisis fundamental para {symbol}-{tf}: {e}")
+                return (50.0, None)
+        
+        # Gather all parallel tasks
+        patrones_result, rango_result, tecnica_meta, fundamental_result = await asyncio.gather(
+            _detect_patterns(),
+            _detect_range(),
+            _analyze_technical(),
+            _analyze_fundamental(),
+            return_exceptions=False
         )
         
-        # Adapter: Convert hexagonal result to legacy format
-        return _adapt_hexagonal_to_legacy(hex_result, df, temporalidad)
+        # Process pattern results
+        patrones_detectados = {}
+        if patrones_result:
+            for _, _, nombre in patrones_result:
+                patrones_detectados[nombre] = True
+        
+        # Process fundamental results
+        if isinstance(fundamental_result, tuple):
+            probabilidad_fundamental, fundamental_meta = fundamental_result
+        else:
+            probabilidad_fundamental, fundamental_meta = fundamental_result, None
+        probabilidad_fundamental = round(probabilidad_fundamental if probabilidad_fundamental is not None else 50, 2)
+        
+        en_rango = rango_result
+        
+        # ===== PREDICTIONS (Parallelized) =====
+        logger.debug(f"[ASYNC-PRED] {symbol}/{tf}: Iniciando paralelización de predicciones...")
+        
+        async def _predict_arima():
+            try:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(None, predecir_arima, df, tf, symbol),
+                    timeout=ARIMA_TIMEOUT_SECONDS
+                )
+            except:
+                return None
+        
+        async def _predict_mm():
+            try:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(None, predecir_media_movil, df, window),
+                    timeout=30.0
+                )
+            except:
+                return None
+        
+        async def _predict_mc():
+            try:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(None, _wrapper_simulacion_monte_carlo, df, tf),
+                    timeout=30.0
+                )
+            except:
+                return (50, 50)
+        
+        try:
+            predicciones_arima, predicciones_media_movil, mc_result = await asyncio.gather(
+                _predict_arima(),
+                _predict_mm(),
+                _predict_mc(),
+                return_exceptions=False
+            )
+            
+            if mc_result and isinstance(mc_result, tuple):
+                probabilidad_alza, probabilidad_baja = mc_result
+            else:
+                probabilidad_alza, probabilidad_baja = 50, 50
+            
+            probabilidad_alza = probabilidad_alza if probabilidad_alza is not None else 50
+            probabilidad_baja = probabilidad_baja if probabilidad_baja is not None else 50
+        except Exception as e:
+            logger.warning(f"Error en predicciones paralelas para {symbol}-{tf}: {e}")
+            predicciones_arima = None
+            predicciones_media_movil = None
+            probabilidad_alza, probabilidad_baja = 50, 50
+        
+        # ===== DYNAMIC SUPPORT/RESISTANCE (WITH CACHE) =====
+        cache_key = _get_niveles_cache_key(symbol, tf, len(df), precio_actual)
+        soportes_cached, resistencias_cached = _get_cached_niveles(cache_key)
+        
+        if soportes_cached is not None and resistencias_cached is not None:
+            soportes_dinamicos = soportes_cached
+            resistencias_dinamicas = resistencias_cached
+        else:
+            try:
+                df, soportes_dinamicos, resistencias_dinamicas = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: ajustar_window_dinamico_optimizado(
+                            df,
+                            symbol,
+                            tf,
+                            precio_actual,
+                            calc_windows=calc_windows,
+                            max_incremento=5,
+                            min_factor=2,
+                            max_factor=8,
+                            min_levels=2,
+                        ),
+                    ),
+                    timeout=15.0
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Error calculando S/R dinámicos para {symbol}-{tf}: {e}",
+                    exc_info=True,
+                )
+                try:
+                    soportes_dinamicos, resistencias_dinamicas = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda: calcular_soportes_resistencias_para_window(
+                                window, df, precio_actual, 2, symbol, tf
+                            ),
+                        ),
+                        timeout=10.0,
+                    )
+                    logger.info(f"[Fallback S/R] {symbol}-{tf}: usando niveles estáticos (window={window})")
+                except Exception as e_fallback:
+                    logger.warning(
+                        f"[Fallback S/R] {symbol}-{tf}: falló cálculo estático: {e_fallback}",
+                        exc_info=True,
+                    )
+                    soportes_dinamicos = []
+                    resistencias_dinamicas = []
+            
+            soportes_dinamicos = _clean_levels(soportes_dinamicos)
+            resistencias_dinamicas = _clean_levels(resistencias_dinamicas)
+            _cache_niveles(cache_key, soportes_dinamicos, resistencias_dinamicas)
+        
+        # Update unified cross-timeframe cache
+        with _niveles_unificados_lock:
+            if symbol not in _niveles_unificados_cache:
+                _niveles_unificados_cache[symbol] = {
+                    "soportes": set(soportes_dinamicos),
+                    "resistencias": set(resistencias_dinamicas),
+                    "timestamp": datetime.now(UTC)
+                }
+            else:
+                entry = _niveles_unificados_cache[symbol]
+                entry["soportes"].update(soportes_dinamicos)
+                entry["resistencias"].update(resistencias_dinamicas)
+                entry["timestamp"] = datetime.now(UTC)
+        
+        # Get key levels and leverage
+        niveles_clave = obtener_niveles_clave(
+            df, soportes_dinamicos, resistencias_dinamicas,
+            symbol, tf, umbral_atr=2.0, max_niveles=2
+        )
+        
+        # ===== ATR CALCULATION =====
+        ATR = _tofloat(df["ATR"].iloc[-1]) if "ATR" in df.columns else None
+        atr_missing = not (ATR and _finite(ATR) and ATR > 0)
+        if atr_missing:
+            ATR = _atr14(df)
+            if not (ATR and _finite(ATR) and ATR > 0):
+                ATR = float(df["close"].iloc[-1]) * 0.002
+            logger.info(f"[ATR] Fallback usado para {symbol}/{tf}: ATR={ATR}")
+        
+        # ===== PROBABILITY CALCULATIONS =====
+        probabilidad_tecnica = round(ajustar_probabilidad_tecnica(
+            df, tf, window, cfg, niveles=niveles_clave, symbol=symbol
+        ), 2)
+        
+        probabilidad_general = calcular_probabilidad_general(
+            probabilidad_tecnica, probabilidad_fundamental, cfg
+        )
+        probabilidad_general = round(probabilidad_general if probabilidad_general is not None else 50, 2)
+        
+        # ===== ZONE VERIFICATION =====
+        verificar_znt = True
+        try:
+            verificar_znt = bool((cfg or {}).get("entrada", {}).get("verificar_zona_no_trading", True))
+        except Exception:
+            verificar_znt = True
+        
+        zona_no_trading = verificar_zona_no_trading(df, window) if verificar_znt else False
+        zona_no_trading_evento = bool(isinstance(fundamental_meta, dict) and fundamental_meta.get("blackout") is True)
+        zona_no_trading = bool(zona_no_trading) or zona_no_trading_evento
+        
+        zona_sobreventa = verificar_zona_sobreventa(df, window)
+        zona_sobrecompra = verificar_zona_sobrecompra(df, window)
+        
+        # ===== OPERATION TYPE DETERMINATION =====
+        tipo_operacion = determinar_tipo_operacion(
+            precio_actual,
+            predicciones_arima[0] if predicciones_arima else None,
+            predicciones_media_movil[0] if predicciones_media_movil else None,
+            probabilidad_alza,
+            probabilidad_baja,
+            patrones_detectados,
+            zona_sobreventa,
+            zona_sobrecompra,
+            probabilidad_general,
+            zona_no_trading,
+        )
+        
+        # ===== CONFLUENCE EVALUATION =====
+        try:
+            confluencia = evaluar_confluencia_trade(
+                symbol=symbol,
+                temporalidad=tf,
+                tipo_operacion=tipo_operacion,
+                precio_actual=precio_actual,
+                niveles=niveles_clave,
+                atr=ATR,
+                prob_tecnica=probabilidad_tecnica,
+                prob_fundamental=probabilidad_fundamental,
+                prob_general=probabilidad_general,
+                tecnica_meta=tecnica_meta,
+                fundamental_meta=fundamental_meta,
+                cfg=cfg,
+            )
+        except Exception as _e:
+            confluencia = {
+                'symbol': symbol,
+                'tf': tf,
+                'label': None,
+                'score': None,
+                'warnings': [f'confluencia_error: {_e}'],
+            }
+        
+        alertas_mt = []
+        try:
+            if isinstance(confluencia, dict):
+                alertas_mt.extend(list(confluencia.get('warnings') or []))
+        except Exception:
+            pass
+        
+        # ===== MULTIPLE ENTRY GENERATION =====
+        bollinger_upper = _coerce_float_safe(salida.get("bollinger_upper")) or _coerce_float_safe(
+            last_of(df, "bollinger_upper", default=None)
+        )
+        bollinger_lower = _coerce_float_safe(salida.get("bollinger_lower")) or _coerce_float_safe(
+            last_of(df, "bollinger_lower", default=None)
+        )
+        
+        max_candidates = int(os.environ.get("ENTRADA_MAX_CANDIDATES", "10"))
+        min_rrr = float(os.environ.get("ENTRADA_MIN_RRR", "2.0"))
+        enable_ladders = os.environ.get("ENTRADA_ENABLE_LADDERS", "false").lower() == "true"
+        enable_retest = os.environ.get("ENTRADA_ENABLE_RETEST", "false").lower() == "true"
+        enable_range_revert = os.environ.get("ENTRADA_ENABLE_RANGE_REVERT", "true").lower() == "true"
+        
+        entradas_mult = generar_entradas_multiples(
+            precio_actual=precio_actual,
+            ATR=ATR,
+            niveles=niveles_clave,
+            tipo_operacion=tipo_operacion,
+            en_rango=en_rango,
+            prob_general=probabilidad_general,
+            bollinger_upper=bollinger_upper,
+            bollinger_lower=bollinger_lower,
+            señales_compra=set(señales_compra),
+            señales_venta=set(señales_venta),
+            max_candidates=max_candidates,
+            min_rrr=min_rrr,
+            enable_ladder=enable_ladders,
+            enable_breakout_retest=enable_retest,
+            enable_range_mean_revert=enable_range_revert,
+        )
+        
+        # Attach metadata to entries
+        try:
+            for _e in (entradas_mult or []):
+                if isinstance(_e, dict):
+                    _m = _e.get('meta')
+                    if not isinstance(_m, dict):
+                        _m = {}
+                        _e['meta'] = _m
+                    if isinstance(tecnica_meta, dict):
+                        _m.setdefault('tecnica', tecnica_meta)
+                    if isinstance(fundamental_meta, dict):
+                        _m.setdefault('fundamental', fundamental_meta)
+                    if isinstance(confluencia, dict):
+                        _m.setdefault('confluencia', confluencia)
+                    if isinstance(alertas_mt, list) and alertas_mt:
+                        _m.setdefault('alertas', alertas_mt)
+        except Exception:
+            pass
+        
+        # ===== LEGACY ENTRY SELECTION (fallback if no entries) =====
+        best = entradas_mult[0] if entradas_mult else None
+        if best:
+            precio_entrada = best.get("precio_entrada")
+            take_profit = best.get("take_profit")
+            stop_loss = best.get("stop_loss")
+        else:
+            if tipo_operacion in señales_compra or (
+                tipo_operacion == "Neutral" and en_rango["estructura_tendencia"] in ("alcista", "indefinida")
+            ):
+                precio_entrada = (
+                    (niveles_clave["resistencia_nivel_1"] + niveles_clave["soporte_nivel_1"]) / 2
+                    if niveles_clave["resistencia_nivel_1"] and niveles_clave["soporte_nivel_1"]
+                    else precio_actual
+                )
+                take_profit, stop_loss = calc_tp_sl_compra(precio_entrada, ATR)
+                if not (stop_loss and take_profit and (stop_loss < precio_entrada < take_profit)):
+                    logger.warning(
+                        f"Valores incorrectos en {symbol} temporalidad:{tf} (compra): SL={stop_loss}, Entrada={precio_entrada}, TP={take_profit}"
+                    )
+                    stop_loss, take_profit = np.nan, np.nan
+            elif tipo_operacion in señales_venta or (
+                tipo_operacion == "Neutral" and en_rango["estructura_tendencia"] in ("bajista", "indefinida")
+            ):
+                precio_entrada = (
+                    (niveles_clave["resistencia_nivel_1"] + niveles_clave["soporte_nivel_1"]) / 2
+                    if niveles_clave["resistencia_nivel_1"] and niveles_clave["soporte_nivel_1"]
+                    else precio_actual
+                )
+                take_profit, stop_loss = calc_tp_sl_venta(precio_entrada, ATR)
+                if not (take_profit and stop_loss and (take_profit < precio_entrada < stop_loss)):
+                    logger.warning(
+                        f"Valores incorrectos en {symbol} temporalidad:{tf} (venta): TP={take_profit}, Entrada={precio_entrada}, SL={stop_loss}"
+                    )
+                    stop_loss, take_profit = np.nan, np.nan
+            else:
+                precio_entrada = None
+                take_profit = None
+                stop_loss = None
+        
+        # ===== PROXIMITY & OPPORTUNITY FLAGS =====
+        def esta_cerca(precio, nivel, umbral_cercania=0.01):
+            return False if nivel is None else abs(precio - nivel) / precio <= umbral_cercania
+        
+        cerca_de_soporte_resistencia = (
+            "Cerca de Soporte Nivel 2"
+            if esta_cerca(precio_actual, niveles_clave.get("soporte_nivel_2"))
+            else "Cerca de Soporte Nivel 1"
+            if esta_cerca(precio_actual, niveles_clave.get("soporte_nivel_1"))
+            else "Cerca de Resistencia Nivel 1"
+            if esta_cerca(precio_actual, niveles_clave.get("resistencia_nivel_1"))
+            else "Cerca de Resistencia Nivel 2"
+            if esta_cerca(precio_actual, niveles_clave.get("resistencia_nivel_2"))
+            else "No Cerca"
+        )
+        
+        flag_oportunidad = False
+        if not zona_no_trading:
+            if probabilidad_general > 53 and not zona_sobrecompra:
+                flag_oportunidad = True
+            elif probabilidad_general < 47 and not zona_sobreventa:
+                flag_oportunidad = True
+        
+        # ===== TREND PREDICTION =====
+        tendencia_predicha = predecir_tendencia_en_tiempo_real(df, temporalidad)
+
+        # ===== VOLATILITY LABELS (for Operational Summary UI) =====
+        volatilidad = None
+        volatilidad_alta = None
+        volatilidad_baja = None
+        if isinstance(tecnica_meta, dict):
+            atr_regime = str(tecnica_meta.get("atr_regime") or "").upper()
+            if atr_regime == "HIGH":
+                volatilidad = "Alta"
+                volatilidad_alta = True
+                volatilidad_baja = False
+            elif atr_regime == "LOW":
+                volatilidad = "Baja"
+                volatilidad_alta = False
+                volatilidad_baja = True
+            elif atr_regime:
+                volatilidad = "Media"
+                volatilidad_alta = False
+                volatilidad_baja = False
+        
+        # ===== COMPLETE OUTPUT DICTIONARY (32+ fields) =====
+        salida = {
+            "patrones_detectados": patrones_detectados,
+            "predicciones_arima": predicciones_arima,
+            "predicciones_media_movil": predicciones_media_movil,
+            "probabilidad_alza": probabilidad_alza,
+            "probabilidad_baja": probabilidad_baja,
+            "macd_cruce": df["macd_cruce"].iloc[-1] if "macd_cruce" in df.columns else None,
+            "macd_cerca_de_cruzar": df["macd_cerca_de_cruzar"].iloc[-1] if "macd_cerca_de_cruzar" in df.columns else None,
+            "bollinger_signal": df["bollinger_signal"].iloc[-1] if "bollinger_signal" in df.columns else None,
+            "bollinger_upper": last_of(df, "bollinger_upper", default=None) if "bollinger_upper" in df.columns else None,
+            "bollinger_lower": last_of(df, "bollinger_lower", default=None) if "bollinger_lower" in df.columns else None,
+            "tendencia_predicha": tendencia_predicha,
+            "volatilidad": volatilidad,
+            "volatilidad_alta": volatilidad_alta,
+            "volatilidad_baja": volatilidad_baja,
+            "ultimo_valor": precio_actual,
+            "soporte_nivel_2": niveles_clave.get("soporte_nivel_2"),
+            "soporte_nivel_1": niveles_clave.get("soporte_nivel_1"),
+            "resistencia_nivel_1": niveles_clave.get("resistencia_nivel_1"),
+            "resistencia_nivel_2": niveles_clave.get("resistencia_nivel_2"),
+            "apalancamiento_compra_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_1"),
+            "apalancamiento_compra_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_2"),
+            "apalancamiento_venta_nivel_1": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_1"),
+            "apalancamiento_venta_nivel_2": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_2"),
+            "apalancamiento_compra_nivel_1_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_1_teorico"),
+            "apalancamiento_compra_nivel_2_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_compra_nivel_2_teorico"),
+            "apalancamiento_venta_nivel_1_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_1_teorico"),
+            "apalancamiento_venta_nivel_2_teorico": niveles_clave.get("multiplicador", {}).get("apalancamiento_venta_nivel_2_teorico"),
+            "precio_entrada": precio_entrada,
+            "take_profit": take_profit,
+            "stop_loss": stop_loss,
+            "es_rango_repetitivo": en_rango.get("es_rango_repetitivo"),
+            "estructura_tendencia": en_rango.get("estructura_tendencia"),
+            "rebotes": en_rango.get("rebotes"),
+            "rango_dinamico": en_rango.get("rango_dinamico"),
+            "soportes_alcanzados": niveles_clave.get("niveles_importantes_soportes"),
+            "resistencias_alcanzadas": niveles_clave.get("niveles_importantes_resistencias"),
+            "cerca_de_soporte_resistencia": cerca_de_soporte_resistencia,
+            "soportes_importantes_alcanzados": niveles_clave.get("soportes_confirmados_orden"),
+            "resistencias_importantes_alcanzadas": niveles_clave.get("resistencias_confirmadas_orden"),
+            "niveles_confirmados_orden_toques_all": niveles_clave.get("niveles_confirmados_orden_toques_all"),
+            "niveles_confirmados_orden_nivel_all": niveles_clave.get("niveles_confirmados_orden_nivel_all"),
+            "niveles_confirmados_orden_nivel_reduced": niveles_clave.get("niveles_confirmados_orden_nivel_reduced"),
+            "probabilidad_tecnica": probabilidad_tecnica,
+            "probabilidad_fundamental": probabilidad_fundamental,
+            "probabilidad_general": probabilidad_general,
+            "zona_no_trading_evento": zona_no_trading_evento,
+            "alertas": alertas_mt,
+            "tecnica_meta": tecnica_meta,
+            "fundamental_meta": fundamental_meta,
+            "confluencia": confluencia,
+            "tipo_operacion": tipo_operacion,
+            "flag_oportunidad": flag_oportunidad,
+            "zona_no_trading": zona_no_trading,
+            "zona_sobreventa": zona_sobreventa,
+            "zona_sobrecompra": zona_sobrecompra,
+            "entradas": entradas_mult,
+        }
+        return json_safe(salida)
     
     except Exception as e:
-        logger.error(f"Error in async calcular_entradas: {e}", exc_info=True)
-        # Return neutral signal on error (backward compatible)
-        return {
-            "tipo_operacion": "Neutral",
-            "probabilidad_alza": 50,
-            "probabilidad_baja": 50,
-            "probabilidad_tecnica": 50,
-            "probabilidad_fundamental": 50,
-            "confianza": 0,
-            "razon": f"Error: {str(e)}",
-            "error": str(e),
-        }
+        logger.exception(f"calcular_entradas_async falló: {e}")
+        if not salida:
+            salida = {}
+        salida.setdefault("entradas_multiples", [])
+        salida.setdefault("entradas", {"lista": []})
+        return json_safe(salida)
 
 
 def calcular_entradas_sync_wrapper(
@@ -19279,37 +19470,48 @@ def calcular_entradas_sync_wrapper(
     """
     Sync wrapper for calcular_entradas_async.
     
-    Phase 7: Async-first design with sync compatibility wrapper.
-    Can be called from sync code with minimal overhead.
+    Phase 7: Async-first architecture with sync compatibility.
+    Simply runs the async function synchronously using asyncio.run().
     
-    Args: Same as async version
-    Returns: Same as async version
+    Args: Same as calcular_entradas_async
+    Returns: Dict with entry signal analysis
     """
     try:
-        # Run async function in current event loop or create new one
-        try:
-            # Try to get existing event loop
-            loop = asyncio.get_running_loop()
-            # If we're already in an async context, create task
-            import concurrent.futures
-            # This would require a different approach - create_task won't work from sync
-            raise RuntimeError("Cannot call sync_wrapper from inside async context")
-        except RuntimeError:
-            # No event loop, create new one using run()
-            return asyncio.run(
-                calcular_entradas_async(
-                    df, df_eventos, symbol, temporalidad,
-                    user_chat_id=user_chat_id,
-                    calc_windows=calc_windows,
-                    cfg=cfg
-                )
+        # Execute async function synchronously
+        logger.debug(f"[ASYNC-PATH] {symbol}: Ejecutando calcular_entradas_async()...")
+        result = asyncio.run(
+            calcular_entradas_async(
+                df, df_eventos, symbol, temporalidad,
+                user_chat_id=user_chat_id,
+                calc_windows=calc_windows,
+                cfg=cfg
             )
+        )
+        if result:
+            logger.debug(f"[ASYNC-PATH] {symbol}: Éxito")
+            return result
+        else:
+            logger.warning(f"[ASYNC-PATH] {symbol}: Resultado vacío")
+            return {
+                "tipo_operacion": "Neutral",
+                "probabilidad_alza": 50,
+                "probabilidad_baja": 50,
+                "probabilidad_tecnica": 50,
+                "probabilidad_fundamental": 50,
+                "confianza": 0,
+                "razon": "Resultado vacío",
+                "error": "Empty result",
+            }
     except Exception as e:
-        logger.error(f"Error in sync wrapper: {e}", exc_info=True)
+        logger.error(f"[ASYNC-PATH] Error en sync wrapper: {e}", exc_info=True)
         return {
             "tipo_operacion": "Neutral",
             "probabilidad_alza": 50,
             "probabilidad_baja": 50,
+            "probabilidad_tecnica": 50,
+            "probabilidad_fundamental": 50,
+            "confianza": 0,
+            "razon": f"Error: {str(e)}",
             "error": str(e),
         }
 
@@ -19318,10 +19520,11 @@ def _adapt_hexagonal_to_legacy(hex_result: dict, df: pd.DataFrame, temporalidad:
     """
     Adapter: Convert hexagonal CalculateEntriesUseCase result to legacy calcular_entradas format.
     
-    Phase 7: Bridge between hexagonal and legacy code.
+    Phase 7: Bridge between hexagonal and legacy code - including leverage calculation.
     """
     try:
         precio_actual = float(df["close"].iloc[-1])
+        symbol = hex_result.get('symbol', 'UNKNOWN')
         
         # Map tipo_operacion
         tipo_op_map = {
@@ -19330,6 +19533,90 @@ def _adapt_hexagonal_to_legacy(hex_result: dict, df: pd.DataFrame, temporalidad:
             'NEUTRAL': 'Neutral',
         }
         tipo_operacion = tipo_op_map.get(hex_result.get('tipo_operacion', 'Neutral'), 'Neutral')
+        
+        # Extract levels from hex result
+        s1 = hex_result.get('niveles', {}).get('s1')
+        s2 = hex_result.get('niveles', {}).get('s2')
+        r1 = hex_result.get('niveles', {}).get('r1')
+        r2 = hex_result.get('niveles', {}).get('r2')
+        
+        logger.info(f"[DEBUG-APAL] {symbol}/{temporalidad}: Extrayendo S1={s1}, S2={s2}, R1={r1}, R2={r2}, precio={precio_actual}")
+        
+        # Calculate leverage for each level using the legacy logic
+        apalancamiento_compra_nivel_1 = None
+        apalancamiento_compra_nivel_2 = None
+        apalancamiento_venta_nivel_1 = None
+        apalancamiento_venta_nivel_2 = None
+        apalancamiento_compra_nivel_1_teorico = None
+        apalancamiento_compra_nivel_2_teorico = None
+        apalancamiento_venta_nivel_1_teorico = None
+        apalancamiento_venta_nivel_2_teorico = None
+        
+        # Fallback ATR calculation
+        ATR = None
+        try:
+            ATR = _tofloat(df["ATR"].iloc[-1]) if "ATR" in df.columns else None
+            if not (ATR and _finite(ATR) and ATR > 0):
+                ATR = _atr14(df)
+                if not (ATR and _finite(ATR) and ATR > 0):
+                    ATR = float(df["close"].iloc[-1]) * 0.002
+        except Exception as e:
+            ATR = float(df["close"].iloc[-1]) * 0.002
+            logger.info(f"[DEBUG-APAL] {symbol}: ATR fallback, error={e}, usando ATR={ATR}")
+        
+        logger.info(f"[DEBUG-APAL] {symbol}/{temporalidad}: ATR={ATR}")
+        
+        # Calculate leverage for BUY (support levels)
+        if pd.notna(s1) and s1 is not None and s1 > 0:
+            try:
+                logger.info(f"[DEBUG-APAL] {symbol}: Calculando apalancamiento compra S1 (precio={precio_actual}, s1={s1})")
+                apalancamiento_compra_nivel_1, apalancamiento_compra_nivel_1_teorico, msg_1 = calcular_apalancamiento_seguro(
+                    precio_actual, s1, ATR, max_leverage=25
+                )
+                apalancamiento_compra_nivel_1 = int(apalancamiento_compra_nivel_1)
+                apalancamiento_compra_nivel_1_teorico = int(apalancamiento_compra_nivel_1_teorico)
+                logger.info(f"[DEBUG-APAL] {symbol}: Apal S1 = {apalancamiento_compra_nivel_1}x (teorico={apalancamiento_compra_nivel_1_teorico}x)")
+            except Exception as e:
+                logger.warning(f"[DEBUG-APAL] {symbol}: S1 error: {e}")
+        
+        if pd.notna(s2) and s2 is not None and s2 > 0:
+            try:
+                logger.info(f"[DEBUG-APAL] {symbol}: Calculando apalancamiento compra S2 (precio={precio_actual}, s2={s2})")
+                apalancamiento_compra_nivel_2, apalancamiento_compra_nivel_2_teorico, msg_2 = calcular_apalancamiento_seguro(
+                    precio_actual, s2, ATR, max_leverage=25
+                )
+                apalancamiento_compra_nivel_2 = int(apalancamiento_compra_nivel_2)
+                apalancamiento_compra_nivel_2_teorico = int(apalancamiento_compra_nivel_2_teorico)
+                logger.info(f"[DEBUG-APAL] {symbol}: Apal S2 = {apalancamiento_compra_nivel_2}x (teorico={apalancamiento_compra_nivel_2_teorico}x)")
+            except Exception as e:
+                logger.warning(f"[DEBUG-APAL] {symbol}: S2 error: {e}")
+        
+        # Calculate leverage for SELL (resistance levels)
+        if pd.notna(r1) and r1 is not None and r1 > 0:
+            try:
+                logger.info(f"[DEBUG-APAL] {symbol}: Calculando apalancamiento venta R1 (precio={precio_actual}, r1={r1})")
+                apalancamiento_venta_nivel_1, apalancamiento_venta_nivel_1_teorico, msg_1 = calcular_apalancamiento_seguro(
+                    precio_actual, r1, ATR, max_leverage=25
+                )
+                apalancamiento_venta_nivel_1 = int(apalancamiento_venta_nivel_1)
+                apalancamiento_venta_nivel_1_teorico = int(apalancamiento_venta_nivel_1_teorico)
+                logger.info(f"[DEBUG-APAL] {symbol}: Apal R1 = {apalancamiento_venta_nivel_1}x (teorico={apalancamiento_venta_nivel_1_teorico}x)")
+            except Exception as e:
+                logger.warning(f"[DEBUG-APAL] {symbol}: R1 error: {e}")
+        
+        if pd.notna(r2) and r2 is not None and r2 > 0:
+            try:
+                logger.info(f"[DEBUG-APAL] {symbol}: Calculando apalancamiento venta R2 (precio={precio_actual}, r2={r2})")
+                apalancamiento_venta_nivel_2, apalancamiento_venta_nivel_2_teorico, msg_2 = calcular_apalancamiento_seguro(
+                    precio_actual, r2, ATR, max_leverage=25
+                )
+                apalancamiento_venta_nivel_2 = int(apalancamiento_venta_nivel_2)
+                apalancamiento_venta_nivel_2_teorico = int(apalancamiento_venta_nivel_2_teorico)
+                logger.info(f"[DEBUG-APAL] {symbol}: Apal R2 = {apalancamiento_venta_nivel_2}x (teorico={apalancamiento_venta_nivel_2_teorico}x)")
+            except Exception as e:
+                logger.warning(f"[DEBUG-APAL] {symbol}: R2 error: {e}")
+        
+        logger.info(f"[DEBUG-APAL] {symbol}: Apal compra C1 = {apalancamiento_compra_nivel_1}x, Apal venta V1 = {apalancamiento_venta_nivel_1}x")
         
         # Build legacy output structure
         return {
@@ -19343,15 +19630,25 @@ def _adapt_hexagonal_to_legacy(hex_result: dict, df: pd.DataFrame, temporalidad:
             "razon": hex_result.get('razon', ''),
             
             # Support/Resistance levels
-            "soporte_nivel_2": hex_result.get('niveles', {}).get('s2'),
-            "soporte_nivel_1": hex_result.get('niveles', {}).get('s1'),
-            "resistencia_nivel_1": hex_result.get('niveles', {}).get('r1'),
-            "resistencia_nivel_2": hex_result.get('niveles', {}).get('r2'),
+            "soporte_nivel_2": s2,
+            "soporte_nivel_1": s1,
+            "resistencia_nivel_1": r1,
+            "resistencia_nivel_2": r2,
+            
+            # Leverage values (RESTORED)
+            "apalancamiento_compra_nivel_1": apalancamiento_compra_nivel_1,
+            "apalancamiento_compra_nivel_2": apalancamiento_compra_nivel_2,
+            "apalancamiento_venta_nivel_1": apalancamiento_venta_nivel_1,
+            "apalancamiento_venta_nivel_2": apalancamiento_venta_nivel_2,
+            "apalancamiento_compra_nivel_1_teorico": apalancamiento_compra_nivel_1_teorico,
+            "apalancamiento_compra_nivel_2_teorico": apalancamiento_compra_nivel_2_teorico,
+            "apalancamiento_venta_nivel_1_teorico": apalancamiento_venta_nivel_1_teorico,
+            "apalancamiento_venta_nivel_2_teorico": apalancamiento_venta_nivel_2_teorico,
             
             # Technical data
             "atr": hex_result.get('atr'),
             "es_rango_repetitivo": hex_result.get('is_range', False),
-            "estructura_tendencia": hex_result.get('structure', 'undefined'),
+            "estructura_tendencia": hex_result.get('structure', 'indefinida'),
             
             # Metadata
             "ultimo_valor": precio_actual,
@@ -19360,7 +19657,7 @@ def _adapt_hexagonal_to_legacy(hex_result: dict, df: pd.DataFrame, temporalidad:
         }
     
     except Exception as e:
-        logger.warning(f"Adapter error: {e}")
+        logger.warning(f"Adapter error: {e}", exc_info=True)
         return hex_result  # Fallback to hexagonal format
 
 

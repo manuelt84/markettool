@@ -27,6 +27,7 @@ from markettool.application.use_cases.parallel_analysis_v2 import (
 from markettool.interfaces.scheduler.bot_init import initialize_bot_async
 from markettool.interfaces.api.route_factory import register_all_routes
 from markettool.interfaces.containers import DIContainer
+from markettool.interfaces.legacy_services import LegacyServices
 
 # Production Readiness (Phase 8)
 from markettool.core.env_validation import validate_production_readiness
@@ -40,20 +41,29 @@ def _warmup_processpool():
     """Pre-spawn ProcessPool workers with dummy task to avoid cold start."""
     try:
         t0 = time.time()
-        from markettool.domain.analysis.parallel_engine import _get_or_create_executor
-        
+        from concurrent.futures import ProcessPoolExecutor
+        from multiprocessing import get_context
+
         # Dummy task para forzar spawn de workers
         def _dummy_task():
             import numpy as np
             return np.arange(10).sum()
+
+        # Spawn a small pool to pre-warm processes (avoid heavy RAM use)
+        max_workers = int(os.environ.get("ANALYSIS_PRED_WORKERS", "2"))
+        warmup_workers = max(1, min(2, max_workers))
         
-        # Crear executors (esto triggerea spawn)
-        prediccion_executor = _get_or_create_executor("prediccion")
-        
-        # Submit dummy tasks para 2 de 4 workers (no todos - ahorro RAM)
-        futures = [prediccion_executor.submit(_dummy_task) for _ in range(2)]
-        
-        # No esperar - daemon thread
+        with ProcessPoolExecutor(
+            max_workers=warmup_workers,
+            mp_context=get_context("spawn"),
+        ) as executor:
+            futures = [executor.submit(_dummy_task) for _ in range(warmup_workers)]
+            for fut in futures:
+                try:
+                    fut.result(timeout=10)
+                except Exception:
+                    pass
+
         logger.info(f"[Warmup] ProcessPool workers pre-spawned in {(time.time()-t0)*1000:.1f}ms")
     except Exception as e:
         logger.warning(f"[Warmup] ProcessPool warmup failed (non-critical): {e}")
@@ -131,6 +141,9 @@ def _warmup_caches_principales():
         warmed_count = 0
         failed_count = 0
         total_combos = len(main_assets) * len(main_timeframes)
+        warmup_verbose = str(os.getenv("WARMUP_VERBOSE", "0")).strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
         
         for symbol in main_assets:
             for tf in main_timeframes:
@@ -143,8 +156,17 @@ def _warmup_caches_principales():
                         warmed_count += 1
                     else:
                         failed_count += 1
+                        if warmup_verbose:
+                            logger.warning(
+                                "[Warmup] Empty history for %s/%s (check FMP/network/cache)",
+                                symbol,
+                                tf,
+                            )
                 except Exception as e:
-                    logger.debug(f"[Warmup] Failed to warm {symbol}/{tf}: {e}")
+                    if warmup_verbose:
+                        logger.warning(f"[Warmup] Failed to warm {symbol}/{tf}: {e}")
+                    else:
+                        logger.debug(f"[Warmup] Failed to warm {symbol}/{tf}: {e}")
                     failed_count += 1
                     
                 # Yield para no bloquear event loop
@@ -155,6 +177,11 @@ def _warmup_caches_principales():
             f"[Warmup] Caches principales pre-poblados: {warmed_count}/{total_combos} exitosos "
             f"({failed_count} fallos) en {elapsed:.1f}ms"
         )
+        if warmed_count == 0:
+            logger.warning(
+                "[Warmup] All cache warmups failed. Check FMP availability, credentials, "
+                "network access, or symbol mapping. Set WARMUP_VERBOSE=1 for per-symbol logs."
+            )
     except Exception as e:
         logger.warning(f"[Warmup] Cache warmup failed (non-critical): {e}")
 
@@ -230,6 +257,64 @@ def main() -> None:
             scheduler,
             _POD_COORDINATOR,
             logger as market_tool_logger,
+            Update,
+            RUNNING,
+            _EXECUTION_TRACKER,
+            estado_suscripcion,
+            es_administrador,
+            normalize_operatoria_payload,
+            temporalidades,
+            _ensure_globals_loaded,
+            filtrar_activos_por_moneda,
+            activos,
+            compute_lock_ttl,
+            acquire_user_lock,
+            release_user_lock,
+            mark_user_state,
+            obtener_opciones_usuario,
+            fs_crear_ejecucion,
+            fs_marcar_worker,
+            fs_finalizar_ejecucion,
+            fs_heartbeat,
+            _USER_CONFIG_CACHE,
+            pytz,
+            _set_timezone_state,
+            clear_current_request_cfg,
+            ocupado_lock,
+            es_grafico_de_velas,
+            analizar_con_yolo,
+            descontar_transaccion,
+            STOP_EVENTS,
+            STOP_EVENTS_LOCK,
+            _optimize_records_for_upload,
+            ejecutar_recurrente,
+            _charge_monitoreo_per_call,
+            _fetch_events_for,
+            _filter_by_symbol_currencies,
+            _hash_payload,
+            _LAST_HASH,
+            _detect_new_results,
+            evaluar_evento_para_symbol,
+            _norm_tf,
+            _tf_is_enabled,
+            _load_cache,
+            _series_to_ms,
+            _snap_and_dedupe_to_minutes,
+            _densify_minutes,
+            _maybe_tick_quote,
+            _MON_CACHE_LOCK,
+            _maybe_refresh_from_gcs,
+            fs_touch_monitoreo,
+            _tf_ms,
+            _current_closed_bucket_start,
+            _fetch_historical_range,
+            merge_bars_series,
+            _backfill_internal_gaps,
+            BUCKET_NAME,
+            _INDICATORS_CACHE,
+            _INDICATORS_CACHE_ENABLED,
+            _INDICATORS_CACHE_TTL_HOURS,
+            _INDICATORS_FORCE_RECALC,
             # Lazy-loaded services (initialized on-demand):
             get_firestore_db,
             get_gcs_client,
@@ -326,6 +411,71 @@ def main() -> None:
         )
         logger.info("✅ Health endpoints: /health, /ready, /healthz, /startup, /cache-status")
         
+        # Create legacy service bundle for migrated routes
+        legacy_services = LegacyServices(
+            application=get_telegram_application(),
+            db=get_firestore_db(),
+            logger=market_tool_logger,
+            update_cls=Update,
+            running_tasks=RUNNING,
+            execution_tracker=_EXECUTION_TRACKER,
+            estado_suscripcion=estado_suscripcion,
+            es_administrador=es_administrador,
+            normalize_operatoria_payload=normalize_operatoria_payload,
+            temporalidades=temporalidades,
+            ensure_globals_loaded=_ensure_globals_loaded,
+            filtrar_activos_por_moneda=filtrar_activos_por_moneda,
+            activos_ref=activos,
+            compute_lock_ttl=compute_lock_ttl,
+            acquire_user_lock=acquire_user_lock,
+            release_user_lock=release_user_lock,
+            mark_user_state=mark_user_state,
+            obtener_opciones_usuario=obtener_opciones_usuario,
+            fs_crear_ejecucion=fs_crear_ejecucion,
+            fs_marcar_worker=fs_marcar_worker,
+            fs_finalizar_ejecucion=fs_finalizar_ejecucion,
+            fs_heartbeat=fs_heartbeat,
+            user_config_cache=_USER_CONFIG_CACHE,
+            pytz_module=pytz,
+            set_timezone_state=_set_timezone_state,
+            clear_current_request_cfg=clear_current_request_cfg,
+            ocupado_lock=ocupado_lock,
+            es_grafico_de_velas=es_grafico_de_velas,
+            analizar_con_yolo=analizar_con_yolo,
+            descontar_transaccion=descontar_transaccion,
+            stop_events_ref=STOP_EVENTS,
+            stop_events_lock=STOP_EVENTS_LOCK,
+            optimize_records_for_upload=_optimize_records_for_upload,
+            ejecutar_recurrente=ejecutar_recurrente,
+            charge_monitoreo_per_call=_charge_monitoreo_per_call,
+            fetch_events_for=_fetch_events_for,
+            filter_by_symbol_currencies=_filter_by_symbol_currencies,
+            hash_payload=_hash_payload,
+            last_hash_ref=_LAST_HASH,
+            detect_new_results=_detect_new_results,
+            evaluar_evento_para_symbol=evaluar_evento_para_symbol,
+            norm_tf=_norm_tf,
+            tf_is_enabled=_tf_is_enabled,
+            load_cache=_load_cache,
+            series_to_ms=_series_to_ms,
+            snap_and_dedupe_to_minutes=_snap_and_dedupe_to_minutes,
+            densify_minutes=_densify_minutes,
+            maybe_tick_quote=_maybe_tick_quote,
+            mon_cache_lock=_MON_CACHE_LOCK,
+            maybe_refresh_from_gcs=_maybe_refresh_from_gcs,
+            fs_touch_monitoreo=fs_touch_monitoreo,
+            tf_ms=_tf_ms,
+            current_closed_bucket_start=_current_closed_bucket_start,
+            fetch_historical_range=_fetch_historical_range,
+            merge_bars_series=merge_bars_series,
+            backfill_internal_gaps=_backfill_internal_gaps,
+            bucket_name=BUCKET_NAME,
+            indicators_cache=_INDICATORS_CACHE,
+            cache_enabled=_INDICATORS_CACHE_ENABLED,
+            ttl_hours=_INDICATORS_CACHE_TTL_HOURS,
+            force_recalc=_INDICATORS_FORCE_RECALC,
+        )
+
         # Create DI container with all port adapters
         logger.info("Step 5/6: Setting up dependency injection container...")
         container = DIContainer.create_default(
@@ -334,6 +484,7 @@ def main() -> None:
             fmp_client=fmp,
             telegram_app=get_telegram_application(),
             default_chat_id=None,  # Would come from config
+            legacy_services=legacy_services,
             logger=market_tool_logger,
         )
         logger.info("✅ DI container created")
@@ -342,6 +493,8 @@ def main() -> None:
         logger.info("Registering hexagonal architecture routes...")
         register_all_routes(get_webhook_app(), container, logger=market_tool_logger)
         logger.info("✅ Hexagonal routes registered")
+
+        logger.info("✅ Legacy routes registered via route_factory")
         
         # Register shutdown callbacks
         async def shutdown_telegram_bot():

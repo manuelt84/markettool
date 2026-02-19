@@ -6,6 +6,8 @@ import logging
 import os
 from typing import Optional, Any
 
+from markettool.interfaces.legacy_services import LegacyServices
+
 from markettool.application.use_cases import (
     GetHistoricosUseCase,
     GetQuoteUseCase,
@@ -41,6 +43,7 @@ class DIContainer:
         quote_provider: QuoteProvider,
         cache_provider: CacheProvider,
         notifier: Notifier,
+        legacy_services: Optional[LegacyServices] = None,
         logger: Optional[logging.Logger] = None,
     ):
         """
@@ -57,6 +60,7 @@ class DIContainer:
         self.quote_provider = quote_provider
         self.cache_provider = cache_provider
         self.notifier = notifier
+        self.legacy_services = legacy_services
         self.logger = logger or logging.getLogger(__name__)
         
         # Cache use case instances
@@ -117,6 +121,7 @@ class DIContainer:
             "get_quote": self.get_quote,
             "run_analysis": self.run_analysis,
             "warm_cache": self.warm_cache,
+            "legacy_services": self.legacy_services,
         }
     
     @classmethod
@@ -127,6 +132,7 @@ class DIContainer:
         fmp_client: Optional[Any] = None,
         telegram_app: Optional[Any] = None,
         default_chat_id: Optional[str] = None,
+        legacy_services: Optional[LegacyServices] = None,
         logger: Optional[logging.Logger] = None,
     ) -> DIContainer:
         """
@@ -197,5 +203,6 @@ class DIContainer:
             quote_provider=quote_provider,
             cache_provider=cache_provider,
             notifier=notifier,
+            legacy_services=legacy_services,
             logger=_logger,
         )
