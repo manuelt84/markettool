@@ -13687,11 +13687,12 @@ async def ejecutar_analisis_con_hilos(
         per_symbol_concurrency,
     )
     
-    # Warn if parallelism is severely limited
-    if per_symbol_concurrency > 0 and effective_concurrency < (total_tasks / 4):
+    # Warn if parallelism is severely limited (only if < 25% of theoretical max)
+    min_theoretical_concurrency = min(len(activos_filtrados), len(temps))  # At least symbol-level or timeframe-level parallelism
+    if per_symbol_concurrency > 0 and effective_concurrency < min_theoretical_concurrency:
         logger.warning(
-            f"[Analisis] ⚠️ Paralelismo limitado: per_symbol={per_symbol_concurrency} permite max {effective_concurrency} tasks concurrentes "
-            f"(de {total_tasks} totales). Aumenta ANALYSIS_PER_SYMBOL_CONCURRENCY={len(temps)} para paralelismo completo."
+            f"[Analisis] ⚠️ Paralelismo limitado: sem={effective_concurrency} < symbols={len(activos_filtrados)}. "
+            f"Consider increasing ANALYSIS_SEMAPHORE."
         )
     
     # 📊 Resetear estadísticas de caché para esta ejecución
