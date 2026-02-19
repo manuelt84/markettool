@@ -19151,7 +19151,7 @@ async def calcular_entradas_async(
                             min_levels=2,
                         ),
                     ),
-                    timeout=30.0  # INCREASED: 15s→30s for complex analysis
+                    timeout=60.0  # INCREASED: 30s→60s (complex analysis under high concurrency)
                 )
             except Exception as e:
                 logger.warning(
