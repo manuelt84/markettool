@@ -13674,11 +13674,8 @@ async def ejecutar_analisis_con_hilos(
     slow_task_sec = int(os.environ.get("ANALYSIS_SLOW_TASK_SEC", "30"))
     
     # Calculate effective concurrency limit
-    effective_concurrency = (
-        min(len(activos_filtrados) * per_symbol_concurrency, _ANALYSIS_SEM)
-        if per_symbol_concurrency > 0
-        else _ANALYSIS_SEM
-    )
+    # Note: _ANALYSIS_SEM is the global limit; per_symbol_concurrency adds per-symbol restrictions
+    effective_concurrency = _ANALYSIS_SEM
     
     logger.info(
         "[Analisis] Inicio: activos=%d tfs=%d tasks=%d workers=%d sem=%d per_symbol=%d",
