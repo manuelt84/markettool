@@ -11584,8 +11584,10 @@ def detectar_rango_zigzag(
         "rebotes": rebotes_validos
     }
 
+# OPT2: Manual cache for level calculations (symbol, temporalidad -> niveles)
+_NIVELES_CACHE = {}
+
 #@profile
-@functools.lru_cache(maxsize=256)  # OPT2: Cache level calculations (448 redundant calcs eliminated)
 def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol, temporalidad_actual, umbral_atr=2.0, max_niveles=5):
     """
     Obtiene niveles clave de soportes y resistencias combinando:
@@ -11604,6 +11606,14 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
     Returns:
         dict: Niveles clave confirmados con toques
     """
+    # OPT2: Check cache first (using hashable parameters only)
+    cache_key = (symbol, temporalidad_actual)
+    if cache_key in _NIVELES_CACHE:
+        result = _NIVELES_CACHE[cache_key]
+        result["DataFrame Actualizado"] = df  # Add current df
+        logger.info(f"[TRACE] obtener_niveles_clave CACHED: {symbol}/{temporalidad_actual}")
+        return result
+    
     logger.info(f"[TRACE] obtener_niveles_clave START: {symbol}/{temporalidad_actual}")
 
     #@profile
@@ -11885,7 +11895,8 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
     niveles_importantes_soportes = filtrar_por_distancia(soportes, atr, precio_actual)
     niveles_importantes_resistencias = filtrar_por_distancia(resistencias, atr, precio_actual)
 
-    return {
+    # OPT2: Build result and cache it before returning
+    result = {
         "soporte_nivel_2": soporte_nivel_2,
         "soporte_nivel_1": soporte_nivel_1,
         "resistencia_nivel_1": resistencia_nivel_1,
@@ -11900,6 +11911,13 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
         "multiplicador": multiplicador,
         "DataFrame Actualizado": df
     }
+    
+    # Cache the result (excluding DataFrame for memory efficiency)
+    cache_key = (symbol, temporalidad_actual)
+    cache_result = {k: v for k, v in result.items() if k != "DataFrame Actualizado"}
+    _NIVELES_CACHE[cache_key] = cache_result
+    
+    return result
 
 #@profile
 def _finite(x) -> bool:
