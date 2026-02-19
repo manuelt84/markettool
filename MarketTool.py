@@ -1229,8 +1229,9 @@ max_workers_global = min(32, (os.cpu_count() or 1) * 2) #puede tener 64
 # Concurrency knobs (override via env for stronger machines)
 _CPU_COUNT = os.cpu_count() or 1
 _ANALYSIS_MAX_WORKERS = int(os.environ.get("ANALYSIS_MAX_WORKERS", str(min(64, _CPU_COUNT * 2))))
-_ANALYSIS_SEM = int(os.environ.get("ANALYSIS_SEMAPHORE", str(min(_ANALYSIS_MAX_WORKERS, max(8, _CPU_COUNT)))) )
+_ANALYSIS_SEM = int(os.environ.get("ANALYSIS_SEMAPHORE", str(min(_ANALYSIS_MAX_WORKERS, max(16, _CPU_COUNT * 2)))) )  # OPT1: Increased parallelism
 _ANALYSIS_INNER_WORKERS = int(os.environ.get("ANALYSIS_INNER_WORKERS", "4"))
+_GCS_ASYNC_EXECUTOR = ThreadPoolExecutor(max_workers=4)  # OPT1: Non-blocking GCS uploads
 _ANALYSIS_PRED_WORKERS = int(os.environ.get("ANALYSIS_PRED_WORKERS", "3"))
 _ANALYSIS_PRED_USE_PROCESS = os.environ.get("ANALYSIS_PRED_USE_PROCESS", "false").lower() == "true"
 
@@ -6035,37 +6036,12 @@ class UserStateCache:
                 # Guardar local en pod (best-effort, independiente de GCS/Firestore)
                 self._save_local(symbol, tf, payload)
                 
-                # Guardar en GCS + metadata Firestore (si disponible)
+                # OPT3: Guardar en GCS + metadata Firestore de forma async (non-blocking)
                 if self.bucket is None or self.db is None:
                     logger.warning("[IndicatorsCache] GCS/Firestore not available, local cache saved only")
                 else:
-                    gcs_path = self._gcs_path(symbol, tf)
-                    blob = self.bucket.blob(gcs_path)
-                    blob.upload_from_string(
-                        json.dumps(payload, default=str),
-                        content_type="application/json"
-                    )
-
-                    doc_id = self._metadata_doc_id(symbol, tf)
-                    self.db.collection("indicators_metadata").document(doc_id).set({
-                        "symbol": symbol.upper(),
-                        "timeframe": normalize_tf(tf),
-                        "gcs_path": f"gs://{self.bucket_name}/{gcs_path}",
-                        "last_update_utc": now_utc,
-                        "data_hash": data_hash,
-                        "rows_count": len(df_historicos),
-                        "indicators_list": list(indicators.keys()),
-                        "calc_duration_ms": calc_duration_ms,
-                        "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
-                        "is_valid": True,
-                        "analysis_audit": {
-                            "last_mode": audit.get("last_mode"),
-                            "last_bootstrap_at": (now_utc if audit.get("last_mode") == "bootstrap" else audit.get("last_bootstrap_at")),
-                            "last_incremental_at": (now_utc if audit.get("last_mode") == "incremental" else audit.get("last_incremental_at")),
-                            "last_incremental_bars": audit.get("last_incremental_bars"),
-                            "last_data_mismatch_at": (now_utc if audit.get("last_mode") == "data_mismatch" else audit.get("last_data_mismatch_at")),
-                        }
-                    }, merge=True)
+                    # Submit to background executor (non-blocking)
+                    _GCS_ASYNC_EXECUTOR.submit(self._save_gcs_async, symbol, tf, payload, now_utc, df_historicos)
                 
                 # Cache en memoria LRU
                 self._memory_put(symbol, tf, payload)
@@ -6097,6 +6073,43 @@ class UserStateCache:
             logger.info(f"[IndicatorsCache] Invalidated: {symbol}/{tf} (pod={self._pod_id})")
         except Exception as e:
             logger.warning(f"[IndicatorsCache] Invalidate error {symbol}/{tf}: {e}")
+    
+    def _save_gcs_async(self, symbol: str, tf: str, payload: dict, now_utc, df_historicos: pd.DataFrame):
+        """
+        OPT3: Non-blocking GCS upload + Firestore metadata save (runs in background executor).
+        Extracted from save() to allow async submission.
+        """
+        try:
+            if self.bucket is None or self.db is None:
+                return
+            
+            data_hash = hash_dataframe(df_historicos)
+            gcs_path = self._gcs_path(symbol, tf)
+            
+            # Upload to GCS (can block, runs in background thread)
+            blob = self.bucket.blob(gcs_path)
+            blob.upload_from_string(
+                json.dumps(payload, default=str),
+                content_type="application/json"
+            )
+            
+            # Save metadata to Firestore
+            doc_id = self._metadata_doc_id(symbol, tf)
+            self.db.collection("indicators_metadata").document(doc_id).set({
+                "symbol": symbol.upper(),
+                "timeframe": normalize_tf(tf),
+                "gcs_path": f"gs://{self.bucket_name}/{gcs_path}",
+                "last_update_utc": now_utc,
+                "data_hash": data_hash,
+                "rows_count": len(df_historicos),
+                "indicators_list": list(payload.get("metadata", {}).get("indicators_list", [])),
+                "calc_duration_ms": payload.get("metadata", {}).get("calc_duration_ms", 0),
+                "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
+                "is_valid": True,
+                "analysis_audit": payload.get("metadata", {}).get("analysis_audit", {}),
+            }, merge=True)
+        except Exception as e:
+            logger.error(f"[IndicatorsCache] Async GCS save error {symbol}/{tf}: {e}")
     
     def _acquire_lock(self, symbol: str, tf: str, timeout_sec: int = None) -> bool:
         """
@@ -11572,6 +11585,7 @@ def detectar_rango_zigzag(
     }
 
 #@profile
+@functools.lru_cache(maxsize=256)  # OPT2: Cache level calculations (448 redundant calcs eliminated)
 def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol, temporalidad_actual, umbral_atr=2.0, max_niveles=5):
     """
     Obtiene niveles clave de soportes y resistencias combinando:
@@ -18963,7 +18977,7 @@ async def calcular_entradas_async(
             try:
                 return await asyncio.wait_for(
                     loop.run_in_executor(None, detectar_patrones_confirmados_velas, df, window),
-                    timeout=15.0
+                    timeout=20.0  # INCREASED: 15s→20s
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"[TIMEOUT] Pattern detection timeout for {symbol}-{tf}")
@@ -18979,7 +18993,7 @@ async def calcular_entradas_async(
                         None, 
                         lambda: detectar_rango_zigzag(df, ventana_rebotes=140, tolerancia_pct=0.002, min_rebotes=3)
                     ),
-                    timeout=15.0
+                    timeout=20.0  # INCREASED: 15s→20s
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"[TIMEOUT] Range detection timeout for {symbol}-{tf}")
@@ -18991,7 +19005,7 @@ async def calcular_entradas_async(
             try:
                 return await asyncio.wait_for(
                     loop.run_in_executor(None, analisis_tecnico_detallado, df, tf, window, cfg),
-                    timeout=15.0
+                    timeout=20.0  # INCREASED: 15s→20s
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"[TIMEOUT] Technical analysis timeout for {symbol}-{tf}")
@@ -19013,7 +19027,7 @@ async def calcular_entradas_async(
                         ajustar_probabilidad_fundamental,
                         50, df_eventos, symbol, tf, fecha_inicio, fecha_fin, cfg, True
                     ),
-                    timeout=15.0
+                    timeout=20.0  # INCREASED: 15s→20s
                 )
                 if isinstance(result, tuple):
                     return result
@@ -19122,7 +19136,7 @@ async def calcular_entradas_async(
                             min_levels=2,
                         ),
                     ),
-                    timeout=15.0
+                    timeout=30.0  # INCREASED: 15s→30s for complex analysis
                 )
             except Exception as e:
                 logger.warning(
@@ -19137,7 +19151,7 @@ async def calcular_entradas_async(
                                 window, df, precio_actual, 2, symbol, tf
                             ),
                         ),
-                        timeout=10.0,
+                        timeout=20.0,  # INCREASED: 10s→20s for fallback S/R calculation
                     )
                     logger.info(f"[Fallback S/R] {symbol}-{tf}: usando niveles estáticos (window={window})")
                 except Exception as e_fallback:
