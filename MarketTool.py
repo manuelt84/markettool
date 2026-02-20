@@ -1132,13 +1132,26 @@ class HistoryManager:
                 # Double-check cache after acquiring lock (another worker may have fetched)
                 cache_df_check = load_cached_history(symbol, tf)
                 # Compare last timestamp instead of entire DF to avoid pandas Bool comparison issues
-                if (not cache_df_check.empty and 
-                    len(cache_df) > 0 and len(cache_df_check) > 0 and
-                    cache_df.index[-1] == cache_df_check.index[-1]):
-                    # Cache hasn't changed, skip FMP fetch
-                    logger.info(f"[FMP-DEDUP] {symbol}/{tf}: Worker ahead already fetched, using cache")
-                    new_df = pd.DataFrame()
+                if not cache_df_check.empty:
+                    if cache_df.empty:
+                        cache_df = cache_df_check
+                        logger.info(f"[FMP-DEDUP] {symbol}/{tf}: cache filled by another worker")
+                        new_df = pd.DataFrame()
+                        continue_fetch = False
+                    else:
+                        last_old = cache_df.index[-1]
+                        last_new = cache_df_check.index[-1]
+                        if last_new > last_old:
+                            cache_df = cache_df_check
+                            logger.info(f"[FMP-DEDUP] {symbol}/{tf}: cache advanced by another worker")
+                            new_df = pd.DataFrame()
+                            continue_fetch = False
+                        else:
+                            continue_fetch = True
                 else:
+                    continue_fetch = True
+
+                if continue_fetch:
                     # Proceed with FMP fetch
                     try:
                         if _is_intraday(tf):
