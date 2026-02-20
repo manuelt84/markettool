@@ -8145,12 +8145,14 @@ def obtener_eventos_economicos(
     *,
     plan: str | None = None,
     desde_inicio: bool = False,
+    last_days: int | None = None,
     grace_minutes: int = 10,
 ) -> pd.DataFrame:
     """
     Pulls economic events around the FX window:
       - starter: only [yesterday, tomorrow]
       - premium + desde_inicio: paginate from 1900-01-01 to tomorrow in APP_CONFIG.econ_chunk_days
+      - premium + last_days: paginate from (now - last_days) to tomorrow (for backtesting, avoids 200+ requests)
     Returns local-tz DataFrame with columns:
       ['date','currency','event','actual','estimate','previous','impact','date_country']
     
@@ -8161,7 +8163,13 @@ def obtener_eventos_economicos(
     dias = obtener_dias_habiles_mercado()
     y = dias[0].strftime("%Y-%m-%d")
     tm = dias[1].strftime("%Y-%m-%d")
-    if plan == "premium" and desde_inicio:
+    
+    if plan == "premium" and last_days:
+        # último N días (para backtesting: typicamente 365)
+        start_dt = pd.to_datetime(tm) - timedelta(days=last_days)
+        start = start_dt.strftime("%Y-%m-%d")
+        end = tm
+    elif plan == "premium" and desde_inicio:
         start, end = "1900-01-01", tm
     else:
         start, end = y, tm
@@ -8169,7 +8177,7 @@ def obtener_eventos_economicos(
 
     # paginate if needed
     fmp_parts = []
-    if plan == "premium" and desde_inicio:
+    if plan == "premium" and (desde_inicio or last_days):
         fi = pd.to_datetime(start)
         ff = pd.to_datetime(end)
         cur = fi
@@ -8230,6 +8238,7 @@ async def get_eventos_economicos_cached(
     *,
     plan: str | None = None,
     desde_inicio: bool = False,
+    last_days: int | None = None,
     grace_minutes: int = 10,
 ) -> pd.DataFrame:
     """
@@ -8241,13 +8250,14 @@ async def get_eventos_economicos_cached(
     ✅ OPTIMIZACION: Timeout de 30s para evitar operaciones congeladas
     """
     # Generar cache_key basada en parámetros
-    key = f"econ_plan={plan or APP_CONFIG.fmp_plan}_desde={desde_inicio}"
+    key = f"econ_plan={plan or APP_CONFIG.fmp_plan}_desde={desde_inicio}_last_days={last_days}"
     
     # Función auxiliar para llamar obtener_eventos_economicos de forma async
     def _fetch():
         return obtener_eventos_economicos(
             plan=plan,
             desde_inicio=desde_inicio,
+            last_days=last_days,
             grace_minutes=grace_minutes,
         )
     
@@ -8262,9 +8272,9 @@ async def get_eventos_economicos_cached(
         return pd.DataFrame()
 
 
-def invalidate_economic_events_cache(plan: str | None = None, desde_inicio: bool = False):
+def invalidate_economic_events_cache(plan: str | None = None, desde_inicio: bool = False, last_days: int | None = None):
     """Invalida caché de eventos para forzar refresh."""
-    key = f"econ_plan={plan or APP_CONFIG.fmp_plan}_desde={desde_inicio}"
+    key = f"econ_plan={plan or APP_CONFIG.fmp_plan}_desde={desde_inicio}_last_days={last_days}"
     _ECONOMIC_EVENTS_CACHE.invalidate(key)
 
 
@@ -21129,6 +21139,39 @@ def _trading_now_utc() -> datetime:
 # Fetch de eventos (API o Firestore)
 # ==========================
 
+def _extract_currencies_from_symbol(symbol: str) -> list[str]:
+    """
+    Extrae las divisas de un símbolo Forex.
+    EURUSD → [EUR, USD]
+    HGUSD → [HKD, USD] (HG = mapeo especial a HKD)
+    GBPUSD → [GBP, USD]
+    CCUSD → [CC, USD] (crypto, sin eventos econ. típicamente)
+    Devuelve lista de up-to-3 carácter códigos ISO, o lista vacía si no se puede parsear.
+    """
+    sym = str(symbol).upper().strip()
+    
+    # Mapeo especial para símbolos no-ISO-estándar (códigos FMP)
+    special_map = {
+        "HG": "HKD",      # Hong Kong Dollar
+        "CC": "CRYPTO",   # Crypto (sin eventos económicos típicamente)
+    }
+    
+    currencies = []
+    
+    # Si es 6+ caracteres, intenta extraer primeros 3 + segundos 3
+    if len(sym) >= 6:
+        c1 = sym[:3]
+        c2 = sym[3:6]
+        currencies = [
+            special_map.get(c1, c1),
+            special_map.get(c2, c2)
+        ]
+        return currencies
+    
+    # Si tiene menos, intenta otros patrones (fallback)
+    return []
+
+
 def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) -> pd.DataFrame:
     """
     Obtiene eventos en ventana [now - hours_back, now + minutes_fwd] normalizados.
@@ -21136,35 +21179,60 @@ def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) ->
     - Eventos próximos sin "actual": 30-60s
     - Eventos recientes con "actual": 3-5min
     - Eventos futuros/antiguos: 30min
+    - Backtesting (hours_back > 720h = 30 días): desde_inicio=True para eventos históricos completos
     """
 
     t0 = time.time()
+    
+    # 🔍 DEBUG: Log parámetros recibidos
+    logger.info("[eventos] _fetch_events_for called with symbol=%s, hours_back=%d, minutes_fwd=%d", symbol, hours_back, minutes_fwd)
 
     # 🔹 aquí usamos el "now bursátil" (Opción B)
     now = _trading_now_utc()
-    a = now - timedelta(hours=int(hours_back))
-    b = now + timedelta(minutes=int(minutes_fwd))
+    
+    # 🔹 BACKTESTING DETECTION: Si hours_back > 720h (30 días), es backtesting histórico
+    # ⚠️ IMPORTANTE: No usar desde_inicio=True que hace queries desde 1900 (200+ requests)
+    # En su lugar, traer últimos 12 meses que es suficiente para backtesting normal
+    is_backtest = hours_back > 720  # 30 dias
+    
+    logger.info("[eventos] Backtest detection: hours_back=%d > 720? is_backtest=%s", hours_back, is_backtest)
+    
+    if is_backtest:
+        # Para backtesting: obtener eventos de últimos 12 meses (NO desde 1900!)
+        # Esto evita 200+ requests FMP que generan timeouts en nginx
+        # last_days=365 trae ~4-5 requests FMP (una por ~85 días)
+        logger.info("[eventos] BACKTEST MODE detected (hours_back=%d > 720), fetching last 365 days of events", hours_back)
+        df = obtener_eventos_economicos(
+            plan=APP_CONFIG.fmp_plan,
+            last_days=365,  # ← últimos 12 meses en lugar de desde 1900
+            grace_minutes=0,
+        )
+        logger.info("[eventos] Got %d events for backtest (last 12 months)", len(df))
+    else:
+        # Para live trading: ventana de ±6 horas
+        a = now - timedelta(hours=int(hours_back))
+        b = now + timedelta(minutes=int(minutes_fwd))
 
-    memo = _EVENTS_MEMO.get(symbol)
-    
-    # Verificar cache con TTL adaptativo
-    if memo:
-        df_cached = memo.get("df")
-        cache_age = time.time() - memo.get("ts", 0)
-        ttl = _calculate_adaptive_ttl(df_cached, now)
+        memo = _EVENTS_MEMO.get(symbol)
         
-        if cache_age < ttl:
-            logger.info("[eventos] Cache HIT %s age=%.1fs ttl=%.1fs", symbol, cache_age, ttl)
-            return df_cached.copy()
-        else:
-            logger.info("[eventos] Cache EXPIRED %s age=%.1fs ttl=%.1fs", symbol, cache_age, ttl)
-    
-    # Cache miss o expirado - fetch nuevo
-    df = obtener_eventos_guardados_o_futuros(
-        _iso(a),
-        _iso(b),
-        grace_minutes=0,
-    )
+        # Verificar cache con TTL adaptativo
+        if memo:
+            df_cached = memo.get("df")
+            cache_age = time.time() - memo.get("ts", 0)
+            ttl = _calculate_adaptive_ttl(df_cached, now)
+            
+            if cache_age < ttl:
+                logger.info("[eventos] Cache HIT %s age=%.1fs ttl=%.1fs", symbol, cache_age, ttl)
+                return df_cached.copy()
+            else:
+                logger.info("[eventos] Cache EXPIRED %s age=%.1fs ttl=%.1fs", symbol, cache_age, ttl)
+        
+        # Cache miss o expirado - fetch nuevo
+        df = obtener_eventos_guardados_o_futuros(
+            _iso(a),
+            _iso(b),
+            grace_minutes=0,
+        )
     if df is None or df.empty:
         df = pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
     # normaliza tipos
