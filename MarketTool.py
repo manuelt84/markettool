@@ -287,6 +287,16 @@ class PonderacionCache:
 # Global instance
 _ponderacion_cache = PonderacionCache()
 
+# ======================================================================
+# Phase 3: Historical Tracking & Alert System
+# ======================================================================
+
+from markettool.interfaces.api.ponderacion_history import PonderacionHistory
+from markettool.interfaces.api.ponderacion_alerts import PonderacionAlert
+
+_ponderacion_history = PonderacionHistory(redis_client=_ponderacion_cache.redis_client if _ponderacion_cache.redis_client else None)
+_ponderacion_alert = PonderacionAlert(redis_client=_ponderacion_cache.redis_client if _ponderacion_cache.redis_client else None)
+
 
 # ======================================================================
 # Config & Infra (Production-grade)
@@ -20288,7 +20298,12 @@ def get_webhook_app():
             from markettool.interfaces.api.ponderacion_routes import register_ponderacion_routes
             register_pod_routes(_webhook_app, _POD_COORDINATOR)
             register_execution_routes(_webhook_app, _EXECUTION_TRACKER, RUNNING, logger)
-            register_ponderacion_routes(_webhook_app, _ponderacion_cache)
+            register_ponderacion_routes(
+                _webhook_app,
+                _ponderacion_cache,
+                ponderacion_history=_ponderacion_history,
+                ponderacion_alert=_ponderacion_alert
+            )
             _routes_registered = True
             logger.debug("Webhook routes (pod, execution, ponderacion) registered")
         except Exception as e:

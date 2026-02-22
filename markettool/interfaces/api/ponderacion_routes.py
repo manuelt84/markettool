@@ -9,12 +9,14 @@ from flask import jsonify, request
 from flask_sock import Sock
 
 
-def register_ponderacion_routes(app, ponderacion_cache) -> None:
+def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None, ponderacion_alert=None) -> None:
     """Register ponderación API routes and WebSocket streaming.
     
     Args:
         app: Flask application instance
         ponderacion_cache: PonderacionCache instance (Redis-backed)
+        ponderacion_history: PonderacionHistory instance (optional)
+        ponderacion_alert: PonderacionAlert instance (optional)
     """
     
     # Initialize Sock for WebSocket support
@@ -137,6 +139,117 @@ def register_ponderacion_routes(app, ponderacion_cache) -> None:
     
     # Expose broadcast function globally (will be called from ponderacion calculations)
     app.broadcast_ponderacion_update = broadcast_ponderacion_update
+    
+    # ===== PHASE 3: Historical & Alert Routes =====
+    
+    @app.route("/api/ponderacion/history", methods=["GET"])
+    def get_ponderacion_history():
+        """Get historical ponderacion records for analysis.
+        
+        Query params:
+        - symbol: Required (e.g., 'BTCUSD')
+        - timeframe: Required (e.g., '1m', '5m', '1h')
+        - limit: Optional, default 100 (max 500)
+        """
+        if not ponderacion_history:
+            return jsonify({"error": "History tracking not enabled"}), 503
+        
+        symbol = request.args.get("symbol", "").strip().upper()
+        timeframe = request.args.get("timeframe", "").strip()
+        limit = min(int(request.args.get("limit", 100)), 500)
+        
+        if not symbol or not timeframe:
+            return jsonify({"error": "Missing symbol or timeframe"}), 400
+        
+        history = ponderacion_history.get_history(symbol, timeframe, limit=limit)
+        return jsonify({
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "records": history,
+            "count": len(history),
+            "timestamp_utc": datetime.utcnow().isoformat(),
+        })
+    
+    @app.route("/api/ponderacion/momentum", methods=["GET"])
+    def get_momentum():
+        """Calculate momentum score for a symbol/timeframe.
+        
+        Query params:
+        - symbol: Required
+        - timeframe: Required
+        - lookback: Optional, default 10 (how many candles to analyze)
+        """
+        if not ponderacion_history:
+            return jsonify({"error": "History tracking not enabled"}), 503
+        
+        symbol = request.args.get("symbol", "").strip().upper()
+        timeframe = request.args.get("timeframe", "").strip()
+        lookback = int(request.args.get("lookback", 10))
+        
+        if not symbol or not timeframe:
+            return jsonify({"error": "Missing symbol or timeframe"}), 400
+        
+        momentum = ponderacion_history.calculate_momentum(symbol, timeframe, lookback=lookback)
+        return jsonify({
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "momentum": momentum,
+            "timestamp_utc": datetime.utcnow().isoformat(),
+        })
+    
+    @app.route("/api/ponderacion/rank-change", methods=["GET"])
+    def get_rank_change():
+        """Get ranking change since last calculation.
+        
+        Query params:
+        - symbol: Required
+        - timeframe: Required
+        """
+        if not ponderacion_history:
+            return jsonify({"error": "History tracking not enabled"}), 503
+        
+        symbol = request.args.get("symbol", "").strip().upper()
+        timeframe = request.args.get("timeframe", "").strip()
+        
+        if not symbol or not timeframe:
+            return jsonify({"error": "Missing symbol or timeframe"}), 400
+        
+        rank_change = ponderacion_history.get_rank_change(symbol, timeframe)
+        return jsonify({
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "rank_change": rank_change,
+            "timestamp_utc": datetime.utcnow().isoformat(),
+        })
+    
+    @app.route("/api/alerts", methods=["GET"])
+    def get_alerts():
+        """Get active alerts.
+        
+        Query params:
+        - symbol: Optional, filter by symbol
+        """
+        if not ponderacion_alert:
+            return jsonify({"error": "Alerts not enabled"}), 503
+        
+        symbol = request.args.get("symbol", "").strip().upper() or None
+        alerts = ponderacion_alert.get_active_alerts(symbol=symbol)
+        
+        return jsonify({
+            "alerts": alerts,
+            "count": len(alerts),
+            "timestamp_utc": datetime.utcnow().isoformat(),
+        })
+    
+    @app.route("/api/alerts/<alert_id>", methods=["PUT"])
+    def mark_alert_read(alert_id):
+        """Mark alert as read."""
+        if not ponderacion_alert:
+            return jsonify({"error": "Alerts not enabled"}), 503
+        
+        ponderacion_alert.mark_alert_read(alert_id)
+        return jsonify({"success": True, "alert_id": alert_id})
 
 
 __all__ = ["register_ponderacion_routes"]
+
