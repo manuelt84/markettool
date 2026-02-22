@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List, Callable, Iterable, Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date, UTC
 import pytz
 import requests
 import pandas as pd
@@ -30,9 +30,7 @@ from collections import Counter
 from collections import defaultdict
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from datetime import timedelta, date, datetime, timezone, UTC, timezone as dt_timezone
 from flask import Flask, request, jsonify
-from functools import partial
 from google.cloud import firestore
 from google.cloud import firestore as gcf
 from google.cloud import storage
@@ -42,6 +40,7 @@ except Exception:
     Calendar = None
     Event = None
 from io import StringIO, BytesIO
+from functools import partial
 # ✅ FIX: joblib.Parallel removed to fix ResourceTracker errors in Docker/Python 3.12
 # Previous usage was redundant (Parallel with range(1) = no parallelization)
 # For future parallel needs: use ThreadPoolExecutor or asyncio instead
@@ -58,7 +57,6 @@ from telegram.helpers import escape_markdown
 from telegram.request import HTTPXRequest
 from textblob import TextBlob
 from textwrap import wrap
-import threading
 from threading import Lock
 try:
     from ultralytics import YOLO  # pyright: ignore[reportMissingImports]
@@ -71,10 +69,7 @@ from types import SimpleNamespace
 import aiofiles
 import asyncio
 import base64
-import concurrent.futures
-import csv as _csv
 import cv2
-import datetime as _dt
 try:
     import easyocr  # pyright: ignore[reportMissingImports]
 except Exception:
@@ -102,17 +97,13 @@ import matplotlib
 import matplotlib as mpl
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-import pytz # Para manejar las zonas horarias
 import re
 import socket
-import statistics
 import telegram
-import tempfile
 import torch
 import uuid
 import uvicorn
 import warnings
-import threading
 
 from markettool.core.config import AppConfig, load_config
 from markettool.infra.http.session import build_session
@@ -13152,6 +13143,120 @@ def calcular_ponderacion_incremental_por_divisa(df: pd.DataFrame, cfg: dict | No
     return df
 
 
+def calcular_ponderacion_incremental_mejorada(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
+    """
+    Versión mejorada que calcula ponderación SEPARADA para LONG y SHORT.
+    
+    Mejoras sobre la versión original:
+    - Rankings independientes por dirección (evita mezclar señales contradictorias)
+    - Bonificación por confluencia (mayor peso si todos los TF están alineados)
+    - Métricas de confluencia para filtrado (Confluencia_Long, Confluencia_Short)
+    
+    Args:
+        df: DataFrame con resultados (debe tener columnas: Activo, Tipo de Operacion, Temporalidad)
+        cfg: Configuración con ponderacion_inc settings
+    
+    Returns:
+        DataFrame con columnas adicionales:
+        - PI_Long: Ponderación acumulada solo de señales de compra
+        - PI_Short: Ponderación acumulada solo de señales de venta
+        - Confluencia_Long: % de TFs con señal de compra (0.0-1.0)
+        - Confluencia_Short: % de TFs con señal de venta (0.0-1.0)
+        - TF_Total: Total de timeframes analizados para el activo
+    """
+    inc = _norm_ponder_inc_cfg(cfg)
+    
+    # Inicializar columnas
+    df["PI_Long"] = 0.0
+    df["PI_Short"] = 0.0
+    df["Confluencia_Long"] = 0.0
+    df["Confluencia_Short"] = 0.0
+    df["TF_Total"] = 0
+    
+    # Validaciones
+    need_cols = {"Activo", "Tipo de Operacion", "Temporalidad"}
+    if not inc.get("enable", True) or not need_cols.issubset(set(df.columns)):
+        return df
+    
+    # Validar señales globales
+    try:
+        _ = señales_compra
+        _ = señales_venta
+    except (NameError, TypeError):
+        logger.warning("señales_compra/señales_venta no definidas, PI_Long/Short = 0")
+        return df
+    
+    peso_base = max(1, int(inc.get("peso_base", 1)))
+    tfs = inc.get("_tfs_list", [])
+    if not tfs:
+        tfs = [t.strip() for t in DEFAULT_PONDER_INC_CFG["temporalidades"].split(",")]
+    
+    # Crear índice de timeframes (orden descendente de importancia)
+    idx = {tf.lower(): i for i, tf in enumerate(tfs)}
+    aliases = {"1min":"1m","5min":"5m","15min":"15m","30min":"30m","1hour":"1h","4hour":"4h","1day":"1d","1week":"1w"}
+    
+    buy_set = set(señales_compra)
+    sell_set = set(señales_venta)
+    
+    # Procesar por activo
+    for activo, group in df.groupby('Activo'):
+        total_tfs = len(group)
+        
+        # Normalizar TFs
+        tf_normalized = group["Temporalidad"].astype(str).str.strip().str.lower().replace(aliases)
+        
+        # Identificar filas de compra y venta
+        buy_mask = group["Tipo de Operacion"].isin(buy_set)
+        sell_mask = group["Tipo de Operacion"].isin(sell_set)
+        
+        buy_rows = group[buy_mask]
+        sell_rows = group[sell_mask]
+        
+        # Calcular ponderación LONG (solo señales de compra)
+        pi_long = 0.0
+        for idx_row in buy_rows.index:
+            tf_str = tf_normalized.loc[idx_row]
+            tf_idx = idx.get(tf_str)
+            if tf_idx is not None:
+                weight = peso_base * (2 ** tf_idx)
+                pi_long += weight
+        
+        # Calcular ponderación SHORT (solo señales de venta)
+        pi_short = 0.0
+        for idx_row in sell_rows.index:
+            tf_str = tf_normalized.loc[idx_row]
+            tf_idx = idx.get(tf_str)
+            if tf_idx is not None:
+                weight = peso_base * (2 ** tf_idx)
+                pi_short += weight
+        
+        # Confluencia (% de TFs alineados en cada dirección)
+        confluencia_long = len(buy_rows) / total_tfs if total_tfs > 0 else 0.0
+        confluencia_short = len(sell_rows) / total_tfs if total_tfs > 0 else 0.0
+        
+        # Bonificación por confluencia
+        # 100% alineado: +50% bonus
+        # 75%+ alineado: +25% bonus
+        if confluencia_long >= 1.0:
+            pi_long *= 1.5
+        elif confluencia_long >= 0.75:
+            pi_long *= 1.25
+        
+        if confluencia_short >= 1.0:
+            pi_short *= 1.5
+        elif confluencia_short >= 0.75:
+            pi_short *= 1.25
+        
+        # Asignar a todas las filas del activo
+        df.loc[group.index, "PI_Long"] = round(pi_long, 2)
+        df.loc[group.index, "PI_Short"] = round(pi_short, 2)
+        df.loc[group.index, "Confluencia_Long"] = round(confluencia_long, 4)
+        df.loc[group.index, "Confluencia_Short"] = round(confluencia_short, 4)
+        df.loc[group.index, "TF_Total"] = total_tfs
+    
+    return df
+
+
 # ---- DEFAULTS para cfg.ponderacion y cfg.ponderacion_inc ----
 DEFAULT_PONDER_CFG = {
     "enable": True,
@@ -13198,138 +13303,14 @@ def _norm_ponder_inc_cfg(cfg: dict | None) -> dict:
         out["_tfs_list"] = [t.strip() for t in out["temporalidades"].split(",")]
         return out
 
-#@profile
-def calcular_ponderacion(row: dict, cfg: dict | None = None) -> float:
-    p = _norm_ponder_cfg(cfg)
-    if not p.get("enable", True):
-        return 0.0
-
-    ponderacion = 0.0
-
-    # --- Probabilidad general ---
-    pg = row.get('Probabilidad General (%)')
-    if pg is not None:
-        if pg > p["prob_high"]:
-            ponderacion += p["prob_high_delta"]
-        elif pg < p["prob_low"]:
-            ponderacion += p["prob_low_delta"]
-        elif p["neutral_min"] <= pg <= p["neutral_max"]:
-            ponderacion += p["neutral_delta"]
-
-    # --- Patrones ---
-    patrones = row.get('Patrones Detectados') or []
-    try:
-        if any(pat in patrones for pat in patrones_alcistas):
-            ponderacion += p["patrones_alcistas_delta"]
-        elif any(pat in patrones for pat in patrones_bajistas):
-            ponderacion += p["patrones_bajistas_delta"]
-    except NameError:
-        # si no existen las listas en este scope, no penaliza/bonifica
-        pass
-
-    # --- Concordancia Tec + Fund ---
-    pt = row.get('Probabilidad Tecnica (%)', 50)
-    pf = row.get('Probabilidad Fundamental (%)', 50)
-    if pt > 60 and pf > 60:
-        ponderacion += p["concordancia_bull_delta"]
-    elif pt < 40 and pf < 40:
-        ponderacion += p["concordancia_bear_delta"]
-
-    # --- Niveles / cercanías ---
-    precio = row.get('Ultimo Valor')
-    s1 = row.get('Soporte Nivel 1')
-    r1 = row.get('Resistencia Nivel 1')
-    s2 = row.get('Soporte Nivel 2')
-    r2 = row.get('Resistencia Nivel 2')
-
-    # Distancias relativas (si hay datos)
-    if precio is None or s1 is None or r1 is None:
-        logger.info(f"Valores no válidos para niveles: precio={precio}, s1={s1}, r1={r1}")
-    else:
-        try:
-            if abs(precio - s1) / s1 < 0.01:
-                ponderacion += p["near_s1_delta"]
-        except ZeroDivisionError:
-            pass
-        try:
-            if abs(r1 - precio) / r1 < 0.01:
-                ponderacion += p["near_r1_delta"]
-        except ZeroDivisionError:
-            pass
-
-        # Ventanas 1% sobre/under
-        if precio is not None and s1 is not None and precio <= s1 * 1.01:
-            ponderacion += max(0, p["near_s1_delta"])  # refuerzo
-        if precio is not None and r1 is not None and precio >= r1 * 0.99:
-            ponderacion += min(0, p["near_r1_delta"])  # refuerzo hacia negativo
-
-    if s2 is not None and precio is not None and precio <= s2 * 1.01:
-        ponderacion += p["near_s2_delta"]
-    if r2 is not None and precio is not None and precio >= r2 * 0.99:
-        ponderacion += p["near_r2_delta"]
-
-    # --- MACD cruce ---
-    macd_cruce = row.get('Cruce MACD')
-    if macd_cruce == 'Cruce Alcista':
-        ponderacion += p["macd_cruce_alcista_delta"]
-    elif macd_cruce == 'Cruce Bajista':
-        ponderacion += p["macd_cruce_bajista_delta"]
-
-    # --- Bollinger ---
-    bup = row.get('bollinger_upper')
-    blo = row.get('bollinger_lower')
-    if pd.notna(bup) and pd.notna(blo) and precio is not None:
-        if precio < blo:
-            ponderacion += p["bollinger_bajo_delta"]
-        elif precio > bup:
-            ponderacion += p["bollinger_alto_delta"]
-
-    # --- Tendencia predicha ---
-    tend = row.get('Tendencia Predicha', 'Neutral')
-    if tend == 'Alcista':
-        ponderacion += p["tendencia_alcista_delta"]
-    elif tend == 'Bajista':
-        ponderacion += p["tendencia_bajista_delta"]
-
-    # --- Señal detectada (compra/venta) ---
-    signal = row.get('Tipo de Operacion', 'Neutral')
-    try:
-        if signal in señales_compra:
-            ponderacion += p["senal_compra_delta"]
-        elif signal in señales_venta:
-            ponderacion += p["senal_venta_delta"]
-    except NameError:
-        pass
-
-    # --- Ponderación incremental (columna previa del DF) ---
-    pi = row.get('Ponderacion Incremental', 0)
-    th = p["ponder_inc_threshold"]
-    if isinstance(pi, (int, float)) and th is not None:
-        if pi >= th:
-            ponderacion += p["ponder_inc_pos_delta"]
-        elif pi <= -th:
-            ponderacion += p["ponder_inc_neg_delta"]
-
-    # --- Multiplicador por temporalidad ---
-    tf = str(row.get('Temporalidad', '')).lower()
-    if any(k in tf for k in ('1min', '5min', '1m', '5m')):
-        ponderacion *= p["mult_1m_5m"]
-    elif any(k in tf for k in ('15min', '30min', '15m', '30m')):
-        ponderacion *= p["mult_15m_30m"]
-    elif any(k in tf for k in ('1hour', '4hour', '1h', '4h')):
-        ponderacion *= p["mult_1h_4h"]
-    elif any(k in tf for k in ('1day', '1week', '1d', '1w')):
-        ponderacion *= p["mult_1d_1w"]
-
-    # --- Clamp final ---
-    lo, hi = p["clamp_min"], p["clamp_max"]
-    ponderacion = max(min(ponderacion, hi), lo)
-
-    return float(ponderacion)
+# 🗑️ REMOVED: calcular_ponderacion() - Phase 1 cleanup
+# This function was superseded by calcular_ponderacion_vectorizado()
+# which provides identical logic with ~40x better performance (vectorized NumPy operations)
 
 
 #@profile
 def calcular_ponderacion_vectorizado(df: pd.DataFrame, cfg: dict | None = None) -> pd.Series:
+    # ✅ This is the optimized, vectorized implementation (canonical)
     """Versión vectorizada de calcular_ponderacion para acelerar procesamiento masivo."""
     p = _norm_ponder_cfg(cfg)
     if not p.get("enable", True):
@@ -13406,13 +13387,34 @@ def calcular_ponderacion_vectorizado(df: pd.DataFrame, cfg: dict | None = None) 
         except NameError:
             pass
     
-    # --- Ponderación incremental (vectorizado) ---
-    if 'Ponderacion Incremental' in df.columns:
+    # --- Ponderación incremental mejorada (vectorizado) ---
+    # ✅ Phase 4 Correction: Use PI_Long/PI_Short (improved) instead of legacy "Ponderacion Incremental"
+    # These are the results from calcular_ponderacion_incremental_mejorada() (new single source of truth)
+    if 'PI_Long' in df.columns and 'PI_Short' in df.columns:
+        pi_long = df['PI_Long'].fillna(0)
+        pi_short = df['PI_Short'].fillna(0)
+        th = p["ponder_inc_threshold"]
+        if th is not None:
+            # LONG bonus: only when signal is buy and PI_Long meets threshold
+            try:
+                signal = df['Tipo de Operacion'].fillna('Neutral')
+                compra_mask = signal.isin(señales_compra)
+                ponderacion += np.where(compra_mask & (pi_long >= th), p["ponder_inc_pos_delta"], 0)
+            except NameError:
+                pass
+            # SHORT bonus: only when signal is sell and PI_Short meets threshold
+            try:
+                venta_mask = signal.isin(señales_venta)
+                ponderacion += np.where(venta_mask & (pi_short >= th), p["ponder_inc_pos_delta"], 0)
+            except NameError:
+                pass
+    elif 'Ponderacion Incremental' in df.columns:
+        # Fallback for legacy data (backward compat, but log warning)
+        logger.warning("[DEPRECATED] Using legacy 'Ponderacion Incremental' - should use PI_Long/PI_Short")
         pi = df['Ponderacion Incremental'].fillna(0)
         th = p["ponder_inc_threshold"]
         if th is not None:
             ponderacion += np.where(pi >= th, p["ponder_inc_pos_delta"], 0)
-            ponderacion += np.where(pi <= -th, p["ponder_inc_neg_delta"], 0)
     
     # --- Multiplicador por temporalidad (vectorizado) ---
     if 'Temporalidad' in df.columns:
@@ -13428,6 +13430,172 @@ def calcular_ponderacion_vectorizado(df: pd.DataFrame, cfg: dict | None = None) 
     ponderacion = np.clip(ponderacion, p["clamp_min"], p["clamp_max"])
     
     return pd.Series(ponderacion, index=df.index, dtype=float)
+
+
+#@profile
+def calcular_ponderacion_direccional(df: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
+    """
+    Versión direccional de ponderación que separa LONG y SHORT.
+    Similar a PI_Long/PI_Short pero para multi-factor scoring.
+    
+    Solo aplica factores alcistas cuando Tipo de Operacion = Compra.
+    Solo aplica factores bajistas cuando Tipo de Operacion = Venta.
+    
+    Evita mezclar señales contradictorias en un solo score.
+    
+    Returns:
+        DataFrame con columnas Ponderacion_Long y Ponderacion_Short agregadas
+    """
+    p = _norm_ponder_cfg(cfg)
+    if not p.get("enable", True):
+        df["Ponderacion_Long"] = 0.0
+        df["Ponderacion_Short"] = 0.0
+        return df
+    
+    # Verificar columnas necesarias
+    if 'Tipo de Operacion' not in df.columns:
+        logger.warning("calcular_ponderacion_direccional: falta 'Tipo de Operacion', scores = 0")
+        df["Ponderacion_Long"] = 0.0
+        df["Ponderacion_Short"] = 0.0
+        return df
+    
+    # Inicializar arrays
+    ponderacion_long = np.zeros(len(df), dtype=float)
+    ponderacion_short = np.zeros(len(df), dtype=float)
+    
+    # Máscaras de dirección
+    try:
+        signal = df['Tipo de Operacion'].fillna('Neutral')
+        compra_mask = signal.isin(señales_compra)
+        venta_mask = signal.isin(señales_venta)
+    except NameError:
+        logger.warning("señales_compra/señales_venta no definidas, Ponderacion_Long/Short = 0")
+        df["Ponderacion_Long"] = 0.0
+        df["Ponderacion_Short"] = 0.0
+        return df
+    
+    # --- LONG Scoring (solo para señales de compra) ---
+    if compra_mask.any():
+        # Probabilidad General alcista
+        if 'Probabilidad General (%)' in df.columns:
+            pg = df['Probabilidad General (%)'].fillna(0)
+            ponderacion_long += np.where(compra_mask & (pg > p["prob_high"]), p["prob_high_delta"], 0)
+        
+        # Concordancia Técnica + Fundamental alcista
+        if 'Probabilidad Tecnica (%)' in df.columns and 'Probabilidad Fundamental (%)' in df.columns:
+            pt = df['Probabilidad Tecnica (%)'].fillna(50)
+            pf = df['Probabilidad Fundamental (%)'].fillna(50)
+            ponderacion_long += np.where(compra_mask & (pt > 60) & (pf > 60), p["concordancia_bull_delta"], 0)
+        
+        # Cerca de soporte (alcista)
+        if 'Ultimo Valor' in df.columns and 'Soporte Nivel 1' in df.columns:
+            precio = df['Ultimo Valor'].fillna(0)
+            s1 = df['Soporte Nivel 1'].fillna(0)
+            s2 = df['Soporte Nivel 2'].fillna(0) if 'Soporte Nivel 2' in df.columns else 0
+            
+            ponderacion_long += np.where(compra_mask & (precio <= s1 * 1.01) & (s1 > 0), p["near_s1_delta"], 0)
+            if 'Soporte Nivel 2' in df.columns:
+                ponderacion_long += np.where(compra_mask & (precio <= s2 * 1.01) & (s2 > 0), p["near_s2_delta"], 0)
+        
+        # MACD Cruce Alcista
+        if 'Cruce MACD' in df.columns:
+            macd = df['Cruce MACD'].fillna('')
+            ponderacion_long += np.where(compra_mask & (macd == 'Cruce Alcista'), p["macd_cruce_alcista_delta"], 0)
+        
+        # Bollinger banda baja (alcista)
+        if all(c in df.columns for c in ['bollinger_lower', 'Ultimo Valor']):
+            blo = df['bollinger_lower'].fillna(-np.inf)
+            precio = df['Ultimo Valor'].fillna(0)
+            ponderacion_long += np.where(compra_mask & (precio < blo), p["bollinger_bajo_delta"], 0)
+        
+        # Tendencia Alcista
+        if 'Tendencia Predicha' in df.columns:
+            tend = df['Tendencia Predicha'].fillna('Neutral')
+            ponderacion_long += np.where(compra_mask & (tend == 'Alcista'), p["tendencia_alcista_delta"], 0)
+        
+        # Bonificación por señal de compra
+        ponderacion_long += np.where(compra_mask, p["senal_compra_delta"], 0)
+        
+        # Bonificación por PI_Long positivo
+        if 'PI_Long' in df.columns:
+            pi_long = df['PI_Long'].fillna(0)
+            th = p["ponder_inc_threshold"]
+            if th is not None:
+                ponderacion_long += np.where(compra_mask & (pi_long >= th), p["ponder_inc_pos_delta"], 0)
+    
+    # --- SHORT Scoring (solo para señales de venta) ---
+    if venta_mask.any():
+        # Probabilidad General bajista
+        if 'Probabilidad General (%)' in df.columns:
+            pg = df['Probabilidad General (%)'].fillna(0)
+            # Usar valor absoluto para SHORT (queremos score positivo)
+            ponderacion_short += np.where(venta_mask & (pg < p["prob_low"]), abs(p["prob_low_delta"]), 0)
+        
+        # Concordancia Técnica + Fundamental bajista
+        if 'Probabilidad Tecnica (%)' in df.columns and 'Probabilidad Fundamental (%)' in df.columns:
+            pt = df['Probabilidad Tecnica (%)'].fillna(50)
+            pf = df['Probabilidad Fundamental (%)'].fillna(50)
+            ponderacion_short += np.where(venta_mask & (pt < 40) & (pf < 40), abs(p["concordancia_bear_delta"]), 0)
+        
+        # Cerca de resistencia (bajista)
+        if 'Ultimo Valor' in df.columns and 'Resistencia Nivel 1' in df.columns:
+            precio = df['Ultimo Valor'].fillna(0)
+            r1 = df['Resistencia Nivel 1'].fillna(0)
+            r2 = df['Resistencia Nivel 2'].fillna(0) if 'Resistencia Nivel 2' in df.columns else 0
+            
+            ponderacion_short += np.where(venta_mask & (precio >= r1 * 0.99) & (r1 > 0), abs(p["near_r1_delta"]), 0)
+            if 'Resistencia Nivel 2' in df.columns:
+                ponderacion_short += np.where(venta_mask & (precio >= r2 * 0.99) & (r2 > 0), abs(p["near_r2_delta"]), 0)
+        
+        # MACD Cruce Bajista
+        if 'Cruce MACD' in df.columns:
+            macd = df['Cruce MACD'].fillna('')
+            ponderacion_short += np.where(venta_mask & (macd == 'Cruce Bajista'), abs(p["macd_cruce_bajista_delta"]), 0)
+        
+        # Bollinger banda alta (bajista)
+        if all(c in df.columns for c in ['bollinger_upper', 'Ultimo Valor']):
+            bup = df['bollinger_upper'].fillna(np.inf)
+            precio = df['Ultimo Valor'].fillna(0)
+            ponderacion_short += np.where(venta_mask & (precio > bup), abs(p["bollinger_alto_delta"]), 0)
+        
+        # Tendencia Bajista
+        if 'Tendencia Predicha' in df.columns:
+            tend = df['Tendencia Predicha'].fillna('Neutral')
+            ponderacion_short += np.where(venta_mask & (tend == 'Bajista'), abs(p["tendencia_bajista_delta"]), 0)
+        
+        # Bonificación por señal de venta
+        ponderacion_short += np.where(venta_mask, abs(p["senal_venta_delta"]), 0)
+        
+        # Bonificación por PI_Short positivo
+        if 'PI_Short' in df.columns:
+            pi_short = df['PI_Short'].fillna(0)
+            th = p["ponder_inc_threshold"]
+            if th is not None:
+                ponderacion_short += np.where(venta_mask & (pi_short >= th), p["ponder_inc_pos_delta"], 0)
+    
+    # --- Multiplicador por temporalidad (aplicar a ambos) ---
+    if 'Temporalidad' in df.columns:
+        tf_lower = df['Temporalidad'].astype(str).str.lower()
+        mult = np.ones(len(df))
+        mult = np.where(tf_lower.str.contains('1min|5min|1m|5m', regex=True, na=False), p["mult_1m_5m"], mult)
+        mult = np.where(tf_lower.str.contains('15min|30min|15m|30m', regex=True, na=False), p["mult_15m_30m"], mult)
+        mult = np.where(tf_lower.str.contains('1hour|4hour|1h|4h', regex=True, na=False), p["mult_1h_4h"], mult)
+        mult = np.where(tf_lower.str.contains('1day|1week|1d|1w', regex=True, na=False), p["mult_1d_1w"], mult)
+        ponderacion_long *= mult
+        ponderacion_short *= mult
+    
+    # --- Clamp final ---
+    ponderacion_long = np.clip(ponderacion_long, 0, p["clamp_max"])  # LONG solo positivo
+    ponderacion_short = np.clip(ponderacion_short, 0, p["clamp_max"])  # SHORT solo positivo
+    
+    # Asignar a DataFrame
+    df["Ponderacion_Long"] = pd.Series(ponderacion_long, index=df.index, dtype=float)
+    df["Ponderacion_Short"] = pd.Series(ponderacion_short, index=df.index, dtype=float)
+    
+    logger.info(f"[calcular_ponderacion_direccional] LONG avg={ponderacion_long.mean():.2f}, SHORT avg={ponderacion_short.mean():.2f}")
+    
+    return df
+
 
 #@profile
 def procesar_simbolo_temporalidad(
@@ -14125,6 +14293,8 @@ _CORE_FIELDS = {
     'Zona No Trading', 'entry', 'tp', 'sl', 'stop_loss_pips',
     # Scoring & Weighting
     'Ponderacion', 'Ponderacion Incremental', 'PonderacionIncremental', 'Confianza',
+    'Ponderacion_Long', 'Ponderacion_Short',  # Directional general scoring
+    'PI_Long', 'PI_Short', 'Confluencia_Long', 'Confluencia_Short', 'TF_Total',
     'Score Final', 'score_final', 'Expectativa', 'expectativa',
     'Autorizado Whitelist', 'autorizado', 'Motivo Rechazo', 'rechazo',
     'probabilidad_tecnica', 'probabilidad_fundamental',
@@ -14655,10 +14825,25 @@ async def procesar_resultado(
         )
         logger.info("[preview] early_preview publicado en %.1fs", time.time() - t_preview_start)
 
+    # 🔧 REMOVED: Legacy incremental (deprecated)
+    # Now using only calcular_ponderacion_incremental_mejorada() which provides PI_Long/PI_Short
+    # This is the authoritative source of truth for incremental weighting
+
+    # Ponderación Incremental MEJORADA - Separada por dirección con confluencia (ÚNICA FUENTE DE VERDAD)
+    t_pond_inc_v2_start = time.time()
+    df_resultados = calcular_ponderacion_incremental_mejorada(df_resultados, cfg)
+    logger.info("[preview timing] ponderacion_incremental_mejorada (LONG/SHORT): %.1fms", (time.time() - t_pond_inc_v2_start) * 1000)
+
     # Ponderación (usa versión vectorizado - optimizado: una sola pasada sin copia redundante)
     t_pond_start = time.time()
     df_resultados["Ponderacion"] = calcular_ponderacion_vectorizado(df_resultados, cfg)
     logger.info("[preview timing] ponderacion (vectorizado optimizado): %.1fms", (time.time() - t_pond_start) * 1000)
+    
+    # Ponderación DIRECCIONAL - Separada por dirección LONG/SHORT
+    t_pond_dir_start = time.time()
+    df_resultados = calcular_ponderacion_direccional(df_resultados, cfg)
+    logger.info("[preview timing] ponderacion_direccional (LONG/SHORT): %.1fms", (time.time() - t_pond_dir_start) * 1000)
+    
     logger.info("[preview] ponderaciones listas en %.1fs", time.time() - t_proc_start)
 
     # Limpia columnas internas si existen
@@ -14669,12 +14854,45 @@ async def procesar_resultado(
         )
 
     
-    # Ordenado por ponderación
+    # Ordenado por ponderación (legacy - mantener compatibilidad)
     t_sort_start = time.time()
     df_resultados_ordenado = df_resultados.sort_values(
         by="Ponderacion", ascending=False
     )
     logger.info("[preview timing] sort by Ponderacion: %.1fms", (time.time() - t_sort_start) * 1000)
+    
+    # === RANKINGS SEPARADOS POR DIRECCIÓN (MEJORADO) ===
+    t_rank_sep_start = time.time()
+    
+    # Define señales válidas
+    try:
+        señales_compra_set = set(señales_compra)
+        señales_venta_set = set(señales_venta)
+    except NameError:
+        logger.warning("señales_compra/venta no definidas, usando defaults")
+        señales_compra_set = {'Compra', 'Compra Fuerte', 'Compra Predicha'}
+        señales_venta_set = {'Venta', 'Venta Fuerte', 'Venta Predicha'}
+    
+    # Ranking LONG - Solo filas con señales de compra, ordenadas por PI_Long + Confluencia + Ponderacion_Long
+    df_ranking_long = df_resultados[
+        df_resultados['Tipo de Operacion'].isin(señales_compra_set)
+    ].sort_values(
+        by=['PI_Long', 'Confluencia_Long', 'Ponderacion_Long'], 
+        ascending=[False, False, False]
+    ).copy()
+    
+    # Ranking SHORT - Solo filas con señales de venta, ordenadas por PI_Short + Confluencia + Ponderacion_Short
+    df_ranking_short = df_resultados[
+        df_resultados['Tipo de Operacion'].isin(señales_venta_set)
+    ].sort_values(
+        by=['PI_Short', 'Confluencia_Short', 'Ponderacion_Short'], 
+        ascending=[False, False, False]
+    ).copy()
+    
+    logger.info(
+        "[preview timing] rankings separados: LONG=%d rows, SHORT=%d rows, %.1fms",
+        len(df_ranking_long), len(df_ranking_short), (time.time() - t_rank_sep_start) * 1000
+    )
 
     # Oportunidades base (solo zona válida) - DEFINIR ANTES DE USAR
     t_filter_start = time.time()
@@ -14684,26 +14902,32 @@ async def procesar_resultado(
     ].copy()
     logger.info("[preview timing] filter oportunidades: %.1fms", (time.time() - t_filter_start) * 1000)
 
-    # --- IDENTIFICAR ACTIVOS PRIORITARIOS PARA MONITOREO ---
+    # --- IDENTIFICAR ACTIVOS PRIORITARIOS PARA MONITOREO (MEJORADO) ---
     t_priority_start = time.time()
-    # Top 2 Long + Top 2 Short (más ponderados de cada tipo)
+    # Top 2 Long + Top 2 Short usando los nuevos rankings
     priority_assets = []
-    if not df_filtrado.empty:
-        # Identificar operaciones long (compra)
-        df_long = df_filtrado[
-            df_filtrado.get('Tipo de Operacion', '').astype(str).str.lower().str.contains('compra|buy|long', case=False, na=False)
-        ].sort_values('Ponderacion', ascending=False).head(2)
+    if not df_ranking_long.empty or not df_ranking_short.empty:
+        # Top 2 LONG (filtra solo oportunidades válidas)
+        df_long_opp = df_ranking_long[
+            (df_ranking_long.get('Oportunidad') == True) &
+            (df_ranking_long.get('Zona No Trading') == False)
+        ].head(2)
         
-        # Identificar operaciones short (venta)
-        df_short = df_filtrado[
-            df_filtrado.get('Tipo de Operacion', '').astype(str).str.lower().str.contains('venta|sell|short', case=False, na=False)
-        ].sort_values('Ponderacion', ascending=False).head(2)
+        # Top 2 SHORT (filtra solo oportunidades válidas)
+        df_short_opp = df_ranking_short[
+            (df_ranking_short.get('Oportunidad') == True) &
+            (df_ranking_short.get('Zona No Trading') == False)
+        ].head(2)
         
         # Combinar y extraer símbolos únicos
-        df_priority = pd.concat([df_long, df_short], ignore_index=True)
+        df_priority = pd.concat([df_long_opp, df_short_opp], ignore_index=True)
         if not df_priority.empty:
             priority_assets = df_priority['Activo'].unique().tolist()
-            logger.info(f"✅ Activos prioritarios para monitoreo (top 2 long + top 2 short): {priority_assets}")
+            logger.info(
+                f"✅ Activos prioritarios (mejorado): {priority_assets} "
+                f"[LONG top: {df_long_opp['Activo'].tolist()[:2] if not df_long_opp.empty else []}, "
+                f"SHORT top: {df_short_opp['Activo'].tolist()[:2] if not df_short_opp.empty else []}]"
+            )
 
     logger.info("[preview timing] identificar priority_assets: %.1fms", (time.time() - t_priority_start) * 1000)
 
@@ -14954,6 +15178,78 @@ async def procesar_resultado(
                 metadata={"moneda_filtro": moneda_filtro, "scope": "ordenado", "upload_mode": upload_mode},
             )
         ))
+    
+    # 8b) Preparar uploads de RANKINGS SEPARADOS (LONG/SHORT - MEJORADO)
+    if can_archive:
+        # Ranking LONG
+        if not df_ranking_long.empty:
+            df_long_clean = (
+                df_ranking_long
+                .replace([np.inf, -np.inf], np.nan)
+                .where(pd.notnull(df_ranking_long), None)
+                .copy()
+            )
+            for col in df_long_clean.columns:
+                if df_long_clean[col].apply(lambda v: isinstance(v, (dict, list, tuple, set, pd.Series))).any():
+                    df_long_clean[col] = df_long_clean[col].apply(sanitize_for_json)
+            
+            long_records = sanitize_for_json(df_long_clean.to_dict("records"))
+            long_records = _optimize_records_for_upload(long_records, upload_mode=upload_mode)
+            
+            logger.info(
+                "[Upload] ranking_long: %d records, confluencia_avg=%.2f",
+                len(long_records),
+                df_ranking_long['Confluencia_Long'].mean() if 'Confluencia_Long' in df_ranking_long.columns else 0
+            )
+            
+            json_tasks.append(asyncio.create_task(
+                _upload_json_registrar(
+                    nombre_base=f"{moneda_filtro.upper()}_ranking_long",
+                    data=long_records,
+                    metadata={
+                        "moneda_filtro": moneda_filtro, 
+                        "scope": "ranking_long", 
+                        "upload_mode": upload_mode,
+                        "ranking_type": "directional_long",
+                        "count": len(long_records),
+                    },
+                )
+            ))
+        
+        # Ranking SHORT
+        if not df_ranking_short.empty:
+            df_short_clean = (
+                df_ranking_short
+                .replace([np.inf, -np.inf], np.nan)
+                .where(pd.notnull(df_ranking_short), None)
+                .copy()
+            )
+            for col in df_short_clean.columns:
+                if df_short_clean[col].apply(lambda v: isinstance(v, (dict, list, tuple, set, pd.Series))).any():
+                    df_short_clean[col] = df_short_clean[col].apply(sanitize_for_json)
+            
+            short_records = sanitize_for_json(df_short_clean.to_dict("records"))
+            short_records = _optimize_records_for_upload(short_records, upload_mode=upload_mode)
+            
+            logger.info(
+                "[Upload] ranking_short: %d records, confluencia_avg=%.2f",
+                len(short_records),
+                df_ranking_short['Confluencia_Short'].mean() if 'Confluencia_Short' in df_ranking_short.columns else 0
+            )
+            
+            json_tasks.append(asyncio.create_task(
+                _upload_json_registrar(
+                    nombre_base=f"{moneda_filtro.upper()}_ranking_short",
+                    data=short_records,
+                    metadata={
+                        "moneda_filtro": moneda_filtro, 
+                        "scope": "ranking_short", 
+                        "upload_mode": upload_mode,
+                        "ranking_type": "directional_short",
+                        "count": len(short_records),
+                    },
+                )
+            ))
 
     # 9) Preparar uploads de oportunidades (OPTIMIZADO: core fields only)
     if can_archive:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping
 
 import pandas as pd
@@ -150,6 +151,65 @@ def register_monitoreo_routes(app, *, services) -> None:
             # NOTE: ensure_stream_initialized removed - no longer maintains GCS stream
             # All real-time data flows through Firestore
 
+            # ============ COLD-START FIX: If cache is empty, fetch historical data ============
+            cache_series = st.get("series", []) or []
+            if not cache_series or len(cache_series) == 0:
+                logging.info(
+                    "INC %s %s: COLD-START detected (empty cache), fetching historical...",
+                    symbol,
+                    timeframe,
+                )
+                try:
+                    # Fetch last ~300 candles (2-3 days for 1m, weeks for 4h)
+                    # This gives the frontend enough context for technical analysis
+                    hist_from = datetime.utcnow() - timedelta(days=14)  # 14 days back
+                    hist_to = datetime.utcnow()
+                    
+                    hist_df = await asyncio.to_thread(
+                        fetch_historical_range,
+                        symbol,
+                        timeframe,
+                        hist_from,
+                        hist_to,
+                    )
+                    
+                    if hist_df is not None and not hist_df.empty:
+                        # Convert DataFrame to dict format that cache expects
+                        hist_series = []
+                        for idx, row in hist_df.iterrows():
+                            ts_ms = int(idx.timestamp() * 1000) if hasattr(idx, 'timestamp') else int(idx)
+                            hist_series.append({
+                                "t": ts_ms,
+                                "o": float(row.get("open", 0)),
+                                "h": float(row.get("high", 0)),
+                                "l": float(row.get("low", 0)),
+                                "c": float(row.get("close", 0)),
+                                "v": float(row.get("volume", 0)) if "volume" in row else None,
+                            })
+                        
+                        if hist_series:
+                            st["series"] = hist_series
+                            cache_series = hist_series
+                            logging.info(
+                                "INC %s %s: Cold-start fetched %d historical candles",
+                                symbol,
+                                timeframe,
+                                len(hist_series),
+                            )
+                    else:
+                        logging.warning(
+                            "INC %s %s: Cold-start fetch returned empty DataFrame",
+                            symbol,
+                            timeframe,
+                        )
+                except Exception as e:
+                    logging.exception(
+                        "INC %s %s: Cold-start fetch failed: %s",
+                        symbol,
+                        timeframe,
+                        str(e),
+                    )
+                    # Continue with empty series - frontend will retry
 
             try:
                 last_ts = int(last_ts) if last_ts is not None else None
@@ -303,18 +363,37 @@ def register_monitoreo_routes(app, *, services) -> None:
                 time.time() - start,
             )
 
+            # ============ COLD-START DETECTION: Add flag when returning initial data ============
+            is_cold_start = last_ts is None and len(inc) > 0
+            is_empty_response = len(inc) == 0
+            
+            if is_empty_response:
+                logging.warning(
+                    "INC EMPTY sym=%s tf=%s (may be first request with no cached/historical data)",
+                    symbol,
+                    timeframe,
+                )
+            
+            resp_payload = {
+                "status": "ok",
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "exec_id": exec_id,
+                "from_ts": inc[0]["t"] if inc else last_ts,
+                "to_ts": inc[-1]["t"] if inc else last_ts,
+                "candles": inc,
+            }
+            
+            # Add cold_start flag for frontend to detect initial data load
+            if is_cold_start:
+                resp_payload["cold_start"] = True
+            
+            # Add empty_response flag if truly no data available
+            if is_empty_response:
+                resp_payload["empty_response"] = True
+
             return (
-                jsonify(
-                    {
-                        "status": "ok",
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "exec_id": exec_id,
-                        "from_ts": inc[0]["t"] if inc else last_ts,
-                        "to_ts": inc[-1]["t"] if inc else last_ts,
-                        "candles": inc,
-                    }
-                ),
+                jsonify(resp_payload),
                 200,
             )
 

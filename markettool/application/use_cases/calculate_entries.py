@@ -17,6 +17,7 @@ from markettool.application.adapters import get_analyzer
 from markettool.application.services import (
     get_sr_service,
     get_fundamental_service,
+    get_risk_service,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ class CalculateEntriesUseCase:
         self.analyzer = get_analyzer()
         self.sr_service = get_sr_service(logger=logger)
         self.fundamental_service = get_fundamental_service(logger=logger)
+        self.risk_service = get_risk_service(logger=logger)
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
     
     async def execute(
@@ -52,7 +54,12 @@ class CalculateEntriesUseCase:
         symbol: str,
         timeframe: str,
         user_chat_id: str = None,
-        config: Optional[Dict] = None
+        config: Optional[Dict] = None,
+        account_balance: float = 1000.0,
+        entry_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        win_rate: float = 0.55,
     ) -> Dict[str, Any]:
         """
         Calculate entry signals using complete hexagonal analysis.
@@ -64,6 +71,11 @@ class CalculateEntriesUseCase:
             timeframe: Timeframe (1day, 1h, etc.)
             user_chat_id: User chat ID for logging
             config: Configuration dictionary
+            account_balance: Account balance for risk management
+            entry_price: Entry price for risk metrics calculation
+            stop_loss: Stop loss price for risk metrics
+            take_profit: Take profit price for risk metrics
+            win_rate: Historical win rate (0-1) for Kelly calculation
         
         Returns:
             Dict with entry signal analysis
@@ -91,8 +103,23 @@ class CalculateEntriesUseCase:
                 config or {}
             )
             
+            # === Step 5: Risk Management ===
+            risk_metrics = None
+            if entry_price and stop_loss and take_profit:
+                risk_metrics = self.risk_service.calculate_position_size(
+                    account_balance=account_balance,
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    risk_pct=config.get('risk_per_trade', 0.02) if config else 0.02,
+                    use_kelly=False,
+                    win_rate=win_rate,
+                    avg_win=1.5,
+                    avg_loss=1.0,
+                )
+            
             # === Return Results ===
-            return {
+            result = {
                 'tipo_operacion': entry_signal['direction'],
                 'probabilidad_alza': entry_signal.get('prob_up', 50),
                 'probabilidad_baja': entry_signal.get('prob_down', 50),
@@ -109,9 +136,27 @@ class CalculateEntriesUseCase:
                 'atr': sr_result.get('atr'),
                 'is_range': sr_result.get('is_range', False),
                 'structure': sr_result.get('structure', 'undefined'),
+                'threshold_buy': entry_signal.get('threshold_buy', 65),
+                'threshold_sell': entry_signal.get('threshold_sell', 35),
+                'volatility_ratio': entry_signal.get('volatility_ratio', 1.0),
                 'technical': technical_result,
                 'fundamental': fundamental_result,
             }
+            
+            # Add risk metrics if available
+            if risk_metrics:
+                result['risk_metrics'] = {
+                    'position_size': round(risk_metrics.position_size, 4),
+                    'risk_amount': round(risk_metrics.risk_amount, 2),
+                    'reward_amount': round(risk_metrics.reward_amount, 2),
+                    'risk_reward_ratio': round(risk_metrics.risk_reward_ratio, 2),
+                    'kelly_fraction': round(risk_metrics.kelly_fraction, 4),
+                    'position_size_kelly': round(risk_metrics.position_size_kelly, 4),
+                    'expectancy': round(risk_metrics.expectancy, 2),
+                    'warning': risk_metrics.warning,
+                }
+            
+            return result
         
         except Exception as e:
             self.logger.error(f"Error in CalculateEntriesUseCase: {e}", exc_info=True)
@@ -346,12 +391,26 @@ class CalculateEntriesUseCase:
         # Combine probabilities
         combined_prob = (technical_prob * 0.6 + fundamental_prob * 0.4)
         
-        # Determine direction
-        if combined_prob > 65:
+        # === DYNAMIC THRESHOLDS BASED ON VOLATILITY ===
+        atr = sr.get('atr', 0)
+        atr_mean = df['atr'].mean() if 'atr' in df.columns else atr
+        volatility_ratio = atr / atr_mean if atr_mean > 0 else 1.0
+        
+        # Widen thresholds in high volatility (need stronger confirmation)
+        # Low volatility: 65/35, High volatility: 70/30
+        threshold_buy = 65 + (volatility_ratio - 1.0) * 5
+        threshold_sell = 35 - (volatility_ratio - 1.0) * 5
+        
+        # Clamp thresholds to reasonable ranges
+        threshold_buy = max(60, min(80, threshold_buy))
+        threshold_sell = max(20, min(40, threshold_sell))
+        
+        # Determine direction using dynamic thresholds
+        if combined_prob > threshold_buy:
             direction = 'Compra'
             prob_up = int(combined_prob)
             prob_down = 100 - prob_up
-        elif combined_prob < 35:
+        elif combined_prob < threshold_sell:
             direction = 'Venta'
             prob_down = int(100 - combined_prob)
             prob_up = 100 - prob_down
@@ -372,6 +431,9 @@ class CalculateEntriesUseCase:
             'fundamental_prob': int(fundamental_prob),
             'confidence': signal.confidence if signal else 0,
             'reason': signal.reason if signal else 'Combined analysis',
+            'threshold_buy': round(threshold_buy, 2),
+            'threshold_sell': round(threshold_sell, 2),
+            'volatility_ratio': round(volatility_ratio, 2),
         }
 
 
