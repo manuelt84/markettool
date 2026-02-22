@@ -870,3 +870,164 @@ def register_monitoreo_routes(app, *, services) -> None:
         except Exception as exc:
             logging.exception("Error en /monitoreo/history")
             return jsonify({"status": "error", "message": str(exc)}), 500
+    # ==================== NEW ENDPOINTS FOR ENTRIES ====================
+    
+    @app.route("/api/entries/all", methods=["POST"])
+    async def get_all_entries():
+        """
+        POST /api/entries/all
+        Get all calculated entries across all symbols, ranked by confluence score.
+        
+        Body:
+        {
+            "limit": 100,           # optional, default 100
+            "sort_by": "score",     # optional: "score", "rrr", "timestamp", "symbol"
+            "skip_expired": true    # optional, default true
+        }
+        
+        Returns:
+        {
+            "entries": [
+                {
+                    "id": "uuid",
+                    "symbol": "EURUSD",
+                    "timeframe": "1H",
+                    "side": "long",
+                    "entry_price": 1.0850,
+                    "take_profit": 1.0890,
+                    "stop_loss": 1.0810,
+                    "rrr": 2.0,
+                    "confluence_score": 85,
+                    "strategies": ["tech", "sr", "smc", "fvg"],
+                    "source": "confluence",
+                    "rank": 1,
+                    "created_at": "2026-02-22T15:30:00Z",
+                    "expires_at": "2026-02-22T16:30:00Z"
+                }
+            ],
+            "total": 245,
+            "timestamp": "2026-02-22T15:35:00Z"
+        }
+        """
+        try:
+            from markettool.application.services.entries_aggregation_service import entries_agg
+            
+            body = request.get_json(force=True) or {}
+            limit = body.get("limit", 100)
+            sort_by = body.get("sort_by", "score")
+            skip_expired = body.get("skip_expired", True)
+            
+            # Ensure limits
+            limit = min(int(limit), 500)  # Max 500 entries
+            
+            entries = await entries_agg.get_all_entries(
+                limit=limit,
+                sort_by=sort_by,
+                skip_expired=skip_expired
+            )
+            
+            return jsonify({
+                "status": "ok",
+                "entries": entries,
+                "total": len(entries),
+                "timestamp": datetime.utcnow().isoformat()
+            }), 200
+        
+        except Exception as exc:
+            logger.exception("Error en /api/entries/all")
+            return jsonify({"status": "error", "message": str(exc)}), 500
+
+    @app.route("/api/entries/search", methods=["POST"])
+    async def search_entries():
+        """
+        POST /api/entries/search
+        Search entries with filters.
+        
+        Body:
+        {
+            "symbol": "EURUSD",     # optional
+            "timeframe": "1H",      # optional
+            "side": "long",         # optional: "long", "short"
+            "min_score": 50,        # optional, default 0
+            "max_score": 100,       # optional, default 100
+            "limit": 50,            # optional, default 100
+            "sort_by": "score"      # optional
+        }
+        
+        Returns:
+        Same as /api/entries/all
+        """
+        try:
+            from markettool.application.services.entries_aggregation_service import entries_agg
+            
+            body = request.get_json(force=True) or {}
+            
+            symbol = body.get("symbol")
+            timeframe = body.get("timeframe")
+            side = body.get("side")
+            min_score = int(body.get("min_score", 0))
+            max_score = int(body.get("max_score", 100))
+            limit = min(int(body.get("limit", 100)), 500)
+            sort_by = body.get("sort_by", "score")
+            
+            entries = await entries_agg.filter_entries(
+                symbol=symbol,
+                timeframe=timeframe,
+                side=side,
+                min_score=min_score,
+                max_score=max_score,
+                limit=limit,
+                sort_by=sort_by
+            )
+            
+            return jsonify({
+                "status": "ok",
+                "entries": entries,
+                "total": len(entries),
+                "filters": {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "side": side,
+                    "min_score": min_score,
+                    "max_score": max_score
+                },
+                "timestamp": datetime.utcnow().isoformat()
+            }), 200
+        
+        except Exception as exc:
+            logger.exception("Error en /api/entries/search")
+            return jsonify({"status": "error", "message": str(exc)}), 500
+
+    @app.route("/api/entries/stats", methods=["GET"])
+    async def get_entries_stats():
+        """
+        GET /api/entries/stats
+        Get statistics about cached entries.
+        
+        Returns:
+        {
+            "total_entries": 245,
+            "avg_score": 67.5,
+            "max_score": 95,
+            "min_score": 35,
+            "avg_rrr": 1.8,
+            "symbols_count": 12,
+            "symbols": ["EURUSD", "GBPUSD", ...],
+            "longs_count": 125,
+            "shorts_count": 120,
+            "last_updated": "2026-02-22T15:35:00Z"
+        }
+        """
+        try:
+            from markettool.application.services.entries_aggregation_service import entries_agg
+            
+            stats = await entries_agg.get_statistics()
+            
+            return jsonify({
+                "status": "ok",
+                "data": stats
+            }), 200
+        
+        except Exception as exc:
+            logger.exception("Error en /api/entries/stats")
+            return jsonify({"status": "error", "message": str(exc)}), 500

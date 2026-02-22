@@ -19,6 +19,7 @@ from markettool.application.services import (
     get_fundamental_service,
     get_risk_service,
 )
+from markettool.application.services.strategy_consolidation_service import strategy_service
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,19 @@ class CalculateEntriesUseCase:
                 timeframe
             )
             
+            # === Step 3a: Strategy Consolidation (All 12 Strategies) ===
+            candles_list = df[['open', 'high', 'low', 'close', 'volume']].tail(50).to_dict('records')
+            indicators_dict = technical_result.get('indicators', {})
+            current_price = technical_result.get('current_price', df['close'].iloc[-1] if len(df) > 0 else 0)
+            
+            consolidation_result = await strategy_service.consolidate_all_strategies(
+                candles=candles_list,
+                indicators=indicators_dict,
+                symbol=symbol,
+                timeframe=timeframe,
+                current_price=current_price
+            )
+            
             # === Step 4: Decision Logic ===
             entry_signal = await self._determine_signal(
                 df,
@@ -141,6 +155,10 @@ class CalculateEntriesUseCase:
                 'volatility_ratio': entry_signal.get('volatility_ratio', 1.0),
                 'technical': technical_result,
                 'fundamental': fundamental_result,
+                # NEW: Strategy Consolidation Results
+                'consolidation': consolidation_result,
+                'confluence_score': consolidation_result.get('confluence_score', 0),
+                'strategies_detected': consolidation_result.get('active_strategies_count', 0),
             }
             
             # Add risk metrics if available
