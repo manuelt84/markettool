@@ -33,6 +33,10 @@ from collections import defaultdict
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from flask import Flask, request, jsonify
+try:
+    from flask_sock import Sock
+except ImportError:
+    Sock = None
 from google.cloud import firestore
 from google.cloud import firestore as gcf
 from google.cloud import storage
@@ -121,6 +125,167 @@ try:
     import psutil
 except Exception:
     psutil = None
+
+try:
+    import redis
+except Exception:
+    redis = None
+
+
+# ======================================================================
+# PonderacionCache: Redis-backed distributed cache with TTL
+# ======================================================================
+
+class PonderacionCache:
+    """
+    Distributed cache for ponderaciones using Redis.
+    Supports automatic TTL per timeframe.
+    Falls back to in-memory dict if Redis unavailable.
+    Includes Pub/Sub for inter-pod cache invalidation.
+    """
+    
+    def __init__(self):
+        self.redis_url = os.getenv("REDIS_URL", None)
+        self.redis_client = None
+        self.pubsub_client = None  # Separate connection for Pub/Sub
+        self.local_cache = {}  # Fallback if Redis unavailable
+        self.cache_misses = 0
+        self.cache_hits = 0
+        self.pubsub_channel = "ponderaciones:changes"
+        
+        if self.redis_url and redis:
+            try:
+                self.redis_client = redis.Redis.from_url(self.redis_url, decode_responses=True)
+                self.redis_client.ping()
+                print(f"[PonderacionCache] Connected to Redis: {self.redis_url}")
+                
+                # Create separate connection for Pub/Sub (recommended practice)
+                self.pubsub_client = redis.Redis.from_url(self.redis_url, decode_responses=True)
+            except Exception as e:
+                print(f"[PonderacionCache] Redis connection failed ({e}). Using in-memory fallback.")
+                self.redis_client = None
+                self.pubsub_client = None
+    
+    def _get_ttl_seconds(self, timeframe: str) -> int:
+        """Returns TTL in seconds based on timeframe."""
+        ttl_map = {
+            "1m": 60,
+            "5m": 300,
+            "15m": 900,
+            "30m": 1800,
+            "1h": 3600,
+            "4h": 14400,
+            "1d": 86400,
+        }
+        return ttl_map.get(timeframe, 3600)  # Default 1h
+    
+    def _make_key(self, symbol: str, timeframe: str, version: str = "v1") -> str:
+        """Generate Redis key."""
+        return f"ponderacion:{symbol}:{timeframe}:{version}"
+    
+    def get(self, symbol: str, timeframe: str, version: str = "v1") -> dict | None:
+        """Get ponderacion from cache. Returns None if not found."""
+        key = self._make_key(symbol, timeframe, version)
+        
+        if self.redis_client:
+            try:
+                data = self.redis_client.get(key)
+                if data:
+                    self.cache_hits += 1
+                    return _json.loads(data)
+            except Exception as e:
+                print(f"[PonderacionCache] Redis get failed: {e}")
+        
+        # Fallback to in-memory
+        if key in self.local_cache:
+            self.cache_hits += 1
+            return self.local_cache[key]
+        
+        self.cache_misses += 1
+        return None
+    
+    def set(self, symbol: str, timeframe: str, data: dict, version: str = "v1") -> bool:
+        """Store ponderacion in cache with TTL."""
+        key = self._make_key(symbol, timeframe, version)
+        ttl = self._get_ttl_seconds(timeframe)
+        json_data = _json.dumps(data)
+        
+        if self.redis_client:
+            try:
+                self.redis_client.setex(key, ttl, json_data)
+                # Publish invalidation event for other pods
+                self._publish_update(symbol, timeframe)
+                return True
+            except Exception as e:
+                print(f"[PonderacionCache] Redis set failed: {e}")
+        
+        # Fallback: store in memory (no TTL)
+        self.local_cache[key] = data
+        # Publish update event
+        self._publish_update(symbol, timeframe)
+        return True
+    
+    def invalidate(self, symbol: str, timeframe: str, version: str = "v1") -> bool:
+        """Remove ponderacion from cache."""
+        key = self._make_key(symbol, timeframe, version)
+        
+        if self.redis_client:
+            try:
+                self.redis_client.delete(key)
+                # Publish invalidation event
+                self._publish_update(symbol, timeframe)
+                return True
+            except Exception as e:
+                print(f"[PonderacionCache] Redis delete failed: {e}")
+        
+        # Fallback: remove from local cache
+        if key in self.local_cache:
+            del self.local_cache[key]
+        # Publish invalidation event
+        self._publish_update(symbol, timeframe)
+        return True
+    
+    def _publish_update(self, symbol: str, timeframe: str) -> None:
+        """Publish cache update to Pub/Sub channel (all pods receive this)."""
+        if self.pubsub_client is None:
+            return
+        
+        try:
+            message = _json.dumps({
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "timestamp": _dt.datetime.utcnow().isoformat(),
+            })
+            self.pubsub_client.publish(self.pubsub_channel, message)
+        except Exception as e:
+            print(f"[PonderacionCache] Pub/Sub publish failed: {e}")
+    
+    def subscribe_to_updates(self):
+        """Return Pub/Sub subscriber for listening to cache updates."""
+        if self.pubsub_client is None:
+            return None
+        try:
+            return self.pubsub_client.pubsub()
+        except Exception as e:
+            print(f"[PonderacionCache] Pub/Sub subscription failed: {e}")
+            return None
+    
+    def stats(self) -> dict:
+        """Return cache statistics."""
+        total = self.cache_hits + self.cache_misses
+        hit_rate = (self.cache_hits / total * 100) if total > 0 else 0
+        return {
+            "hits": self.cache_hits,
+            "misses": self.cache_misses,
+            "total": total,
+            "hit_rate_pct": round(hit_rate, 2),
+            "redis_connected": self.redis_client is not None,
+            "local_cache_size": len(self.local_cache),
+        }
+
+
+# Global instance
+_ponderacion_cache = PonderacionCache()
 
 
 # ======================================================================
@@ -20120,10 +20285,12 @@ def get_webhook_app():
         try:
             from markettool.interfaces.api.pod_routes import register_pod_routes
             from markettool.interfaces.api.execution_routes import register_execution_routes
+            from markettool.interfaces.api.ponderacion_routes import register_ponderacion_routes
             register_pod_routes(_webhook_app, _POD_COORDINATOR)
             register_execution_routes(_webhook_app, _EXECUTION_TRACKER, RUNNING, logger)
+            register_ponderacion_routes(_webhook_app, _ponderacion_cache)
             _routes_registered = True
-            logger.debug("Webhook routes (pod, execution) registered")
+            logger.debug("Webhook routes (pod, execution, ponderacion) registered")
         except Exception as e:
             logger.warning(f"Error registering webhook routes: {e}")
     
