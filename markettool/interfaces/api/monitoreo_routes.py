@@ -151,6 +151,35 @@ def register_monitoreo_routes(app, *, services) -> None:
             # NOTE: ensure_stream_initialized removed - no longer maintains GCS stream
             # All real-time data flows through Firestore
 
+            # ============ 1MIN HOTFIX: Force Firestore refresh for 1m to avoid cache staleness ============
+            if timeframe == "1min":
+                try:
+                    fs_doc_ref = db.collection("executions").document(exec_id)
+                    fs_live_ref = fs_doc_ref.collection("live_data").document(f"{symbol}_1min")
+                    fs_snap = await asyncio.to_thread(fs_live_ref.get)
+                    
+                    if fs_snap.exists():
+                        fs_data = fs_snap.to_dict() or {}
+                        fs_candles = fs_data.get("candles", []) or []
+                        
+                        if fs_candles and len(fs_candles) > 0:
+                            # Convert Firestore candles to millisecond format
+                            from markettool.core.data_conversion import series_to_ms
+                            fs_series = series_to_ms(fs_candles)
+                            cache_series_old = st.get("series", []) or []
+                            
+                            if len(fs_series) > len(cache_series_old):
+                                st["series"] = fs_series
+                                logging.info(
+                                    "INC 1min HOTFIX %s: Refreshed from Firestore: %d candles (was %d in cache)",
+                                    symbol,
+                                    len(fs_series),
+                                    len(cache_series_old)
+                                )
+                except Exception as e:
+                    logging.warning("INC 1min HOTFIX %s: Firestore refresh failed: %s", symbol, e)
+                    # Continue with cache as-is
+
             # ============ COLD-START FIX: If cache is empty, fetch historical data ============
             cache_series = st.get("series", []) or []
             if not cache_series or len(cache_series) == 0:
@@ -272,12 +301,16 @@ def register_monitoreo_routes(app, *, services) -> None:
                 )
             )
 
-            eps = 1
+            # 1MIN HOTFIX: Increase tolerance for 1m to handle Firestore write delays (50-500ms)
+            eps = 5000 if timeframe == "1min" else 1
+            
             if last_ts is None:
                 inc = base_ms
             elif last_server_t is not None and last_server_t > last_ts + eps:
+                # New data is available beyond the tolerance window
                 inc = [c for c in base_ms if int(c.get("t", 0)) > last_ts]
             else:
+                # Within tolerance: include last_server if it's changed and within eps window
                 inc = (
                     [last_server]
                     if (
@@ -287,6 +320,21 @@ def register_monitoreo_routes(app, *, services) -> None:
                     )
                     else []
                 )
+                # 1MIN HOTFIX: If we're waiting for a new 1m candle and cache shows no change,
+                # double-check by looking at time gap - if >= 60s, last_server might be valid
+                if (
+                    timeframe == "1min"
+                    and not inc
+                    and last_ts
+                    and last_server_t
+                    and (last_server_t - last_ts) >= 55000  # Within 5 seconds of expected 60s boundary
+                ):
+                    inc = [last_server]  # Return the last_server even if "changed" is False
+                    logging.info(
+                        "INC 1min HOTFIX %s: Returning last_server (time gap %.0fs suggests new candle)",
+                        symbol,
+                        (last_server_t - last_ts) / 1000.0
+                    )
 
             logging.info(
                 "INC %s %s last_ts=%s last_server_t=%s changed=%s -> inc_len=%d",
