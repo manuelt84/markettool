@@ -10,6 +10,7 @@ import random
 import socket
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Callable, Optional, Tuple
 
@@ -18,6 +19,7 @@ from google.cloud import firestore
 from google.cloud import storage
 
 from markettool.infra.fmp import normalize_tf
+from markettool.core.cache_config import validate_data_freshness, get_freshness_requirement_for_timeframe, CACHE_CONFIG
 
 
 logger = logging.getLogger("MarketTool")
@@ -99,10 +101,10 @@ class IndicatorsCache:
         self._pod_id = socket.gethostname()
         self._window_func = window_func
 
-        from collections import OrderedDict
         self._memory_cache = OrderedDict()
         self._memory_cache_max = _INDICATORS_MEMORY_CACHE_SIZE
-        self._memory_cache_ttl_sec = 300
+        self._memory_cache_ttl_sec = CACHE_CONFIG['memory_ttl_seconds']  # Use unified config
+        self._memory_cache_lock = threading.RLock()  # PROPOSAL 3: Thread-safe lock
         self._local_dir = os.environ.get("INDICATORS_DIR", "indicators")
 
         self._enabled = _INDICATORS_CACHE_ENABLED
@@ -183,25 +185,38 @@ class IndicatorsCache:
 
     def _memory_get(self, symbol: str, tf: str) -> Optional[dict]:
         cache_key = f"{symbol}_{tf}"
-        if cache_key in self._memory_cache:
+        with self._memory_cache_lock:  # PROPOSAL 3: Thread-safe lock
+            if cache_key not in self._memory_cache:
+                return None
+            
             data, timestamp = self._memory_cache[cache_key]
             age = time.time() - timestamp
+            
+            # Check both TTL and data freshness
             if age < self._memory_cache_ttl_sec:
                 self._memory_cache.move_to_end(cache_key)
                 logger.debug("[IndicatorsCache] Memory hit: %s/%s (age=%.0fs)", symbol, tf, age)
                 return data
+            
+            # Expired - remove from cache
             del self._memory_cache[cache_key]
+            logger.debug("[IndicatorsCache] Memory expired: %s/%s (age=%.0fs > ttl=%ds)", 
+                        symbol, tf, age, self._memory_cache_ttl_sec)
         return None
 
     def _memory_put(self, symbol: str, tf: str, data: dict) -> None:
         cache_key = f"{symbol}_{tf}"
-        if cache_key in self._memory_cache:
-            del self._memory_cache[cache_key]
-        self._memory_cache[cache_key] = (data, time.time())
-        while len(self._memory_cache) > self._memory_cache_max:
-            oldest_key = next(iter(self._memory_cache))
-            del self._memory_cache[oldest_key]
-            logger.debug("[IndicatorsCache] Evicted from memory: %s", oldest_key)
+        with self._memory_cache_lock:  # PROPOSAL 3: Thread-safe lock
+            if cache_key in self._memory_cache:
+                del self._memory_cache[cache_key]
+            
+            self._memory_cache[cache_key] = (data, time.time())
+            
+            # Enforce LRU eviction
+            while len(self._memory_cache) > self._memory_cache_max:
+                oldest_key = next(iter(self._memory_cache))
+                del self._memory_cache[oldest_key]
+                logger.debug("[IndicatorsCache] Evicted from memory (LRU): %s", oldest_key)
 
     def load(self, symbol: str, tf: str) -> Optional[dict]:
         if not self._enabled:

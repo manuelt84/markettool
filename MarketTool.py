@@ -14602,6 +14602,98 @@ class DataFramePartitionCache:
         return self.cache[cache_key]
 
 # ==============================
+# Helper: Popular entries_agg cache
+# ==============================
+async def _populate_entries_agg_from_results(df_oportunidades, exec_id: str):
+    """
+    Popula el cache de entries_agg con los resultados del análisis.
+    Transforma DataFrame de oportunidades a formato entries_agg y agrupa por symbol/timeframe.
+    """
+    try:
+        from markettool.application.services.entries_aggregation_service import entries_agg
+        
+        if df_oportunidades.empty:
+            logger.info("[entries_agg] No hay oportunidades para agregar al cache")
+            return
+        
+        # Agrupar por symbol + timeframe para bulk update
+        grouped = df_oportunidades.groupby(['Activo', 'Temporalidad'])
+        total_added = 0
+        
+        for (symbol, timeframe), group_df in grouped:
+            # Transformar filas a formato entries_agg
+            calculated_entries = []
+            for _, row in group_df.iterrows():
+                # Determinar side basado en tipo de operación
+                tipo_op = str(row.get('Tipo de Operacion', '')).lower()
+                if 'compra' in tipo_op or 'long' in tipo_op:
+                    side = 'long'
+                elif 'venta' in tipo_op or 'short' in tipo_op:
+                    side = 'short'
+                else:
+                    side = 'neutral'
+                
+                # Calcular RRR si no existe
+                entry = float(row.get('Precio de Entrada', 0))
+                tp = float(row.get('Take Profit', 0))
+                sl = float(row.get('Stop Loss', 0))
+                
+                if entry > 0 and tp > 0 and sl > 0:
+                    if side == 'long':
+                        risk = abs(entry - sl)
+                        reward = abs(tp - entry)
+                    else:  # short
+                        risk = abs(sl - entry)
+                        reward = abs(entry - tp)
+                    rrr = (reward / risk) if risk > 0 else 0
+                else:
+                    rrr = 0
+                
+                entry_data = {
+                    'side': side,
+                    'entry': entry,
+                    'tp': tp,
+                    'sl': sl,
+                    'rrr': rrr,
+                    'score': float(row.get('Ponderacion', 0)),
+                    'source': 'confluence',
+                    'strategies': ['tech', 'sr'],  # Could be enhanced with actual strategies
+                    'metadata': {
+                        'soporte_1': row.get('Soporte Nivel 1'),
+                        'soporte_2': row.get('Soporte Nivel 2'),
+                        'resistencia_1': row.get('Resistencia Nivel 1'),
+                        'resistencia_2': row.get('Resistencia Nivel 2'),
+                        'lev_buy_1': row.get('Apalancamiento Compra Nivel 1'),
+                        'lev_buy_2': row.get('Apalancamiento Compra Nivel 2'),
+                        'lev_sell_1': row.get('Apalancamiento Venta Nivel 1'),
+                        'lev_sell_2': row.get('Apalancamiento Venta Nivel 2'),
+                        'volatilidad': row.get('Volatilidad'),
+                        'pi_long': row.get('PI_Long'),
+                        'pi_short': row.get('PI_Short'),
+                        'confluencia_long': row.get('Confluencia_Long'),
+                        'confluencia_short': row.get('Confluencia_Short'),
+                        'exec_id': exec_id,
+                    }
+                }
+                calculated_entries.append(entry_data)
+            
+            # Bulk update para este symbol/timeframe (TTL: 2 horas)
+            count = await entries_agg.bulk_update_from_calculations(
+                symbol=symbol,
+                timeframe=timeframe,
+                calculated_entries=calculated_entries,
+                ttl_minutes=120
+            )
+            total_added += count
+            logger.debug(f"[entries_agg] {symbol}/{timeframe}: {count} entries agregados")
+        
+        logger.info(f"[entries_agg] ✅ Cache actualizado: {total_added} entries en {len(grouped)} pares")
+        
+    except Exception as e:
+        logger.error(f"[entries_agg] Error crítico: {e}", exc_info=True)
+
+
+# ==============================
 # procesar_resultado (optimizado)
 # ==============================
 async def procesar_resultado(
@@ -15434,6 +15526,12 @@ async def procesar_resultado(
         opp_records = df_filtrado.where(pd.notnull(df_filtrado), None).to_dict("records")
         opp_records = _optimize_records_for_upload(opp_records, upload_mode=upload_mode)
         logger.info("[Upload] oportunidades: %d records", len(opp_records))
+
+        # ✅ HOOK: Popular entries_agg cache con las oportunidades calculadas
+        try:
+            await _populate_entries_agg_from_results(df_filtrado, exec_id)
+        except Exception as e:
+            logger.error(f"[entries_agg] Error al popular cache: {e}", exc_info=True)
 
         json_tasks.append(asyncio.create_task(
             _upload_json_registrar(

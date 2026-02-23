@@ -5,48 +5,69 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time
 from typing import Any, Optional, Set
 
 from markettool.core.models.historico import Historico
+from markettool.core.cache_config import CACHE_CONFIG
 
 
 class LocalCache:
-    """File-based cache using local filesystem."""
+    """File-based cache using local filesystem with TTL and thread-safe operations."""
     
     def __init__(self, cache_dir: str = "./cache", logger: Optional[logging.Logger] = None):
         self.cache_dir = cache_dir
         self.logger = logger or logging.getLogger(__name__)
+        self._lock = threading.RLock()  # 🆕 Thread-safe file operations
+        self._default_ttl = CACHE_CONFIG['local_ttl_seconds']  # 🆕 Use unified TTL config
         os.makedirs(cache_dir, exist_ok=True)
     
-    async def get(self, key: str) -> Optional[Any]:
-        """Get from local cache."""
-        path = os.path.join(self.cache_dir, key + ".json")
-        try:
-            if os.path.exists(path):
-                with open(path, "r") as f:
-                    return json.load(f)
-        except Exception as e:
-            self.logger.error(f"Failed to read cache: {e}")
+    async def get(self, key: str, ttl_seconds: Optional[int] = None) -> Optional[Any]:
+        """Get from local cache with TTL validation (thread-safe with RLock)."""
+        with self._lock:
+            path = os.path.join(self.cache_dir, key + ".json")
+            try:
+                if os.path.exists(path):
+                    # Check TTL if specified
+                    ttl = ttl_seconds or self._default_ttl
+                    if ttl > 0:
+                        age_seconds = time.time() - os.path.getmtime(path)
+                        if age_seconds > ttl:
+                            self.logger.debug("[LocalCache] Expired: %s (age=%ds > ttl=%ds)", 
+                                            key, int(age_seconds), ttl)
+                            return None
+                    
+                    with open(path, "r") as f:
+                        data = json.load(f)
+                        self.logger.debug("[LocalCache] Hit: %s", key)
+                        return data
+            except Exception as e:
+                self.logger.error("[LocalCache] Failed to read cache: %s: %s", key, e)
         return None
     
     async def set(self, key: str, value: Any, ttl_seconds: Optional[int] = None) -> None:
-        """Set in local cache."""
-        path = os.path.join(self.cache_dir, key + ".json")
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
-                json.dump(value if not isinstance(value, Historico) else value.to_dict(), f)
-        except Exception as e:
-            self.logger.error(f"Failed to write cache: {e}")
+        """Set in local cache (thread-safe with RLock)."""
+        with self._lock:
+            path = os.path.join(self.cache_dir, key + ".json")
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    json.dump(value if not isinstance(value, Historico) else value.to_dict(), f)
+                self.logger.debug("[LocalCache] Set: %s (ttl=%s)", key, ttl_seconds or "default")
+            except Exception as e:
+                self.logger.error(f"[LocalCache] Failed to write cache: {key}: {e}")
     
     async def delete(self, key: str) -> None:
-        """Delete from local cache."""
-        path = os.path.join(self.cache_dir, key + ".json")
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception as e:
-            self.logger.error(f"Failed to delete cache: {e}")
+        """Delete from local cache (thread-safe with RLock)."""
+        with self._lock:
+            path = os.path.join(self.cache_dir, key + ".json")
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    self.logger.debug("[LocalCache] Deleted: %s", key)
+            except Exception as e:
+                self.logger.error(f"[LocalCache] Failed to delete cache: {key}: {e}")
     
     async def exists(self, key: str) -> bool:
         """Check if key exists."""
@@ -54,14 +75,16 @@ class LocalCache:
         return os.path.exists(path)
     
     async def clear(self) -> None:
-        """Clear local cache."""
-        try:
-            import shutil
-            if os.path.exists(self.cache_dir):
-                shutil.rmtree(self.cache_dir)
-            os.makedirs(self.cache_dir, exist_ok=True)
-        except Exception as e:
-            self.logger.error(f"Failed to clear cache: {e}")
+        """Clear local cache (thread-safe with RLock)."""
+        with self._lock:
+            try:
+                import shutil
+                if os.path.exists(self.cache_dir):
+                    shutil.rmtree(self.cache_dir)
+                os.makedirs(self.cache_dir, exist_ok=True)
+                self.logger.debug("[LocalCache] Cleared all entries")
+            except Exception as e:
+                self.logger.error(f"[LocalCache] Failed to clear cache: {e}")
     
     async def get_historico(self, symbol: str, timeframe: str) -> Optional[Historico]:
         """Get cached historico."""

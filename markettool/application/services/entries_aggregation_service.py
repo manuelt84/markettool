@@ -10,6 +10,11 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
 from enum import Enum
 import asyncio
+import logging
+import uuid
+
+
+logger = logging.getLogger("MarketTool")
 
 
 class SortBy(Enum):
@@ -42,6 +47,12 @@ class EntryCandidateData:
     atr_multiplier: Optional[float] = None
     risk_percentage: Optional[float] = None
     metadata: Optional[Dict[str, Any]] = None
+    # Leverage recommendations (calculated)
+    leverage_recommendations: Optional[Dict[str, float]] = None
+    # Entry status and confirmation
+    status: str = "pending"  # pending, triggered, filled, expired, cancelled
+    confirmation_count: int = 0  # number of confluent signals
+    confirmation_pct: float = 0.0  # % of signals aligned
 
 
 class EntriesAggregationService:
@@ -65,7 +76,7 @@ class EntriesAggregationService:
         self._entries_cache: Dict[str, EntryCandidateData] = {}
         self._last_cache_update: Optional[datetime] = None
 
-    async def get_all_entries(
+    def get_all_entries(
         self,
         limit: int = 100,
         sort_by: str = "score",
@@ -107,7 +118,7 @@ class EntriesAggregationService:
         
         return result
 
-    async def filter_entries(
+    def filter_entries(
         self,
         symbol: Optional[str] = None,
         timeframe: Optional[str] = None,
@@ -243,7 +254,7 @@ class EntriesAggregationService:
         
         return len(expired_ids)
 
-    async def get_statistics(self) -> Dict[str, Any]:
+    def get_statistics(self) -> Dict[str, Any]:
         """
         Get statistics about cached entries.
         
@@ -288,6 +299,67 @@ class EntriesAggregationService:
             'shorts_count': len(shorts),
             'last_updated': self._last_cache_update.isoformat() if self._last_cache_update else None
         }
+
+    def _calculate_leverage_recommendations(
+        self,
+        entry_price: float,
+        take_profit: float,
+        stop_loss: float,
+        rrr: float,
+        confluence_score: float,
+        risk_percentage: Optional[float] = None
+    ) -> Dict[str, float]:
+        """
+        Calculate leverage recommendations based on RRR, confluence, and risk.
+        Always returns a valid dict, never empty.
+        """
+        try:
+            # Default fallback based purely on RRR if prices are invalid
+            if not (entry_price > 0 and take_profit > 0 and stop_loss > 0):
+                # Fallback: use RRR and confluence only
+                base_leverage = max(1, min(25, rrr))
+                confidence_multiplier = 0.5 + (confluence_score / 100.0) * 0.5
+                leverage_base = base_leverage * confidence_multiplier
+            else:
+                # Calculate distance from entry to stop loss
+                distance = abs(entry_price - stop_loss) / entry_price
+                if distance <= 0:
+                    # Fallback
+                    base_leverage = max(1, min(25, rrr))
+                    confidence_multiplier = 0.5 + (confluence_score / 100.0) * 0.5
+                    leverage_base = base_leverage * confidence_multiplier
+                else:
+                    # Normal calculation
+                    base_leverage = min(25, max(1, rrr / distance)) if distance > 0 else 1
+                    confidence_multiplier = 0.5 + (confluence_score / 100.0) * 0.5
+                    risk_multiplier = 1.0
+                    if risk_percentage:
+                        risk_multiplier = 1.0 + (risk_percentage / 5.0) * 0.5
+                    leverage_base = base_leverage * confidence_multiplier * risk_multiplier
+            
+            # Calculate different levels - always return valid numbers
+            level_1_conservative = max(1, min(20, int(leverage_base * 0.8)))
+            level_1_theoretical = max(1, min(100, int(leverage_base * 1.2)))
+            level_2_moderate = max(1, min(50, int(leverage_base * 1.5)))
+            level_2_theoretical = max(1, min(200, int(leverage_base * 2.0)))
+            recommended = max(1, min(25, int(leverage_base)))
+            
+            return {
+                "level_1_conservative": float(level_1_conservative),
+                "level_1_theoretical": float(level_1_theoretical),
+                "level_2_moderate": float(level_2_moderate),
+                "level_2_theoretical": float(level_2_theoretical),
+                "recommended": float(recommended),
+            }
+        except Exception:
+            # Last resort: hardcoded minimums
+            return {
+                "level_1_conservative": 1.0,
+                "level_1_theoretical": 2.0,
+                "level_2_moderate": 3.0,
+                "level_2_theoretical": 5.0,
+                "recommended": 2.0,
+            }
 
     def _sort_entries(
         self,
@@ -354,23 +426,81 @@ class EntriesAggregationService:
         
         new_count = 0
         for calc_entry in calculated_entries:
+            entry_price = float(calc_entry.get('entry', 0))
+            take_profit = float(calc_entry.get('tp', 0))
+            stop_loss = float(calc_entry.get('sl', 0))
+            rrr = float(calc_entry.get('rrr', 0))
+            confluence_score = float(calc_entry.get('score', 0))
+            strategies = calc_entry.get('strategies', [])
+            
+            # 🔧 FIX: Determine source with refined confluence detection
+            # Priority: 
+            # 1. Explicit source from calc_entry (if provided)
+            # 2. Single strategy → use that strategy
+            # 3. Multiple strategies with high score (≥85) AND ≥3 strategies → confluence
+            # 4. Multiple strategies → use highest priority strategy
+            # 5. No strategies → unknown
+            
+            if 'source' in calc_entry and calc_entry['source']:
+                # Explicit source provided by strategy
+                source = calc_entry['source']
+            elif not strategies or len(strategies) == 0:
+                # No strategies detected
+                source = "unknown"
+            elif len(strategies) == 1:
+                # Single strategy - use it directly
+                source = strategies[0].lower()
+            elif len(strategies) >= 3 and confluence_score >= 85:
+                # TRUE confluence: 3+ strategies with very high score
+                source = "confluence"
+            else:
+                # Multiple strategies but not strong enough for confluence
+                # Use highest priority strategy
+                strategy_priority = {"fvg": 4, "smc": 3, "sr": 2, "tech": 1}
+                sorted_strategies = sorted(
+                    strategies,
+                    key=lambda s: strategy_priority.get(s.lower(), 0),
+                    reverse=True
+                )
+                source = sorted_strategies[0].lower()
+            
+            # Debug logging for source assignment
+            if len(strategies) > 1:
+                logger.debug(
+                    "[EntriesAgg] %s/%s: strategies=%s score=%.1f → source=%s",
+                    symbol, timeframe, strategies, confluence_score, source
+                )
+            
             entry = EntryCandidateData(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
                 timeframe=timeframe,
                 side=calc_entry.get('side', 'long').lower(),
-                entry_price=float(calc_entry.get('entry', 0)),
-                take_profit=float(calc_entry.get('tp', 0)),
-                stop_loss=float(calc_entry.get('sl', 0)),
-                rrr=float(calc_entry.get('rrr', 0)),
-                confluence_score=float(calc_entry.get('score', 0)),
-                strategies=calc_entry.get('strategies', []),
-                source=calc_entry.get('source', 'unknown'),
+                entry_price=entry_price,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                rrr=rrr,
+                confluence_score=confluence_score,
+                strategies=strategies,
+                source=source,
                 created_at=now.isoformat(),
                 expires_at=expires_at,
                 atr_multiplier=calc_entry.get('atr_mult'),
                 risk_percentage=calc_entry.get('risk_pct'),
-                metadata=calc_entry.get('metadata')
+                metadata=calc_entry.get('metadata'),
+                # Calculate leverage recommendations
+                leverage_recommendations=self._calculate_leverage_recommendations(
+                    entry_price=entry_price,
+                    take_profit=take_profit,
+                    stop_loss=stop_loss,
+                    rrr=rrr,
+                    confluence_score=confluence_score,
+                    risk_percentage=calc_entry.get('risk_pct')
+                ),
+                # Set entry status
+                status="pending",
+                confirmation_count=len(strategies),
+                confirmation_pct=min(100.0, confluence_score)
             )
             await self.add_entry(entry)
             new_count += 1

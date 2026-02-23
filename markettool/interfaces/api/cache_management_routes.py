@@ -21,7 +21,7 @@ def register_cache_routes(app: Flask, container: DIContainer, logger: logging.Lo
     """
     
     @app.route("/api/v1/cache/stats", methods=["GET"])
-    async def get_cache_stats():
+    async def v1_get_cache_stats():
         """Get cache statistics (hits, misses, size)."""
         try:
             stats = await container.warm_cache.get_cache_stats()
@@ -35,7 +35,7 @@ def register_cache_routes(app: Flask, container: DIContainer, logger: logging.Lo
             return {"status": "error", "message": str(e)}, 500
     
     @app.route("/api/v1/cache/warmup", methods=["POST"])
-    async def warmup_cache():
+    async def v1_warmup_cache():
         """
         Warm cache with frequently used symbols.
         
@@ -70,7 +70,7 @@ def register_cache_routes(app: Flask, container: DIContainer, logger: logging.Lo
             return {"status": "error", "message": str(e)}, 500
     
     @app.route("/api/v1/cache/clear", methods=["POST"])
-    async def clear_cache():
+    async def v1_clear_cache():
         """Clear entire cache."""
         try:
             await container.warm_cache.cache.clear()
@@ -84,7 +84,7 @@ def register_cache_routes(app: Flask, container: DIContainer, logger: logging.Lo
             return {"status": "error", "message": str(e)}, 500
     
     @app.route("/api/v1/cache/invalidate/<symbol>/<timeframe>", methods=["DELETE"])
-    async def invalidate_cache(symbol: str, timeframe: str):
+    async def v1_invalidate_cache(symbol: str, timeframe: str):
         """Invalidate cache for specific symbol/timeframe."""
         try:
             await container.warm_cache.cache.invalidate_historico(symbol, timeframe)

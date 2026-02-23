@@ -12,6 +12,7 @@ import pandas as pd
 from flask import jsonify, request
 
 from markettool.application.use_cases.legacy import LegacyMonitoreoUseCase
+from markettool.core.cache_config import validate_data_freshness, get_freshness_requirement_for_timeframe
 
 
 def register_monitoreo_routes(app, *, services) -> None:
@@ -164,7 +165,7 @@ def register_monitoreo_routes(app, *, services) -> None:
                         
                         if fs_candles and len(fs_candles) > 0:
                             # Convert Firestore candles to millisecond format
-                            from markettool.core.data_conversion import series_to_ms
+                            # series_to_ms already available from outer scope (line 32)
                             fs_series = series_to_ms(fs_candles)
                             cache_series_old = st.get("series", []) or []
                             
@@ -872,8 +873,72 @@ def register_monitoreo_routes(app, *, services) -> None:
             return jsonify({"status": "error", "message": str(exc)}), 500
     # ==================== NEW ENDPOINTS FOR ENTRIES ====================
     
+    # 🚀 Cache for freshness requirements (avoid repeated function calls)
+    _freshness_cache = {}
+    
+    def _validate_entry_freshness(entry: dict, freshness_cache: dict) -> dict:
+        """
+        🆕 PROPOSAL2: Validate data freshness for each entry (OPTIMIZED).
+        
+        Adds freshness metadata to entry:
+        - freshness_status: "fresh" | "stale" | "unknown"
+        - data_age_seconds: estimated age of underlying data
+        - freshness_requirement_seconds: max age allowed for this timeframe
+        
+        Args:
+            entry: Entry dict
+            freshness_cache: Dict to cache timeframe requirements (avoid repeated calls)
+        
+        Returns: entry dict with added metadata
+        """
+        try:
+            symbol = entry.get("symbol", "unknown")
+            timeframe = entry.get("timeframe", "unknown")
+            created_at_str = entry.get("created_at")
+            
+            if not created_at_str:
+                entry["freshness_status"] = "unknown"
+                return entry
+            
+            # 🚀 OPTIMIZED: Faster datetime parsing
+            try:
+                # Fast path: assume ISO format with Z
+                if 'Z' in created_at_str:
+                    created_at_str_clean = created_at_str.replace('Z', '')
+                    created_at = datetime.fromisoformat(created_at_str_clean)
+                else:
+                    created_at = datetime.fromisoformat(created_at_str)
+                
+                now = datetime.utcnow()
+                data_age_seconds = int((now - created_at).total_seconds())
+            except:
+                data_age_seconds = 0
+            
+            # 🚀 OPTIMIZED: Cache freshness requirements (avoid 500 function calls)
+            if timeframe not in freshness_cache:
+                try:
+                    freshness_cache[timeframe] = get_freshness_requirement_for_timeframe(timeframe)
+                except:
+                    freshness_cache[timeframe] = 3600  # Default 1 hour
+            
+            freshness_req_seconds = freshness_cache[timeframe]
+            
+            # Validate freshness
+            is_fresh = data_age_seconds <= freshness_req_seconds
+            
+            entry["freshness_status"] = "fresh" if is_fresh else "stale"
+            entry["data_age_seconds"] = data_age_seconds
+            
+            # 🚀 REMOVED: Verbose debug logging (was causing slowdown with 500 entries)
+            
+            return entry
+        except Exception as e:
+            # Silent fail - don't log debug per entry (too verbose)
+            entry["freshness_status"] = "unknown"
+            return entry
+    
     @app.route("/api/entries/all", methods=["POST"])
-    async def get_all_entries():
+    def get_all_entries():
         """
         POST /api/entries/all
         Get all calculated entries across all symbols, ranked by confluence score.
@@ -882,7 +947,8 @@ def register_monitoreo_routes(app, *, services) -> None:
         {
             "limit": 100,           # optional, default 100
             "sort_by": "score",     # optional: "score", "rrr", "timestamp", "symbol"
-            "skip_expired": true    # optional, default true
+            "skip_expired": true,   # optional, default true
+            "validate_freshness": false  # 🆕 optional, default false (enable for freshness validation)
         }
         
         Returns:
@@ -902,7 +968,20 @@ def register_monitoreo_routes(app, *, services) -> None:
                     "source": "confluence",
                     "rank": 1,
                     "created_at": "2026-02-22T15:30:00Z",
-                    "expires_at": "2026-02-22T16:30:00Z"
+                    "expires_at": "2026-02-22T16:30:00Z",
+                    "atr_multiplier": 1.5,
+                    "risk_percentage": 2.0,
+                    "status": "pending",
+                    "confirmation_count": 4,
+                    "confirmation_pct": 85.0,
+                    "leverage_recommendations": {
+                        "level_1_conservative": 5.0,
+                        "level_1_theoretical": 8.0,
+                        "level_2_moderate": 10.0,
+                        "level_2_theoretical": 15.0,
+                        "recommended": 8.0
+                    },
+                    "metadata": {}
                 }
             ],
             "total": 245,
@@ -916,29 +995,59 @@ def register_monitoreo_routes(app, *, services) -> None:
             limit = body.get("limit", 100)
             sort_by = body.get("sort_by", "score")
             skip_expired = body.get("skip_expired", True)
+            validate_freshness = body.get("validate_freshness", False)  # 🚀 OFF by default for performance
             
             # Ensure limits
             limit = min(int(limit), 500)  # Max 500 entries
             
-            entries = await entries_agg.get_all_entries(
+            entries = entries_agg.get_all_entries(
                 limit=limit,
                 sort_by=sort_by,
                 skip_expired=skip_expired
             )
             
-            return jsonify({
+            # 🚀 OPTIMIZED: Freshness validation now OPTIONAL (default OFF to avoid 504 timeout)
+            response_data = {
                 "status": "ok",
                 "entries": entries,
                 "total": len(entries),
                 "timestamp": datetime.utcnow().isoformat()
-            }), 200
+            }
+            
+            # Only validate if explicitly requested
+            if validate_freshness:
+                validated_entries = []
+                fresh_count = 0
+                stale_count = 0
+                
+                for entry in entries:
+                    validated = _validate_entry_freshness(entry, _freshness_cache)
+                    validated_entries.append(validated)
+                    if validated.get("freshness_status") == "fresh":
+                        fresh_count += 1
+                    elif validated.get("freshness_status") == "stale":
+                        stale_count += 1
+                
+                logger.info(
+                    "[FRESHNESS] Total: %d, Fresh: %d, Stale: %d",
+                    len(validated_entries), fresh_count, stale_count
+                )
+                
+                response_data["entries"] = validated_entries
+                response_data["freshness_summary"] = {
+                    "fresh_count": fresh_count,
+                    "stale_count": stale_count,
+                    "total": len(validated_entries),
+                }
+            
+            return jsonify(response_data), 200
         
         except Exception as exc:
             logger.exception("Error en /api/entries/all")
             return jsonify({"status": "error", "message": str(exc)}), 500
 
     @app.route("/api/entries/search", methods=["POST"])
-    async def search_entries():
+    def search_entries():
         """
         POST /api/entries/search
         Search entries with filters.
@@ -955,7 +1064,7 @@ def register_monitoreo_routes(app, *, services) -> None:
         }
         
         Returns:
-        Same as /api/entries/all
+        Same as /api/entries/all with leverage_recommendations, status, confirmation_count, confirmation_pct
         """
         try:
             from markettool.application.services.entries_aggregation_service import entries_agg
@@ -970,7 +1079,7 @@ def register_monitoreo_routes(app, *, services) -> None:
             limit = min(int(body.get("limit", 100)), 500)
             sort_by = body.get("sort_by", "score")
             
-            entries = await entries_agg.filter_entries(
+            entries = entries_agg.filter_entries(
                 symbol=symbol,
                 timeframe=timeframe,
                 side=side,
@@ -999,7 +1108,7 @@ def register_monitoreo_routes(app, *, services) -> None:
             return jsonify({"status": "error", "message": str(exc)}), 500
 
     @app.route("/api/entries/stats", methods=["GET"])
-    async def get_entries_stats():
+    def get_entries_stats():
         """
         GET /api/entries/stats
         Get statistics about cached entries.
@@ -1021,7 +1130,7 @@ def register_monitoreo_routes(app, *, services) -> None:
         try:
             from markettool.application.services.entries_aggregation_service import entries_agg
             
-            stats = await entries_agg.get_statistics()
+            stats = entries_agg.get_statistics()
             
             return jsonify({
                 "status": "ok",

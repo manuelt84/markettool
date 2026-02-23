@@ -27,8 +27,8 @@ def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None
     _clients_lock = asyncio.Lock()
     
     @app.route("/api/ponderacion/stats", methods=["GET"])
-    def get_cache_stats():
-        """Get cache statistics (hits, misses, Redis status)."""
+    def get_ponderacion_cache_stats():
+        """Get ponderación cache statistics (hits, misses, Redis status)."""
         stats = ponderacion_cache.stats()
         return jsonify({
             "cache": stats,

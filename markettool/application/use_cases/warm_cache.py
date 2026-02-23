@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from typing import List, Optional, Set
 
 from markettool.core.ports.cache_provider import CacheProvider
 from markettool.core.ports.historicos_repo import HistoricosRepository
 from markettool.core.errors import DataNotFoundError
+from markettool.core.cache_config import CACHE_CONFIG, validate_data_freshness
 
 
 class WarmCacheUseCase:
@@ -25,6 +27,8 @@ class WarmCacheUseCase:
         self.cache = cache_provider
         self.repo = historicos_repo
         self.logger = logger or logging.getLogger(__name__)
+        self._semaphore = asyncio.Semaphore(10)  # 🆕 Concurrency limit to prevent race conditions
+        self._lock = threading.RLock()  # 🆕 Thread-safe stats updates
     
     async def execute(
         self,
@@ -85,37 +89,66 @@ class WarmCacheUseCase:
         force: bool,
         stats: dict,
     ) -> None:
-        """Warm cache for one symbol/timeframe."""
-        try:
-            cache_key = f"{symbol}:{timeframe}"
-            
-            # Check if already cached
-            if not force:
-                exists = await self.cache.exists(f"historicos:{cache_key}")
-                if exists:
-                    stats["skipped"] += 1
-                    return
-            
-            # Fetch and cache
-            historico = await self.repo.get_historico(
-                symbol=symbol,
-                timeframe=timeframe,
-            )
-            
-            if historico.is_empty:
-                self.logger.warning(f"No data for {cache_key}")
-                stats["failed"] += 1
-                return
-            
-            await self.cache.set_historico(historico)
-            stats["succeeded"] += 1
-            self.logger.debug(f"Cached {cache_key}")
+        """
+        Warm cache for one symbol/timeframe.
         
-        except Exception as e:
-            stats["failed"] += 1
-            error_msg = f"Failed to warm {symbol}/{timeframe}: {e}"
-            stats["errors"].append(error_msg)
-            self.logger.error(error_msg)
+        🆕 Now validates data freshness before caching.
+        """
+        async with self._semaphore:  # 🆕 Limit concurrent tasks
+            try:
+                cache_key = f"{symbol}:{timeframe}"
+                
+                # Check if already cached
+                if not force:
+                    exists = await self.cache.exists(f"historicos:{cache_key}")
+                    if exists:
+                        with self._lock:
+                            stats["skipped"] += 1
+                        return
+                
+                # Fetch data from repo
+                historico = await self.repo.get_historico(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                )
+                
+                if historico.is_empty:
+                    self.logger.warning(f"No data for {cache_key}")
+                    with self._lock:
+                        stats["failed"] += 1
+                    return
+                
+                # 🆕 CRITICAL: Validate data freshness BEFORE caching
+                if hasattr(historico, 'df') and historico.df is not None:
+                    is_fresh, age_seconds, reason = validate_data_freshness(
+                        historico.df, symbol, timeframe
+                    )
+                    
+                    if not is_fresh:
+                        self.logger.warning(
+                            f"[WARMUP] Skipping stale data for {cache_key}: {reason} (age={age_seconds}s)"
+                        )
+                        with self._lock:
+                            stats["failed"] += 1
+                            stats["errors"].append(f"{cache_key}: {reason}")
+                        return
+                    
+                    self.logger.debug(f"[WARMUP] Fresh data for {cache_key}: age={age_seconds}s")
+                
+                # Cache with appropriate TTL from CACHE_CONFIG
+                ttl = CACHE_CONFIG['local_ttl_seconds']  # Use local TTL for warmup (1 hour)
+                await self.cache.set_historico(historico, ttl_seconds=ttl)
+                
+                with self._lock:
+                    stats["succeeded"] += 1
+                self.logger.debug(f"Cached {cache_key} with TTL={ttl}s")
+            
+            except Exception as e:
+                with self._lock:
+                    stats["failed"] += 1
+                    error_msg = f"Failed to warm {symbol}/{timeframe}: {e}"
+                    stats["errors"].append(error_msg)
+                self.logger.error(error_msg)
     
     async def execute_full_warmup(self) -> dict:
         """

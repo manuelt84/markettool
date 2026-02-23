@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, List, Optional
 from datetime import datetime, timedelta
 
 from markettool.core.ports.cache_provider import CacheProvider
 from markettool.core.errors import CacheError
+from markettool.core.cache_config import CACHE_CONFIG, validate_data_freshness
 
 
 class MultiLayerCacheProvider(CacheProvider):
@@ -36,6 +38,7 @@ class MultiLayerCacheProvider(CacheProvider):
         self.local = local_cache
         self.gcs = gcs_cache
         self.logger = logger or logging.getLogger(__name__)
+        self._lock = threading.RLock()  # 🆕 Thread-safe fallback operations
         
         # Verify at least one cache is configured
         if not any([memory_cache, local_cache, gcs_cache]):
@@ -62,10 +65,11 @@ class MultiLayerCacheProvider(CacheProvider):
                     value = await self.local.get(key)
                     if value is not None:
                         self.logger.debug(f"Cache HIT (local) for {key}")
-                        # Write back to memory
+                        # 🆕 Write back to memory with memory-specific TTL (no stale propagation)
                         if self.memory:
                             try:
-                                await self.memory.set(key, value)
+                                # Use memory TTL, not local TTL (prevents 1h data getting 10min expiry)
+                                await self.memory.set(key, value, ttl_seconds=CACHE_CONFIG['memory_ttl_seconds'])
                             except Exception:
                                 pass
                         return value
@@ -78,15 +82,15 @@ class MultiLayerCacheProvider(CacheProvider):
                     value = await self.gcs.get(key)
                     if value is not None:
                         self.logger.debug(f"Cache HIT (gcs) for {key}")
-                        # Write back to memory and local
+                        # 🆕 Write back to faster layers with layer-specific TTLs (prevents 24h data getting 10min TTL)
                         if self.memory:
                             try:
-                                await self.memory.set(key, value)
+                                await self.memory.set(key, value, ttl_seconds=CACHE_CONFIG['memory_ttl_seconds'])
                             except Exception:
                                 pass
                         if self.local:
                             try:
-                                await self.local.set(key, value)
+                                await self.local.set(key, value, ttl_seconds=CACHE_CONFIG['local_ttl_seconds'])
                             except Exception:
                                 pass
                         return value
@@ -107,40 +111,47 @@ class MultiLayerCacheProvider(CacheProvider):
         ttl_seconds: Optional[int] = None,
     ) -> None:
         """
-        Set value across all configured cache layers.
+        Set value across all configured cache layers with per-layer TTLs.
+        
+        🆕 Each layer gets its appropriate TTL from CACHE_CONFIG if not specified.
+        This prevents TTL corruption (e.g., 24h GCS data getting 10min memory TTL).
         """
-        errors = []
-        
-        # Write to memory
-        if self.memory:
-            try:
-                await self.memory.set(key, value, ttl_seconds)
-            except Exception as e:
-                errors.append(f"Memory: {e}")
-                self.logger.warning(f"Failed to set in memory cache: {e}")
-        
-        # Write to local
-        if self.local:
-            try:
-                await self.local.set(key, value, ttl_seconds)
-            except Exception as e:
-                errors.append(f"Local: {e}")
-                self.logger.warning(f"Failed to set in local cache: {e}")
-        
-        # Write to GCS
-        if self.gcs:
-            try:
-                await self.gcs.set(key, value, ttl_seconds)
-            except Exception as e:
-                errors.append(f"GCS: {e}")
-                self.logger.warning(f"Failed to set in GCS cache: {e}")
-        
-        # If all layers failed, raise error
-        if errors and not any([
-            hasattr(self, f) and getattr(self, f)
-            for f in ["memory", "local", "gcs"]
-        ]):
-            raise CacheError(f"Failed to set {key} in any cache layer: {errors}")
+        with self._lock:  # 🆕 Thread-safe multi-layer write
+            errors = []
+            
+            # Write to memory with memory-specific TTL
+            if self.memory:
+                try:
+                    memory_ttl = ttl_seconds if ttl_seconds is not None else CACHE_CONFIG['memory_ttl_seconds']
+                    await self.memory.set(key, value, memory_ttl)
+                except Exception as e:
+                    errors.append(f"Memory: {e}")
+                    self.logger.warning(f"Failed to set in memory cache: {e}")
+            
+            # Write to local with local-specific TTL
+            if self.local:
+                try:
+                    local_ttl = ttl_seconds if ttl_seconds is not None else CACHE_CONFIG['local_ttl_seconds']
+                    await self.local.set(key, value, local_ttl)
+                except Exception as e:
+                    errors.append(f"Local: {e}")
+                    self.logger.warning(f"Failed to set in local cache: {e}")
+            
+            # Write to GCS with GCS-specific TTL
+            if self.gcs:
+                try:
+                    gcs_ttl = ttl_seconds if ttl_seconds is not None else CACHE_CONFIG['gcs_ttl_seconds']
+                    await self.gcs.set(key, value, gcs_ttl)
+                except Exception as e:
+                    errors.append(f"GCS: {e}")
+                    self.logger.warning(f"Failed to set in GCS cache: {e}")
+            
+            # If all layers failed, raise error
+            if errors and not any([
+                hasattr(self, f) and getattr(self, f)
+                for f in ["memory", "local", "gcs"]
+            ]):
+                raise CacheError(f"Failed to set {key} in any cache layer: {errors}")
     
     async def invalidate(self, key: str) -> None:
         """

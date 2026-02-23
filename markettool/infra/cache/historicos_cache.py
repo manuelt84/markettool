@@ -10,7 +10,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -20,35 +20,67 @@ from google.cloud import storage
 
 from markettool.core.config import load_config
 from markettool.infra.fmp import normalize_tf
+from markettool.core.cache_config import validate_data_freshness, get_freshness_requirement_for_timeframe, CACHE_CONFIG
 
 
 logger = logging.getLogger("MarketTool")
 APP_CONFIG = load_config()
 
+# ============================================================================
+# Thread-safe infrastructure for incremental cache merging
+# ============================================================================
 
-# ✅ TTL POLICY BY TIMEFRAME - Ensures fresh data based on update frequency
-# For high-frequency TFs (1m, 5m), use aggressive cache expiration
-# For lower-frequency TFs (1h, 1d), use longer cache TTL
-_TTL_BY_TIMEFRAME = {
-    # Intraday (minute/hour - must refresh frequently)
-    "1min":     300,      # 5 minutes   - 1m bars change every minute, cache max 5 min old
-    "5min":     600,      # 10 minutes  - 5m bars update every 5 min, cache max 10 min old
-    "15min":    900,      # 15 minutes  - 15m bars update every 15 min, cache max 15 min old
-    "30min":    1800,     # 30 minutes  - 30m bars update every 30 min
-    "1hour":    3600,     # 1 hour      - hourly bars update every hour
-    "4hour":    7200,     # 2 hours     - 4h bars update every 4 hours, cache max 2 hours old
+# Per-file locks dictionary to allow concurrent updates to different symbols
+_FILE_LOCKS_DICT: Dict[str, threading.RLock] = {}
+_LOCKS_MUTEX = threading.RLock()  # Protects the locks dictionary itself
+
+# Maximum rows to keep in local cache (0 = unlimited)
+_MAX_HISTORICO_CACHE_ROWS = int(os.environ.get("MAX_HISTORICO_CACHE_ROWS", "0"))
+
+# Validate and cap max rows for safety
+if _MAX_HISTORICO_CACHE_ROWS > 100000:
+    logger.warning("[HistCache] MAX_HISTORICO_CACHE_ROWS=%d very high, capping at 100000", 
+                   _MAX_HISTORICO_CACHE_ROWS)
+    _MAX_HISTORICO_CACHE_ROWS = 100000
+
+if _MAX_HISTORICO_CACHE_ROWS == 0:
+    logger.info("[HistCache] Incremental cache mode: UNLIMITED rows (preserve all history)")
+else:
+    logger.info("[HistCache] Incremental cache mode: MAX %d rows per symbol/timeframe", 
+                _MAX_HISTORICO_CACHE_ROWS)
+
+
+def _get_file_lock(symbol: str, tf: str) -> threading.RLock:
+    """Get or create a reentrant lock for a specific symbol/timeframe.
     
-    # Daily and above (can use longer cache)
-    "1day":     86400,    # 1 day       - daily bars update once per day
-    "1week":    604800,   # 1 week      - weekly bars update once per week
-    "1month":   2592000,  # 30 days     - monthly bars update once per month
+    This allows multiple threads to update different symbols concurrently,
+    while preventing race conditions on the same symbol/timeframe.
     
-    # Fallback for unknown TF - use conservative 30 minutes
-    "_default": 1800,
-}
+    Args:
+        symbol: Trading symbol
+        tf: Timeframe string
+        
+    Returns:
+        RLock for this specific symbol/timeframe combination
+    """
+    key = f"{symbol}_{normalize_tf(tf)}"
+    
+    # Fast path: lock already exists
+    if key in _FILE_LOCKS_DICT:
+        return _FILE_LOCKS_DICT[key]
+    
+    # Slow path: create new lock (thread-safe)
+    with _LOCKS_MUTEX:
+        if key not in _FILE_LOCKS_DICT:
+            _FILE_LOCKS_DICT[key] = threading.RLock()
+        return _FILE_LOCKS_DICT[key]
+
 
 def _get_ttl_for_timeframe(tf: str) -> int:
-    """Get the maximum cache TTL in seconds for a given timeframe.
+    """Get the maximum cache TTL in seconds for a given timeframe using unified CACHE_CONFIG.
+    
+    Delegates to cache_config.get_freshness_requirement_for_timeframe() for timeframe-based expiration.
+    Falls back to CACHE_CONFIG['local_ttl_seconds'] for unknown timeframes.
     
     Args:
         tf: Timeframe string (e.g., "1min", "5min", "1hour", "1day")
@@ -56,35 +88,17 @@ def _get_ttl_for_timeframe(tf: str) -> int:
     Returns:
         TTL in seconds
     """
-    # Normalize timeframe (handle variants)
-    tf_norm = tf.lower().strip()
-    # Try exact match first
-    if tf_norm in _TTL_BY_TIMEFRAME:
-        return _TTL_BY_TIMEFRAME[tf_norm]
-    
-    # Try partial matches for common variants
-    if "1m" in tf_norm:
-        return _TTL_BY_TIMEFRAME["1min"]
-    if "5m" in tf_norm:
-        return _TTL_BY_TIMEFRAME["5min"]
-    if "15m" in tf_norm:
-        return _TTL_BY_TIMEFRAME["15min"]
-    if "30m" in tf_norm:
-        return _TTL_BY_TIMEFRAME["30min"]
-    if ("1h" in tf_norm or "60" in tf_norm) and "4h" not in tf_norm:
-        return _TTL_BY_TIMEFRAME["1hour"]
-    if "4h" in tf_norm:
-        return _TTL_BY_TIMEFRAME["4hour"]
-    if "1d" in tf_norm or "daily" in tf_norm:
-        return _TTL_BY_TIMEFRAME["1day"]
-    if "1w" in tf_norm or "weekly" in tf_norm:
-        return _TTL_BY_TIMEFRAME["1week"]
-    if "1mon" in tf_norm or "monthly" in tf_norm:
-        return _TTL_BY_TIMEFRAME["1month"]
-    
-    # Default for unknown
-    logger.debug("[Cache] Unknown timeframe %s, using default TTL=%ds", tf, _TTL_BY_TIMEFRAME["_default"])
-    return _TTL_BY_TIMEFRAME["_default"]
+    try:
+        # Use unified cache_config for timeframe requirements
+        ttl = get_freshness_requirement_for_timeframe(tf)
+        logger.debug("[Cache] Timeframe %s mapped to freshness requirement TTL=%ds", tf, ttl)
+        return ttl
+    except (ValueError, KeyError) as e:
+        # Unknown timeframe - use local cache default
+        default_ttl = CACHE_CONFIG['local_ttl_seconds']
+        logger.debug("[Cache] Unknown timeframe %s, using default local_ttl=%ds (reason: %s)", 
+                     tf, default_ttl, str(e))
+        return default_ttl
 
 
 def safe_op(default=None, log: logging.Logger | None = None):
@@ -127,50 +141,201 @@ def _hist_path(symbol: str, tf: str) -> str:
     return _hist_path_csv(symbol, tf)
 
 
-def _save_local_history_df(symbol: str, tf: str, df: pd.DataFrame) -> None:
-    """Best-effort local save for historicos (similar to indicators cache)."""
+def _merge_local_data(existing_df: Optional[pd.DataFrame], new_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge existing cached data with new data using incremental strategy.
+    
+    Similar to merge_histories() in historicos_service.py:
+    - Concatenates DataFrames
+    - Deduplicates with keep='last' (newer data wins)
+    - Sorts by index
+    
+    Args:
+        existing_df: Previously cached DataFrame (or None)
+        new_df: New data to merge
+        
+    Returns:
+        Merged DataFrame with all historical data
+    """
     try:
-        if df is None or getattr(df, "empty", True):
-            return
-
-        out = df.copy()
-        idx_utc = pd.DatetimeIndex(pd.to_datetime(out.index, utc=True, errors="coerce"))
-        mask = ~idx_utc.isna()
-        if not mask.all():
-            out = out.loc[mask].copy()
-            idx_utc = idx_utc[mask]
-
-        out["time"] = idx_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-        for c in ("open", "high", "low", "close", "volume"):
-            if c not in out.columns:
-                out[c] = np.nan
-
-        payload = out[["time", "open", "high", "low", "close", "volume"]].tail(1000).to_dict(orient="records")
-
-        os.makedirs(APP_CONFIG.hist_dir, exist_ok=True)
-        local_hist = _hist_path_json(symbol, tf)
-        with open(local_hist, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        logger.debug("[hist_local] Saved %s rows=%d", local_hist, len(payload))
+        # No existing data - just use new
+        if existing_df is None or existing_df.empty:
+            return new_df.copy()
+        
+        # No new data - return existing
+        if new_df.empty:
+            return existing_df.copy()
+        
+        # Both exist - merge incrementally
+        merged = pd.concat([existing_df, new_df], axis=0, ignore_index=False)
+        merged = merged[~merged.index.isna()].sort_index()
+        merged = merged[~merged.index.duplicated(keep="last")]  # Newer data wins
+        
+        rows_added = len(merged) - len(existing_df)
+        logger.debug("[HistCache] Merged: %d existing + %d new = %d total (net +%d rows)",
+                    len(existing_df), len(new_df), len(merged), rows_added)
+        
+        return merged
+        
     except Exception as exc:
-        logger.debug("[hist_local] Save failed %s/%s: %s", symbol, tf, exc)
+        logger.warning("[HistCache] Merge failed (%s), using new data only: %s", 
+                      type(exc).__name__, exc)
+        return new_df.copy()
+
+
+def _save_local_history_df(symbol: str, tf: str, df: pd.DataFrame) -> None:
+    """Incremental local save for historicos with thread-safe merge.
+    
+    NEW BEHAVIOR:
+    - Loads existing cached data (if any)
+    - Merges with new data using pd.concat + deduplication
+    - Preserves all historical data (unless MAX_HISTORICO_CACHE_ROWS limit set)
+    - Thread-safe via per-file locks
+    - Atomic write using temp file + os.replace
+    
+    Args:
+        symbol: Trading symbol
+        tf: Timeframe string
+        df: New DataFrame to save/merge
+    """
+    if df is None or getattr(df, "empty", True):
+        return
+    
+    # Get per-file lock for thread safety
+    file_lock = _get_file_lock(symbol, tf)
+    
+    with file_lock:
+        try:
+            # 1. Prepare new data
+            out = df.copy()
+            idx_utc = pd.DatetimeIndex(pd.to_datetime(out.index, utc=True, errors="coerce"))
+            mask = ~idx_utc.isna()
+            if not mask.all():
+                out = out.loc[mask].copy()
+                idx_utc = idx_utc[mask]
+
+            out["time"] = idx_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+            for c in ("open", "high", "low", "close", "volume"):
+                if c not in out.columns:
+                    out[c] = np.nan
+            
+            new_data_df = out[["time", "open", "high", "low", "close", "volume"]].copy()
+            new_rows = len(new_data_df)
+            
+            # 2. Load existing cache (if any)
+            existing_df = None
+            local_hist = _hist_path_json(symbol, tf)
+            
+            if os.path.exists(local_hist):
+                try:
+                    raw = Path(local_hist).read_text(encoding="utf-8")
+                    existing_data = json.loads(raw) if raw.strip() else []
+                    if existing_data:
+                        existing_df = pd.DataFrame(existing_data)
+                        logger.debug("[HistCache] Loaded existing cache: %d rows for %s/%s", 
+                                   len(existing_df), symbol, tf)
+                except (json.JSONDecodeError, Exception) as load_exc:
+                    logger.warning("[HistCache] Corrupt cache file %s, will recreate: %s", 
+                                 local_hist, load_exc)
+                    existing_df = None
+            
+            # 3. Merge existing + new data
+            if existing_df is not None and not existing_df.empty:
+                # Convert existing to same format for merge
+                if "time" in existing_df.columns:
+                    existing_df["time"] = pd.to_datetime(existing_df["time"], errors="coerce", utc=True)
+                    existing_df = existing_df.dropna(subset=["time"]).set_index("time").sort_index()
+                    existing_df = existing_df[["open", "high", "low", "close", "volume"]]
+                    
+                    # Now merge
+                    new_data_df_indexed = new_data_df.copy()
+                    new_data_df_indexed["time"] = pd.to_datetime(new_data_df_indexed["time"], utc=True)
+                    new_data_df_indexed = new_data_df_indexed.set_index("time").sort_index()
+                    new_data_df_indexed = new_data_df_indexed[["open", "high", "low", "close", "volume"]]
+                    
+                    merged = _merge_local_data(existing_df, new_data_df_indexed)
+                    
+                    # Convert back to records format
+                    merged_with_time = merged.copy()
+                    merged_with_time["time"] = merged.index.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    new_data_df = merged_with_time[["time", "open", "high", "low", "close", "volume"]]
+            
+            # 4. Apply row limit (if configured)
+            total_rows = len(new_data_df)
+            if _MAX_HISTORICO_CACHE_ROWS > 0 and total_rows > _MAX_HISTORICO_CACHE_ROWS:
+                new_data_df = new_data_df.tail(_MAX_HISTORICO_CACHE_ROWS)
+                logger.info("[HistCache] Truncated %s/%s from %d to %d rows (limit=%d)",
+                           symbol, tf, total_rows, len(new_data_df), _MAX_HISTORICO_CACHE_ROWS)
+                total_rows = len(new_data_df)
+            
+            # 5. Atomic write (temp file + rename)
+            payload = new_data_df.to_dict(orient="records")
+            os.makedirs(APP_CONFIG.hist_dir, exist_ok=True)
+            
+            temp_file = local_hist + ".tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            
+            # Atomic replacement
+            os.replace(temp_file, local_hist)
+            
+            logger.info("[HistCache] Saved %s/%s: %d rows (new=%d, total=%d)",
+                       symbol, tf, total_rows, new_rows, total_rows)
+            
+        except Exception as exc:
+            logger.warning("[HistCache] Incremental save failed %s/%s: %s", symbol, tf, exc)
+            
+            # Fallback: try simple save without merge
+            try:
+                simple_payload = out[["time", "open", "high", "low", "close", "volume"]].tail(1000).to_dict(orient="records")
+                os.makedirs(APP_CONFIG.hist_dir, exist_ok=True)
+                with open(local_hist, "w", encoding="utf-8") as f:
+                    json.dump(simple_payload, f, ensure_ascii=False)
+                logger.debug("[HistCache] Fallback save succeeded: %d rows", len(simple_payload))
+            except Exception as fallback_exc:
+                logger.debug("[HistCache] Fallback save also failed: %s", fallback_exc)
 
 
 def _load_local(symbol: str, tf: str) -> Optional[pd.DataFrame]:
-    """Best-effort local load for historicos using the JSON cache."""
+    """Best-effort local load for historicos using the JSON cache.
+    
+    Validates:
+    1. File TTL expiration (via os.path.getmtime)
+    2. Data freshness requirements (via validate_data_freshness)
+    
+    Enhanced for incremental cache:
+    - Handles larger files (10K-100K+ rows)
+    - Better error handling for corrupt JSON
+    - Logs file size for performance monitoring
+    """
     try:
         local_hist = _hist_path_json(symbol, tf)
         if not os.path.exists(local_hist):
             return None
 
+        # Check file TTL expiration first
         ttl_seconds = int(os.environ.get("HIST_LOCAL_TTL_SECONDS", APP_CONFIG.cache_ttl_historicos))
         if ttl_seconds > 0:
             age_seconds = time.time() - os.path.getmtime(local_hist)
             if age_seconds > ttl_seconds:
+                logger.debug("[hist_local] Cache expired: %s/%s (age=%ds > ttl=%ds)", 
+                             symbol, tf, int(age_seconds), ttl_seconds)
                 return None
 
+        # Load DataFrame from JSON with size monitoring
+        file_size_mb = os.path.getsize(local_hist) / (1024 * 1024)
+        if file_size_mb > 5:
+            logger.debug("[HistCache] Loading large cache file: %.2f MB for %s/%s",
+                        file_size_mb, symbol, tf)
+        
         raw = Path(local_hist).read_text(encoding="utf-8")
-        data = json.loads(raw) if raw.strip() else []
+        
+        try:
+            data = json.loads(raw) if raw.strip() else []
+        except json.JSONDecodeError as json_err:
+            logger.warning("[HistCache] Corrupt JSON in %s: %s (will trigger refresh)",
+                          local_hist, json_err)
+            return None
+        
         if isinstance(data, dict):
             data = data.get("data", data.get("payload", []))
 
@@ -187,6 +352,16 @@ def _load_local(symbol: str, tf: str) -> Optional[pd.DataFrame]:
         df = _ensure_cols(df)
         if df.index.tz is None:
             df.index = df.index.tz_localize(pytz.UTC)
+        
+        # 🆕 Validate data freshness (max age per timeframe)
+        is_fresh, age_seconds, reason = validate_data_freshness(df, symbol, tf)
+        if not is_fresh:
+            logger.debug("[hist_local] Data too stale for %s/%s: %s (age=%ds)", 
+                        symbol, tf, reason, age_seconds)
+            return None
+        
+        logger.debug("[hist_local] Loaded fresh %s/%s: %d rows, age=%ds, size=%.2fMB", 
+                    symbol, tf, len(df), age_seconds, file_size_mb)
         return df
     except Exception as exc:
         logger.debug("[hist_local] Load failed %s/%s: %s", symbol, tf, exc)
