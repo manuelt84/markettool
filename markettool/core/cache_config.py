@@ -138,7 +138,13 @@ def validate_data_freshness(
             if isinstance(last_time, str):
                 last_time = pd.to_datetime(last_time, utc=True)
             else:
-                last_time = pd.Timestamp(last_time, tz='UTC')
+                # Handle both tz-aware and tz-naive timestamps
+                if hasattr(last_time, 'tz') and last_time.tz is not None:
+                    # Already tz-aware, just convert to UTC if needed
+                    last_time = pd.Timestamp(last_time).tz_convert('UTC')
+                else:
+                    # tz-naive, localize to UTC
+                    last_time = pd.Timestamp(last_time).tz_localize('UTC', ambiguous='raise', nonexistent='raise')
         else:
             # Assume it's a timestamp
             last_time = pd.Timestamp(data_timestamp, unit='s', tz='UTC') if data_timestamp else pd.Timestamp.utcnow(tz='UTC')

@@ -204,18 +204,27 @@ def register_monitoreo_routes(app, *, services) -> None:
                     )
                     
                     if hist_df is not None and not hist_df.empty:
-                        # Convert DataFrame to dict format that cache expects
-                        hist_series = []
-                        for idx, row in hist_df.iterrows():
-                            ts_ms = int(idx.timestamp() * 1000) if hasattr(idx, 'timestamp') else int(idx)
-                            hist_series.append({
-                                "t": ts_ms,
-                                "o": float(row.get("open", 0)),
-                                "h": float(row.get("high", 0)),
-                                "l": float(row.get("low", 0)),
-                                "c": float(row.get("close", 0)),
-                                "v": float(row.get("volume", 0)) if "volume" in row else None,
-                            })
+                        # ✅ Vectorized conversion (no iterrows blocking)
+                        hist_df_copy = hist_df.copy()
+                        
+                        # Convert timestamps efficiently
+                        if hasattr(hist_df_copy.index, 'timestamp'):
+                            timestamps_ms = (hist_df_copy.index.astype(int) // 1e6).astype(int)
+                        else:
+                            timestamps_ms = (hist_df_copy.index.astype(int) // 1000).astype(int)
+                        
+                        # Vectorized dict creation
+                        hist_series = [
+                            {
+                                "t": int(t_ms),
+                                "o": float(hist_df_copy.iloc[i].get("open", 0)),
+                                "h": float(hist_df_copy.iloc[i].get("high", 0)),
+                                "l": float(hist_df_copy.iloc[i].get("low", 0)),
+                                "c": float(hist_df_copy.iloc[i].get("close", 0)),
+                                "v": float(hist_df_copy.iloc[i].get("volume", 0)) if "volume" in hist_df_copy.columns else None,
+                            }
+                            for i, t_ms in enumerate(timestamps_ms)
+                        ]
                         
                         if hist_series:
                             st["series"] = hist_series

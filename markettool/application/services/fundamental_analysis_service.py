@@ -133,19 +133,20 @@ class FundamentalAnalysisService:
         # Placeholder: Simple sentiment based on keywords
         # In real implementation, use NLP/sentiment analysis
         
-        impact = 0.0
-        count = 0
+        # ✅ Vectorized sentiment calculation (no iterrows blocking)
+        def get_text(row):
+            return str(row.get('text', '') or row.get('title', ''))
         
-        for _, row in df_news.iterrows():
-            text = str(row.get('text', '') or row.get('title', ''))
-            sentiment = self._simple_sentiment(text)
-            impact += sentiment
-            count += 1
+        def calc_sentiment(row):
+            return self._simple_sentiment(get_text(row))
         
-        if count == 0:
+        # Apply vectorized calculation
+        sentiments = df_news.apply(calc_sentiment, axis=1).values
+        
+        if len(sentiments) == 0:
             return 0.0
         
-        return impact / count
+        return float(sentiments.sum()) / len(sentiments)
     
     # ==================== PRIVATE HELPERS ====================
     
@@ -169,35 +170,37 @@ class FundamentalAnalysisService:
         if df_events.empty:
             return 0.0
         
+        # ✅ Vectorized events impact calculation (no iterrows blocking)
         impact_weights = {
             'High': 1.0,
             'Medium': 0.5,
             'Low': 0.2,
         }
         
-        total_impact = 0.0
-        count = 0
-        
-        for _, event in df_events.iterrows():
+        def calc_event_impact(event):
             importance = event.get('impact', 'Low')
             weight = impact_weights.get(importance, 0.2)
             
-            # Determine direction based on actual vs forecast
             actual = event.get('actual', None)
             forecast = event.get('estimate', None)
             
             if actual is not None and forecast is not None:
                 try:
                     diff = float(actual) - float(forecast)
-                    # Positive surprise = bullish (crude assumption)
                     direction = 1.0 if diff > 0 else -1.0
                 except:
                     direction = 0.0
             else:
                 direction = 0.0
             
-            total_impact += weight * direction
-            count += 1
+            return weight * direction
+        
+        impacts = df_events.apply(calc_event_impact, axis=1).values
+        
+        if len(impacts) == 0:
+            return 0.0
+        
+        return float(impacts.sum())
         
         if count == 0:
             return 0.0

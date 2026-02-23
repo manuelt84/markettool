@@ -1974,11 +1974,34 @@ def fs_marcar_worker(
     db.collection("ejecuciones").document(exec_id).set(payload, merge=True)
 
 
-def fs_heartbeat(exec_id: str):
+def fs_heartbeat(exec_id: str, progress: dict | None = None):
+    """Update execution heartbeat and optionally progress data.
+    
+    Args:
+        exec_id: Execution ID
+        progress: Optional progress data with keys:
+            - analyzed: Number of symbols analyzed
+            - total: Total number of symbols
+            - percentage: Progress percentage (0-100)
+            - current_symbol: Currently processing symbol
+            - current_tf: Currently processing timeframe
+    """
     ts = int(time.time())
-    db.collection("ejecuciones").document(exec_id).set(
-        {"last_heartbeat": ts, "updated_at": ts}, merge=True
-    )
+    update_data = {"last_heartbeat": ts, "updated_at": ts}
+    
+    # 🆕 Add progress data if provided
+    if progress:
+        update_data["progress"] = {
+            "analyzed": progress.get("analyzed", 0),
+            "total": progress.get("total", 0),
+            "percentage": round(progress.get("percentage", 0), 2),
+            "current_symbol": progress.get("current_symbol"),
+            "current_tf": progress.get("current_tf"),
+            "timestamp": ts
+        }
+    
+    db.collection("ejecuciones").document(exec_id).set(update_data, merge=True)
+    
     # ⬇️ Mantén vivo el user_state (sirve para que el watchdog no lo resetee por error)
     try:
         snap = db.collection("ejecuciones").document(exec_id).get()
@@ -2780,7 +2803,7 @@ def construir_payload_enriquecido(
         "last": last,
         "meta": {"computed_at": pd.Timestamp.now('UTC').isoformat(), **(extra_meta or {})},
         "levels": niveles or {},
-        "entradas": entradas or {}
+        "entradas": entradas.get("entradas", []) if isinstance(entradas, dict) else (entradas if isinstance(entradas, list) else [])  # ✅ FIXED: Extract trading entries array from analysis dict
     }
 
 #@profile
@@ -12469,7 +12492,6 @@ def _add_entry(
             }
         }
     })
-    logging.info(f" + AGREGADA {side.upper()} [{basado_en}] entry={entry:.6f} tp={tp:.6f} sl={sl:.6f} RRR={rrr:.3f} score={score:.3f}")
 
 
 #@profile
@@ -12736,7 +12758,7 @@ def generar_entradas_multiples(
                             
                             if not is_dup:
                                 entries.append(candidate)
-                                logger.info(f" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}")
+                                logger.info(f" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] source={candidate['basado_en']} entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}")
                     except Exception as e:
                         logger.debug(f"Error ejecutando tarea de entrada: {e}")
                         continue
@@ -12749,7 +12771,7 @@ def generar_entradas_multiples(
                 if result:
                     candidate, basado_en = result
                     entries.append(candidate)
-                    logging.info(f" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}")
+                    logging.info(f" + AGREGADA {candidate['side'].upper()} [{candidate['basado_en']}] source={candidate['basado_en']} entry={candidate['precio_entrada']:.6f} tp={candidate['take_profit']:.6f} sl={candidate['stop_loss']:.6f} RRR={candidate['rrr']:.3f} score={candidate['score']:.3f}")
     
     # ====== LIMITE DE CANDIDATOS (por performance/ruido) ======
     if len(entries) > max_candidates:
@@ -14003,7 +14025,8 @@ async def ejecutar_analisis_con_hilos(
     user_chat_id,
     context,
     overrides: dict | None = None,           # operatoria normalizada
-    cfg: dict | None = None
+    cfg: dict | None = None,
+    exec_id: str | None = None               # 🆕 For progress tracking
 ):
     resultados = []
     errores = []
@@ -14194,7 +14217,75 @@ async def ejecutar_analisis_con_hilos(
             f"(sem={_ANALYSIS_SEM}, per_symbol={per_symbol_concurrency}, workers={max_workers})"
         )
         
-        results = await asyncio.gather(*analisis_tasks, return_exceptions=True)
+        # ✅ Progress tracking: Process in chunks with periodic updates (safe + reactive)
+        if exec_id:
+            total_tasks = len(analisis_tasks)
+            chunk_size = max(1, total_tasks // 10)  # Divide into ~10 chunks for updates
+            results = []
+            
+            # Update progress at start
+            try:
+                initial_symbol, initial_tf = (task_meta[0] if task_meta else (None, None))
+                await asyncio.to_thread(
+                    fs_heartbeat,
+                    exec_id,
+                    progress={
+                        "analyzed": 0,
+                        "total": total_tasks,
+                        "percentage": 0,
+                        "current_symbol": initial_symbol,
+                        "current_tf": initial_tf
+                    }
+                )
+            except Exception as e:
+                logger.error(f"[Progress] CRITICAL: Error updating INITIAL progress - exec_id={exec_id}, error={type(e).__name__}: {e}", exc_info=True)
+            
+            # Process in chunks for periodic progress updates
+            for chunk_idx in range(0, len(analisis_tasks), chunk_size):
+                chunk_end = min(chunk_idx + chunk_size, len(analisis_tasks))
+                chunk = analisis_tasks[chunk_idx:chunk_end]
+                
+                # Execute this chunk
+                chunk_results = await asyncio.gather(*chunk, return_exceptions=True)
+                results.extend(chunk_results)
+                
+                # Update progress after chunk completes
+                completed_count = len(results)
+                if completed_count < total_tasks:  # Don't update at 100% yet
+                    try:
+                        current_symbol, current_tf = task_meta[min(completed_count - 1, len(task_meta) - 1)] if task_meta else (None, None)
+                        await asyncio.to_thread(
+                            fs_heartbeat,
+                            exec_id,
+                            progress={
+                                "analyzed": completed_count,
+                                "total": total_tasks,
+                                "percentage": round((completed_count / total_tasks) * 100, 1),
+                                "current_symbol": current_symbol,
+                                "current_tf": current_tf
+                            }
+                        )
+                    except Exception as e:
+                        logger.debug(f"[Progress] Skipped progress update (chunk {chunk_idx}): {type(e).__name__}")
+            
+            # Final progress update at 100%
+            try:
+                await asyncio.to_thread(
+                    fs_heartbeat,
+                    exec_id,
+                    progress={
+                        "analyzed": total_tasks,
+                        "total": total_tasks,
+                        "percentage": 100.0,
+                        "current_symbol": task_meta[-1][0] if task_meta else None,
+                        "current_tf": task_meta[-1][1] if task_meta else None
+                    }
+                )
+            except Exception as e:
+                logger.error(f"[Progress] CRITICAL: Error updating FINAL progress - {type(e).__name__}: {e}", exc_info=True)
+        else:
+            # Original behavior: simple gather without progress tracking
+            results = await asyncio.gather(*analisis_tasks, return_exceptions=True)
         
         t_gather_elapsed = (time.time() - t_gather_start)
         avg_time_per_task = (t_gather_elapsed / len(analisis_tasks)) if analisis_tasks else 0
@@ -14822,7 +14913,13 @@ async def procesar_resultado(
         df_velas  = res.get("_ohlcv_df")
         df_inds   = res.get("_indicadores_df")
         niveles   = res.get("_niveles") or {}
-        entradas  = res.get("_entradas") or {}
+        
+        # ✅ EXTRACT: Get the full analysis result dict
+        _entrada_result = res.get("_entradas") or {}
+        # Extract the array of trading entries (not the analysis metadata dict)
+        entradas_array = _entrada_result.get("entradas", []) if isinstance(_entrada_result, dict) else []
+        # Also keep the full result for metadata
+        entradas_full = _entrada_result
 
         tiene_datos = (
             isinstance(df_velas, pd.DataFrame) and not df_velas.empty
@@ -14850,7 +14947,7 @@ async def procesar_resultado(
                     df_indicadores=df_inds if isinstance(df_inds, pd.DataFrame) else None,
                     subir_a_bucket_y_obtener_url=subir_a_bucket_y_obtener_url,
                     niveles=niveles,
-                    entradas=entradas,
+                    entradas=entradas_full,  # ✅ FIXED: Pass full analysis dict with metadata
                     extra_metadata={"moneda_filtro": moneda_filtro},
                     user_id=user_id
                 )
@@ -17267,6 +17364,7 @@ async def ejecutar_recurrente(
                 "whitelist":   (operatoria_cfg or {}).get("whitelist"),
             },
             cfg=cfg,
+            exec_id=exec_id,  # 🆕 Pass exec_id for progress tracking
         )
         logger.info(f"[Analisis completado] Retornando {len(resultados) if resultados else 0} resultados")
 

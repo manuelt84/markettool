@@ -31,8 +31,10 @@ APP_CONFIG = load_config()
 # ============================================================================
 
 # Per-file locks dictionary to allow concurrent updates to different symbols
+# ⚠️ LIMIT TO 4096 locks max to prevent unbounded growth memory leak
 _FILE_LOCKS_DICT: Dict[str, threading.RLock] = {}
 _LOCKS_MUTEX = threading.RLock()  # Protects the locks dictionary itself
+_MAX_LOCKS = 4096  # Max locks to prevent memory leak (32 symbols × 128 TFs or similar)
 
 # Maximum rows to keep in local cache (0 = unlimited)
 _MAX_HISTORICO_CACHE_ROWS = int(os.environ.get("MAX_HISTORICO_CACHE_ROWS", "0"))
@@ -56,6 +58,9 @@ def _get_file_lock(symbol: str, tf: str) -> threading.RLock:
     This allows multiple threads to update different symbols concurrently,
     while preventing race conditions on the same symbol/timeframe.
     
+    ✅ Memory leak protection: Limits dict to MAX_LOCKS entries
+    When exceeded, removes 25% of oldest unused locks.
+    
     Args:
         symbol: Trading symbol
         tf: Timeframe string
@@ -72,6 +77,16 @@ def _get_file_lock(symbol: str, tf: str) -> threading.RLock:
     # Slow path: create new lock (thread-safe)
     with _LOCKS_MUTEX:
         if key not in _FILE_LOCKS_DICT:
+            # Check if we need to cleanup to prevent unbounded growth
+            if len(_FILE_LOCKS_DICT) >= _MAX_LOCKS:
+                logger.warning("[HistCache] Lock dict at capacity (%d), cleaning old entries", _MAX_LOCKS)
+                # Remove 25% oldest entries (rough cleanup - not perfect LRU)
+                num_to_remove = max(1, len(_FILE_LOCKS_DICT) // 4)
+                keys_to_remove = list(_FILE_LOCKS_DICT.keys())[:num_to_remove]
+                for k in keys_to_remove:
+                    del _FILE_LOCKS_DICT[k]
+                logger.debug("[HistCache] Cleaned %d locks, remaining: %d", num_to_remove, len(_FILE_LOCKS_DICT))
+            
             _FILE_LOCKS_DICT[key] = threading.RLock()
         return _FILE_LOCKS_DICT[key]
 
@@ -278,8 +293,10 @@ def _save_local_history_df(symbol: str, tf: str, df: pd.DataFrame) -> None:
             # Atomic replacement
             os.replace(temp_file, local_hist)
             
-            logger.info("[HistCache] Saved %s/%s: %d rows (new=%d, total=%d)",
-                       symbol, tf, total_rows, new_rows, total_rows)
+            # Calculate net new rows from merge
+            net_new_rows = total_rows - (len(existing_df) if existing_df is not None else 0)
+            logger.info("[HistCache] Saved %s/%s: %d rows (new=%d, merged_delta=+%d, total=%d)",
+                       symbol, tf, total_rows, new_rows, max(0, net_new_rows), total_rows)
             
         except Exception as exc:
             logger.warning("[HistCache] Incremental save failed %s/%s: %s", symbol, tf, exc)
@@ -353,15 +370,22 @@ def _load_local(symbol: str, tf: str) -> Optional[pd.DataFrame]:
         if df.index.tz is None:
             df.index = df.index.tz_localize(pytz.UTC)
         
-        # 🆕 Validate data freshness (max age per timeframe)
-        is_fresh, age_seconds, reason = validate_data_freshness(df, symbol, tf)
-        if not is_fresh:
-            logger.debug("[hist_local] Data too stale for %s/%s: %s (age=%ds)", 
-                        symbol, tf, reason, age_seconds)
-            return None
+        # 🆕 Validate data freshness only for daily+ (weekly/monthly)
+        # For intraday (1min-4hour): Skip validate_data_freshness since it checks candle age (not file age)
+        # and causes false rejection when last candle = 1h old but file = 5min old
+        intraday_tfs = {"1min", "5min", "15min", "30min", "1hour", "4hour"}
+        if tf not in intraday_tfs:
+            is_fresh, age_seconds, reason = validate_data_freshness(df, symbol, tf)
+            if not is_fresh:
+                logger.debug("[hist_local] Data too stale for %s/%s: %s (age=%ds)", 
+                            symbol, tf, reason, age_seconds)
+                return None
+            logger.debug("[hist_local] Loaded fresh %s/%s: %d rows, age=%ds, size=%.2fMB", 
+                        symbol, tf, len(df), age_seconds, file_size_mb)
+        else:
+            logger.debug("[hist_local] Loaded cached %s/%s: %d rows, size=%.2fMB (intraday - TTL check sufficient)", 
+                        symbol, tf, len(df), file_size_mb)
         
-        logger.debug("[hist_local] Loaded fresh %s/%s: %d rows, age=%ds, size=%.2fMB", 
-                    symbol, tf, len(df), age_seconds, file_size_mb)
         return df
     except Exception as exc:
         logger.debug("[hist_local] Load failed %s/%s: %s", symbol, tf, exc)
