@@ -110,8 +110,18 @@ def _warmup_caches_principales():
     """
     Pre-populate caches for most traded assets to avoid cold start.
     ✅ EXPANDED: Cubre principales majors, cruces, crypto y commodities.
+    ✅ IMPROVED: Skips gracefully if FMP credentials missing; still works with local cache.
     """
     try:
+        # Check if FMP_API_KEY is available first
+        fmp_api_key = (os.environ.get("FMP_API_KEY") or "").strip()
+        if not fmp_api_key:
+            logger.info(
+                "[Warmup] FMP_API_KEY not configured. Skipping cache warmup. "
+                "This is fine if using pre-cached data or local history."
+            )
+            return
+        
         t0 = time.time()
         
         # Import functions that naturally populate caches
@@ -145,6 +155,10 @@ def _warmup_caches_principales():
             "1", "true", "yes", "y", "on"
         }
         
+        # Limit warmup attempts on first failure (fast-fail to avoid hanging)
+        max_consecutive_failures = 3
+        consecutive_failures = 0
+        
         for symbol in main_assets:
             for tf in main_timeframes:
                 try:
@@ -154,8 +168,10 @@ def _warmup_caches_principales():
                         # Calcular indicadores (popula cache de indicadores)
                         _ = calcular_indicadores(df, tf, symbol=symbol)
                         warmed_count += 1
+                        consecutive_failures = 0  # Reset on success
                     else:
                         failed_count += 1
+                        consecutive_failures += 1
                         if warmup_verbose:
                             logger.warning(
                                 "[Warmup] Empty history for %s/%s (check FMP/network/cache)",
@@ -163,27 +179,44 @@ def _warmup_caches_principales():
                                 tf,
                             )
                 except Exception as e:
+                    consecutive_failures += 1
                     if warmup_verbose:
                         logger.warning(f"[Warmup] Failed to warm {symbol}/{tf}: {e}")
                     else:
                         logger.debug(f"[Warmup] Failed to warm {symbol}/{tf}: {e}")
                     failed_count += 1
                     
+                    # Fast-fail if too many consecutive failures (likely FMP issue)
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.info(
+                            f"[Warmup] {max_consecutive_failures} consecutive failures. "
+                            "Stopping warmup (likely FMP/network issue). System continues normally."
+                        )
+                        break
+                    
                 # Yield para no bloquear event loop
                 time.sleep(0.01)
+            
+            # Also break outer loop if fast-fail triggered
+            if consecutive_failures >= max_consecutive_failures:
+                break
         
         elapsed = (time.time() - t0) * 1000
         logger.info(
             f"[Warmup] Caches principales pre-poblados: {warmed_count}/{total_combos} exitosos "
             f"({failed_count} fallos) en {elapsed:.1f}ms"
         )
-        if warmed_count == 0:
+        
+        # Only warn if we got zero results (actual problem)
+        if warmed_count == 0 and failed_count > 0:
             logger.warning(
-                "[Warmup] All cache warmups failed. Check FMP availability, credentials, "
-                "network access, or symbol mapping. Set WARMUP_VERBOSE=1 for per-symbol logs."
+                "[Warmup] ⚠️ No caches were warmed successfully. This may indicate: "
+                "1) FMP API issues or rate limits, 2) Network connectivity problems, "
+                "3) Invalid API key. The system will fall back to on-demand loading. "
+                "For diagnostics, set WARMUP_VERBOSE=1."
             )
     except Exception as e:
-        logger.warning(f"[Warmup] Cache warmup failed (non-critical): {e}")
+        logger.info(f"[Warmup] Cache warmup skipped (non-critical): {e}")
 
 
 def _launch_performance_warmups():
