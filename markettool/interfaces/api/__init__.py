@@ -1,6 +1,6 @@
 """HTTP API interface."""
 
-from .app import asgi_app, webhook_app
+from .app import get_asgi_app, get_webhook_app, asgi_app, webhook_app
 from .route_factory import register_all_routes
 from .historicos_routes import register_historicos_routes
 from .quotes_routes import register_quotes_routes
@@ -14,6 +14,8 @@ from .pod_routes import register_pod_routes
 from .webhook_routes import register_webhook_routes
 
 __all__ = [
+	"get_asgi_app",
+	"get_webhook_app",
 	"asgi_app",
 	"webhook_app",
 	"register_all_routes",  # New factory

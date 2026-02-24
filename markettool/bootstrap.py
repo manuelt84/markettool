@@ -274,6 +274,11 @@ def main() -> None:
         )
         logger.info("✅ HTTP_SESSION created (hexagonal)")
         
+        # Import ASGI/Flask app factory from new hexagonal module
+        logger.info("Loading hexagonal API components...")
+        from markettool.interfaces.api.app import get_webhook_app, get_asgi_app
+        logger.info("✅ ASGI/Flask app factory loaded")
+        
         # Import legacy components from MarketTool.py
         logger.info("Loading legacy MarketTool modules...")
         from MarketTool import (
@@ -352,8 +357,6 @@ def main() -> None:
             get_firestore_db,
             get_gcs_client,
             get_telegram_application,
-            get_webhook_app,
-            get_asgi_app,
             # Cache metrics for health monitoring
             _warmup_start_time,
             _warmup_end_time,
