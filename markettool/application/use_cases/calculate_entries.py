@@ -18,10 +18,12 @@ from markettool.application.services import (
     get_sr_service,
     get_fundamental_service,
     get_risk_service,
+    get_backtesting_outcomes_service,
 )
 from markettool.application.services.strategy_consolidation_service import strategy_service
 
 logger = logging.getLogger(__name__)
+
 
 
 class CalculateEntriesUseCase:
@@ -34,6 +36,7 @@ class CalculateEntriesUseCase:
     - Fundamental analysis
     - Risk management
     - Trading validations
+    - Backtesting outcomes (optional, controlled by BACKTEST_OUTCOMES_ENABLED env var)
     """
     
     def __init__(
@@ -46,6 +49,7 @@ class CalculateEntriesUseCase:
         self.sr_service = get_sr_service(logger=logger)
         self.fundamental_service = get_fundamental_service(logger=logger)
         self.risk_service = get_risk_service(logger=logger)
+        self.backtesting_service = get_backtesting_outcomes_service(logger=logger)
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
     
     async def execute(
@@ -453,6 +457,49 @@ class CalculateEntriesUseCase:
             'threshold_sell': round(threshold_sell, 2),
             'volatility_ratio': round(volatility_ratio, 2),
         }
+    
+    def enrich_entries_with_outcomes(
+        self,
+        entries: List[Dict[str, Any]],
+        df: pd.DataFrame,
+        symbol: str,
+        timeframe: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Enrich entries with backtesting outcome data (TP/SL hit analysis).
+        
+        This is an optional secondary step that:
+        1. Takes a list of entry signals
+        2. Computes TP/SL hit outcomes using historical candles
+        3. Adds outcome metrics to each entry
+        
+        PERFORMANCE NOTE: This operation iterates through all candles for each entry.
+        Enable only if BACKTEST_OUTCOMES_ENABLED=true in environment.
+        
+        Args:
+            entries: List of entry dicts with keys:
+                    ['entry', 'tp', 'sl', 'side', 'createdAt'] (must exist)
+            df: Historical OHLCV DataFrame
+            symbol: Trading symbol
+            timeframe: Timeframe
+        
+        Returns:
+            List of entries with added outcome fields:
+            ['outcome', 'outcomeAt', 'activatedAt', 'barsToOutcome', 'maxProfitPct', 'maxLossPct']
+        
+        Example:
+            >>> entries = [
+            ...     {'entry': 1.2000, 'tp': 1.2500, 'sl': 1.1900, 'side': 'LONG', 'createdAt': 1234567890}
+            ... ]
+            >>> enriched = use_case.enrich_entries_with_outcomes(entries, df, 'EURUSD', '1h')
+            >>> print(enriched[0]['outcome'])  # 'tp', 'sl', or 'pending'
+        """
+        return self.backtesting_service.compute_outcomes_for_entries(
+            entries=entries,
+            df=df,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
 
 
 # ==================== FACTORY ====================

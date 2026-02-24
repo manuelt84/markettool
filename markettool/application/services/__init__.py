@@ -27,6 +27,11 @@ from .zone_validation_service import (
     ZoneValidation,
     ZoneType,
 )
+from .backtesting_outcomes_service import (
+    BacktestingOutcomesService,
+    get_backtesting_outcomes_service,
+    OutcomeResult,
+)
 
 __all__ = [
     'SupportResistanceService',
@@ -47,4 +52,7 @@ __all__ = [
     'get_zone_validator',
     'ZoneValidation',
     'ZoneType',
+    'BacktestingOutcomesService',
+    'get_backtesting_outcomes_service',
+    'OutcomeResult',
 ]
