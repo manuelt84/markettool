@@ -23,7 +23,7 @@ import numpy as np
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.schedulers.background import BackgroundScheduler
+# ✅ Phase 4: Removed BackgroundScheduler import (legacy, replaced by AsyncIOScheduler)
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from asgiref.wsgi import WsgiToAsgi
@@ -1143,6 +1143,57 @@ def _parse_history_refresh_ttl_minutes() -> dict[str, int]:
 
 _HISTORY_REFRESH_TTL_MINUTES = _parse_history_refresh_ttl_minutes()
 
+# ✅ CACHE-FIRST OPTIMIZATION METRICS
+_CACHE_FIRST_STATS = {
+    "fmp_calls_saved": 0,
+    "fmp_calls_made": 0,
+    "start_time": time.time(),
+}
+_CACHE_FIRST_STATS_LOCK = threading.Lock()
+
+def _record_fmp_call_saved():
+    """Record when FMP call was avoided due to fresh cache."""
+    global _CACHE_FIRST_STATS
+    with _CACHE_FIRST_STATS_LOCK:
+        _CACHE_FIRST_STATS["fmp_calls_saved"] += 1
+        saved = _CACHE_FIRST_STATS["fmp_calls_saved"]
+        made = _CACHE_FIRST_STATS["fmp_calls_made"]
+        if (saved + made) > 0 and (saved + made) % 100 == 0:
+            savings_pct = 100.0 * saved / (saved + made)
+            logger.info(f"[CACHE-FIRST] Statistics: {saved} saved vs {made} made ({savings_pct:.1f}% cache-first success rate)")
+
+def _record_fmp_call_made():
+    """Record when FMP call was actually made."""
+    global _CACHE_FIRST_STATS
+    with _CACHE_FIRST_STATS_LOCK:
+        _CACHE_FIRST_STATS["fmp_calls_made"] += 1
+
+def get_cache_first_stats():
+    """Returns current cache-first optimization statistics.
+    
+    Returns:
+        dict with keys:
+        - fmp_calls_saved: Number of FMP calls avoided via fresh cache
+        - fmp_calls_made: Number of actual FMP calls made
+        - success_rate: Percentage of calls avoided (0-100)
+        - uptime_seconds: Time since statistics started tracking
+    """
+    with _CACHE_FIRST_STATS_LOCK:
+        stats = _CACHE_FIRST_STATS.copy()
+    
+    total = stats["fmp_calls_saved"] + stats["fmp_calls_made"]
+    success_rate = 100.0 * stats["fmp_calls_saved"] / total if total > 0 else 0.0
+    uptime = time.time() - stats["start_time"]
+    
+    return {
+        "fmp_calls_saved": stats["fmp_calls_saved"],
+        "fmp_calls_made": stats["fmp_calls_made"],
+        "total_calls": total,
+        "success_rate_pct": success_rate,
+        "uptime_seconds": int(uptime),
+        "estimated_time_saved_seconds": int(stats["fmp_calls_saved"] * 0.4),  # Assume 400ms per FMP call
+    }
+
 class HistoryManager:
     def __init__(self, client: FMPClient):
         self.client = client
@@ -1278,14 +1329,26 @@ class HistoryManager:
                 elif last.tzinfo != pytz.UTC:
                     last = last.astimezone(pytz.UTC)
                 
-                # ✅ CACHE-FIRST: Skip FMP fetch if cache is fresh within TTL
+                # ✅ CACHE-FIRST OPTIMIZATION: Early exit if cache is fresh
+                # This avoids waiting for FMP semaphore when not needed
                 ttl_min = _HISTORY_REFRESH_TTL_MINUTES.get(tf, 1)
                 age_min = max(0.0, (now - last).total_seconds() / 60.0)
-                logger.info(f"[CACHE-FIRST] {symbol}/{tf}: age={age_min:.2f}min, ttl={ttl_min}min, allow_refresh={allow_refresh}")
                 
-                if allow_refresh and age_min < ttl_min:
-                    logger.info(f"[CACHE-FIRST] {symbol}/{tf}: SKIPPING FMP (cache fresh within TTL)")
-                    allow_refresh = False
+                if age_min < ttl_min:
+                    # Cache is fresh! Return immediately without FMP call
+                    _record_fmp_call_saved()  # ✅ Record this optimization
+                    logger.info(f"[CACHE-FIRST] {symbol}/{tf}: CACHE FRESH (age={age_min:.1f}min < ttl={ttl_min}min) → NO FMP CALL NEEDED")
+                    # Bypass FMP entirely - use cached data as-is
+                    out = cache_df
+                    if cfg.bars and isinstance(cfg.bars, int) and cfg.bars > 0 and len(out) > cfg.bars:
+                        out = out.tail(cfg.bars)
+                    if cfg.append_realtime and not out.empty:
+                        out = self._append_realtime_last_bar(symbol, tf, out)
+                    return out  # ← EARLY EXIT: Saved FMP call!
+                else:
+                    # Cache is stale, but proceed to check if refresh is allowed
+                    logger.info(f"[CACHE-FIRST] {symbol}/{tf}: cache stale (age={age_min:.1f}min ≥ ttl={ttl_min}min) → Will fetch from FMP if allowed")
+                    allow_refresh = allow_refresh if cfg.allow_refresh else False
                     
                 base_tf = self._base_interval_for(tf)
                 from_dt = last + self._timedelta_for(base_tf, 1)
@@ -1322,6 +1385,7 @@ class HistoryManager:
 
                 if continue_fetch:
                     # Proceed with FMP fetch
+                    _record_fmp_call_made()  # ✅ Record that we're making an actual FMP call
                     try:
                         if _is_intraday(tf):
                             base_tf = self._base_interval_for(tf)
@@ -1562,6 +1626,71 @@ def get_firestore_db():
             logger.error(f"Failed to initialize Firestore: {e}")
             raise
     return _db
+
+
+async def _firestore_stream_with_timeout(
+    collection_name: str,
+    query_filters: list | None = None,
+    timeout_seconds: float = 2.0,
+    fallback_value=None
+):
+    """
+    Async wrapper for Firestore .stream() with timeout and fallback.
+    
+    Benefits:
+    - Prevents blocking on Firestore latency spikes (> 2s)
+    - Returns fallback value (empty list/dict) on timeout
+    - Uses asyncio.to_thread for non-blocking I/O
+    
+    Args:
+        collection_name: Firestore collection name
+        query_filters: Optional list of (field, op, value) tuples for .where() filters
+        timeout_seconds: Max time to wait for Firestore response (default: 2s)
+        fallback_value: Value to return on timeout/error (default: [])
+    
+    Returns:
+        List of document dicts on success, fallback_value on timeout/error
+    
+    Example:
+        docs = await _firestore_stream_with_timeout("user_states", timeout_seconds=2.0, fallback_value=[])
+    """
+    if fallback_value is None:
+        fallback_value = []
+    
+    def _sync_stream():
+        """Synchronous function to run in thread pool."""
+        firestore_db = get_firestore_db()
+        collection_ref = firestore_db.collection(collection_name)
+        
+        # Apply query filters if provided
+        query = collection_ref
+        if query_filters:
+            for field, op, value in query_filters:
+                query = query.where(field, op, value)
+        
+        # Stream and convert to list of dicts
+        docs = query.stream()
+        return [doc.to_dict() for doc in docs if doc.exists]
+    
+    try:
+        # Run blocking .stream() in thread pool with timeout
+        result = await asyncio.wait_for(
+            asyncio.to_thread(_sync_stream),
+            timeout=timeout_seconds
+        )
+        return result
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[Firestore] .stream() timeout after %.1fs for collection '%s'. Using fallback.",
+            timeout_seconds, collection_name
+        )
+        return fallback_value
+    except Exception as e:
+        logger.warning(
+            "[Firestore] .stream() failed for collection '%s': %s. Using fallback.",
+            collection_name, e
+        )
+        return fallback_value
 
 
 class _LazyFirestoreProxy:
@@ -4856,19 +4985,28 @@ async def cargar_admin_ids():
     """Carga los chat_ids desde Firestore o devuelve una lista vacía si no hay datos.
     
     Implementa retry con exponential backoff para mayor confiabilidad.
+    ✅ Phase 3 Optimization: Added 2s timeout to prevent blocking on Firestore latency spikes.
     """
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread to prevent event loop blocking
+            # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread + timeout to prevent event loop blocking
             def _sync_load_admin_ids():
                 firestore_db = get_firestore_db()
                 collection_ref = firestore_db.collection("admin_ids")
                 docs = collection_ref.stream()
                 return [doc.to_dict().get("chat_id") for doc in docs if doc.exists]
             
-            admin_ids = await asyncio.to_thread(_sync_load_admin_ids)
+            # ✅ Phase 3: Timeout wrapper (2s max) with fallback
+            admin_ids = await asyncio.wait_for(
+                asyncio.to_thread(_sync_load_admin_ids),
+                timeout=2.0
+            )
             return admin_ids
+        except asyncio.TimeoutError:
+            logger.warning(f"[cargar_admin_ids] Firestore timeout after 2s (attempt {attempt + 1}/{max_retries}). Using fallback.")
+            if attempt >= max_retries - 1:
+                return []  # Fallback after all retries
         except Exception as e:
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
@@ -4884,11 +5022,12 @@ async def cargar_chat_ids():
     """Carga los chat_ids desde Firestore o devuelve un diccionario vacío si no hay datos.
     
     Implementa retry con exponential backoff para mayor confiabilidad.
+    ✅ Phase 3 Optimization: Added 2s timeout to prevent blocking on Firestore latency spikes.
     """
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread to prevent event loop blocking
+            # ⚠️ FIXED: Wrap blocking .stream() with asyncio.to_thread + timeout to prevent event loop blocking
             def _sync_load_chat_ids():
                 firestore_db = get_firestore_db()
                 collection_ref = firestore_db.collection("chat_ids")
@@ -4898,8 +5037,16 @@ async def cargar_chat_ids():
                     for doc in docs if doc.exists
                 }
             
-            chat_ids = await asyncio.to_thread(_sync_load_chat_ids)
+            # ✅ Phase 3: Timeout wrapper (2s max) with fallback
+            chat_ids = await asyncio.wait_for(
+                asyncio.to_thread(_sync_load_chat_ids),
+                timeout=2.0
+            )
             return chat_ids
+        except asyncio.TimeoutError:
+            logger.warning(f"[cargar_chat_ids] Firestore timeout after 2s (attempt {attempt + 1}/{max_retries}). Using fallback.")
+            if attempt >= max_retries - 1:
+                return {}  # Fallback after all retries
         except Exception as e:
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
@@ -7823,6 +7970,7 @@ def cargar_eventos_completos() -> list[dict]:
     """
     Retorna eventos de ~últimos 365 días desde Firestore (colección 'eventos_completos').
     Backend en UTC (sin conversiones locales).
+    ✅ Phase 3 Optimization: Added 2s timeout to prevent blocking on Firestore latency spikes.
     """
     try:
         col = db.collection("eventos_completos")
@@ -7832,8 +7980,19 @@ def cargar_eventos_completos() -> list[dict]:
         ff_utc = now_utc.to_pydatetime()
 
         q = col.where("date_utc", ">=", fi_utc).where("date_utc", "<=", ff_utc)
-        docs = q.stream()
-        return [doc.to_dict() for doc in docs if getattr(doc, "exists", True)]
+        
+        # ✅ Phase 3: Wrap .stream() with timeout (max 2s)
+        def _stream_with_timeout():
+            docs = q.stream()
+            return [doc.to_dict() for doc in docs if getattr(doc, "exists", True)]
+        
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_stream_with_timeout)
+            try:
+                return future.result(timeout=2.0)
+            except TimeoutError:
+                logger.warning("[Firestore] cargar_eventos_completos timeout after 2s. Using empty fallback.")
+                return []
     except Exception as e:
         logger.info("[Firestore] cargar_eventos_completos error: %s", e)
         return []
@@ -8667,6 +8826,7 @@ def _firestore_load_events_range(fecha_inicio, fecha_fin) -> list[dict]:
     """
     Carga eventos por rango [fecha_inicio, fecha_fin] usando 'date_utc' (UTC).
     Incluye fin de día completo.
+    ✅ Phase 3 Optimization: Added 2s timeout to prevent blocking on Firestore latency spikes.
     """
     try:
         col = db.collection("eventos_completos")
@@ -8687,8 +8847,19 @@ def _firestore_load_events_range(fecha_inicio, fecha_fin) -> list[dict]:
 
     try:
         q = col.where("date_utc", ">=", fi_utc).where("date_utc", "<=", ff_utc)
-        docs = q.stream()
-        return [doc.to_dict() for doc in docs if getattr(doc, "exists", True)]
+        
+        # ✅ Phase 3: Wrap .stream() with timeout (max 2s)
+        def _stream_with_timeout():
+            docs = q.stream()
+            return [doc.to_dict() for doc in docs if getattr(doc, "exists", True)]
+        
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_stream_with_timeout)
+            try:
+                return future.result(timeout=2.0)
+            except TimeoutError:
+                logger.warning("[Firestore] _firestore_load_events_range timeout after 2s. Using empty fallback.")
+                return []
     except Exception as e:
         logger.info("[Firestore] load range error: %s", e)
         return []
@@ -19325,7 +19496,9 @@ async def listar_pagos(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# Scheduler for background tasks - uses AsyncIOScheduler (runs in event loop, not separate thread)
+# ✅ Phase 4: AsyncIOScheduler for background tasks
+# Runs in event loop (no separate thread) → eliminates queue overhead vs BackgroundScheduler
+# Event loop is auto-detected when scheduler.start() is called (see bot_init.setup_scheduler)
 scheduler = AsyncIOScheduler()
 
 # Legacy function - DEPRECATED: Use markettool.interfaces.scheduler.bot_init.setup_scheduler instead

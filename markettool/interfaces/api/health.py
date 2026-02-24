@@ -8,7 +8,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from flask import Flask, jsonify, Response
 
@@ -63,70 +63,83 @@ class HealthStatus:
 
 
 class HealthChecker:
-    """Service health checker."""
+    """
+    Service health checker.
     
-    def __init__(self) -> None:
-        """Initialize health checker."""
-        self._start_time = time.time()
-        self._ready = False
-        self._version = os.environ.get("APP_VERSION", "unknown")
-        self._environment = os.environ.get("ENVIRONMENT", "production")
-        self._worker_id = os.environ.get("WORKER_ID", "unknown")
+    ✅ Hexagonal architecture compliant: Uses HealthService from DI Container
+    instead of importing from MarketTool.py legacy.
+    """
+    
+    def __init__(self, health_service: Optional[Any] = None) -> None:
+        """
+        Initialize health checker.
+        
+        Args:
+            health_service: HealthService instance from DI Container (optional for backward compatibility)
+        """
+        self._health_service = health_service
     
     @property
     def is_ready(self) -> bool:
         """Check if service is ready to accept requests."""
-        return self._ready
+        if self._health_service:
+            return self._health_service.is_ready
+        # Fallback for legacy code paths
+        return getattr(self, "_ready", False)
     
     def mark_ready(self) -> None:
         """Mark service as ready."""
-        self._ready = True
-        logger.info("✅ Service marked as READY")
+        if self._health_service:
+            self._health_service.mark_ready()
+        else:
+            self._ready = True
+            logger.info("✅ Service marked as READY")
     
     def mark_not_ready(self) -> None:
         """Mark service as not ready (e.g., during shutdown)."""
-        self._ready = False
-        logger.info("⏸️  Service marked as NOT READY")
-    
-    async def check_telegram_bot(self) -> bool:
-        """Check if Telegram bot is responsive."""
-        try:
-            from MarketTool import application
-            return application is not None and application.bot is not None
-        except Exception as exc:
-            logger.warning("Telegram bot health check failed: %s", exc)
-            return False
-    
-    async def check_firestore(self) -> bool:
-        """Check if Firestore is accessible."""
-        try:
-            from MarketTool import db
-            if db is None:
-                return False
-            # Quick ping - check if we can list collections
-            collections = list(db.collections(max_results=1))
-            return True
-        except Exception as exc:
-            logger.warning("Firestore health check failed: %s", exc)
-            return False
-    
-    async def check_cache(self) -> bool:
-        """Check if cache is operational."""
-        try:
-            # For now, just check if cache module is available
-            from MarketTool import historicos_cache
-            return historicos_cache is not None
-        except Exception as exc:
-            logger.warning("Cache health check failed: %s", exc)
-            return False
+        if self._health_service:
+            self._health_service.mark_not_ready()
+        else:
+            self._ready = False
+            logger.info("⏸️  Service marked as NOT READY")
     
     async def get_health_status(self) -> HealthStatus:
-        """Get comprehensive health status."""
+        """
+        Get comprehensive health status.
+        
+        ✅ Uses HealthService if available (hexagonal), falls back to legacy if not.
+        """
+        if self._health_service:
+            # Use hexagonal HealthService
+            system_health = await self._health_service.get_system_health()
+            
+            # Convert to legacy HealthStatus format
+            return HealthStatus(
+                status=system_health.status,
+                timestamp=system_health.timestamp,
+                uptime_seconds=system_health.uptime_seconds,
+                version=system_health.version,
+                telegram_bot=system_health.components.get("telegram_bot", type("obj", (), {"healthy": False})()).healthy,
+                firestore=system_health.components.get("firestore", type("obj", (), {"healthy": False})()).healthy,
+                cache=system_health.components.get("cache", type("obj", (), {"healthy": False})()).healthy,
+                environment=system_health.environment,
+                worker_id=system_health.worker_id,
+            )
+        else:
+            # ⚠️ DEPRECATED: Legacy fallback (imports from MarketTool.py)
+            logger.warning("HealthChecker using DEPRECATED legacy fallback - please inject HealthService")
+            return await self._get_health_status_legacy()
+    
+    async def _get_health_status_legacy(self) -> HealthStatus:
+        """
+        ⚠️ DEPRECATED: Legacy health check with MarketTool.py imports.
+        This method will be removed once all deployments use DI Container.
+        """
         # Check all components in parallel
         telegram_ok, firestore_ok, cache_ok = await asyncio.gather(
-            self.check_telegram_bot(),
-            self.check_firestore(),
-            self.check_cache(),
+            self._check_telegram_bot_legacy(),
+            self._check_firestore_legacy(),
+            self._check_cache_legacy(),
             return_exceptions=True
         )
         
@@ -139,35 +152,83 @@ class HealthChecker:
         all_ok = telegram_ok and firestore_ok and cache_ok
         status = "healthy" if all_ok else "degraded"
         
-        uptime = time.time() - self._start_time
+        start_time = getattr(self, "_start_time", time.time())
+        uptime = time.time() - start_time
         
         return HealthStatus(
             status=status,
             timestamp=datetime.now(timezone.utc).isoformat(),
             uptime_seconds=round(uptime, 2),
-            version=self._version,
+            version=os.environ.get("APP_VERSION", "unknown"),
             telegram_bot=telegram_ok,
             firestore=firestore_ok,
             cache=cache_ok,
-            environment=self._environment,
-            worker_id=self._worker_id,
+            environment=os.environ.get("ENVIRONMENT", "production"),
+            worker_id=os.environ.get("WORKER_ID", "unknown"),
         )
+    
+    async def _check_telegram_bot_legacy(self) -> bool:
+        """⚠️ DEPRECATED: Legacy check that imports from MarketTool.py"""
+        try:
+            from MarketTool import application
+            return application is not None and application.bot is not None
+        except Exception as exc:
+            logger.warning("Telegram bot health check failed: %s", exc)
+            return False
+    
+    async def _check_firestore_legacy(self) -> bool:
+        """⚠️ DEPRECATED: Legacy check that imports from MarketTool.py"""
+        try:
+            from MarketTool import db
+            if db is None:
+                return False
+            # Quick ping - check if we can list collections
+            list(db.collections(max_results=1))
+            return True
+        except Exception as exc:
+            logger.warning("Firestore health check failed: %s", exc)
+            return False
+    
+    async def _check_cache_legacy(self) -> bool:
+        """⚠️ DEPRECATED: Legacy check that imports from MarketTool.py"""
+        try:
+            from MarketTool import historicos_cache
+            return historicos_cache is not None
+        except Exception as exc:
+            logger.warning("Cache health check failed: %s", exc)
+            return False
 
 
 # Global health checker instance
 _health_checker: HealthChecker | None = None
 
 
-def get_health_checker() -> HealthChecker:
-    """Get or create global health checker instance."""
+def get_health_checker(health_service: Optional[Any] = None) -> HealthChecker:
+    """
+    Get or create global health checker instance.
+    
+    Args:
+        health_service: Optional HealthService from DI Container (recommended)
+        
+    Returns:
+        HealthChecker instance
+        
+    Note:
+        If health_service is provided (hexagonal), it will be used for health checks.
+        Otherwise falls back to legacy imports from MarketTool.py (deprecated).
+    """
     global _health_checker
     if _health_checker is None:
-        _health_checker = HealthChecker()
+        _health_checker = HealthChecker(health_service=health_service)
+    elif health_service is not None and _health_checker._health_service is None:
+        # Update existing instance with health service if it didn't have one
+        _health_checker._health_service = health_service
     return _health_checker
 
 
 def register_health_routes(
     app: Flask,
+    health_service: Optional[Any] = None,
     warmup_start_ref=None,
     warmup_end_ref=None,
     levels_hits_ref=None,
@@ -181,6 +242,7 @@ def register_health_routes(
     
     Args:
         app: Flask application
+        health_service: HealthService from DI Container (recommended for hexagonal architecture)
         warmup_start_ref: Callable that returns warmup start time (optional)
         warmup_end_ref: Callable that returns warmup end time (optional)
         levels_hits_ref: Callable that returns niveles cache hits (optional)
@@ -190,7 +252,7 @@ def register_health_routes(
         app_config: App configuration object (optional)
     """
     
-    health_checker = get_health_checker()
+    health_checker = get_health_checker(health_service=health_service)
     
     def _get_cache_stats() -> Dict[str, Any] | None:
         """Get MarketTool cache statistics if available."""

@@ -45,6 +45,11 @@ class APITimeoutError(ExternalAPIError):
     pass
 
 
+class PlanNotAllowed(ExternalAPIError):
+    """API plan does not allow this operation."""
+    pass
+
+
 # Analysis/Signal errors
 class AnalysisError(MarketToolError):
     """Analysis operation failed."""

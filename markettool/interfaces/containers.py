@@ -19,6 +19,7 @@ from markettool.core.ports import (
     QuoteProvider,
     CacheProvider,
     Notifier,
+    HistoricalDataProvider,
 )
 from markettool.infra.repositories import (
     FirestoreHistoricosRepository,
@@ -26,6 +27,9 @@ from markettool.infra.repositories import (
     MultiLayerCacheProvider,
     TelegramNotifier,
 )
+from markettool.infra.adapters import FMPHistoricalDataAdapter
+from markettool.application.services.historicos_service import HistoryManager
+from markettool.application.services.health_service import HealthService
 from markettool.infra.cache.memory_cache import MemoryCache
 from markettool.infra.cache.local_cache import LocalCache
 from markettool.infra.cache.gcs_cache import GCSCache
@@ -43,8 +47,14 @@ class DIContainer:
         quote_provider: QuoteProvider,
         cache_provider: CacheProvider,
         notifier: Notifier,
+        historical_data_provider: HistoricalDataProvider,
+        telegram_app: Optional[Any] = None,
+        firestore_db: Optional[Any] = None,
         legacy_services: Optional[LegacyServices] = None,
         logger: Optional[logging.Logger] = None,
+        version: str = "unknown",
+        environment: str = "production",
+        worker_id: str = "unknown",
     ):
         """
         Initialize container with port implementations.
@@ -54,14 +64,31 @@ class DIContainer:
             quote_provider: Quote provider
             cache_provider: Cache implementation
             notifier: Notification service
+            historical_data_provider: Historical data provider (for HistoryManager)
+            telegram_app: Telegram application instance (for health checks)
+            firestore_db: Firestore database client (for health checks)
+            legacy_services: Legacy MarketTool services
             logger: Optional logger
+            version: Application version
+            environment: Deployment environment
+            worker_id: Worker/pod identifier
         """
         self.historicos_repo = historicos_repo
         self.quote_provider = quote_provider
         self.cache_provider = cache_provider
         self.notifier = notifier
+        self.historical_data_provider = historical_data_provider
+        self.telegram_app = telegram_app
+        self.firestore_db = firestore_db
         self.legacy_services = legacy_services
         self.logger = logger or logging.getLogger(__name__)
+        self.version = version
+        self.environment = environment
+        self.worker_id = worker_id
+        
+        # Application services
+        self._history_manager: Optional[HistoryManager] = None
+        self._health_service: Optional[HealthService] = None
         
         # Cache use case instances
         self._get_historicos_uc: Optional[GetHistoricosUseCase] = None
@@ -79,6 +106,29 @@ class DIContainer:
                 logger=self.logger,
             )
         return self._get_historicos_uc
+    
+    @property
+    def history_manager(self) -> HistoryManager:
+        """Get HistoryManager service instance."""
+        if self._history_manager is None:
+            self._history_manager = HistoryManager(
+                provider=self.historical_data_provider,
+            )
+        return self._history_manager
+    
+    @property
+    def health_service(self) -> HealthService:
+        """Get HealthService instance."""
+        if self._health_service is None:
+            self._health_service = HealthService(
+                telegram_app=self.telegram_app,
+                firestore_db=self.firestore_db,
+                cache_provider=self.cache_provider,
+                version=self.version,
+                environment=self.environment,
+                worker_id=self.worker_id,
+            )
+        return self._health_service
     
     @property
     def get_quote(self) -> GetQuoteUseCase:
@@ -113,7 +163,7 @@ class DIContainer:
     
     def get_all(self) -> dict:
         """
-        Get dictionary of all use cases.
+        Get dictionary of all use cases and services.
         Useful for dependency injection into routes.
         """
         return {
@@ -121,6 +171,8 @@ class DIContainer:
             "get_quote": self.get_quote,
             "run_analysis": self.run_analysis,
             "warm_cache": self.warm_cache,
+            "history_manager": self.history_manager,
+            "health_service": self.health_service,
             "legacy_services": self.legacy_services,
         }
     
@@ -150,6 +202,12 @@ class DIContainer:
             Fully configured DIContainer
         """
         _logger = logger or logging.getLogger(__name__)
+        
+        # Create HistoricalDataProvider from FMP client
+        historical_data_provider = None
+        if fmp_client:
+            historical_data_provider = FMPHistoricalDataAdapter(fmp_client=fmp_client)
+            _logger.info("✅ FMPHistoricalDataAdapter created")
         
         # Create port adapters
         historicos_repo = FirestoreHistoricosRepository(
@@ -197,12 +255,23 @@ class DIContainer:
             logger=_logger,
         )
         
+        # Get deployment info from environment
+        version = os.environ.get("APP_VERSION", "unknown")
+        environment = os.environ.get("ENVIRONMENT", "production")
+        worker_id = os.environ.get("WORKER_ID", "unknown")
+        
         # Create and return container
         return cls(
             historicos_repo=historicos_repo,
             quote_provider=quote_provider,
             cache_provider=cache_provider,
             notifier=notifier,
+            historical_data_provider=historical_data_provider,
+            telegram_app=telegram_app,
+            firestore_db=firestore_db,
             legacy_services=legacy_services,
             logger=_logger,
+            version=version,
+            environment=environment,
+            worker_id=worker_id,
         )

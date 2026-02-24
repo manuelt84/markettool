@@ -15,7 +15,9 @@ from zoneinfo import ZoneInfo
 from google.cloud import firestore
 
 from markettool.core.time import ensure_utc_index, utc_now
-from markettool.infra.fmp import FMPClient, FMPPlanNotAllowed, normalize_tf
+from markettool.core.ports.historical_data_provider import HistoricalDataProvider
+from markettool.core.errors import PlanNotAllowed
+from markettool.infra.fmp import normalize_tf
 from markettool.infra.cache.historicos_cache import load_cached_history, save_cached_history
 
 
@@ -90,8 +92,16 @@ def normalize_resample_rule(rule: str) -> str:
 
 
 class HistoryManager:
-    def __init__(self, client: FMPClient):
-        self.client = client
+    """Manages historical data fetching, caching, and resampling."""
+    
+    def __init__(self, provider: HistoricalDataProvider):
+        """
+        Initialize HistoryManager with a HistoricalDataProvider.
+        
+        Args:
+            provider: Implementation of HistoricalDataProvider port (e.g., FMPHistoricalDataAdapter)
+        """
+        self.provider = provider
 
     def _base_interval_for(self, tf: str) -> str:
         tf = normalize_tf(tf)
@@ -151,7 +161,7 @@ class HistoryManager:
             )
             if lag_min > tol:
                 return df
-            px = self.client.quote_last(symbol)
+            px = self.provider.quote_last(symbol)
             if px is None or math.isnan(px) or px <= 0:
                 return df
             out = df.copy()
@@ -237,14 +247,14 @@ class HistoryManager:
             try:
                 if self._is_intraday(tf):
                     base_tf = self._base_interval_for(tf)
-                    raw = self.client.historical_intraday(symbol, base_tf, from_dt, to_dt)
+                    raw = self.provider.historical_intraday(symbol, base_tf, from_dt, to_dt)
                     raw = ensure_utc_index(raw)
                     new_df = self._maybe_resample(raw, tf)
                 else:
-                    raw = self.client.historical_eod(symbol, from_dt, to_dt)
+                    raw = self.provider.historical_eod(symbol, from_dt, to_dt)
                     raw = ensure_utc_index(raw)
                     new_df = self._maybe_resample_eod(raw, tf) if tf in EOD_RESAMPLE_RULE else raw
-            except FMPPlanNotAllowed:
+            except PlanNotAllowed:
                 logger.info("Plan no permite intradia para %s (%s).", symbol, tf)
                 new_df = pd.DataFrame()
             except Exception as exc:

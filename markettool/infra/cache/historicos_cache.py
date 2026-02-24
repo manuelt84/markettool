@@ -22,9 +22,189 @@ from markettool.core.config import load_config
 from markettool.infra.fmp import normalize_tf
 from markettool.core.cache_config import validate_data_freshness, get_freshness_requirement_for_timeframe, CACHE_CONFIG
 
+# Optional Redis support
+try:
+    import redis
+except ImportError:
+    redis = None
 
 logger = logging.getLogger("MarketTool")
 APP_CONFIG = load_config()
+
+# ============================================================================
+# Redis-based distributed cache layer (L2)
+# ============================================================================
+
+class RedisHistoricosCache:
+    """
+    Redis-backed distributed cache for OHLCV historical data.
+    
+    Benefits:
+    - Shared across multiple pods (avoids per-pod cache warmup)
+    - Persists across container restarts (avoids 120s penalty)
+    - Automatic TTL expiration per timeframe
+    - Fallback to disabled state if Redis unavailable
+    
+    Storage format:
+    - Key: "hist:{symbol}:{tf}"
+    - Value: Gzip-compressed JSON array of OHLCV records
+    - TTL: Timeframe-based (1min=60s, 5min=300s, 1day=86400s)
+    """
+    
+    def __init__(self):
+        self.redis_url = os.getenv("REDIS_URL", None)
+        self.redis_client = None
+        self.enabled = False
+        self.hits = 0
+        self.misses = 0
+        
+        if self.redis_url and redis:
+            try:
+                self.redis_client = redis.Redis.from_url(
+                    self.redis_url, 
+                    decode_responses=False,  # We'll handle binary (gzip) data
+                    socket_connect_timeout=2,
+                    socket_timeout=3,
+                )
+                self.redis_client.ping()
+                self.enabled = True
+                logger.info("[RedisHistCache] Connected to Redis: %s", self.redis_url)
+            except Exception as e:
+                logger.warning("[RedisHistCache] Redis connection failed (%s). Cache disabled.", e)
+                self.redis_client = None
+                self.enabled = False
+        else:
+            reason = "no REDIS_URL" if not self.redis_url else "redis library not installed"
+            logger.info("[RedisHistCache] Redis cache disabled (%s)", reason)
+    
+    def _make_key(self, symbol: str, tf: str) -> str:
+        """Generate Redis key for historicos."""
+        return f"hist:{symbol.upper()}:{normalize_tf(tf)}"
+    
+    def _get_ttl_seconds(self, tf: str) -> int:
+        """Get TTL in seconds based on timeframe."""
+        ttl_map = {
+            "1min": 60,
+            "5min": 300,
+            "15min": 900,
+            "30min": 1800,
+            "1hour": 3600,
+            "4hour": 14400,
+            "1day": 86400,
+            "1week": 604800,
+            "1month": 2592000,
+        }
+        return ttl_map.get(normalize_tf(tf), 3600)  # Default 1h
+    
+    def get(self, symbol: str, tf: str) -> Optional[pd.DataFrame]:
+        """Load OHLCV DataFrame from Redis if available."""
+        if not self.enabled:
+            return None
+        
+        key = self._make_key(symbol, tf)
+        
+        try:
+            import gzip
+            
+            # Get compressed data from Redis
+            compressed = self.redis_client.get(key)
+            if not compressed:
+                self.misses += 1
+                return None
+            
+            # Decompress and parse JSON
+            raw_json = gzip.decompress(compressed).decode('utf-8')
+            data = json.loads(raw_json)
+            
+            if not data:
+                self.misses += 1
+                return None
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(data)
+            if "time" not in df.columns:
+                self.misses += 1
+                return None
+            
+            df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
+            df = df.dropna(subset=["time"]).set_index("time").sort_index()
+            df = df[["open", "high", "low", "close", "volume"]]
+            
+            if df.index.tz is None:
+                df.index = df.index.tz_localize(pytz.UTC)
+            
+            self.hits += 1
+            logger.debug("[RedisHistCache] HIT: %s/%s (%d rows)", symbol, tf, len(df))
+            return df
+            
+        except Exception as e:
+            logger.debug("[RedisHistCache] GET failed for %s/%s: %s", symbol, tf, e)
+            self.misses += 1
+            return None
+    
+    def set(self, symbol: str, tf: str, df: pd.DataFrame) -> bool:
+        """Save OHLCV DataFrame to Redis with TTL."""
+        if not self.enabled or df is None or df.empty:
+            return False
+        
+        key = self._make_key(symbol, tf)
+        ttl = self._get_ttl_seconds(tf)
+        
+        try:
+            import gzip
+            
+            # Prepare data as JSON records
+            df_copy = df.copy()
+            df_copy["time"] = df_copy.index.strftime("%Y-%m-%dT%H:%M:%SZ")
+            data = df_copy[["time", "open", "high", "low", "close", "volume"]].to_dict(orient="records")
+            
+            # Compress JSON
+            json_bytes = json.dumps(data).encode('utf-8')
+            compressed = gzip.compress(json_bytes, compresslevel=6)
+            
+            # Save to Redis with TTL
+            self.redis_client.setex(key, ttl, compressed)
+            
+            compression_ratio = len(json_bytes) / len(compressed)
+            logger.debug("[RedisHistCache] SET: %s/%s (%d rows, %.1fKB → %.1fKB, ratio=%.1fx, TTL=%ds)",
+                        symbol, tf, len(df), 
+                        len(json_bytes)/1024, len(compressed)/1024,
+                        compression_ratio, ttl)
+            return True
+            
+        except Exception as e:
+            logger.warning("[RedisHistCache] SET failed for %s/%s: %s", symbol, tf, e)
+            return False
+    
+    def invalidate(self, symbol: str, tf: str) -> bool:
+        """Remove entry from Redis cache."""
+        if not self.enabled:
+            return False
+        
+        key = self._make_key(symbol, tf)
+        
+        try:
+            self.redis_client.delete(key)
+            logger.debug("[RedisHistCache] INVALIDATE: %s/%s", symbol, tf)
+            return True
+        except Exception as e:
+            logger.debug("[RedisHistCache] INVALIDATE failed for %s/%s: %s", symbol, tf, e)
+            return False
+    
+    def get_stats(self) -> dict:
+        """Return cache statistics."""
+        total = self.hits + self.misses
+        hit_rate = (self.hits / total * 100) if total > 0 else 0.0
+        return {
+            "enabled": self.enabled,
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate_pct": hit_rate,
+            "redis_url": self.redis_url if self.redis_url else "not configured",
+        }
+
+# Global Redis cache instance
+_REDIS_HIST_CACHE = RedisHistoricosCache()
 
 # ============================================================================
 # Thread-safe infrastructure for incremental cache merging
@@ -407,13 +587,14 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     """
     Carga historicos del cache.
     Orden:
-      1) LazyHistoricosLoader
-      2) Local JSON cache
-      3) Firestore metadata (TTL compartido)
-      4) GCS
-      5) Legacy local files
+      1) LazyHistoricosLoader (L1 - in-memory, fastest)
+      2) Redis (L2 - shared across pods, persists across restarts)
+      3) Local JSON cache (L2 fallback - pod-specific)
+      4) Firestore metadata (TTL compartido)
+      5) GCS
+      6) Legacy local files
     """
-    # Opcion 1: Lazy loader
+    # Opcion 1: Lazy loader (L1 - in-memory)
     try:
         df = _LAZY_HIST_LOADER.get(symbol, tf)
         if not df.empty:
@@ -422,7 +603,26 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     except Exception as exc:
         logger.debug("[LazyLoader] Failed to load %s/%s: %s", symbol, tf, exc)
 
-    # Opcion 2: Local files
+    # ✅ NEW Opcion 2: Redis (L2 - shared distributed cache)
+    try:
+        df = _REDIS_HIST_CACHE.get(symbol, tf)
+        if df is not None and not df.empty:
+            logger.debug("[load_cached] Hit Redis: %s/%s (%d rows)", symbol, tf, len(df))
+            # Populate LazyLoader for future in-memory hits
+            try:
+                _LAZY_HIST_LOADER.put(symbol, tf, df)
+            except Exception:
+                pass
+            # Also save to local cache as backup
+            try:
+                _save_local_history_df(symbol, tf, df)
+            except Exception:
+                pass
+            return df
+    except Exception as exc:
+        logger.debug("[load_cached] Redis check failed: %s", exc)
+
+    # Opcion 3: Local files (L2 fallback)
     try:
         df = _load_local(symbol, tf)
         if df is not None and not df.empty:
@@ -431,11 +631,16 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
                 _LAZY_HIST_LOADER.put(symbol, tf, df)
             except Exception:
                 pass
+            # ✅ Backfill Redis if it was a miss
+            try:
+                _REDIS_HIST_CACHE.set(symbol, tf, df)
+            except Exception:
+                pass
             return df
     except Exception as exc:
         logger.debug("[load_cached] Local check failed: %s", exc)
 
-    # Opcion 3: Firestore metadata
+    # Opcion 4: Firestore metadata
     try:
         metadata = get_historicos_metadata(symbol, tf)
         if metadata is not None and not is_metadata_stale(metadata, tf):
@@ -570,7 +775,17 @@ def save_cached_history(symbol: str, tf: str, out: pd.DataFrame, *, storage_dir:
         payload = out.tail(1000).to_dict(orient="records")
 
         try:
+            # ✅ Save to local JSON cache (incremental merge)
             _save_local_history_df(symbol, tf, out)
+            
+            # ✅ Save to Redis distributed cache (shared across pods)
+            try:
+                _REDIS_HIST_CACHE.set(symbol, tf, out)
+            except Exception as redis_err:
+                logger.debug("[save_cached_history] Redis save failed for %s/%s: %s", 
+                            symbol, tf, redis_err)
+            
+            # Legacy temp file save
             with open(local_json, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, default=str)
             logger.debug("[save_cached_history] Local saved: %s rows=%d (GCS deferred to warmup)", symbol, len(out))
