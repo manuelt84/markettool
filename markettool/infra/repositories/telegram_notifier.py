@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 from markettool.core.models.signal import Signal, SignalType
 from markettool.core.ports.notifier import Notifier

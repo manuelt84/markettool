@@ -9,7 +9,7 @@ from typing import List, Optional, Set
 
 from markettool.core.ports.cache_provider import CacheProvider
 from markettool.core.ports.historicos_repo import HistoricosRepository
-from markettool.core.errors import DataNotFoundError
+pass
 from markettool.core.cache_config import CACHE_CONFIG, validate_data_freshness
 
 

@@ -19,7 +19,7 @@ from google.cloud import firestore
 from google.cloud import storage
 
 from markettool.infra.fmp import normalize_tf
-from markettool.core.cache_config import validate_data_freshness, get_freshness_requirement_for_timeframe, CACHE_CONFIG
+from markettool.core.cache_config import CACHE_CONFIG
 
 
 logger = logging.getLogger("MarketTool")

@@ -11,7 +11,7 @@ from typing import Optional, Dict, Tuple
 import pandas as pd
 import numpy as np
 import pytz
-from zoneinfo import ZoneInfo
+pass
 from google.cloud import firestore
 
 from markettool.core.time import ensure_utc_index, utc_now

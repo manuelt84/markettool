@@ -9,7 +9,7 @@ Services exposed:
 """
 
 import logging
-from typing import Dict, Any, List
+pass
 from flask import Blueprint, request, jsonify
 
 from markettool.application.services import (

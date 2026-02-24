@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+pass
 import os
 from typing import TYPE_CHECKING
 
@@ -144,6 +144,7 @@ def setup_scheduler(
     pod_coordinator,
     app_config,
     parallel_engine=None,
+    container=None,  # ✅ DI Container for hexagonal services
 ) -> None:
     """
     Set up APScheduler jobs for recurring tasks.
@@ -171,25 +172,30 @@ def setup_scheduler(
         
         try:
             from markettool.application.use_cases.parallel_analysis_v2 import run_parallel_analysis
-            from MarketTool import (
-                load_cached_history,  # Función para cargar histórico
-                cargar_activos_en_mercado,  # Activos disponibles
-                guardar_seniales_a_firebase,  # Persist signals
-            )
             
+            # ✅ Sprint 4: Using hexagonal services from DI Container
             logger.info("[Parallel Analysis v2] Starting parallel analysis batch (100x faster)...")
             
-            # Get symbols to analyze
+            # Get symbols to analyze (hexagonal way)
             symbols = None
-            if hasattr(cargar_activos_en_mercado, '__call__'):
+            if container:
                 try:
+                    symbols = await container.get_market_symbols.execute()
+                    logger.info(f"[Hexagonal] Loaded {len(symbols)} symbols from GetMarketSymbolsUseCase")
+                except Exception as e:
+                    logger.warning(f"[Parallel Analysis] Error loading symbols from container: {e}")
+            
+            if not symbols:
+                # Fallback to legacy if container unavailable
+                try:
+                    from MarketTool import cargar_activos_en_mercado
                     symbols = cargar_activos_en_mercado()
-                    # If it's a coroutine, await it
                     if hasattr(symbols, '__await__'):
                         symbols = await symbols
+                    logger.warning("[Legacy] Using MarketTool.cargar_activos_en_mercado (fallback)")
                 except Exception as e:
-                    logger.warning("[Parallel Analysis] Error loading symbols: %s", e)
-                    symbols = None
+                    logger.error(f"[Parallel Analysis] Failed to load symbols: {e}")
+                    return
             
             if not symbols:
                 logger.warning("[Parallel Analysis] No symbols to analyze, skipping batch")
@@ -200,12 +206,27 @@ def setup_scheduler(
             
             logger.info(f"[Parallel Analysis v2] Analyzing {len(symbols)} symbols × {len(tfs)} TF...")
             
+            # Define load_history function (hexagonal or legacy)
+            async def load_history_fn(symbol: str, tf: str):
+                """Load historical data using hexagonal or legacy method."""
+                if container:
+                    try:
+                        # ✅ Hexagonal: Use HistoryManager
+                        from markettool.application.services.historicos_service import HistoryConfig
+                        df = container.history_manager.get(symbol, tf, cfg=HistoryConfig(bars=500))
+                        return df
+                    except Exception as exc:
+                        logger.warning(f"[Hexagonal] Failed to load {symbol}/{tf}: {exc}")
+                
+                # Fallback to legacy
+                from MarketTool import load_cached_history
+                return load_cached_history(symbol, tf)
+            
             # Run parallel analysis using new v2 API
-            # This replaces the sequential loop with 3-level parallelism
             results = await run_parallel_analysis(
                 symbols=symbols,
                 tfs=tfs,
-                load_history_fn=load_cached_history,
+                load_history_fn=load_history_fn,
                 df_eventos=None,  # Optional market events dataframe
                 cfg=parallel_engine.config,  # Use the configured AnalysisConfig
                 on_progress=lambda s, tf, sig: logger.debug(
@@ -215,11 +236,41 @@ def setup_scheduler(
             
             logger.info(f"[Parallel Analysis v2] ✅ Batch complete: {len(results)} symbols analyzed")
             
-            # Persist signals to Firestore
+            # Persist signals to Firestore (hexagonal or legacy)
             if results:
                 try:
-                    await guardar_seniales_a_firebase(results)
-                    logger.info("[Parallel Analysis v2] ✅ Signals persisted to Firestore")
+                    if container:
+                        # ✅ Hexagonal: Use SignalRepository
+                        # Convert results to Signal objects
+                        from markettool.core.models.signal import Signal, SignalType
+                        from datetime import datetime, timezone
+                        
+                        signals = []
+                        for result in results:
+                            # Map result dict to Signal model
+                            signal = Signal(
+                                symbol=result.get('symbol', ''),
+                                signal_type=SignalType(result.get('direction', 'NEUTRAL')),
+                                timestamp=datetime.now(timezone.utc),
+                                confidence=result.get('confidence', 0.5),
+                                entry_price=result.get('entry_price'),
+                                target_price=result.get('target_price'),
+                                stop_loss=result.get('stop_loss'),
+                                reason=result.get('reason'),
+                                indicators=result.get('indicators', {}),
+                                source="parallel_analysis_v2",
+                                analysis_type="technical",
+                            )
+                            signals.append(signal)
+                        
+                        saved_count = await container.signal_repository.save_batch(signals)
+                        logger.info(f"[Hexagonal] ✅ {saved_count} signals persisted to Firestore via SignalRepository")
+                    else:
+                        # Legacy fallback
+                        from MarketTool import guardar_seniales_a_firebase
+                        await guardar_seniales_a_firebase(results)
+                        logger.info("[Legacy] ✅ Signals persisted to Firestore (legacy method)")
+                        
                 except Exception as e:
                     logger.exception("[Parallel Analysis v2] Error persisting signals: %s", e)
                     # Don't fail the job if persistence fails

@@ -6,13 +6,13 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Any, Callable, Mapping
+pass
 
-import pandas as pd
+pass
 from flask import jsonify, request
 
 from markettool.application.use_cases.legacy import LegacyMonitoreoUseCase
-from markettool.core.cache_config import validate_data_freshness, get_freshness_requirement_for_timeframe
+from markettool.core.cache_config import get_freshness_requirement_for_timeframe
 
 
 def register_monitoreo_routes(app, *, services) -> None:

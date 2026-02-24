@@ -19,10 +19,10 @@ Strategies implemented:
 12. Economic Events (handled separately)
 """
 
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Any
 from datetime import datetime
-import numpy as np
-from dataclasses import dataclass, asdict
+pass
+from dataclasses import dataclass
 
 
 @dataclass

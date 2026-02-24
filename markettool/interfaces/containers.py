@@ -13,6 +13,7 @@ from markettool.application.use_cases import (
     GetQuoteUseCase,
     RunAnalysisUseCase,
     WarmCacheUseCase,
+    GetMarketSymbolsUseCase,
 )
 from markettool.core.ports import (
     HistoricosRepository,
@@ -20,12 +21,14 @@ from markettool.core.ports import (
     CacheProvider,
     Notifier,
     HistoricalDataProvider,
+    SignalRepository,
 )
 from markettool.infra.repositories import (
     FirestoreHistoricosRepository,
     FMPQuoteProvider,
     MultiLayerCacheProvider,
     TelegramNotifier,
+    FirestoreSignalRepository,
 )
 from markettool.infra.adapters import FMPHistoricalDataAdapter
 from markettool.application.services.historicos_service import HistoryManager
@@ -48,6 +51,7 @@ class DIContainer:
         cache_provider: CacheProvider,
         notifier: Notifier,
         historical_data_provider: HistoricalDataProvider,
+        signal_repository: SignalRepository,
         telegram_app: Optional[Any] = None,
         firestore_db: Optional[Any] = None,
         legacy_services: Optional[LegacyServices] = None,
@@ -78,6 +82,7 @@ class DIContainer:
         self.cache_provider = cache_provider
         self.notifier = notifier
         self.historical_data_provider = historical_data_provider
+        self.signal_repository = signal_repository
         self.telegram_app = telegram_app
         self.firestore_db = firestore_db
         self.legacy_services = legacy_services
@@ -89,6 +94,7 @@ class DIContainer:
         # Application services
         self._history_manager: Optional[HistoryManager] = None
         self._health_service: Optional[HealthService] = None
+        self._get_market_symbols_uc: Optional[GetMarketSymbolsUseCase] = None
         
         # Cache use case instances
         self._get_historicos_uc: Optional[GetHistoricosUseCase] = None
@@ -161,6 +167,16 @@ class DIContainer:
             )
         return self._warm_cache_uc
     
+    @property
+    def get_market_symbols(self) -> GetMarketSymbolsUseCase:
+        """Get GetMarketSymbolsUseCase instance."""
+        if self._get_market_symbols_uc is None:
+            self._get_market_symbols_uc = GetMarketSymbolsUseCase(
+                firestore_client=self.firestore_db,
+                logger=self.logger,
+            )
+        return self._get_market_symbols_uc
+    
     def get_all(self) -> dict:
         """
         Get dictionary of all use cases and services.
@@ -173,6 +189,8 @@ class DIContainer:
             "warm_cache": self.warm_cache,
             "history_manager": self.history_manager,
             "health_service": self.health_service,
+            "get_market_symbols": self.get_market_symbols,
+            "signal_repository": self.signal_repository,
             "legacy_services": self.legacy_services,
         }
     
@@ -255,6 +273,13 @@ class DIContainer:
             logger=_logger,
         )
         
+        # Create signal repository
+        signal_repository = FirestoreSignalRepository(
+            firestore_client=firestore_db,
+            logger=_logger,
+        )
+        _logger.info("✅ FirestoreSignalRepository created")
+        
         # Get deployment info from environment
         version = os.environ.get("APP_VERSION", "unknown")
         environment = os.environ.get("ENVIRONMENT", "production")
@@ -267,6 +292,7 @@ class DIContainer:
             cache_provider=cache_provider,
             notifier=notifier,
             historical_data_provider=historical_data_provider,
+            signal_repository=signal_repository,
             telegram_app=telegram_app,
             firestore_db=firestore_db,
             legacy_services=legacy_services,

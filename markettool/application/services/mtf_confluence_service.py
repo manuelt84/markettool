@@ -11,7 +11,7 @@ Implements confluence evaluation by comparing signals on:
 """
 
 import logging
-from typing import Dict, Optional, List, Any, Tuple
+from typing import Dict, Optional, Any, Tuple
 from dataclasses import dataclass
 import pandas as pd
 

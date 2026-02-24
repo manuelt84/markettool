@@ -5,6 +5,7 @@ from .quote_provider import QuoteProvider
 from .cache_provider import CacheProvider
 from .notifier import Notifier
 from .historical_data_provider import HistoricalDataProvider
+from .signal_repository import SignalRepository
 
 __all__ = [
     "HistoricosRepository",
@@ -12,4 +13,5 @@ __all__ = [
     "CacheProvider",
     "Notifier",
     "HistoricalDataProvider",
+    "SignalRepository",
 ]

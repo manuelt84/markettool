@@ -11,7 +11,7 @@ Services exposed:
 """
 
 import logging
-from typing import Dict, Any, List, Optional
+pass
 from flask import Blueprint, request, jsonify
 
 from markettool.application.services import get_risk_service

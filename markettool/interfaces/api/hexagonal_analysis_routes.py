@@ -10,7 +10,7 @@ Services exposed:
 """
 
 import logging
-from typing import Dict, Any, Optional, List
+pass
 from flask import Blueprint, request, jsonify
 import pandas as pd
 import numpy as np
@@ -20,7 +20,7 @@ from markettool.application.services import (
     get_fundamental_service,
 )
 from markettool.application.adapters import get_analyzer
-from markettool.application.use_cases import get_calculate_entries_use_case
+pass
 
 logger = logging.getLogger(__name__)
 

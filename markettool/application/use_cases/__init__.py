@@ -5,6 +5,7 @@ from .get_historicos import GetHistoricosUseCase
 from .get_quote import GetQuoteUseCase
 from .run_analysis import RunAnalysisUseCase
 from .warm_cache import WarmCacheUseCase
+from .get_market_symbols import GetMarketSymbolsUseCase
 
 __all__ = [
     "CalculateEntriesUseCase",
@@ -13,4 +14,5 @@ __all__ = [
     "GetQuoteUseCase",
     "RunAnalysisUseCase",
     "WarmCacheUseCase",
+    "GetMarketSymbolsUseCase",
 ]

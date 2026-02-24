@@ -8,10 +8,14 @@ from markettool.infra.repositories.multi_layer_cache_provider import (
     MultiLayerCacheProvider,
 )
 from markettool.infra.repositories.telegram_notifier import TelegramNotifier
+from markettool.infra.repositories.firestore_signal_repository import (
+    FirestoreSignalRepository,
+)
 
 __all__ = [
     "FirestoreHistoricosRepository",
     "FMPQuoteProvider",
     "MultiLayerCacheProvider",
     "TelegramNotifier",
+    "FirestoreSignalRepository",
 ]

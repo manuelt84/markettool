@@ -5,11 +5,11 @@ from __future__ import annotations
 import logging
 import threading
 from typing import Any, List, Optional
-from datetime import datetime, timedelta
+pass
 
 from markettool.core.ports.cache_provider import CacheProvider
 from markettool.core.errors import CacheError
-from markettool.core.cache_config import CACHE_CONFIG, validate_data_freshness
+from markettool.core.cache_config import CACHE_CONFIG
 
 
 class MultiLayerCacheProvider(CacheProvider):
@@ -271,7 +271,7 @@ class MultiLayerCacheProvider(CacheProvider):
         timeframe: str,
     ):
         """Get cached historical data."""
-        from markettool.core.models.historico import Historico
+        pass
         
         key = f"historico:{symbol}:{timeframe}"
         return await self.get(key)

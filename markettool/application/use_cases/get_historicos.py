@@ -9,7 +9,7 @@ from typing import Optional
 from markettool.core.models.historico import Historico
 from markettool.core.ports.cache_provider import CacheProvider
 from markettool.core.ports.historicos_repo import HistoricosRepository
-from markettool.core.errors import InsufficientDataError, DataNotFoundError
+from markettool.core.errors import InsufficientDataError
 
 
 class GetHistoricosUseCase:

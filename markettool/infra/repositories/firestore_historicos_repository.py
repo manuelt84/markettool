@@ -10,7 +10,7 @@ import pandas as pd
 
 from markettool.core.models.historico import Historico
 from markettool.core.ports.historicos_repo import HistoricosRepository
-from markettool.core.errors import DataNotFoundError, DataValidationError
+from markettool.core.errors import DataNotFoundError
 
 
 class FirestoreHistoricosRepository(HistoricosRepository):

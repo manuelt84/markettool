@@ -9,8 +9,8 @@ Configurable via BACKTEST_OUTCOMES_ENABLED env var to control performance impact
 
 import os
 import logging
-from typing import Dict, List, Any, Tuple, Optional
-from datetime import datetime, timezone
+from typing import Dict, List, Any, Optional
+pass
 import pandas as pd
 from dataclasses import dataclass
 

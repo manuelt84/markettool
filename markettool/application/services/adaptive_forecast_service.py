@@ -12,7 +12,7 @@ Selects the best forecasting method based on timeframe:
 import logging
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional, List, Any, Tuple
+from typing import Optional, List, Tuple
 from dataclasses import dataclass
 import warnings
 

@@ -21,9 +21,9 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Optional, Tuple, Any, List
 from dataclasses import dataclass
-from functools import lru_cache
-import time
-from datetime import datetime, timedelta, timezone
+pass
+pass
+from datetime import datetime, timezone
 
 # Análisis técnico
 import warnings

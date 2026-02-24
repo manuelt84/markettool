@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json as _json
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
-from typing import Optional
+pass
 
 
 class PonderacionHistory:
