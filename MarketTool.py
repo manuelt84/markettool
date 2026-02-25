@@ -14882,6 +14882,155 @@ async def _populate_entries_agg_from_results(df_oportunidades, exec_id: str):
         grouped = df_oportunidades.groupby(['Activo', 'Temporalidad'])
         total_added = 0
         
+        def _normalize_source(value: object | None) -> str | None:
+            if value is None:
+                return None
+            raw = str(value).strip().lower()
+            if not raw:
+                return None
+            raw = raw.replace('-', ' ').replace('_', ' ')
+            mapping = {
+                'confluence': 'confluence',
+                'confluencia': 'confluence',
+                'unknow': 'unknown',
+                'unknown': 'unknown',
+                'tech': 'tech',
+                'technical': 'tech',
+                'tecnica': 'tech',
+                'tecnico': 'tech',
+                'sr': 'sr',
+                'support resistance': 'sr',
+                'support/resistance': 'sr',
+                'support resistance level': 'sr',
+                'order block': 'ob',
+                'orderblock': 'ob',
+                'ob': 'ob',
+                'fvg': 'fvg',
+                'fair value gap': 'fvg',
+                'smc': 'smc',
+                'smart money': 'smc',
+                'breaker': 'breaker',
+                'inducement': 'inducement',
+                'divergence': 'divergence',
+                'fibonacci': 'fibonacci',
+                'mt': 'mt',
+                'market tool': 'mt',
+                'markettool': 'mt',
+                'event': 'eventos',
+                'events': 'eventos',
+                'eventos': 'eventos',
+                'arima': 'arima',
+                'media movil': 'media_movil',
+                'media móvil': 'media_movil',
+                'moving average': 'media_movil',
+                'moving avg': 'media_movil',
+                'smart money concepts': 'smc',
+            }
+            if raw in mapping:
+                return mapping[raw]
+            # Keyword scan for composite labels
+            if 'order block' in raw:
+                return 'ob'
+            if 'fair value' in raw or 'fvg' in raw:
+                return 'fvg'
+            if 'smart' in raw and 'money' in raw:
+                return 'smc'
+            if 'support' in raw or 'resistance' in raw:
+                return 'sr'
+            if 'diverg' in raw:
+                return 'divergence'
+            if 'break' in raw:
+                return 'breaker'
+            if 'induc' in raw:
+                return 'inducement'
+            if 'fibo' in raw:
+                return 'fibonacci'
+            if 'event' in raw:
+                return 'eventos'
+            if 'tech' in raw:
+                return 'tech'
+            if 'market' in raw and 'tool' in raw:
+                return 'mt'
+            return None
+
+        def _parse_strategies(value: object | None) -> list[str]:
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple, set)):
+                candidates = list(value)
+            else:
+                raw = str(value).strip()
+                if not raw:
+                    return []
+                raw = raw.replace('[', '').replace(']', '').replace('"', '').replace("'", '')
+                candidates = [p.strip() for p in raw.replace('|', ',').replace(';', ',').split(',')]
+            out: list[str] = []
+            for item in candidates:
+                normalized = _normalize_source(item)
+                if normalized and normalized not in out:
+                    out.append(normalized)
+            return out
+
+        def _extract_source_from_row(row: pd.Series) -> str | None:
+            for key in (
+                'source',
+                'Source',
+                'fuente',
+                'Fuente',
+                'estrategia',
+                'Estrategia',
+                'strategy',
+                'Strategy',
+                'tipo_entrada',
+                'Tipo de Entrada',
+                'Tipo de Senal',
+                'Tipo de Señal',
+                'Tipo',
+                'Categoria',
+                'Categoría',
+            ):
+                if key in row and row.get(key):
+                    normalized = _normalize_source(row.get(key))
+                    if normalized:
+                        return normalized
+            # Heuristica: inferir por nombre de columna o valor string
+            for col, value in row.items():
+                col_norm = str(col).strip().lower().replace('-', ' ').replace('_', ' ')
+                if not col_norm:
+                    continue
+                if 'order block' in col_norm:
+                    return 'ob'
+                if 'fvg' in col_norm or 'fair value' in col_norm:
+                    return 'fvg'
+                if 'smc' in col_norm or ('smart' in col_norm and 'money' in col_norm):
+                    return 'smc'
+                if 'breaker' in col_norm:
+                    return 'breaker'
+                if 'inducement' in col_norm:
+                    return 'inducement'
+                if 'diverg' in col_norm:
+                    return 'divergence'
+                if 'fibo' in col_norm:
+                    return 'fibonacci'
+                if 'support' in col_norm or 'resistance' in col_norm or col_norm == 'sr':
+                    return 'sr'
+                if 'tech' in col_norm or 'tecnic' in col_norm:
+                    return 'tech'
+                if 'event' in col_norm:
+                    return 'eventos'
+                if 'arima' in col_norm:
+                    return 'arima'
+                if 'media movil' in col_norm or 'moving average' in col_norm:
+                    return 'media_movil'
+                if 'market tool' in col_norm or col_norm == 'mt':
+                    return 'mt'
+
+                if isinstance(value, str):
+                    normalized = _normalize_source(value)
+                    if normalized:
+                        return normalized
+            return None
+
         for (symbol, timeframe), group_df in grouped:
             # Transformar filas a formato entries_agg
             calculated_entries = []
@@ -14911,6 +15060,24 @@ async def _populate_entries_agg_from_results(df_oportunidades, exec_id: str):
                 else:
                     rrr = 0
                 
+                strategies = _parse_strategies(
+                    row.get('strategies') or
+                    row.get('Strategies') or
+                    row.get('estrategias') or
+                    row.get('Estrategias') or
+                    row.get('signals') or
+                    row.get('Signals') or
+                    row.get('signal_types') or
+                    row.get('Signal Types')
+                )
+                source = _extract_source_from_row(row)
+
+                if not source and strategies:
+                    if len(strategies) >= 3 and float(row.get('Ponderacion', 0) or 0) >= 85:
+                        source = 'confluence'
+                    else:
+                        source = strategies[0]
+
                 entry_data = {
                     'side': side,
                     'entry': entry,
@@ -14918,8 +15085,8 @@ async def _populate_entries_agg_from_results(df_oportunidades, exec_id: str):
                     'sl': sl,
                     'rrr': rrr,
                     'score': float(row.get('Ponderacion', 0)),
-                    'source': 'confluence',
-                    'strategies': ['tech', 'sr'],  # Could be enhanced with actual strategies
+                    'source': source,
+                    'strategies': strategies,
                     'metadata': {
                         'soporte_1': row.get('Soporte Nivel 1'),
                         'soporte_2': row.get('Soporte Nivel 2'),
