@@ -103,13 +103,34 @@ def register_monitoreo_routes(app, *, services) -> None:
                 enabled = tf_is_enabled(exec_id, symbol, tf_api)
 
             logging.info(
-                "HIST TFCHK sym=%s tf=%s enabled=%s user_id=%s exec_id=%s",
+                "INC TFCHK sym=%s tf=%s enabled=%s user_id=%s exec_id=%s",
                 symbol,
                 timeframe,
                 enabled,
                 user_id,
                 exec_id,
             )
+
+            # Auto-renovar heartbeat solo si está cerca de expirar (optimización de Firestore)
+            # Simplificado: siempre renovar si enabled es False, para recuperación rápida
+            if exec_id and symbol and not enabled:
+                try:
+                    now_ms = int(time.time() * 1000)
+                    
+                    heartbeat_data = {
+                        "tf_states": {
+                            tf_api: {
+                                "enabled": True,
+                                "estado": "running",
+                                "last_heartbeat_ms": now_ms,
+                                "last_ts": now_ms,
+                            }
+                        }
+                    }
+                    await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, heartbeat_data)
+                    enabled = tf_is_enabled(exec_id, symbol, tf_api)
+                except Exception as e:
+                    logging.warning("INC AUTO-RENEW fallido para %s %s: %s", symbol, tf_api, e)
 
             if not enabled:
                 return (
@@ -151,35 +172,6 @@ def register_monitoreo_routes(app, *, services) -> None:
 
             # NOTE: ensure_stream_initialized removed - no longer maintains GCS stream
             # All real-time data flows through Firestore
-
-            # ============ 1MIN HOTFIX: Force Firestore refresh for 1m to avoid cache staleness ============
-            if timeframe == "1min":
-                try:
-                    fs_doc_ref = db.collection("executions").document(exec_id)
-                    fs_live_ref = fs_doc_ref.collection("live_data").document(f"{symbol}_1min")
-                    fs_snap = await asyncio.to_thread(fs_live_ref.get)
-                    
-                    if fs_snap.exists():
-                        fs_data = fs_snap.to_dict() or {}
-                        fs_candles = fs_data.get("candles", []) or []
-                        
-                        if fs_candles and len(fs_candles) > 0:
-                            # Convert Firestore candles to millisecond format
-                            # series_to_ms already available from outer scope (line 32)
-                            fs_series = series_to_ms(fs_candles)
-                            cache_series_old = st.get("series", []) or []
-                            
-                            if len(fs_series) > len(cache_series_old):
-                                st["series"] = fs_series
-                                logging.info(
-                                    "INC 1min HOTFIX %s: Refreshed from Firestore: %d candles (was %d in cache)",
-                                    symbol,
-                                    len(fs_series),
-                                    len(cache_series_old)
-                                )
-                except Exception as e:
-                    logging.warning("INC 1min HOTFIX %s: Firestore refresh failed: %s", symbol, e)
-                    # Continue with cache as-is
 
             # ============ COLD-START FIX: If cache is empty, fetch historical data ============
             cache_series = st.get("series", []) or []
@@ -684,6 +676,33 @@ def register_monitoreo_routes(app, *, services) -> None:
                 user_id,
                 exec_id,
             )
+
+            # Auto-renovar heartbeat solo si está cerca de expirar (optimización de Firestore)
+            # Simplificado: siempre renovar si enabled es False, para recuperación rápida
+            if exec_id and symbol and not enabled:
+                try:
+                    now_ms = int(time.time() * 1000)
+                    
+                    heartbeat_data = {
+                        "tf_states": {
+                            tf_api: {
+                                "enabled": True,
+                                "estado": "running",
+                                "last_heartbeat_ms": now_ms,
+                                "last_ts": now_ms,
+                            }
+                        }
+                    }
+                    await asyncio.to_thread(fs_touch_monitoreo, exec_id, symbol, heartbeat_data)
+                    logging.info(
+                        "HIST AUTO-RENEW sym=%s tf=%s - TTL renovado por request del frontend",
+                        symbol,
+                        tf_api,
+                    )
+                    # Re-validar enabled después de renovar
+                    enabled = tf_is_enabled(exec_id, symbol, tf_api)
+                except Exception as e:
+                    logging.warning("HIST AUTO-RENEW fallido para %s %s: %s", symbol, tf_api, e)
 
             if not enabled:
                 return (
