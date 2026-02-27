@@ -976,7 +976,8 @@ def register_monitoreo_routes(app, *, services) -> None:
             "limit": 100,           # optional, default 100
             "sort_by": "score",     # optional: "score", "rrr", "timestamp", "symbol"
             "skip_expired": true,   # optional, default true
-            "validate_freshness": false  # 🆕 optional, default false (enable for freshness validation)
+            "validate_freshness": false,  # 🆕 optional, default false (enable for freshness validation)
+            "exec_id": "uuid"       # 🆕 optional, filter by execution ID
         }
         
         Returns:
@@ -1002,6 +1003,7 @@ def register_monitoreo_routes(app, *, services) -> None:
                     "status": "pending",
                     "confirmation_count": 4,
                     "confirmation_pct": 85.0,
+                    "execution_id": "exec-uuid-123",
                     "leverage_recommendations": {
                         "level_1_conservative": 5.0,
                         "level_1_theoretical": 8.0,
@@ -1024,14 +1026,20 @@ def register_monitoreo_routes(app, *, services) -> None:
             sort_by = body.get("sort_by", "score")
             skip_expired = body.get("skip_expired", True)
             validate_freshness = body.get("validate_freshness", False)  # 🚀 OFF by default for performance
+            exec_id = body.get("exec_id")  # 🆕 Optional execution ID filter
             
             # Ensure limits
             limit = min(int(limit), 500)  # Max 500 entries
             
+            # Log filter status
+            if exec_id:
+                logger.info(f"[/api/entries/all] Filtering by execution_id: {exec_id}")
+            
             entries = entries_agg.get_all_entries(
                 limit=limit,
                 sort_by=sort_by,
-                skip_expired=skip_expired
+                skip_expired=skip_expired,
+                execution_id=exec_id
             )
             
             # 🚀 OPTIMIZED: Freshness validation now OPTIONAL (default OFF to avoid 504 timeout)
@@ -1041,6 +1049,10 @@ def register_monitoreo_routes(app, *, services) -> None:
                 "total": len(entries),
                 "timestamp": datetime.utcnow().isoformat()
             }
+            
+            # Add filter info if exec_id was provided
+            if exec_id:
+                response_data["filters"] = {"execution_id": exec_id}
             
             # Only validate if explicitly requested
             if validate_freshness:

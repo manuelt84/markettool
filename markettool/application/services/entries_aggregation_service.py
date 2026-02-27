@@ -53,6 +53,8 @@ class EntryCandidateData:
     status: str = "pending"  # pending, triggered, filled, expired, cancelled
     confirmation_count: int = 0  # number of confluent signals
     confirmation_pct: float = 0.0  # % of signals aligned
+    # 🆕 Execution tracking
+    execution_id: Optional[str] = None  # Links entry to specific execution/analysis session
 
 
 class EntriesAggregationService:
@@ -80,7 +82,8 @@ class EntriesAggregationService:
         self,
         limit: int = 100,
         sort_by: str = "score",
-        skip_expired: bool = True
+        skip_expired: bool = True,
+        execution_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Get all entries, ranked and filtered.
@@ -89,11 +92,16 @@ class EntriesAggregationService:
             limit: Max entries to return
             sort_by: Sort key ('score', 'rrr', 'timestamp')
             skip_expired: Exclude expired entries
+            execution_id: Filter by execution ID (optional)
             
         Returns:
             List of entry dicts, ranked by sort_by
         """
         entries = list(self._entries_cache.values())
+        
+        # Filter by execution_id if provided
+        if execution_id:
+            entries = [e for e in entries if e.execution_id == execution_id]
         
         # Filter expired
         if skip_expired:
@@ -393,7 +401,8 @@ class EntriesAggregationService:
         symbol: str,
         timeframe: str,
         calculated_entries: List[Dict[str, Any]],
-        ttl_minutes: int = 60
+        ttl_minutes: int = 60,
+        execution_id: Optional[str] = None
     ) -> int:
         """
         Update cache with newly calculated entries for a symbol/TF.
@@ -404,6 +413,7 @@ class EntriesAggregationService:
             timeframe: Timeframe (e.g., '1H')
             calculated_entries: New entries from calculation
             ttl_minutes: Time-to-live for entries
+            execution_id: Optional execution ID to link entries to analysis session
             
         Returns:
             Number of entries added
@@ -471,6 +481,11 @@ class EntriesAggregationService:
                     symbol, timeframe, strategies, confluence_score, source
                 )
             
+            # Extract execution_id from metadata or use parameter
+            entry_exec_id = execution_id
+            if not entry_exec_id and calc_entry.get('metadata'):
+                entry_exec_id = calc_entry['metadata'].get('exec_id')
+            
             entry = EntryCandidateData(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
@@ -500,7 +515,9 @@ class EntriesAggregationService:
                 # Set entry status
                 status="pending",
                 confirmation_count=len(strategies),
-                confirmation_pct=min(100.0, confluence_score)
+                confirmation_pct=min(100.0, confluence_score),
+                # 🆕 Link to execution session
+                execution_id=entry_exec_id
             )
             await self.add_entry(entry)
             new_count += 1

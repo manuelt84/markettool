@@ -16,6 +16,7 @@ from markettool.interfaces.api.cache_routes import register_cache_routes as regi
 from markettool.interfaces.api.hexagonal_analysis_routes import register_hexagonal_analysis_routes
 from markettool.interfaces.api.risk_management_routes import register_risk_management_routes
 from markettool.interfaces.api.signal_validation_routes import register_signal_validation_routes
+from markettool.interfaces.api.mt5_routes import register_mt5_routes
 
 if TYPE_CHECKING:
     from flask import Flask
@@ -47,6 +48,7 @@ def register_all_routes(
     register_hexagonal_analysis_routes(app)
     register_risk_management_routes(app)
     register_signal_validation_routes(app)
+    register_mt5_routes(app)
     logger.info("✅ Hexagonal API routes registered")
 
     # Legacy routes migrated into hexagonal registration

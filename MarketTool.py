@@ -15111,10 +15111,11 @@ async def _populate_entries_agg_from_results(df_oportunidades, exec_id: str):
                 symbol=symbol,
                 timeframe=timeframe,
                 calculated_entries=calculated_entries,
-                ttl_minutes=120
+                ttl_minutes=120,
+                execution_id=exec_id  # 🆕 Link entries to execution session
             )
             total_added += count
-            logger.debug(f"[entries_agg] {symbol}/{timeframe}: {count} entries agregados")
+            logger.debug(f"[entries_agg] {symbol}/{timeframe}: {count} entries agregados con exec_id={exec_id}")
         
         logger.info(f"[entries_agg] ✅ Cache actualizado: {total_added} entries en {len(grouped)} pares")
         

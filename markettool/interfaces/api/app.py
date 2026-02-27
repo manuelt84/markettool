@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from flask import Flask
+from flask import Flask, request, make_response
 from asgiref.wsgi import WsgiToAsgi
 
 if TYPE_CHECKING:
@@ -38,6 +38,30 @@ def get_webhook_app(
     if _webhook_app is None:
         _webhook_app = Flask(__name__)
         logger.info("✅ Flask webhook app created")
+        
+        # Register CORS middleware (manual implementation without flask_cors)
+        @_webhook_app.before_request
+        def handle_cors_preflight():
+            """Handle CORS preflight requests and add CORS headers to all responses."""
+            if request.method == "OPTIONS":
+                response = make_response()
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
+                response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+                response.headers["Access-Control-Max-Age"] = "3600"
+                return response
+        
+        @_webhook_app.after_request
+        def add_cors_headers(response):
+            """Add CORS headers to all responses."""
+            if request.path.startswith("/api/"):
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
+                response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+                response.headers["Access-Control-Expose-Headers"] = "Content-Type, X-Total-Count"
+            return response
+        
+        logger.info("✅ CORS middleware enabled for all /api/* routes")
     
     # Register routes once after app creation (if container provided)
     if container is not None and not _routes_registered:
