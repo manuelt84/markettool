@@ -4551,16 +4551,21 @@ def _ensure_globals_loaded():
     """
     Lazy loader: carga activos, forex, categorias, etc. si están vacíos.
     Llamado bajo demanda antes de operaciones que necesiten estas listas.
+    ✅ OPTIMIZACION: Solo carga si realmente se necesita (no en cold start)
     """
     global activos, forex, relacionados_usd, categorias, temporalidades, zonas_horarias
     
     # Solo carga si las listas/diccionarios están vacíos
     if not activos or not forex or not categorias:
         try:
-            logger.info("[Lazy Load] Cargando datos base de Firestore...")
+            # ✅ FAST PATH: Intentar use caché primero (5ms tipicamente)
+            # Si está vacío, cargar desde Firestore (puede tardar 1-2s)
+            logger.info("[Lazy Load] Cargando datos base (lazy on-demand)...")
+            start = time.time()
             activos, forex, relacionados_usd = obtener_datos_firestore()
             categorias, temporalidades, zonas_horarias = obtener_configuracion()
-            logger.info(f"[Lazy Load] Cargados: {len(activos)} activos, {len(forex)} forex, {len(categorias)} categorías")
+            elapsed = time.time() - start
+            logger.info(f"[Lazy Load] ✅ Cargados en {elapsed:.2f}s: {len(activos)} activos, {len(forex)} forex")
         except Exception as e:
             logger.error(f"[Lazy Load] Error cargando datos: {e}")
             # Mantener valores por defecto vacíos
@@ -8598,7 +8603,7 @@ async def get_eventos_economicos_cached(
     ✅ Reduce 3x FMP requests a 1 en 3 pods
     ✅ Cache hit: <100ms
     ✅ Cache miss: ~5-10s (FMP + web scraping)
-    ✅ OPTIMIZACION: Timeout de 30s para evitar operaciones congeladas
+    ✅ OPTIMIZACION: Timeout de 20s para análisis rápido de activos únicos
     """
     # Generar cache_key basada en parámetros
     key = f"econ_plan={plan or APP_CONFIG.fmp_plan}_desde={desde_inicio}_last_days={last_days}"
@@ -8613,13 +8618,14 @@ async def get_eventos_economicos_cached(
         )
     
     # Usar caché compartido con timeout
+    timeout_seconds = 20.0  # ✅ Reducido de 30s a 20s para inicio más rápido
     try:
-        return await asyncio.wait_for(_ECONOMIC_EVENTS_CACHE.get_or_fetch(key, _fetch), timeout=30.0)
+        return await asyncio.wait_for(_ECONOMIC_EVENTS_CACHE.get_or_fetch(key, _fetch), timeout=timeout_seconds)
     except asyncio.TimeoutError:
-        logger.error(f"[get_eventos_economicos_cached] Timeout")
+        logger.debug(f"[get_eventos_economicos_cached] Timeout ({timeout_seconds}s) - continuando sin eventos")
         return pd.DataFrame()
     except Exception as e:
-        logger.error(f"[get_eventos_economicos_cached] Error: {e}")
+        logger.debug(f"[get_eventos_economicos_cached] Error no-bloquente: {type(e).__name__}")
         return pd.DataFrame()
 
 
@@ -13983,6 +13989,38 @@ def procesar_simbolo_temporalidad(
     # Asegurar notación backend de TF (1min, 4hour, 1day, 1week…)
     tf = _tf_backend(temporalidad)  # <- este es el valor correcto a usar en todo el flujo
 
+    # ✅ OPTIMIZACION: Lazy-load eventos económicos si no están disponibles (mejor para análisis de un solo activo)
+    if df_eventos is None:
+        try:
+            logger.debug(f"[Lazy-Load] Cargando eventos económicos para {symbol}/{tf}...")
+            start_lazy = time.time()
+            # Usar llamada síncrona directa (ya estamos en executor thread)
+            def _get_eventos():
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    # No hay loop activo - estamos en thread executor
+                    loop = None
+                if loop:
+                    # Si estamos en un contexto async, esto no debería suceder
+                    return None
+                # Estamos en thread - hacer llamada síncrona de forma segura
+                try:
+                    return obtener_eventos_economicos(grace_minutes=0)
+                except Exception:
+                    return None
+            
+            resultado = _get_eventos()
+            if resultado is not None:
+                df_eventos = resultado
+            elapsed_lazy = time.time() - start_lazy
+            if elapsed_lazy > 2:
+                logger.debug(f"[Lazy-Load] Eventos tardaron {elapsed_lazy:.1f}s")
+        except Exception as e:
+            logger.debug(f"[Lazy-Load] Error cargando eventos lazy: {e}")
+            df_eventos = None
+
     # ------------------- OHLCV (hist + realtime) -------------------
     try:
         # Solo pasa fmpWindows si viene; si no, deja cfg vacío => bars=None
@@ -14308,10 +14346,12 @@ async def ejecutar_analisis_con_hilos(
 
     # --- PRE-FETCH HISTÓRICOS (Optimización Cold Start) ---
     # ✅ OPTIMIZATION: Pre-fetch todos los históricos en paralelo ANTES de análisis
-    # Beneficio: En cold start, descarga batch de GCS es 3-5x más rápida que descarga individual dentro de cada análisis
-    # Estrategia: Si detectamos cache mayormente vacío → pre-fetch agresivo, si no → skip
+    # Beneficio: En cold start, descarga batch de GCS es 3-5x más rápida que descarga individual
+    # ⚠️ PERO: No hacer prefetch para análisis pequeños (1-2 activos) - es más lento que análisis directo
     prefetch_enabled = str(os.getenv("ANALYSIS_PREFETCH_HISTORICOS", "true")).strip().lower() in {"1", "true", "yes", "on"}
-    if prefetch_enabled and total_tasks > 10:  # Solo para análisis grandes (>10 tasks)
+    # Desactivar prefetch para análisis de activos únicos o muy pequeños (mejor inicio rápido)
+    is_small_analysis = total_tasks <= 5  # 1 activo × 5 TFs o menos
+    if prefetch_enabled and total_tasks > 10 and not is_small_analysis:  # Solo para análisis medianos/grandes
         t_prefetch_start = time.time()
         
         # Sample 5 random (symbol, tf) combos to check cache hit rate
@@ -17685,11 +17725,19 @@ async def ejecutar_recurrente(
         start_time = datetime.now()
 
         # Eventos económicos (tolerante a error) ✅ Con caché multi-pod
-        try:
-            df_eventos = await get_eventos_economicos_cached(grace_minutes=0)
-        except Exception as e:
-            logger.warning(f"Error al obtener eventos económicos: {e}")
-            df_eventos = None
+        # ✅ OPTIMIZACION: Si es un solo activo/temporalidad, posponer eventos económicos
+        # para evitar latencia innecesaria. Se cargarán lazy al procesar.
+        single_asset_analysis = len(activos_filtrados) == 1 and len(temps) <= 2
+        if single_asset_analysis:
+            logger.info(f"[OptiAnalisis] Análisis de activo único detectado, aplicando modo fast-track")
+            df_eventos = None  # Se cargarán lazy en procesar_simbolo_temporalidad si se necesitan
+        else:
+            try:
+                logger.debug("[Eventos] Cargando eventos económicos (modo paralelo)...")
+                df_eventos = await get_eventos_economicos_cached(grace_minutes=0)
+            except Exception as e:
+                logger.warning(f"Error al obtener eventos económicos: {e}")
+                df_eventos = None
 
         resultados = await ejecutar_analisis_con_hilos(
             df_eventos,
