@@ -25,12 +25,56 @@ class LegacyCacheUseCase:
     def stats(self) -> Tuple[dict, int]:
         try:
             cached_keys = list(self._services.indicators_cache._memory_cache.keys())
+            
+            # ✅ Include Redis cache stats (all 3 layers)
+            redis_stats = {}
+            try:
+                from markettool.infra.cache.redis_cache import (
+                    get_indicators_cache,
+                    get_ohlcv_cache,
+                    get_entradas_cache,
+                )
+                
+                indicators_cache = get_indicators_cache()
+                ohlcv_cache = get_ohlcv_cache()
+                entradas_cache = get_entradas_cache()
+                
+                redis_stats = {
+                    "indicators": {
+                        "available": indicators_cache.is_available,
+                        "hits": indicators_cache.hits,
+                        "misses": indicators_cache.misses,
+                        "errors": indicators_cache.errors,
+                        "hit_rate": f"{indicators_cache.hit_rate:.1%}" if indicators_cache.total_requests > 0 else "N/A",
+                        "total_requests": indicators_cache.total_requests,
+                    },
+                    "ohlcv": {
+                        "available": ohlcv_cache.is_available,
+                        "hits": ohlcv_cache.hits,
+                        "misses": ohlcv_cache.misses,
+                        "errors": ohlcv_cache.errors,
+                        "hit_rate": f"{ohlcv_cache.hit_rate:.1%}" if ohlcv_cache.total_requests > 0 else "N/A",
+                        "total_requests": ohlcv_cache.total_requests,
+                    },
+                    "entradas": {
+                        "available": entradas_cache.is_available,
+                        "hits": entradas_cache.hits,
+                        "misses": entradas_cache.misses,
+                        "errors": entradas_cache.errors,
+                        "hit_rate": f"{entradas_cache.hit_rate:.1%}" if entradas_cache.total_requests > 0 else "N/A",
+                        "total_requests": entradas_cache.total_requests,
+                    },
+                }
+            except Exception as e:
+                redis_stats = {"error": f"Redis stats unavailable: {e}"}
+            
             return {
                 "enabled": self._services.cache_enabled,
                 "memory_cache_size": len(cached_keys),
                 "ttl_hours": self._services.ttl_hours,
                 "force_recalc": self._services.force_recalc,
                 "cached_symbols": cached_keys,
+                "redis": redis_stats,
             }, 200
         except Exception as exc:
             return {"error": str(exc)}, 500
