@@ -14400,6 +14400,16 @@ def procesar_simbolo_temporalidad(
         "soporte_nivel_2": entradas.get("soporte_nivel_2"),
         "resistencia_nivel_1": entradas.get("resistencia_nivel_1"),
         "resistencia_nivel_2": entradas.get("resistencia_nivel_2"),
+        "multiplicador": {
+            "apalancamiento_compra_nivel_1": entradas.get("apalancamiento_compra_nivel_1"),
+            "apalancamiento_compra_nivel_2": entradas.get("apalancamiento_compra_nivel_2"),
+            "apalancamiento_venta_nivel_1": entradas.get("apalancamiento_venta_nivel_1"),
+            "apalancamiento_venta_nivel_2": entradas.get("apalancamiento_venta_nivel_2"),
+            "apalancamiento_compra_nivel_1_teorico": entradas.get("apalancamiento_compra_nivel_1_teorico"),
+            "apalancamiento_compra_nivel_2_teorico": entradas.get("apalancamiento_compra_nivel_2_teorico"),
+            "apalancamiento_venta_nivel_1_teorico": entradas.get("apalancamiento_venta_nivel_1_teorico"),
+            "apalancamiento_venta_nivel_2_teorico": entradas.get("apalancamiento_venta_nivel_2_teorico"),
+        }
     }
 
 
