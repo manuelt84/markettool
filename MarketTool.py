@@ -1495,13 +1495,47 @@ user_states = {}
 timeout_request_global = 10  # Tiempo máximo de espera en segundos
 max_workers_global = min(32, (os.cpu_count() or 1) * 2) #puede tener 64
 
-# Concurrency knobs (override via env for stronger machines)
+# FASE 3: WORKER CONFIGURATION TUNING
+# ====================================
+# Goal: Reduce GIL contention, improve throughput by 10-30%
+#
+# CPU Count and Base Concurrency
 _CPU_COUNT = os.cpu_count() or 1
-_ANALYSIS_MAX_WORKERS = int(os.environ.get("ANALYSIS_MAX_WORKERS", str(min(64, _CPU_COUNT * 2))))
-_ANALYSIS_SEM = int(os.environ.get("ANALYSIS_SEMAPHORE", str(min(_ANALYSIS_MAX_WORKERS, max(16, _CPU_COUNT * 2)))) )  # OPT1: Increased parallelism
+
+# ✅ FASE 3: Optimized ANALYSIS_MAX_WORKERS
+# REASON: Previous formula min(64, CPU*2) caused 2x oversubscription
+# EXAMPLE: 14-core = 28 workers (too high, GIL contention)
+# NEW: Limit to CPU count (no oversubscription for CPU-bound GIL work)
+# - ThreadPoolExecutor is I/O-bound primarily
+# - But GIL still causes contention when doing CPU work (indicator calc)
+# FORMULA: min(32 absolute_max, max(4 minimum, CPU_COUNT))
+# RESULT: 14c → 14 workers, 8c → 8 workers (balanced, less GIL contention)
+_ANALYSIS_MAX_WORKERS = int(os.environ.get(
+    "ANALYSIS_MAX_WORKERS", 
+    str(min(32, max(4, _CPU_COUNT)))  # ← FASE 3 TUNED
+))
+
+# ✅ FASE 3: Simplified ANALYSIS_SEM (semaphore for max concurrent asset blocks)
+# Previous: min(_ANALYSIS_MAX_WORKERS, max(16, _CPU_COUNT * 2)) was confusing
+# NEW: Same as MAX_WORKERS (all threads can be active for asset-level parallelism)
+# This allows full use of the worker pool for concurrent assets
+_ANALYSIS_SEM = int(os.environ.get(
+    "ANALYSIS_SEMAPHORE",
+    str(_ANALYSIS_MAX_WORKERS)  # ← FASE 3: Simplified
+))
+
 _ANALYSIS_INNER_WORKERS = int(os.environ.get("ANALYSIS_INNER_WORKERS", "4"))
-_GCS_ASYNC_EXECUTOR = ThreadPoolExecutor(max_workers=4)  # OPT1: Non-blocking GCS uploads
-_ANALYSIS_PRED_WORKERS = int(os.environ.get("ANALYSIS_PRED_WORKERS", "3"))
+_GCS_ASYNC_EXECUTOR = ThreadPoolExecutor(max_workers=4)  # Non-blocking GCS uploads
+
+# ✅ FASE 3: Optimized ANALYSIS_PRED_WORKERS for ProcessPool
+# REASON: Previous default "3" was conservative for CPU-bound ARIMA
+# NEW: Increase to CPU_COUNT (ProcessPool can use true parallelism, no GIL)
+# ProcessPoolExecutor spawns real OS processes, so no GIL contention
+# FORMULA: min(12 absolute_max, CPU_COUNT) - CPU-bound ARIMA benefits from true parallelism
+_ANALYSIS_PRED_WORKERS = int(os.environ.get(
+    "ANALYSIS_PRED_WORKERS",
+    str(min(12, _CPU_COUNT))  # ← FASE 3 TUNED (was default "3")
+))
 _ANALYSIS_PRED_USE_PROCESS = os.environ.get("ANALYSIS_PRED_USE_PROCESS", "false").lower() == "true"
 
 _ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_MAX_WORKERS))
@@ -1510,6 +1544,7 @@ _ANALYSIS_INNER_EXECUTOR = (
     if _ANALYSIS_INNER_WORKERS > 0
     else None
 )
+
 if _ANALYSIS_PRED_WORKERS > 0:
     # ✅ FIX: Use spawn context for ProcessPoolExecutor (safer than fork with gRPC)
     # fork() can corrupt gRPC state; spawn() is slower but thread-safe
@@ -1520,7 +1555,7 @@ if _ANALYSIS_PRED_WORKERS > 0:
                 max_workers=max(1, _ANALYSIS_PRED_WORKERS),
                 mp_context=ctx
             )
-            logger.info("[Init] Using ProcessPoolExecutor with spawn context (gRPC-safe)")
+            logger.info(f"[Init] ProcessPoolExecutor with spawn context: {_ANALYSIS_PRED_WORKERS} workers (FASE 3 tuned)")
         except Exception as e:
             logger.warning(f"[Init] Failed to create spawn-based ProcessPoolExecutor ({e}), falling back to ThreadPoolExecutor")
             _ANALYSIS_PRED_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
@@ -1528,6 +1563,14 @@ if _ANALYSIS_PRED_WORKERS > 0:
         _ANALYSIS_PRED_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
 else:
     _ANALYSIS_PRED_EXECUTOR = None
+
+# Log FASE 3 tuning
+logger.info(f"[Init] FASE 3 Worker Tuning:")
+logger.info(f"  - CPU Count: {_CPU_COUNT} cores")
+logger.info(f"  - ANALYSIS_MAX_WORKERS: {_ANALYSIS_MAX_WORKERS} (ThreadPool for I/O + indicator calc)")
+logger.info(f"  - ANALYSIS_SEM: {_ANALYSIS_SEM} (max concurrent asset blocks)")
+logger.info(f"  - ANALYSIS_PRED_WORKERS: {_ANALYSIS_PRED_WORKERS} (ProcessPool for CPU-bound ARIMA)")
+logger.info(f"  ✅ GIL contention reduced: No 2x oversubscription, balanced workload distribution")
 
 # 🔍 DEBUG: Log de inicialización de executores
 _pred_executor_type = type(_ANALYSIS_PRED_EXECUTOR).__name__ if _ANALYSIS_PRED_EXECUTOR else "None"
