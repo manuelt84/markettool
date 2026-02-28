@@ -189,32 +189,51 @@ class PonderacionCache:
         return f"ponderacion:{symbol}:{timeframe}:{version}"
     
     def get(self, symbol: str, timeframe: str, version: str = "v1") -> dict | None:
-        """Get ponderacion from cache. Returns None if not found."""
+        """Get ponderacion from cache (Memory-first strategy). Returns None if not found.
+        
+        Tier-0: Local memory (0-5ms)   ← PRIMARY
+        Tier-1: Redis (fallback, 10ms if local)
+        Tier-2: None (cache miss)
+        """
         key = self._make_key(symbol, timeframe, version)
         
-        if self.redis_client:
-            try:
-                data = self.redis_client.get(key)
-                if data:
-                    self.cache_hits += 1
-                    return _json.loads(data)
-            except Exception as e:
-                print(f"[PonderacionCache] Redis get failed: {e}")
-        
-        # Fallback to in-memory
+        # ✅ TIER-0: Check local memory FIRST (0-5ms) ← OPTIMAL for latency
         if key in self.local_cache:
             self.cache_hits += 1
             return self.local_cache[key]
         
+        # ✅ TIER-1: Check Redis ONLY IF CONFIGURED (fallback, avoid network when possible)
+        if self.redis_client:
+            try:
+                data = self.redis_client.get(key)
+                if data:
+                    parsed_data = _json.loads(data)
+                    # IMPORTANT: Repopulate local memory for next access
+                    self.local_cache[key] = parsed_data
+                    self.cache_hits += 1
+                    return parsed_data
+            except Exception as e:
+                print(f"[PonderacionCache] Redis get failed (non-critical): {e}")
+                # Continue, NOT fatal
+        
+        # ✅ TIER-2: Cache miss
         self.cache_misses += 1
         return None
     
     def set(self, symbol: str, timeframe: str, data: dict, version: str = "v1") -> bool:
-        """Store ponderacion in cache with TTL."""
+        """Store ponderacion in cache with TTL (Memory-first strategy).
+        
+        Tier-0: Local memory (always, primary store) ← ALWAYS
+        Tier-1: Redis (optional, if configured)
+        """
         key = self._make_key(symbol, timeframe, version)
         ttl = self._get_ttl_seconds(timeframe)
         json_data = _json.dumps(data)
         
+        # ✅ TIER-0: Store in local memory ALWAYS (primary store)
+        self.local_cache[key] = data
+        
+        # ✅ TIER-1: Store in Redis IF AVAILABLE (optional, async)
         if self.redis_client:
             try:
                 self.redis_client.setex(key, ttl, json_data)
@@ -222,11 +241,10 @@ class PonderacionCache:
                 self._publish_update(symbol, timeframe)
                 return True
             except Exception as e:
-                print(f"[PonderacionCache] Redis set failed: {e}")
+                print(f"[PonderacionCache] Redis set failed (non-critical): {e}")
+                # NOT fatal, data is already in memory
         
-        # Fallback: store in memory (no TTL)
-        self.local_cache[key] = data
-        # Publish update event
+        # Publish update event (even if Redis failed)
         self._publish_update(symbol, timeframe)
         return True
     
@@ -2928,6 +2946,9 @@ def construir_payload_enriquecido(
             if col in d.columns and pd.notna(d[col].iat[i]):
                 last[col] = bool(d[col].iat[i])
 
+    entradas_full = entradas if isinstance(entradas, dict) else {}
+    entradas_list = entradas_full.get("entradas", []) if isinstance(entradas_full, dict) else (entradas if isinstance(entradas, list) else [])
+
     return {
         "symbol": str(symbol).upper(),
         "timeframe": str(tf),
@@ -2937,7 +2958,11 @@ def construir_payload_enriquecido(
         "last": last,
         "meta": {"computed_at": pd.Timestamp.now('UTC').isoformat(), **(extra_meta or {})},
         "levels": niveles or {},
-        "entradas": entradas.get("entradas", []) if isinstance(entradas, dict) else (entradas if isinstance(entradas, list) else [])  # ✅ FIXED: Extract trading entries array from analysis dict
+        # Mantener array de entradas candidatas para compatibilidad actual
+        "entradas": entradas_list,
+        # Restaurar resumen completo de señal (campos técnicos y niveles para frontend)
+        "resumen_senal": entradas_full,
+        "resumen": entradas_full,
     }
 
 #@profile
