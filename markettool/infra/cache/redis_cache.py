@@ -8,6 +8,12 @@ Caches (with intelligent TTL per timeframe):
 3. Calculated Entries - Deterministic results from analysis
 
 All caches include Pub/Sub for cross-pod invalidation.
+
+Configuración via .env:
+- CACHE_STRATEGY: "redis_gcs" (default), "redis_only", "gcs_only", "memory_only"
+- REDIS_URL: URL de conexión a Redis
+- GCS_BUCKET: Nombre del bucket de GCS
+- CACHE_ENABLED: "true"/"false"
 """
 
 import json
@@ -18,6 +24,21 @@ import os
 from typing import Optional, Dict, Any, Callable, Tuple, TYPE_CHECKING
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+
+# Import cache configuration
+try:
+    from markettool.config.cache_config import CacheConfig, CacheBackend
+except ImportError:
+    # Fallback if config not available
+    class CacheConfig:  # type: ignore
+        CACHE_ENABLED = True
+        REDIS_ENABLED = True
+        GCS_ENABLED = True
+        MEMORY_ENABLED = True
+        @classmethod
+        def get_cache_layers(cls):
+            return ["redis", "gcs", "memory"]
+    CacheBackend = None  # type: ignore
 
 # Type checking imports (for IDE/mypy)
 if TYPE_CHECKING:
@@ -78,6 +99,11 @@ class RedisDistributedCache:
         self.is_available = False
         self.stats = CacheStats()
         self.pubsub_channel = f"{prefix}:changes"
+        
+        # Respect cache configuration
+        if not CacheConfig.REDIS_ENABLED:
+            logger.info(f"[RedisCache:{prefix}] Redis deshabilitado por configuración")
+            return
         
         if self.redis_url and _HAS_REDIS:
             try:

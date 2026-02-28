@@ -9741,7 +9741,9 @@ def calcular_indicadores(df, temporalidad, symbol=None):
         raise
 
 def limitar_probabilidad(probabilidad_exito):
-    return max(1, min(probabilidad_exito, 100))def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] = None, niveles: Optional[dict] = None, symbol: str | None = None):
+    return max(1, min(probabilidad_exito, 100))
+
+def ajustar_probabilidad_tecnica(df, temporalidad, window, cfg: Optional[dict] = None, niveles: Optional[dict] = None, symbol: str | None = None):
     """
     Calcula la probabilidad técnica usando:
       - flags de activación y magnitudes desde cfg.tecnica si existen
