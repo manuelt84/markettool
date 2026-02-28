@@ -62,6 +62,36 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 
+def _convert_numpy_types(obj: Any) -> Any:
+    """
+    Recursively convert numpy types to native Python types for JSON serialization.
+    
+    Handles:
+    - numpy.bool_ -> bool
+    - numpy.integer -> int
+    - numpy.floating -> float
+    - nested dicts and lists
+    """
+    try:
+        import numpy as np
+        
+        if isinstance(obj, (np.bool_, np.bool8)):
+            return bool(obj)
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, dict):
+            return {k: _convert_numpy_types(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [_convert_numpy_types(item) for item in obj]
+        else:
+            return obj
+    except ImportError:
+        # numpy not available, return as-is
+        return obj
+
+
 @dataclass
 class CacheStats:
     """Statistics for cache performance."""
@@ -363,7 +393,9 @@ class OHLCVRedisCache(RedisDistributedCache):
             # Serialize with index
             data_dict = df.to_dict(orient="list")
             data_dict["index"] = df.index.strftime("%Y-%m-%d %H:%M:%S").tolist()
-            serialized = json.dumps(data_dict)
+            # Convert numpy types for JSON serialization
+            cleaned_data = _convert_numpy_types(data_dict)
+            serialized = json.dumps(cleaned_data)
             
             ttl = self._get_ttl_seconds(tf)
             return self.set(key, serialized, ttl_seconds=ttl)
@@ -413,7 +445,9 @@ class EntradasRedisCache(RedisDistributedCache):
         key = self.make_key(symbol, tf, entry_id)
         
         try:
-            serialized = json.dumps(entradas)
+            # Convert numpy types to native Python types for JSON serialization
+            cleaned_entradas = _convert_numpy_types(entradas)
+            serialized = json.dumps(cleaned_entradas)
             ttl = ttl_override or self._get_ttl_seconds(tf)
             return self.set(key, serialized, ttl_seconds=ttl)
         except Exception as e:
