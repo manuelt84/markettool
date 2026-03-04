@@ -1180,3 +1180,117 @@ def register_monitoreo_routes(app, *, services) -> None:
         except Exception as exc:
             logger.exception("Error en /api/entries/stats")
             return jsonify({"status": "error", "message": str(exc)}), 500
+
+    @app.route("/api/monitoreos/list", methods=["POST"])
+    def list_monitoreos():
+        """
+        ✅ FASE OPTIMIZATION: List user's monitoreos with 24h optimization.
+        
+        POST /api/monitoreos/list
+        Body:
+        {
+          "user_id": "uid123",
+          "hours_back": 24,      # optional (default 24)
+          "limit": 50            # optional (default 50)
+        }
+        
+        Returns:
+        {
+          "status": "ok",
+          "strategy": "recent" | "fallback",
+          "count": 12,
+          "monitoreos": [
+            {
+              "id": "exec123__EURUSD",
+              "symbol": "EURUSD",
+              "exec_id": "exec123",
+              "estado": "running",
+              "updated_at": 1740000000000,
+              "allowed_timeframes": ["1m", "5m"]
+            }
+          ]
+        }
+        """
+        try:
+            body = request.get_json(force=True) or {}
+            user_id = str(body.get("user_id") or "").strip()
+            hours_back = int(body.get("hours_back", 24))
+            limit_count = int(body.get("limit", 50))
+            
+            if not user_id:
+                return jsonify({"status": "error", "message": "user_id required"}), 400
+            
+            # ✅ Calculate 24h cutoff timestamp
+            cutoff_ms = int((time.time() - hours_back * 3600) * 1000)
+            
+            # ✅ STRATEGY 1: Query with 24h filter (requires index)
+            try:
+                docs = db.collection("monitoreos").where(
+                    "user_id", "==", user_id
+                ).where(
+                    "updated_at", ">", cutoff_ms
+                ).order_by(
+                    "updated_at", direction="DESCENDING"
+                ).limit(limit_count).stream()
+                
+                monitoreos = []
+                for doc in docs:
+                    data = doc.to_dict() or {}
+                    monitoreos.append({
+                        "id": doc.id,
+                        "symbol": data.get("symbol"),
+                        "exec_id": data.get("exec_id"),
+                        "estado": data.get("estado"),
+                        "updated_at": data.get("updated_at"),
+                        "allowed_timeframes": data.get("allowed_timeframes", []),
+                    })
+                
+                logger.info(f"[MonitoreosAPI] Strategy=RECENT user={user_id} count={len(monitoreos)}")
+                
+                return jsonify({
+                    "status": "ok",
+                    "strategy": "recent",
+                    "count": len(monitoreos),
+                    "monitoreos": monitoreos
+                }), 200
+            
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "index" in error_msg or "precondition" in error_msg:
+                    # ✅ STRATEGY 2: Fallback - no 24h filter, just limit
+                    logger.warn(f"[MonitoreosAPI] Index missing, using fallback: {e}")
+                    
+                    docs = db.collection("monitoreos").where(
+                        "user_id", "==", user_id
+                    ).order_by(
+                        "updated_at", direction="DESCENDING"
+                    ).limit(limit_count).stream()
+                    
+                    monitoreos = []
+                    for doc in docs:
+                        data = doc.to_dict() or {}
+                        # Client-side filtering for 24h
+                        if data.get("updated_at", 0) > cutoff_ms:
+                            monitoreos.append({
+                                "id": doc.id,
+                                "symbol": data.get("symbol"),
+                                "exec_id": data.get("exec_id"),
+                                "estado": data.get("estado"),
+                                "updated_at": data.get("updated_at"),
+                                "allowed_timeframes": data.get("allowed_timeframes", []),
+                            })
+                    
+                    logger.info(f"[MonitoreosAPI] Strategy=FALLBACK user={user_id} count={len(monitoreos)}")
+                    
+                    return jsonify({
+                        "status": "ok",
+                        "strategy": "fallback",
+                        "count": len(monitoreos),
+                        "monitoreos": monitoreos
+                    }), 200
+                else:
+                    raise
+        
+        except Exception as exc:
+            logger.exception("Error en /api/monitoreos/list")
+            return jsonify({"status": "error", "message": str(exc)}), 500

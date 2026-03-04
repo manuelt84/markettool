@@ -60,6 +60,25 @@ class MT5OrderResponse:
 
 
 @dataclass
+class MT5CloseOrderRequest:
+    """MT5 close order request parameters."""
+    symbol: str  # e.g., "EURUSD"
+    position_ticket: int  # MT5 position/order ticket to close
+    volume: Optional[float] = None  # Volume to close (None = close all)
+    comment: str = ""  # Close reason
+
+
+@dataclass
+class MT5CloseOrderResponse:
+    """MT5 close order response."""
+    success: bool
+    order_id: Optional[str] = None  # UUID of the close request
+    mt5_close_ticket: Optional[int] = None  # MT5 close order ticket
+    message: str = ""
+    error_code: Optional[int] = None
+
+
+@dataclass
 class PendingOrder:
     """Pending order waiting for EA to execute."""
     order_id: str  # UUID
@@ -160,6 +179,51 @@ class BrokerMT5Service:
         except Exception as e:
             logger.error(f"Error queuing order: {e}", exc_info=True)
             return MT5OrderResponse(success=False, message=str(e))
+    
+    def close_order(self, close_request: MT5CloseOrderRequest) -> MT5CloseOrderResponse:
+        """
+        Queue a close order for MT5 EA to execute.
+
+        Args:
+            close_request: Close order parameters
+
+        Returns:
+            MT5CloseOrderResponse with success status and order_id
+        """
+        try:
+            # Generate unique close order ID
+            order_id = str(uuid.uuid4())
+            
+            # Create a virtual "order" to track the close request
+            # We'll reuse the existing structure but mark it as a close order
+            close_order_req = MT5OrderRequest(
+                symbol=close_request.symbol,
+                volume=close_request.volume or 1.0,  # Dummy volume for close
+                side="CLOSE",  # Special marker for close orders
+                order_type="MARKET",
+                entry_price=0.0,  # Not used for close
+                stop_loss=None,
+                take_profit=None,
+                magic=0,
+                comment=f"CLOSE_TICKET_{close_request.position_ticket}|{close_request.comment}"
+            )
+            
+            # Add to pending orders queue
+            pending = PendingOrder(order_id=order_id, request=close_order_req)
+            self.pending_orders[order_id] = pending
+            
+            logger.info(f"📋 Close order {order_id} queued for EA execution (ticket: {close_request.position_ticket})")
+            
+            # Return success with order ID (EA will execute asynchronously)
+            return MT5CloseOrderResponse(
+                success=True,
+                order_id=order_id,
+                message=f"Close order queued successfully with ID {order_id}"
+            )
+
+        except Exception as e:
+            logger.error(f"Error queuing close order: {e}", exc_info=True)
+            return MT5CloseOrderResponse(success=False, message=str(e))
     
     def get_pending_order_for_ea(self) -> Optional[dict]:
         """

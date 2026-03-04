@@ -9,6 +9,7 @@ from flask import request, jsonify
 from markettool.application.services.broker_mt5_service import (
     get_mt5_service,
     MT5OrderRequest,
+    MT5CloseOrderRequest,
     MT5Environment,
 )
 
@@ -167,7 +168,71 @@ def register_mt5_routes(app: Flask) -> None:
             logger.error(f"❌ MT5 place order error: {e}", exc_info=True)
             return jsonify({"error": str(e)}), 500
 
-    @app.route("/api/v1/broker/mt5/account-info", methods=["GET"])
+    @app.route("/api/v1/broker/mt5/close-order", methods=["POST"])
+    def mt5_close_order():
+        """
+        Close an order on MT5 (queues for EA to execute).
+        
+        Request JSON:
+        {
+            "symbol": "EURUSD",
+            "position_ticket": 123456,  # MT5 position/order ticket to close
+            "volume": 0.05,              # Optional: volume to close (None = close all)
+            "comment": "Take profit"     # Optional: close reason
+        }
+        """
+        try:
+            data = request.get_json()
+            
+            if not data:
+                return jsonify({"error": "No JSON data provided"}), 400
+            
+            logger.info(f"📋 Close order request for {data.get('symbol')} ticket {data.get('position_ticket')}")
+            
+            # Validate required fields
+            if not data.get("symbol"):
+                return jsonify({"error": "symbol required"}), 400
+            
+            if "position_ticket" not in data:
+                return jsonify({"error": "position_ticket required"}), 400
+            
+            # Create close order request
+            close_request = MT5CloseOrderRequest(
+                symbol=data.get("symbol"),
+                position_ticket=int(data.get("position_ticket")),
+                volume=float(data.get("volume")) if data.get("volume") else None,
+                comment=data.get("comment", ""),
+            )
+            
+            logger.info(f"   Symbol: {close_request.symbol}")
+            logger.info(f"   Ticket: {close_request.position_ticket}")
+            if close_request.volume:
+                logger.info(f"   Volume: {close_request.volume}")
+            
+            # Place close order (will be queued for EA)
+            service = get_mt5_service()
+            response = service.close_order(close_request)
+            
+            if response.success:
+                logger.info(f"✅ Close order queued successfully: {response.order_id}")
+                return jsonify({
+                    "status": "success",
+                    "orderId": response.order_id,
+                    "message": response.message,
+                }), 200
+            else:
+                logger.warning(f"❌ Close order failed: {response.message}")
+                return jsonify({
+                    "status": "failed",
+                    "error": response.message,
+                    "errorCode": response.error_code,
+                }), 400
+
+        except Exception as e:
+            logger.error(f"❌ MT5 close order error: {e}", exc_info=True)
+            return jsonify({"error": str(e)}), 500
+
+    
     def mt5_account_info():
         """Get MT5 account information."""
         try:
