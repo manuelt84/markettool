@@ -42,6 +42,62 @@ def register_monitoreo_routes(app, *, services) -> None:
     merge_bars_series = services.merge_bars_series
     backfill_internal_gaps = services.backfill_internal_gaps
     bucket_name = services.bucket_name
+
+    def _build_timeframe_data_quality(candles: list[dict], timeframe: str) -> dict:
+        try:
+            if not candles:
+                return {
+                    "last_candle_ts": None,
+                    "lag_seconds": None,
+                    "freshness_requirement_seconds": get_freshness_requirement_for_timeframe(timeframe),
+                    "recent_gap_count": 0,
+                    "largest_gap_bars": 0,
+                    "status": "empty",
+                }
+
+            tf_value = norm_tf(timeframe)
+            freshness_req = get_freshness_requirement_for_timeframe(tf_value)
+            last_ts = int(candles[-1].get("t", 0))
+            now_ms = int(time.time() * 1000)
+            lag_seconds = max(0, int((now_ms - last_ts) / 1000)) if last_ts else None
+            tf_value_ms = tf_ms(tf_value)
+
+            recent = candles[-240:] if len(candles) > 240 else candles
+            gap_counts = []
+            for prev, curr in zip(recent, recent[1:]):
+                try:
+                    delta = int(curr["t"]) - int(prev["t"])
+                    if delta > tf_value_ms:
+                        gap_counts.append(max(0, (delta // tf_value_ms) - 1))
+                except Exception:
+                    continue
+
+            recent_gap_count = len(gap_counts)
+            largest_gap_bars = max(gap_counts) if gap_counts else 0
+            status = "fresh"
+            if lag_seconds is not None and lag_seconds > freshness_req:
+                status = "stale"
+            elif recent_gap_count > 0:
+                status = "gappy"
+
+            return {
+                "last_candle_ts": last_ts,
+                "lag_seconds": lag_seconds,
+                "freshness_requirement_seconds": freshness_req,
+                "recent_gap_count": recent_gap_count,
+                "largest_gap_bars": largest_gap_bars,
+                "status": status,
+            }
+        except Exception:
+            return {
+                "last_candle_ts": None,
+                "lag_seconds": None,
+                "freshness_requirement_seconds": get_freshness_requirement_for_timeframe(timeframe),
+                "recent_gap_count": 0,
+                "largest_gap_bars": 0,
+                "status": "unknown",
+            }
+
     @app.route("/monitoreo/eventos", methods=["POST"])
     async def monitoreo_eventos():
         """
@@ -432,6 +488,7 @@ def register_monitoreo_routes(app, *, services) -> None:
                 "from_ts": inc[0]["t"] if inc else last_ts,
                 "to_ts": inc[-1]["t"] if inc else last_ts,
                 "candles": inc,
+                "data_quality": _build_timeframe_data_quality(base_ms, timeframe),
             }
             
             # Add cold_start flag for frontend to detect initial data load
@@ -892,6 +949,7 @@ def register_monitoreo_routes(app, *, services) -> None:
                 "count": len(filt),
                 "candles": filt,
                 "gapfill": (gapfill_meta if "gapfill_meta" in locals() else None),
+                "data_quality": _build_timeframe_data_quality(filt, timeframe),
             }
             # Removed: persisted_path response (no longer persisting to GCS stream)
             return jsonify(resp), 200

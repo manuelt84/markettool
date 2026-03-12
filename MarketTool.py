@@ -798,15 +798,159 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
 # Format: timeframe -> seconds before cache is considered "stale"
 
 CACHE_FRESHNESS_THRESHOLDS = {
-    "1min": 5 * 60,           # 5 min: Scalping needs fresh data
-    "5min": 10 * 60,          # 10 min
-    "15min": 30 * 60,         # 30 min
+    "1min": 90,               # 90s: intradia estricta
+    "5min": 6 * 60,           # 6 min
+    "15min": 18 * 60,         # 18 min
     "30min": 60 * 60,         # 1 hour
     "1hour": 2 * 3600,        # 2 hours
     "4hour": 4 * 3600,        # 4 hours
     "1day": 12 * 3600,        # 12 hours (very tolerant)
     "1week": 24 * 3600,       # 24 hours (very tolerant)
 }
+
+ANALYSIS_STRICT_REFRESH_TFS = {"1min", "5min", "15min"}
+
+ANALYSIS_GAPFILL_BAR_BUDGET = {
+    "1min": 180,
+    "5min": 144,
+    "15min": 96,
+    "30min": 96,
+    "1hour": 72,
+    "4hour": 48,
+    "1day": 30,
+    "1week": 12,
+}
+
+ANALYSIS_GAP_LOOKBACK_BARS = {
+    "1min": 240,
+    "5min": 180,
+    "15min": 160,
+    "30min": 120,
+    "1hour": 96,
+    "4hour": 60,
+    "1day": 30,
+    "1week": 12,
+}
+
+
+def _should_force_fresh_intraday(tf: str) -> bool:
+    return normalize_tf(tf) in ANALYSIS_STRICT_REFRESH_TFS
+
+
+def _get_analysis_freshness_max_seconds(tf: str) -> int:
+    tf_norm = normalize_tf(tf)
+    return CACHE_FRESHNESS_THRESHOLDS.get(tf_norm, 3600)
+
+
+def _analysis_df_to_bar_series(df: pd.DataFrame) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    out = []
+    try:
+        src = df.sort_index()
+        for idx, row in src.iterrows():
+            ts = pd.Timestamp(idx)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            out.append(
+                {
+                    "t": int(ts.timestamp() * 1000),
+                    "o": float(row.get("open", np.nan)),
+                    "h": float(row.get("high", np.nan)),
+                    "l": float(row.get("low", np.nan)),
+                    "c": float(row.get("close", np.nan)),
+                    "v": float(row.get("volume", 0.0) or 0.0),
+                }
+            )
+    except Exception:
+        return []
+    return out
+
+
+def _analysis_bar_series_to_df(series: list[dict]) -> pd.DataFrame:
+    if not series:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    rows = []
+    for bar in series:
+        try:
+            rows.append(
+                {
+                    "time": pd.to_datetime(int(bar["t"]), unit="ms", utc=True),
+                    "open": float(bar.get("o", np.nan)),
+                    "high": float(bar.get("h", np.nan)),
+                    "low": float(bar.get("l", np.nan)),
+                    "close": float(bar.get("c", np.nan)),
+                    "volume": float(bar.get("v", 0.0) or 0.0),
+                }
+            )
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(rows).set_index("time").sort_index()
+    return _ensure_cols(df)
+
+
+def _build_analysis_data_quality_diag(df: pd.DataFrame, symbol: str, tf: str) -> dict:
+    tf_norm = normalize_tf(tf)
+    freshness_limit = _get_analysis_freshness_max_seconds(tf_norm)
+    diag = {
+        "symbol": symbol,
+        "timeframe": tf_norm,
+        "last_candle_ts": None,
+        "lag_seconds": None,
+        "freshness_limit_seconds": freshness_limit,
+        "strict_intraday": _should_force_fresh_intraday(tf_norm),
+        "recent_gap_count": 0,
+        "largest_gap_bars": 0,
+        "gaps_detected": 0,
+        "gaps_filled": 0,
+        "entry_gate_status": "allowed",
+        "gate_reason": "",
+    }
+    if df is None or df.empty:
+        diag["entry_gate_status"] = "blocked"
+        diag["gate_reason"] = "Sin velas disponibles"
+        return diag
+
+    try:
+        idx = pd.DatetimeIndex(df.index)
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
+        last_ts = idx[-1]
+        lag_seconds = max(0, int((pd.Timestamp.now(tz="UTC") - last_ts).total_seconds()))
+        diag["last_candle_ts"] = int(last_ts.timestamp() * 1000)
+        diag["lag_seconds"] = lag_seconds
+
+        tf_ms = _tf_ms(tf_norm)
+        lookback = ANALYSIS_GAP_LOOKBACK_BARS.get(tf_norm, 120)
+        recent_idx = idx[-lookback:] if len(idx) > lookback else idx
+        if len(recent_idx) >= 2:
+            deltas = np.diff(recent_idx.view("int64") // 10**6)
+            expected = tf_ms
+            gaps = [int(max(0, (delta // expected) - 1)) for delta in deltas if delta > expected]
+            diag["recent_gap_count"] = len(gaps)
+            diag["largest_gap_bars"] = max(gaps) if gaps else 0
+            diag["gaps_detected"] = int(sum(gaps)) if gaps else 0
+
+        if diag["strict_intraday"]:
+            reasons = []
+            if lag_seconds > freshness_limit:
+                reasons.append(f"Última vela atrasada ({lag_seconds}s > {freshness_limit}s)")
+            if diag["gaps_detected"] > 0:
+                reasons.append(f"Gaps sin resolver en ventana reciente ({diag['gaps_detected']})")
+            if reasons:
+                diag["entry_gate_status"] = "blocked"
+                diag["gate_reason"] = "; ".join(reasons)
+    except Exception as exc:
+        diag["entry_gate_status"] = "blocked" if diag["strict_intraday"] else "unknown"
+        diag["gate_reason"] = f"Error validando frescura OHLCV: {exc}"
+
+    return diag
 
 def _get_cache_freshness_max(tf: str) -> int:
     """Get cache freshness threshold for timeframe (in seconds)."""
@@ -1358,18 +1502,27 @@ class HistoryManager:
                 # This avoids waiting for FMP semaphore when not needed
                 ttl_min = _HISTORY_REFRESH_TTL_MINUTES.get(tf, 1)
                 age_min = max(0.0, (now - last).total_seconds() / 60.0)
+                strict_intraday = _should_force_fresh_intraday(tf)
+                last_candle_age_seconds = max(0, int((now - last).total_seconds()))
+                freshness_limit_seconds = _get_analysis_freshness_max_seconds(tf)
                 
                 if age_min < ttl_min:
-                    # Cache is fresh! Return immediately without FMP call
-                    _record_fmp_call_saved()  # ✅ Record this optimization
-                    logger.info(f"[CACHE-FIRST] {symbol}/{tf}: CACHE FRESH (age={age_min:.1f}min < ttl={ttl_min}min) → NO FMP CALL NEEDED")
-                    # Bypass FMP entirely - use cached data as-is
-                    out = cache_df
-                    if cfg.bars and isinstance(cfg.bars, int) and cfg.bars > 0 and len(out) > cfg.bars:
-                        out = out.tail(cfg.bars)
-                    if cfg.append_realtime and not out.empty:
-                        out = self._append_realtime_last_bar(symbol, tf, out)
-                    return out  # ← EARLY EXIT: Saved FMP call!
+                    if strict_intraday and last_candle_age_seconds > freshness_limit_seconds:
+                        logger.info(
+                            f"[CACHE-FIRST] {symbol}/{tf}: cache hit but last candle stale "
+                            f"({last_candle_age_seconds}s > {freshness_limit_seconds}s) → FORCE REFRESH"
+                        )
+                    else:
+                        # Cache is fresh! Return immediately without FMP call
+                        _record_fmp_call_saved()  # ✅ Record this optimization
+                        logger.info(f"[CACHE-FIRST] {symbol}/{tf}: CACHE FRESH (age={age_min:.1f}min < ttl={ttl_min}min) → NO FMP CALL NEEDED")
+                        # Bypass FMP entirely - use cached data as-is
+                        out = cache_df
+                        if cfg.bars and isinstance(cfg.bars, int) and cfg.bars > 0 and len(out) > cfg.bars:
+                            out = out.tail(cfg.bars)
+                        if cfg.append_realtime and not out.empty:
+                            out = self._append_realtime_last_bar(symbol, tf, out)
+                        return out  # ← EARLY EXIT: Saved FMP call!
                 else:
                     # Cache is stale, but proceed to check if refresh is allowed
                     logger.info(f"[CACHE-FIRST] {symbol}/{tf}: cache stale (age={age_min:.1f}min ≥ ttl={ttl_min}min) → Will fetch from FMP if allowed")
@@ -9622,6 +9775,34 @@ def obtener_datos_con_hilos(
             return pd.DataFrame()
 
         df_out = df_historico.sort_index()
+
+        gapfill_added = 0
+        if not df_out.empty:
+            try:
+                series_ms = _analysis_df_to_bar_series(df_out)
+                if series_ms:
+                    gapfill_added = _backfill_internal_gaps(
+                        series_ms,
+                        symbol,
+                        tf,
+                        exec_id=None,
+                        max_minutes_per_call=ANALYSIS_GAPFILL_BAR_BUDGET.get(tf, 96),
+                        allow_small_tf=True,
+                    )
+                    if gapfill_added:
+                        logger.info(
+                            "[ANALYSIS_GAPFILL] %s/%s añadió %d velas antes de generar entradas",
+                            symbol,
+                            tf,
+                            gapfill_added,
+                        )
+                        df_out = _analysis_bar_series_to_df(series_ms)
+            except Exception as gap_exc:
+                logger.warning(f"[ANALYSIS_GAPFILL] Failed for {symbol}/{tf}: {gap_exc}")
+
+        diag = _build_analysis_data_quality_diag(df_out, symbol, tf)
+        diag["gaps_filled"] = int(gapfill_added)
+        df_out.attrs["analysis_data_quality"] = diag
         
         # ✅ NIVEL 1.5: Guardar en Redis para próxima vez (non-blocking)
         try:
@@ -14484,6 +14665,7 @@ def procesar_simbolo_temporalidad(
         if df_combinado is None or df_combinado.empty:
             logger.info(f"No hay datos combinados para {symbol} en {tf}.")
             return None
+        data_quality = df_combinado.attrs.get("analysis_data_quality") or _build_analysis_data_quality_diag(df_combinado, symbol, tf)
     except Exception as e:
         logger.info(f"obtener_datos_con_hilos falló para {symbol}-{tf}: {e}")
         return None
@@ -14534,6 +14716,22 @@ def procesar_simbolo_temporalidad(
         logger.info(f"calcular_entradas falló para {symbol}-{tf}: {e}")
         return None
 
+    gate_status = data_quality.get("entry_gate_status", "allowed")
+    gate_reason = str(data_quality.get("gate_reason") or "").strip()
+    if gate_status == "blocked":
+        logger.warning("[ENTRY_GATE] %s/%s bloqueado: %s", symbol, tf, gate_reason)
+        entradas["entradas"] = []
+        entradas["tipo_operacion"] = "Neutral"
+        entradas["flag_oportunidad"] = False
+        entradas["alertas"] = list(entradas.get("alertas") or [])
+        if gate_reason and gate_reason not in entradas["alertas"]:
+            entradas["alertas"].append(gate_reason)
+        entradas["entry_gate_status"] = gate_status
+        entradas["gate_reason"] = gate_reason
+        entradas["gaps_detected"] = data_quality.get("gaps_detected", 0)
+        entradas["gaps_filled"] = data_quality.get("gaps_filled", 0)
+        entradas["lag_seconds"] = data_quality.get("lag_seconds")
+
     # ✅ FASE 3: WHITELISTING - Evaluar si autorizado operar
     try:
         whitelist_result = evaluar_si_autorizado_operar(
@@ -14560,10 +14758,16 @@ def procesar_simbolo_temporalidad(
         motivo_rechazo = "Error evaluación"
 
     # Injectar datos top-level en entradas para el front (JSON enriquecido)
+    if gate_status == "blocked":
+        es_autorizado_operar = False
+        motivo_rechazo = f"{motivo_rechazo}; {gate_reason}" if motivo_rechazo else gate_reason
     entradas['score'] = score_whitelist
     entradas['expectativa'] = expectativa_val
     entradas['rechazo'] = motivo_rechazo
     entradas['autorizado'] = es_autorizado_operar
+    entradas['entry_gate_status'] = gate_status
+    entradas['gate_reason'] = gate_reason
+    entradas['data_quality'] = data_quality
 
     # Devolver resultados (con conversión de None a valores apropiados)
     resultado = {
@@ -14576,6 +14780,12 @@ def procesar_simbolo_temporalidad(
         "Score Final": score_whitelist,                # ✅ PHASE 3 (Score Final para ranking)
         "Expectativa": expectativa_val,                # ✅ PHASE 3
         "Motivo Rechazo": motivo_rechazo or "",        # ✅ PHASE 3
+        "Entry Gate Status": gate_status,
+        "Gate Reason": gate_reason,
+        "Last Candle Timestamp": data_quality.get("last_candle_ts"),
+        "Lag Seconds": data_quality.get("lag_seconds"),
+        "Gaps Detectados": data_quality.get("gaps_detected", 0),
+        "Gaps Filled": data_quality.get("gaps_filled", 0),
         "Ultimo Valor": entradas.get('ultimo_valor'),
         "Soporte Nivel 2": entradas.get('soporte_nivel_2'),
         "Soporte Nivel 1": entradas.get('soporte_nivel_1'),
