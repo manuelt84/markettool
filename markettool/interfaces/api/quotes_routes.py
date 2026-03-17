@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from markettool.core.errors import DataNotFoundError
@@ -11,6 +12,32 @@ from markettool.core.errors import DataNotFoundError
 if TYPE_CHECKING:
     from markettool.interfaces.containers import DIContainer
     from flask import Flask
+
+
+def _run_async_for_request(coro):
+    """Run async coroutine in request handler with proper event loop management."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        result = loop.run_until_complete(coro)
+        
+        # Allow pending tasks brief time to initialize
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            try:
+                loop.run_until_complete(asyncio.wait(pending, timeout=0.5))
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+        
+        return result
+    finally:
+        try:
+            loop.close()
+        except RuntimeError:
+            pass
 
 
 def register_quotes_routes(app: Flask, container: DIContainer, logger: logging.Logger) -> None:
@@ -38,7 +65,7 @@ def register_quotes_routes(app: Flask, container: DIContainer, logger: logging.L
             symbol = symbol.strip().upper()
             cache_ttl = int(request.args.get("cache_ttl", 60))
             
-            quote = asyncio.run(container.get_quote.execute_with_cache(
+            quote = _run_async_for_request(container.get_quote.execute_with_cache(
                 symbol=symbol,
                 cache_ttl_seconds=cache_ttl,
             ))
@@ -75,7 +102,7 @@ def register_quotes_routes(app: Flask, container: DIContainer, logger: logging.L
             if not symbols:
                 return {"status": "error", "message": "Missing symbols"}, 400
             
-            quotes = asyncio.run(container.get_quote.execute_batch(symbols))
+            quotes = _run_async_for_request(container.get_quote.execute_batch(symbols))
             
             return {
                 "status": "ok",
@@ -91,7 +118,7 @@ def register_quotes_routes(app: Flask, container: DIContainer, logger: logging.L
     def get_supported_symbols():
         """Get list of supported symbols."""
         try:
-            symbols = asyncio.run(container.get_quote.get_supported_symbols())
+            symbols = _run_async_for_request(container.get_quote.get_supported_symbols())
             return {
                 "status": "ok",
                 "symbols": symbols,

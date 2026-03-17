@@ -4,11 +4,38 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from markettool.interfaces.containers import DIContainer
     from flask import Flask
+
+
+def _run_async_for_request(coro):
+    """Run async coroutine in request handler with proper event loop management."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        result = loop.run_until_complete(coro)
+        
+        # Allow pending tasks brief time to initialize
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            try:
+                loop.run_until_complete(asyncio.wait(pending, timeout=0.5))
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+        
+        return result
+    finally:
+        try:
+            loop.close()
+        except RuntimeError:
+            pass
 
 
 def register_cache_routes(app: Flask, container: DIContainer, logger: logging.Logger) -> None:
@@ -25,7 +52,7 @@ def register_cache_routes(app: Flask, container: DIContainer, logger: logging.Lo
     def v1_get_cache_stats():
         """Get cache statistics (hits, misses, size)."""
         try:
-            stats = asyncio.run(container.warm_cache.get_cache_stats())
+            stats = _run_async_for_request(container.warm_cache.get_cache_stats())
             return {
                 "status": "ok",
                 "stats": stats,
@@ -55,7 +82,7 @@ def register_cache_routes(app: Flask, container: DIContainer, logger: logging.Lo
             timeframes = data.get("timeframes", ["1hour", "1day"])
             force = data.get("force", False)
             
-            result = asyncio.run(container.warm_cache.execute(
+            result = _run_async_for_request(container.warm_cache.execute(
                 symbols=symbols,
                 timeframes=timeframes,
                 force=force,
@@ -74,7 +101,7 @@ def register_cache_routes(app: Flask, container: DIContainer, logger: logging.Lo
     def v1_clear_cache():
         """Clear entire cache."""
         try:
-            asyncio.run(container.warm_cache.cache.clear())
+            _run_async_for_request(container.warm_cache.cache.clear())
             return {
                 "status": "ok",
                 "message": "Cache cleared",
@@ -88,7 +115,7 @@ def register_cache_routes(app: Flask, container: DIContainer, logger: logging.Lo
     def v1_invalidate_cache(symbol: str, timeframe: str):
         """Invalidate cache for specific symbol/timeframe."""
         try:
-            asyncio.run(container.warm_cache.cache.invalidate_historico(symbol, timeframe))
+            _run_async_for_request(container.warm_cache.cache.invalidate_historico(symbol, timeframe))
             return {
                 "status": "ok",
                 "message": f"Cache invalidated for {symbol}/{timeframe}",

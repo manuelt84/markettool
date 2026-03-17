@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from markettool.core.errors import DataNotFoundError, InsufficientDataError
@@ -11,6 +12,32 @@ from markettool.core.errors import DataNotFoundError, InsufficientDataError
 if TYPE_CHECKING:
     from markettool.interfaces.containers import DIContainer
     from flask import Flask
+
+
+def _run_async_for_request(coro):
+    """Run async coroutine in request handler with proper event loop management."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        result = loop.run_until_complete(coro)
+        
+        # Allow pending tasks brief time to initialize
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            try:
+                loop.run_until_complete(asyncio.wait(pending, timeout=0.5))
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+        
+        return result
+    finally:
+        try:
+            loop.close()
+        except RuntimeError:
+            pass
 
 
 def register_historicos_routes(app: Flask, container: DIContainer, logger: logging.Logger) -> None:
@@ -43,7 +70,7 @@ def register_historicos_routes(app: Flask, container: DIContainer, logger: loggi
             end_date = request.args.get("end_date")
             use_cache = request.args.get("use_cache", "true").lower() == "true"
             
-            historico = asyncio.run(container.get_historicos.execute(
+            historico = _run_async_for_request(container.get_historicos.execute(
                 symbol=symbol,
                 timeframe=timeframe,
                 start_date=start_date,
@@ -85,7 +112,7 @@ def register_historicos_routes(app: Flask, container: DIContainer, logger: loggi
             target_tf = target_tf.strip().lower()
             days_back = int(request.args.get("days_back", 30))
             
-            historico = asyncio.run(container.get_historicos.execute_with_resample(
+            historico = _run_async_for_request(container.get_historicos.execute_with_resample(
                 symbol=symbol,
                 source_timeframe=source_tf,
                 target_timeframe=target_tf,

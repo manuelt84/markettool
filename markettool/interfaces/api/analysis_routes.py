@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from markettool.core.errors import AnalysisError, InsufficientDataError
@@ -11,6 +12,37 @@ from markettool.core.errors import AnalysisError, InsufficientDataError
 if TYPE_CHECKING:
     from markettool.interfaces.containers import DIContainer
     from flask import Flask
+
+
+def _run_async_for_request(coro):
+    """Run async coroutine in request handler with proper event loop management.
+    
+    Creates a dedicated event loop for each request that doesn't prematurely
+    close while pending tasks are still running.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        result = loop.run_until_complete(coro)
+        
+        # Allow pending tasks brief time to initialize
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            try:
+                loop.run_until_complete(asyncio.wait(pending, timeout=0.5))
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+        
+        return result
+    finally:
+        try:
+            loop.close()
+        except RuntimeError:
+            # Expected if tasks are still pending
+            pass
 
 
 def register_analysis_routes(app: Flask, container: DIContainer, logger: logging.Logger) -> None:
@@ -40,14 +72,14 @@ def register_analysis_routes(app: Flask, container: DIContainer, logger: logging
             analysis_type = request.args.get("analysis_type", "technical")
             
             # First get historical data
-            historico = asyncio.run(container.get_historicos.execute(
+            historico = _run_async_for_request(container.get_historicos.execute(
                 symbol=symbol,
                 timeframe=timeframe,
                 use_cache=True,
             ))
             
             # Run analysis
-            signals = asyncio.run(container.run_analysis.execute(
+            signals = _run_async_for_request(container.run_analysis.execute(
                 historico=historico,
                 analysis_type=analysis_type,
             ))
@@ -102,12 +134,12 @@ def register_analysis_routes(app: Flask, container: DIContainer, logger: logging
                     # Normalize symbol
                     sym_normalized = symbol.strip().upper()
                     tf_normalized = timeframe.strip().lower()
-                    historico = asyncio.run(container.get_historicos.execute(
+                    historico = _run_async_for_request(container.get_historicos.execute(
                         symbol=sym_normalized,
                         timeframe=tf_normalized,
                         use_cache=True,
                     ))
-                    signals = asyncio.run(container.run_analysis.execute(
+                    signals = _run_async_for_request(container.run_analysis.execute(
                         historico=historico,
                         analysis_type=analysis_type,
                     ))
