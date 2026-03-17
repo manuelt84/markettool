@@ -18,85 +18,43 @@ from flask import jsonify, request
 
 from markettool.application.use_cases.legacy import LegacyAnalisisUseCase
 
-# Persistent background event loop for handling async operations
 _bg_loop = None
 _bg_thread = None
 _bg_lock = threading.Lock()
+_bg_ready = threading.Event()
 
-def _initialize_bg_loop():
-    """Initialize a persistent background event loop in a daemon thread."""
-    global _bg_loop, _bg_thread
-    
+
+def _bg_loop_worker() -> None:
+    global _bg_loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _bg_loop = loop
+    _bg_ready.set()
+    loop.run_forever()
+
+
+def _ensure_bg_loop():
+    global _bg_thread
     with _bg_lock:
-        if _bg_loop is not None:
-            return
-        
-        def _run_bg_loop():
-            global _bg_loop
-            _bg_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(_bg_loop)
-            try:
-                _bg_loop.run_forever()
-            finally:
-                _bg_loop.close()
-        
-        _bg_thread = threading.Thread(target=_run_bg_loop, daemon=True, name="AsyncIOBackgroundLoop")
+        if _bg_loop is not None and _bg_loop.is_running():
+            return _bg_loop
+        _bg_ready.clear()
+        _bg_thread = threading.Thread(
+            target=_bg_loop_worker,
+            daemon=True,
+            name="analisis-bg-loop",
+        )
         _bg_thread.start()
-        
-        # Wait for loop to start
-        while _bg_loop is None:
-            threading.Event().wait(0.001)
 
-def _get_bg_loop():
-    """Get the background event loop, initializing if needed."""
-    if _bg_loop is None:
-        _initialize_bg_loop()
+    if not _bg_ready.wait(timeout=5):
+        raise RuntimeError("No se pudo iniciar event loop de analisis")
     return _bg_loop
 
 def _run_async_for_request(coro):
-    """Run async coroutine in a request handler by managing event loop properly.
-    
-    Problem: asyncio.run() creates a new loop and closes it immediately after
-    the coroutine returns. This kills any background tasks created inside.
-    
-    Solution: Create event loop, run main coroutine, allow pending background
-    tasks to run briefly before closing. This gives them time to schedule
-    and initialize.
-    """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    try:
-        # Run the main coroutine - this returns when use_case.ejecutar 
-        # returns (with 202 status), leaving background tasks pending
-        result = loop.run_until_complete(coro)
-        
-        # After main coroutine returns, allow pending tasks to run briefly
-        # This gives them time to initialize and schedule themselves
-        pending = asyncio.all_tasks(loop)
-        if pending:
-            # Wait for pending tasks with timeout
-            # We don't want to block HTTP request indefinitely
-            try:
-                loop.run_until_complete(asyncio.wait(pending, timeout=0.5))
-            except asyncio.TimeoutError:
-                # Expected - tasks didn't complete in timeout, that's ok
-                pass
-            except Exception:
-                # Other errors, just continue
-                pass
-        
-        return result
-    finally:
-        # Cleanup: Don't cancel background tasks, just close the loop
-        # Background tasks were created with stronger reasons than this HTTP request
-        try:
-            loop.close()
-        except RuntimeError as e:
-            # RuntimeError: Event loop is running or has pending tasks
-            # This is expected - background tasks are still pending/running
-            # Just ignore and let the loop cleanup itself
-            pass
+    """Run coroutine on a persistent loop so spawned tasks survive HTTP request."""
+    loop = _ensure_bg_loop()
+    fut = asyncio.run_coroutine_threadsafe(coro, loop)
+    return fut.result()
 
 
 def register_analisis_routes(app, *, services) -> None:
