@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -23,7 +24,7 @@ def register_historicos_routes(app: Flask, container: DIContainer, logger: loggi
     """
     
     @app.route("/api/v1/historicos/<symbol>/<timeframe>", methods=["GET"])
-    async def get_historico(symbol: str, timeframe: str):
+    def get_historico(symbol: str, timeframe: str):
         """
         Get historical OHLCV data for symbol and timeframe.
         
@@ -35,17 +36,20 @@ def register_historicos_routes(app: Flask, container: DIContainer, logger: loggi
         try:
             from flask import request
             
+            # Normalize inputs
+            symbol = symbol.strip().upper()
+            timeframe = timeframe.strip().lower()
             start_date = request.args.get("start_date")
             end_date = request.args.get("end_date")
             use_cache = request.args.get("use_cache", "true").lower() == "true"
             
-            historico = await container.get_historicos.execute(
+            historico = asyncio.run(container.get_historicos.execute(
                 symbol=symbol,
                 timeframe=timeframe,
                 start_date=start_date,
                 end_date=end_date,
                 use_cache=use_cache,
-            )
+            ))
             
             return {
                 "status": "ok",
@@ -65,7 +69,7 @@ def register_historicos_routes(app: Flask, container: DIContainer, logger: loggi
             return {"status": "error", "message": "Internal server error"}, 500
     
     @app.route("/api/v1/historicos/<symbol>/<source_tf>/resample/<target_tf>", methods=["GET"])
-    async def resample_historico(symbol: str, source_tf: str, target_tf: str):
+    def resample_historico(symbol: str, source_tf: str, target_tf: str):
         """
         Get historical data resampled to different timeframe.
         
@@ -75,14 +79,18 @@ def register_historicos_routes(app: Flask, container: DIContainer, logger: loggi
         try:
             from flask import request
             
+            # Normalize inputs
+            symbol = symbol.strip().upper()
+            source_tf = source_tf.strip().lower()
+            target_tf = target_tf.strip().lower()
             days_back = int(request.args.get("days_back", 30))
             
-            historico = await container.get_historicos.execute_with_resample(
+            historico = asyncio.run(container.get_historicos.execute_with_resample(
                 symbol=symbol,
                 source_timeframe=source_tf,
                 target_timeframe=target_tf,
                 days_back=days_back,
-            )
+            ))
             
             return {
                 "status": "ok",

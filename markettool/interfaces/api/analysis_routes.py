@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -23,7 +24,7 @@ def register_analysis_routes(app: Flask, container: DIContainer, logger: logging
     """
     
     @app.route("/api/v1/analysis/<symbol>/<timeframe>", methods=["GET"])
-    async def analyze_symbol(symbol: str, timeframe: str):
+    def analyze_symbol(symbol: str, timeframe: str):
         """
         Run technical analysis on symbol and generate trading signals.
         
@@ -33,20 +34,23 @@ def register_analysis_routes(app: Flask, container: DIContainer, logger: logging
         try:
             from flask import request
             
+            # Normalize inputs
+            symbol = symbol.strip().upper()
+            timeframe = timeframe.strip().lower()
             analysis_type = request.args.get("analysis_type", "technical")
             
             # First get historical data
-            historico = await container.get_historicos.execute(
+            historico = asyncio.run(container.get_historicos.execute(
                 symbol=symbol,
                 timeframe=timeframe,
                 use_cache=True,
-            )
+            ))
             
             # Run analysis
-            signals = await container.run_analysis.execute(
+            signals = asyncio.run(container.run_analysis.execute(
                 historico=historico,
                 analysis_type=analysis_type,
-            )
+            ))
             
             return {
                 "status": "ok",
@@ -70,7 +74,7 @@ def register_analysis_routes(app: Flask, container: DIContainer, logger: logging
             return {"status": "error", "message": "Internal server error"}, 500
     
     @app.route("/api/v1/analysis/batch", methods=["POST"])
-    async def analyze_batch():
+    def analyze_batch():
         """
         Run analysis on multiple symbols.
         
@@ -95,15 +99,18 @@ def register_analysis_routes(app: Flask, container: DIContainer, logger: logging
             results = {}
             for symbol in symbols:
                 try:
-                    historico = await container.get_historicos.execute(
-                        symbol=symbol,
-                        timeframe=timeframe,
+                    # Normalize symbol
+                    sym_normalized = symbol.strip().upper()
+                    tf_normalized = timeframe.strip().lower()
+                    historico = asyncio.run(container.get_historicos.execute(
+                        symbol=sym_normalized,
+                        timeframe=tf_normalized,
                         use_cache=True,
-                    )
-                    signals = await container.run_analysis.execute(
+                    ))
+                    signals = asyncio.run(container.run_analysis.execute(
                         historico=historico,
                         analysis_type=analysis_type,
-                    )
+                    ))
                     results[symbol] = [s.to_dict() for s in signals.signals]
                 except Exception as e:
                     logger.error(f"Failed to analyze {symbol}: {e}")

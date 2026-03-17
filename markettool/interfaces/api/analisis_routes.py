@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 pass
 pass
 pass
@@ -62,8 +63,8 @@ def register_analisis_routes(app, *, services) -> None:
             stop_events_ref.pop(exec_id, None)
 
     @app.route("/analisis/ejecutar", methods=["POST"])
-    async def ejecutar_analisis_desde_app():
-        payload, status = await use_case.ejecutar(request.json or {})
+    def ejecutar_analisis_desde_app():
+        payload, status = asyncio.run(use_case.ejecutar(request.json or {}))
         return jsonify(payload), status
 
     @app.route("/analisis/resultados", methods=["GET"])
@@ -75,15 +76,15 @@ def register_analisis_routes(app, *, services) -> None:
         return jsonify(payload), status
 
     @app.route("/analisis/stop", methods=["POST"])
-    async def detener_analisis_desde_app():
-        payload, status = await use_case.stop((request.get_json(force=True) or {}).get("exec_id"))
+    def detener_analisis_desde_app():
+        payload, status = asyncio.run(use_case.stop((request.get_json(force=True) or {}).get("exec_id")))
         return jsonify(payload), status
 
     @app.route("/analisis/imagen", methods=["POST"])
-    async def subir_imagen_y_analizar():
-        payload, status = await use_case.imagen(
+    def subir_imagen_y_analizar():
+        payload, status = asyncio.run(use_case.imagen(
             request.form or {},
             request.get_json(silent=True) or {},
             request.files,
-        )
+        ))
         return jsonify(payload), status

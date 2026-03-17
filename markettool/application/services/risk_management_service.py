@@ -84,12 +84,14 @@ class RiskManagementService:
             )
         
         # Determine if BUY or SELL
-        if entry_price < stop_loss:
-            # BUY trade
+        # For BUY: entry_price > stop_loss (we go below entry on SL)
+        # For SELL: entry_price < stop_loss (we go above entry on SL)
+        if entry_price > stop_loss:
+            # BUY trade: entry above stop
             risk_per_unit = entry_price - stop_loss
             reward_per_unit = take_profit - entry_price
         else:
-            # SELL trade
+            # SELL trade: entry below stop
             risk_per_unit = stop_loss - entry_price
             reward_per_unit = entry_price - take_profit
         
@@ -209,8 +211,15 @@ class RiskManagementService:
         """
         Kelly Criterion: f* = (bp - q) / b
         where b = odds (RRR), p = win rate, q = loss rate
+        
+        Returns 0 if parameters are invalid
         """
+        # Validate win_rate
         if win_rate <= 0 or win_rate >= 1:
+            return 0.0
+        
+        # Validate that avg_win and avg_loss are positive
+        if avg_win <= 0 or avg_loss <= 0:
             return 0.0
         
         p = win_rate

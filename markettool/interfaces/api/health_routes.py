@@ -1,4 +1,8 @@
-"""Health and cache status routes."""
+"""Health and cache status routes - DEPRECATED.
+
+This module is superseded by health.py which provides comprehensive health checking.
+Kept only for backward compatibility with routes like /cache-status and /.
+"""
 
 from __future__ import annotations
 
@@ -18,14 +22,11 @@ def register_health_routes(
     atr_misses_ref,
     app_config,
 ) -> None:
-    @app.route("/health", methods=["GET"])
-    def health():
-        return {"status": "ok", "instance": socket.gethostname()}
-
-    @app.route("/healthz", methods=["GET"])
-    def health_check():
-        return jsonify({"status": "ok"}), 200
-
+    """
+    DEPRECATED: Use health.py register_health_routes instead.
+    Only registers /cache-status and / endpoints for backward compatibility.
+    """
+    
     @app.route("/cache-status", methods=["GET"])
     def cache_status():
         warmup_status = "not started"

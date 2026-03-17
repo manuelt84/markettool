@@ -8,7 +8,7 @@ from .analysis_routes import register_analysis_routes
 from .cache_management_routes import register_cache_routes
 from .analisis_routes import register_analisis_routes as register_analisis_routes_legacy
 from .execution_routes import register_execution_routes
-from .health_routes import register_health_routes
+from .health import register_health_routes
 from .monitoreo_routes import register_monitoreo_routes
 from .pod_routes import register_pod_routes
 from .webhook_routes import register_webhook_routes

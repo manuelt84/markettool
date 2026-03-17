@@ -177,14 +177,18 @@ def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None
         Query params:
         - symbol: Required
         - timeframe: Required
-        - lookback: Optional, default 10 (how many candles to analyze)
+        - lookback: Optional, default 10 (how many candles to analyze, 1-500)
         """
         if not ponderacion_history:
             return jsonify({"error": "History tracking not enabled"}), 503
         
         symbol = request.args.get("symbol", "").strip().upper()
         timeframe = request.args.get("timeframe", "").strip()
-        lookback = int(request.args.get("lookback", 10))
+        # Validate lookback bounds: 1-500
+        try:
+            lookback = max(1, min(int(request.args.get("lookback", 10)), 500))
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid lookback parameter: must be integer"}), 400
         
         if not symbol or not timeframe:
             return jsonify({"error": "Missing symbol or timeframe"}), 400

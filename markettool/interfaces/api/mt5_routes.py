@@ -233,6 +233,7 @@ def register_mt5_routes(app: Flask) -> None:
             return jsonify({"error": str(e)}), 500
 
     
+    @app.route("/api/v1/broker/mt5/account-info", methods=["GET"])
     def mt5_account_info():
         """Get MT5 account information."""
         try:
@@ -250,6 +251,8 @@ def register_mt5_routes(app: Flask) -> None:
     def mt5_symbol_info(symbol: str):
         """Get MT5 symbol information."""
         try:
+            # Normalize symbol
+            symbol = symbol.strip().upper()
             service = get_mt5_service()
             
             # Get symbol info if available from EA polling
