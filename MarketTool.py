@@ -14873,7 +14873,25 @@ def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
     """
     logger.info(f"Filtrando activos por: {moneda_filtro}")
 
-    moneda_filtro = moneda_filtro.strip().lower()  # Normalizar el filtro
+    if not moneda_filtro:
+        return []
+
+    raw_filter = str(moneda_filtro).strip()
+    if "," in raw_filter:
+        parts = [p.strip() for p in raw_filter.split(",") if p.strip()]
+        merged: list[str] = []
+        seen = set()
+        for part in parts:
+            part_results = filtrar_activos_por_moneda(lista_activos, part)
+            for sym in part_results:
+                key = str(sym).upper()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(str(sym).upper())
+        return merged
+
+    moneda_filtro = raw_filter.lower()  # Normalizar el filtro
 
     # Filtro especial para todas las monedas
     if moneda_filtro in {"all", "todos"}:

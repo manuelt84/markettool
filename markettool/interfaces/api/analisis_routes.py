@@ -18,6 +18,71 @@ from flask import jsonify, request
 
 from markettool.application.use_cases.legacy import LegacyAnalisisUseCase
 
+# Persistent background event loop for handling async operations
+_bg_loop = None
+_bg_thread = None
+_bg_lock = threading.Lock()
+
+def _initialize_bg_loop():
+    """Initialize a persistent background event loop in a daemon thread."""
+    global _bg_loop, _bg_thread
+    
+    with _bg_lock:
+        if _bg_loop is not None:
+            return
+        
+        def _run_bg_loop():
+            global _bg_loop
+            _bg_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(_bg_loop)
+            try:
+                _bg_loop.run_forever()
+            finally:
+                _bg_loop.close()
+        
+        _bg_thread = threading.Thread(target=_run_bg_loop, daemon=True, name="AsyncIOBackgroundLoop")
+        _bg_thread.start()
+        
+        # Wait for loop to start
+        while _bg_loop is None:
+            threading.Event().wait(0.001)
+
+def _get_bg_loop():
+    """Get the background event loop, initializing if needed."""
+    if _bg_loop is None:
+        _initialize_bg_loop()
+    return _bg_loop
+
+def _run_async_for_request(coro):
+    """Run async coroutine in a request handler by submitting to background loop.
+    
+    This allows background tasks to continue executing after the HTTP response.
+    The coroutine is executed immediately while blocking the request, but any
+    background tasks it creates are registered with the persistent loop.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        # Critical: Don't close the loop yet! Background tasks might be using it.
+        # Instead, wait a moment for tasks to initialize in the loop
+        try:
+            pending = asyncio.all_tasks(loop)
+            # Keep loop alive briefly while tasks initialize
+            if pending:
+                # Run pending tasks for a short time to let them start
+                loop.run_until_complete(asyncio.sleep(0.2))
+        except Exception:
+            pass
+        
+        # Now close
+        try:
+            loop.close()
+        except Exception:
+            pass
+
 
 def register_analisis_routes(app, *, services) -> None:
     use_case = LegacyAnalisisUseCase(services)
@@ -64,7 +129,7 @@ def register_analisis_routes(app, *, services) -> None:
 
     @app.route("/analisis/ejecutar", methods=["POST"])
     def ejecutar_analisis_desde_app():
-        payload, status = asyncio.run(use_case.ejecutar(request.json or {}))
+        payload, status = _run_async_for_request(use_case.ejecutar(request.json or {}))
         return jsonify(payload), status
 
     @app.route("/analisis/resultados", methods=["GET"])
@@ -77,12 +142,12 @@ def register_analisis_routes(app, *, services) -> None:
 
     @app.route("/analisis/stop", methods=["POST"])
     def detener_analisis_desde_app():
-        payload, status = asyncio.run(use_case.stop((request.get_json(force=True) or {}).get("exec_id")))
+        payload, status = _run_async_for_request(use_case.stop((request.get_json(force=True) or {}).get("exec_id")))
         return jsonify(payload), status
 
     @app.route("/analisis/imagen", methods=["POST"])
     def subir_imagen_y_analizar():
-        payload, status = asyncio.run(use_case.imagen(
+        payload, status = _run_async_for_request(use_case.imagen(
             request.form or {},
             request.get_json(silent=True) or {},
             request.files,

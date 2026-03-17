@@ -33,9 +33,30 @@ class LegacyAnalisisUseCase:
             if not user_id:
                 return {"status": "error", "message": "user_id es obligatorio"}, 400
 
-            activo = data.get("activo")
-            if activo is None:
-                return {"status": "error", "message": "Falta 'activo'"}, 400
+            raw_assets = data.get("activos_solicitados")
+            if raw_assets is None:
+                raw_assets = data.get("activos")
+
+            requested_assets: list[str] = []
+            if isinstance(raw_assets, str):
+                requested_assets = [p.strip().upper() for p in raw_assets.split(",") if str(p).strip()]
+            elif isinstance(raw_assets, (list, tuple, set)):
+                requested_assets = [str(p).strip().upper() for p in raw_assets if str(p).strip()]
+
+            if not requested_assets:
+                activo_fallback = data.get("activo")
+                if activo_fallback is None:
+                    return {"status": "error", "message": "Falta 'activo'"}, 400
+                requested_assets = [str(activo_fallback).strip().upper()]
+
+            # De-duplicate preserving order for stable execution + billing estimate.
+            requested_assets = list(dict.fromkeys(requested_assets))
+            activo = ",".join(requested_assets)
+            self._services.logger.info(
+                "[/analisis/ejecutar] activos solicitados (raw->normalized): %s -> %s",
+                data.get("activos_solicitados") if data.get("activos_solicitados") is not None else data.get("activo"),
+                requested_assets,
+            )
 
             origen = (data.get("origen") or "app").lower()
 
@@ -53,6 +74,10 @@ class LegacyAnalisisUseCase:
                 await asyncio.to_thread(self._services.ensure_globals_loaded)
                 activos_filtrados_est = await asyncio.to_thread(
                     self._services.filtrar_activos_por_moneda, self._services.activos_ref, activo
+                )
+                self._services.logger.info(
+                    "[/analisis/ejecutar] activos resueltos tras filtro: %s",
+                    list(activos_filtrados_est or []),
                 )
                 n_transacciones_req = max(
                     1,
@@ -131,7 +156,7 @@ class LegacyAnalisisUseCase:
                 self._services.fs_crear_ejecucion,
                 user_id=user_id,
                 chat_id=chat_id or None,
-                activos_solicitados=[activo],
+                activos_solicitados=requested_assets,
                 origen="app",
                 opciones_usuario=opciones_usuario,
             )
