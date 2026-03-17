@@ -43,6 +43,19 @@ def register_monitoreo_routes(app, *, services) -> None:
     backfill_internal_gaps = services.backfill_internal_gaps
     bucket_name = services.bucket_name
 
+    def _quota_error_response(message: str):
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "code": "INSUFFICIENT_TRANSACTIONS",
+                    "error_code": "transacciones_insuficientes",
+                    "message": message,
+                }
+            ),
+            402,
+        )
+
     def _build_timeframe_data_quality(candles: list[dict], timeframe: str) -> dict:
         try:
             if not candles:
@@ -144,7 +157,7 @@ def register_monitoreo_routes(app, *, services) -> None:
 
             ok, msg = await charge_monitoreo_per_call(user_id, origen="app")
             if not ok:
-                return jsonify({"status": "error", "message": msg}), 402
+                return _quota_error_response(msg)
 
             logging.info(
                 "INC START user=%s exec=%s body=%s",
@@ -779,7 +792,7 @@ def register_monitoreo_routes(app, *, services) -> None:
 
             ok, msg = await charge_monitoreo_per_call(user_id, origen="app")
             if not ok:
-                return jsonify({"status": "error", "message": msg}), 402
+                return _quota_error_response(msg)
 
             try:
                 limit = int(limit)

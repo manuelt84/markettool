@@ -19522,6 +19522,36 @@ async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen
 
         sus = canon_snap.to_dict() or {}
         curr = int(sus.get("transacciones_restantes") or 0)
+
+        # Si no alcanza la cuota, NO descontar y reportar insuficiencia.
+        # Mantener estado inactiva cuando ya no hay saldo.
+        if curr < dec:
+            if curr <= 0:
+                transaction.set(
+                    canon_ref,
+                    {
+                        "transacciones_restantes": 0,
+                        "estado": "inactiva",
+                        "updated_at": firestore.SERVER_TIMESTAMP,
+                    },
+                    merge=True,
+                )
+
+                if alias_ref is not None:
+                    transaction.set(
+                        alias_ref,
+                        {
+                            "user_id": sus.get("user_id") or canon_ref.id,
+                            "doc_alias_of": sus.get("user_id") or canon_ref.id,
+                            "transacciones_restantes": 0,
+                            "estado": "inactiva",
+                            "updated_at": firestore.SERVER_TIMESTAMP,
+                        },
+                        merge=True,
+                    )
+
+            return {"ok": False, "remaining": curr}
+
         nuevo = max(curr - dec, 0)
         estado = "activa" if nuevo > 0 else "inactiva"
 
@@ -19550,14 +19580,23 @@ async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen
                 merge=True,
             )
 
-        return nuevo
+        return {"ok": True, "remaining": nuevo}
 
     try:
         tx = db.transaction()
-        nuevo = _tx(tx)
-        if nuevo <= 0:
+        result = _tx(tx)
+        if not isinstance(result, dict):
+            return False, "❌ Error de consistencia al descontar transacción."
+
+        ok = bool(result.get("ok"))
+        remaining = int(result.get("remaining") or 0)
+
+        if not ok:
+            return False, "No cuenta con la cuota de transacciones requerida. Por favor, adquiere un paquete."
+
+        if remaining <= 0:
             return True, "✅ Transacción aplicada. Te quedan 0; tu suscripción quedó inactiva."
-        return True, f"✅ Transacción aplicada. Te quedan {nuevo}."
+        return True, f"✅ Transacción aplicada. Te quedan {remaining}."
     except Exception as e:
         return False, f"❌ Error inesperado al descontar transacción: {e}"
 

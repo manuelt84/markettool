@@ -30,7 +30,12 @@ class LegacyMonitoreoUseCase:
 
             ok, msg = await self._services.charge_monitoreo_per_call(user_id, origen="app")
             if not ok:
-                return {"status": "error", "message": msg}, 402
+                return {
+                    "status": "error",
+                    "code": "INSUFFICIENT_TRANSACTIONS",
+                    "error_code": "transacciones_insuficientes",
+                    "message": msg,
+                }, 402
 
             key = (exec_id, symbol)
             cached_hash = self._services.last_hash_ref.get(key)
