@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from markettool.interfaces.api.historicos_routes import register_historicos_routes
@@ -17,10 +18,61 @@ from markettool.interfaces.api.hexagonal_analysis_routes import register_hexagon
 from markettool.interfaces.api.risk_management_routes import register_risk_management_routes
 from markettool.interfaces.api.signal_validation_routes import register_signal_validation_routes
 from markettool.interfaces.api.mt5_routes import register_mt5_routes
+from markettool.interfaces.api.ponderacion_routes import register_ponderacion_routes
+from markettool.interfaces.api.ponderacion_history import PonderacionHistory
+from markettool.interfaces.api.ponderacion_alerts import PonderacionAlert
 
 if TYPE_CHECKING:
     from flask import Flask
     from markettool.interfaces.containers import DIContainer
+
+
+class _PonderacionCacheAdapter:
+    """Minimal ponderacion cache adapter for API routes in hexagonal runtime."""
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.redis_client = None
+        self._hits = 0
+        self._misses = 0
+
+        redis_url = os.getenv("REDIS_URL")
+        if not redis_url:
+            return
+
+        try:
+            import redis as redis_lib
+
+            client = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+            client.ping()
+            self.redis_client = client
+        except Exception as exc:
+            self.logger.warning("Ponderacion cache adapter Redis unavailable: %s", exc)
+
+    def _make_key(self, symbol: str, timeframe: str, version: str = "v1") -> str:
+        return f"ponderacion:{symbol}:{timeframe}:{version}"
+
+    def invalidate(self, symbol: str, timeframe: str, version: str = "v1") -> bool:
+        if self.redis_client is None:
+            return True
+        try:
+            self.redis_client.delete(self._make_key(symbol, timeframe, version))
+            return True
+        except Exception as exc:
+            self.logger.warning("Ponderacion cache invalidate failed: %s", exc)
+            return False
+
+    def stats(self) -> dict:
+        total = self._hits + self._misses
+        hit_rate = (self._hits / total * 100) if total > 0 else 0.0
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "total": total,
+            "hit_rate_pct": round(hit_rate, 2),
+            "redis_connected": self.redis_client is not None,
+            "local_cache_size": 0,
+        }
 
 
 def register_all_routes(
@@ -49,6 +101,17 @@ def register_all_routes(
     register_risk_management_routes(app)
     register_signal_validation_routes(app)
     register_mt5_routes(app)
+
+    # Ponderacion API routes (available in hexagonal runtime via lightweight adapter)
+    ponderacion_cache = _PonderacionCacheAdapter(logger=logger)
+    ponderacion_history = PonderacionHistory(redis_client=ponderacion_cache.redis_client)
+    ponderacion_alert = PonderacionAlert(redis_client=ponderacion_cache.redis_client)
+    register_ponderacion_routes(
+        app,
+        ponderacion_cache=ponderacion_cache,
+        ponderacion_history=ponderacion_history,
+        ponderacion_alert=ponderacion_alert,
+    )
     logger.info("✅ Hexagonal API routes registered")
 
     # Legacy routes migrated into hexagonal registration
