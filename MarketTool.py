@@ -5626,12 +5626,8 @@ def obtener_noticias(symbol, fecha_inicio, fecha_fin, limite=50, max_reintentos=
         logger.info(f"[News] Cache HIT para {symbol}")
         return df_cache.copy()
 
-    # Determinar la última fecha registrada en el caché
-    if not df_cache.empty:
-        ultima_fecha = df_cache['publishedDate'].max()
-        fecha_inicio = ultima_fecha + timedelta(seconds=1)  # Buscar desde la última fecha más 1 segundo
-        logger.info(f"Última fecha en caché para {symbol}: {ultima_fecha}")
-    elif fecha_inicio is None:
+    # Cache MISS: df_cache is None — determinar fecha_inicio desde parámetro o default
+    if fecha_inicio is None:
         # ✅ FIX: Convert UTC to NY timezone for FMP API consistency
         now_utc = datetime.now(timezone.utc)
         ny_tz = pytz.timezone(FMP_INTRADAY_SOURCE_TZ)  # "America/New_York"
@@ -8188,6 +8184,17 @@ class SharedNewsCache:
                             logger.info(f"[SharedNewsCache] Saved to GCS: {symbol}")
                     except Exception as e:
                         logger.error(f"[SharedNewsCache] Error saving to GCS: {e}")
+                else:
+                    # GCS deshabilitado: persistir en disco local como fallback
+                    try:
+                        os.makedirs(CARPETA_FOREX_NEWS, exist_ok=True)
+                        disk_path = os.path.join(CARPETA_FOREX_NEWS, f"{symbol}_noticias.json")
+                        with open(disk_path, "w", encoding="utf-8") as f:
+                            f.write(df.to_json(orient='records', date_format='iso'))
+                        if logger.isEnabledFor(logging.INFO):
+                            logger.info(f"[SharedNewsCache] Saved to disk: {disk_path}")
+                    except Exception as e:
+                        logger.warning(f"[SharedNewsCache] Error saving to disk: {e}")
                 
                 # Cachear localmente
                 self._local_cache[symbol] = (now, df)
@@ -20461,47 +20468,43 @@ async def menu_zonas_horarias(update, context):
 
 #@profile
 async def cargar_noticias_en_memoria():
-    global cache_noticias
+    """
+    Carga archivos de caché de noticias del disco en _NEWS_CACHE (SharedNewsCache).
+    Formato de archivo: {symbol}_noticias.json  (sin temporalidad en el nombre).
+    """
     # ✅ Crear carpeta si no existe
     os.makedirs(CARPETA_FOREX_NEWS, exist_ok=True)
+    loaded = 0
     for archivo in os.listdir(CARPETA_FOREX_NEWS):
-        if archivo.endswith("_noticias.json"):
-            partes_archivo = archivo.split("_")
-            if len(partes_archivo) < 3:
-                continue  # Saltar archivos con un nombre inesperado
-
-            symbol = partes_archivo[0]
-            temporalidad = partes_archivo[1]
-
-            if temporalidad not in temporalidades:
+        if not archivo.endswith("_noticias.json"):
+            continue
+        # Nombre esperado: {SYMBOL}_noticias.json  (e.g. EURUSD_noticias.json)
+        symbol = archivo[: -len("_noticias.json")]
+        if not symbol:
+            continue
+        archivo_cache = os.path.join(CARPETA_FOREX_NEWS, archivo)
+        try:
+            with open(archivo_cache, "r", encoding="utf-8") as fh:
+                data_local = json.load(fh)
+            if not (isinstance(data_local, list) and data_local):
                 continue
-
-            archivo_cache = os.path.join(CARPETA_FOREX_NEWS, archivo)
-            if os.path.exists(archivo_cache):
-                with open(archivo_cache, "r", encoding="utf-8") as file:
-                    try:
-                        data_local = json.load(file)
-                        if isinstance(data_local, list) and len(data_local) > 0:
-                            df_local = pd.DataFrame(data_local)
-                            if 'publishedDate' in df_local.columns:
-                                df_local["publishedDate"] = pd.to_datetime(
-                                    df_local["publishedDate"], errors="coerce"
-                                )
-                                df_local = df_local.dropna(subset=["publishedDate"])
-                                df_local["publishedDate"] = (
-                                    df_local["publishedDate"]
-                                    .dt.tz_localize(pytz.UTC)  # Asignar timezone UTC
-                                    .dt.tz_convert(pytz.UTC)  # Convertir al timezone del usuario
-                                )
-                            # ✅ Proteger acceso con lock
-                            with cache_noticias_lock:
-                                if symbol not in cache_noticias:
-                                    cache_noticias[symbol] = {}
-                                cache_noticias[symbol][temporalidad] = df_local.sort_values("publishedDate")
-                            logger.info(f"Noticias cargadas en memoria para {symbol} ({temporalidad}).")
-                    except Exception as e:
-                        logger.info(f"Error al cargar noticias de {symbol} ({temporalidad}): {e}")
-    logger.info("Noticias cargadas en memoria.")
+            df_local = pd.DataFrame(data_local)
+            if 'publishedDate' in df_local.columns:
+                df_local["publishedDate"] = pd.to_datetime(
+                    df_local["publishedDate"], errors="coerce"
+                )
+                df_local = df_local.dropna(subset=["publishedDate"])
+                if df_local["publishedDate"].dt.tz is None:
+                    df_local["publishedDate"] = df_local["publishedDate"].dt.tz_localize(pytz.UTC)
+                else:
+                    df_local["publishedDate"] = df_local["publishedDate"].dt.tz_convert(pytz.UTC)
+            # Precargar en SharedNewsCache (local cache)
+            _NEWS_CACHE._local_cache[symbol] = (time.time(), df_local.sort_values("publishedDate"))
+            loaded += 1
+            logger.info(f"[cargar_noticias] Precargado disco → caché: {symbol} ({len(df_local)} rows)")
+        except Exception as e:
+            logger.warning(f"[cargar_noticias] Error cargando {archivo}: {e}")
+    logger.info(f"[cargar_noticias] Cargados {loaded} archivos de noticias en memoria.")
 
 
 #@profile
