@@ -54,33 +54,48 @@ def _get_bg_loop():
     return _bg_loop
 
 def _run_async_for_request(coro):
-    """Run async coroutine in a request handler by submitting to background loop.
+    """Run async coroutine in a request handler by managing event loop properly.
     
-    This allows background tasks to continue executing after the HTTP response.
-    The coroutine is executed immediately while blocking the request, but any
-    background tasks it creates are registered with the persistent loop.
+    Problem: asyncio.run() creates a new loop and closes it immediately after
+    the coroutine returns. This kills any background tasks created inside.
+    
+    Solution: Create event loop, run main coroutine, allow pending background
+    tasks to run briefly before closing. This gives them time to schedule
+    and initialize.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     try:
-        return loop.run_until_complete(coro)
-    finally:
-        # Critical: Don't close the loop yet! Background tasks might be using it.
-        # Instead, wait a moment for tasks to initialize in the loop
-        try:
-            pending = asyncio.all_tasks(loop)
-            # Keep loop alive briefly while tasks initialize
-            if pending:
-                # Run pending tasks for a short time to let them start
-                loop.run_until_complete(asyncio.sleep(0.2))
-        except Exception:
-            pass
+        # Run the main coroutine - this returns when use_case.ejecutar 
+        # returns (with 202 status), leaving background tasks pending
+        result = loop.run_until_complete(coro)
         
-        # Now close
+        # After main coroutine returns, allow pending tasks to run briefly
+        # This gives them time to initialize and schedule themselves
+        pending = asyncio.all_tasks(loop)
+        if pending:
+            # Wait for pending tasks with timeout
+            # We don't want to block HTTP request indefinitely
+            try:
+                loop.run_until_complete(asyncio.wait(pending, timeout=0.5))
+            except asyncio.TimeoutError:
+                # Expected - tasks didn't complete in timeout, that's ok
+                pass
+            except Exception:
+                # Other errors, just continue
+                pass
+        
+        return result
+    finally:
+        # Cleanup: Don't cancel background tasks, just close the loop
+        # Background tasks were created with stronger reasons than this HTTP request
         try:
             loop.close()
-        except Exception:
+        except RuntimeError as e:
+            # RuntimeError: Event loop is running or has pending tasks
+            # This is expected - background tasks are still pending/running
+            # Just ignore and let the loop cleanup itself
             pass
 
 
