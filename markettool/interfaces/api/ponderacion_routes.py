@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import logging
+import os
+import threading
+import uuid
 from datetime import datetime
 from flask import jsonify, request
 from flask_sock import Sock
+
+
+logger = logging.getLogger(__name__)
 
 
 def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None, ponderacion_alert=None) -> None:
@@ -21,6 +28,9 @@ def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None
     
     # Initialize Sock for WebSocket support
     sock = Sock(app)
+    instance_id = str(uuid.uuid4())
+    pubsub_channel = os.getenv("PONDERACION_STREAM_CHANNEL", "ponderacion:stream:updates")
+    redis_pubsub_enabled = os.getenv("PONDERACION_REDIS_PUBSUB_ENABLED", "true").lower() == "true"
 
     def _parse_int_query(name: str, default: int, *, min_value: int, max_value: int) -> tuple[int, str | None]:
         raw = request.args.get(name, default)
@@ -34,6 +44,63 @@ def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None
     # Keep track of connected clients for broadcasting
     _connected_clients = set()
     _clients_lock = asyncio.Lock()
+
+    redis_client = None
+    if getattr(ponderacion_history, "redis_client", None) is not None:
+        redis_client = ponderacion_history.redis_client
+    elif getattr(ponderacion_alert, "redis_client", None) is not None:
+        redis_client = ponderacion_alert.redis_client
+    elif getattr(ponderacion_cache, "redis_client", None) is not None:
+        redis_client = ponderacion_cache.redis_client
+
+    def _broadcast_message_to_clients(message: str) -> None:
+        disconnected = set()
+        for ws in _connected_clients:
+            try:
+                ws.send(message)
+            except Exception:
+                disconnected.add(ws)
+        for ws in disconnected:
+            _connected_clients.discard(ws)
+
+    def _start_pubsub_listener() -> None:
+        if not redis_pubsub_enabled or redis_client is None:
+            return
+        if getattr(app, "_ponderacion_pubsub_listener_started", False):
+            return
+
+        def _listener() -> None:
+            pubsub = None
+            try:
+                pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+                pubsub.subscribe(pubsub_channel)
+                logger.info("[PonderacionStream] Pub/Sub listener started on channel=%s", pubsub_channel)
+                for message in pubsub.listen():
+                    if not message or message.get("type") != "message":
+                        continue
+                    raw = message.get("data")
+                    if raw is None:
+                        continue
+                    try:
+                        payload = _json.loads(raw)
+                    except Exception:
+                        continue
+                    if payload.get("origin") == instance_id:
+                        continue
+                    _broadcast_message_to_clients(_json.dumps(payload))
+            except Exception as exc:
+                logger.warning("[PonderacionStream] Pub/Sub listener stopped: %s", exc)
+            finally:
+                try:
+                    if pubsub is not None:
+                        pubsub.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_listener, daemon=True, name="ponderacion-pubsub-listener").start()
+        app._ponderacion_pubsub_listener_started = True
+
+    _start_pubsub_listener()
     
     @app.route("/api/ponderacion/stats", methods=["GET"])
     def get_ponderacion_cache_stats():
@@ -41,6 +108,23 @@ def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None
         stats = ponderacion_cache.stats()
         return jsonify({
             "cache": stats,
+            "stream": {
+                "connected_clients": len(_connected_clients),
+                "redis_pubsub_enabled": redis_pubsub_enabled,
+                "redis_connected": redis_client is not None,
+                "pubsub_channel": pubsub_channel,
+            },
+            "timestamp_utc": datetime.utcnow().isoformat(),
+        })
+
+    @app.route("/api/ponderacion/stream/status", methods=["GET"])
+    def get_ponderacion_stream_status():
+        return jsonify({
+            "connected_clients": len(_connected_clients),
+            "redis_pubsub_enabled": redis_pubsub_enabled,
+            "redis_connected": redis_client is not None,
+            "pubsub_channel": pubsub_channel,
+            "instance_id": instance_id,
             "timestamp_utc": datetime.utcnow().isoformat(),
         })
     
@@ -123,28 +207,24 @@ def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None
             timeframe: Timeframe identifier
             data: Ponderación data to broadcast
         """
-        if not _connected_clients:
-            return  # No clients connected
-        
-        message = _json.dumps({
+        payload = {
             "type": "ponderacion_update",
             "symbol": symbol,
             "timeframe": timeframe,
             "data": data,
             "timestamp_utc": datetime.utcnow().isoformat(),
-        })
-        
-        # Send to all connected clients
-        disconnected = set()
-        for ws in _connected_clients:
+            "origin": instance_id,
+        }
+        message = _json.dumps(payload)
+
+        if _connected_clients:
+            _broadcast_message_to_clients(message)
+
+        if redis_pubsub_enabled and redis_client is not None:
             try:
-                ws.send(message)
-            except Exception:
-                disconnected.add(ws)
-        
-        # Remove disconnected clients
-        for ws in disconnected:
-            _connected_clients.discard(ws)
+                redis_client.publish(pubsub_channel, message)
+            except Exception as exc:
+                logger.warning("[PonderacionStream] Publish failed: %s", exc)
     
     # Expose broadcast function globally (will be called from ponderacion calculations)
     app.broadcast_ponderacion_update = broadcast_ponderacion_update
