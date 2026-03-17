@@ -21,6 +21,15 @@ def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None
     
     # Initialize Sock for WebSocket support
     sock = Sock(app)
+
+    def _parse_int_query(name: str, default: int, *, min_value: int, max_value: int) -> tuple[int, str | None]:
+        raw = request.args.get(name, default)
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            return default, f"Invalid {name} parameter: must be integer"
+        parsed = max(min_value, min(parsed, max_value))
+        return parsed, None
     
     # Keep track of connected clients for broadcasting
     _connected_clients = set()
@@ -155,18 +164,30 @@ def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None
             return jsonify({"error": "History tracking not enabled"}), 503
         
         symbol = request.args.get("symbol", "").strip().upper()
-        timeframe = request.args.get("timeframe", "").strip()
-        limit = min(int(request.args.get("limit", 100)), 500)
+        timeframe = request.args.get("timeframe", "").strip().lower()
+        limit, err = _parse_int_query("limit", 100, min_value=1, max_value=500)
+        if err:
+            return jsonify({"error": err}), 400
         
         if not symbol or not timeframe:
             return jsonify({"error": "Missing symbol or timeframe"}), 400
         
         history = ponderacion_history.get_history(symbol, timeframe, limit=limit)
+        method_breakdown: dict[str, int] = {}
+        for item in history:
+            method = str(item.get("calculation_method") or "unknown")
+            method_breakdown[method] = method_breakdown.get(method, 0) + 1
+
         return jsonify({
             "symbol": symbol,
             "timeframe": timeframe,
             "records": history,
             "count": len(history),
+            "schema": {
+                "version": 2,
+                "canonical_score_field": "canonical_score",
+                "method_breakdown": method_breakdown,
+            },
             "timestamp_utc": datetime.utcnow().isoformat(),
         })
     
@@ -183,12 +204,11 @@ def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None
             return jsonify({"error": "History tracking not enabled"}), 503
         
         symbol = request.args.get("symbol", "").strip().upper()
-        timeframe = request.args.get("timeframe", "").strip()
+        timeframe = request.args.get("timeframe", "").strip().lower()
         # Validate lookback bounds: 1-500
-        try:
-            lookback = max(1, min(int(request.args.get("lookback", 10)), 500))
-        except (ValueError, TypeError):
-            return jsonify({"error": "Invalid lookback parameter: must be integer"}), 400
+        lookback, err = _parse_int_query("lookback", 10, min_value=1, max_value=500)
+        if err:
+            return jsonify({"error": err}), 400
         
         if not symbol or not timeframe:
             return jsonify({"error": "Missing symbol or timeframe"}), 400
@@ -213,7 +233,7 @@ def register_ponderacion_routes(app, ponderacion_cache, ponderacion_history=None
             return jsonify({"error": "History tracking not enabled"}), 503
         
         symbol = request.args.get("symbol", "").strip().upper()
-        timeframe = request.args.get("timeframe", "").strip()
+        timeframe = request.args.get("timeframe", "").strip().lower()
         
         if not symbol or not timeframe:
             return jsonify({"error": "Missing symbol or timeframe"}), 400

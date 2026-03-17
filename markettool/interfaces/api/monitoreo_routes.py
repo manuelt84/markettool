@@ -42,6 +42,19 @@ def register_monitoreo_routes(app, *, services) -> None:
     merge_bars_series = services.merge_bars_series
     backfill_internal_gaps = services.backfill_internal_gaps
     bucket_name = services.bucket_name
+    max_history_window_ms = int(timedelta(days=365).total_seconds() * 1000)
+
+    def _parse_int_field(value, default: int, *, min_value: int | None = None, max_value: int | None = None):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+
+        if min_value is not None:
+            parsed = max(min_value, parsed)
+        if max_value is not None:
+            parsed = min(max_value, parsed)
+        return parsed
 
     def _quota_error_response(message: str):
         return (
@@ -713,10 +726,12 @@ def register_monitoreo_routes(app, *, services) -> None:
 
             fill_gaps = bool(body.get("fill_gaps", False))
             force_api = bool(body.get("force_api", False))
-            try:
-                max_minutes_per_call = int(body.get("max_minutes_per_call") or 10_000)
-            except Exception:
-                max_minutes_per_call = 10_000
+            max_minutes_per_call = _parse_int_field(
+                body.get("max_minutes_per_call"),
+                10_000,
+                min_value=1,
+                max_value=100_000,
+            )
 
             if not user_id:
                 return jsonify({"status": "error", "message": "user_id es obligatorio"}), 400
@@ -794,11 +809,7 @@ def register_monitoreo_routes(app, *, services) -> None:
             if not ok:
                 return _quota_error_response(msg)
 
-            try:
-                limit = int(limit)
-            except Exception:
-                limit = 600
-            limit = max(1, min(limit, 5000))
+            limit = _parse_int_field(limit, 600, min_value=1, max_value=5000)
 
             st = await asyncio.to_thread(load_cache, exec_id, symbol, timeframe)
 
@@ -839,16 +850,23 @@ def register_monitoreo_routes(app, *, services) -> None:
 
                         closed_end = current_closed_bucket_start(timeframe) - tf_ms_value
 
-                        from_in = from_ts
-                        to_in = to_ts
-                        try:
-                            from_in = int(from_in) if from_in is not None else None
-                        except Exception:
-                            from_in = None
-                        try:
-                            to_in = int(to_in) if to_in is not None else None
-                        except Exception:
-                            to_in = None
+                        from_in = _parse_int_field(from_ts, None) if from_ts is not None else None
+                        to_in = _parse_int_field(to_ts, None) if to_ts is not None else None
+
+                        if from_in is not None and to_in is not None:
+                            lo = min(from_in, to_in)
+                            hi = max(from_in, to_in)
+                            if (hi - lo) > max_history_window_ms:
+                                return (
+                                    jsonify(
+                                        {
+                                            "status": "error",
+                                            "message": "Rango temporal excede el maximo de 365 dias",
+                                            "max_window_ms": max_history_window_ms,
+                                        }
+                                    ),
+                                    400,
+                                )
 
                         from_eff = (
                             from_in
@@ -911,16 +929,23 @@ def register_monitoreo_routes(app, *, services) -> None:
                     st["dirty"] = True
                     logging.info("HIST PERSIST FLAGGED sym=%s tf=%s", symbol, timeframe)
 
-            if from_ts is not None:
-                try:
-                    from_ts = int(from_ts)
-                except Exception:
-                    from_ts = None
-            if to_ts is not None:
-                try:
-                    to_ts = int(to_ts)
-                except Exception:
-                    to_ts = None
+            from_ts = _parse_int_field(from_ts, None) if from_ts is not None else None
+            to_ts = _parse_int_field(to_ts, None) if to_ts is not None else None
+
+            if from_ts is not None and to_ts is not None:
+                lo = min(from_ts, to_ts)
+                hi = max(from_ts, to_ts)
+                if (hi - lo) > max_history_window_ms:
+                    return (
+                        jsonify(
+                            {
+                                "status": "error",
+                                "message": "Rango temporal excede el maximo de 365 dias",
+                                "max_window_ms": max_history_window_ms,
+                            }
+                        ),
+                        400,
+                    )
 
             if from_ts is not None or to_ts is not None:
                 lo = float("-inf") if from_ts is None else from_ts

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json as _json
+import logging
 from datetime import datetime
 from collections import deque
 pass
+
+logger = logging.getLogger(__name__)
 
 
 class PonderacionHistory:
@@ -22,6 +25,54 @@ class PonderacionHistory:
     def _make_history_key(self, symbol: str, timeframe: str) -> str:
         """Generate Redis key for ponderacion history."""
         return f"ponderacion:history:{symbol}:{timeframe}"
+
+    @staticmethod
+    def _to_float(value) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_record(self, raw_record: dict) -> dict:
+        """Normalize multiple ponderacion formats into a canonical schema."""
+        record = dict(raw_record or {})
+
+        pi_long = self._to_float(record.get("pi_long", record.get("PI_Long")))
+        pi_short = self._to_float(record.get("pi_short", record.get("PI_Short")))
+        dir_long = self._to_float(record.get("ponderacion_long", record.get("Ponderacion_Long")))
+        dir_short = self._to_float(record.get("ponderacion_short", record.get("Ponderacion_Short")))
+        legacy_score = self._to_float(
+            record.get("ponderacion", record.get("Ponderacion", record.get("ponderacion_value")))
+        )
+
+        score = legacy_score
+        method = "legacy_single"
+
+        if score is None and pi_long is not None and pi_short is not None:
+            score = pi_long - pi_short
+            method = "pi_delta"
+
+        if score is None and dir_long is not None and dir_short is not None:
+            score = dir_long - dir_short
+            method = "directional_delta"
+
+        if score is None:
+            score = 0.0
+            method = "fallback_zero"
+
+        record["canonical_score"] = float(score)
+        record["calculation_method"] = str(record.get("calculation_method") or method)
+        if pi_long is not None:
+            record["pi_long"] = pi_long
+        if pi_short is not None:
+            record["pi_short"] = pi_short
+        if dir_long is not None:
+            record["ponderacion_long"] = dir_long
+        if dir_short is not None:
+            record["ponderacion_short"] = dir_short
+        return record
     
     def add_record(self, symbol: str, timeframe: str, ponderacion_data: dict) -> bool:
         """Add ponderacion record to history with timestamp.
@@ -35,10 +86,10 @@ class PonderacionHistory:
             True if successful
         """
         key = self._make_history_key(symbol, timeframe)
-        record = {
+        record = self._normalize_record({
             "timestamp": datetime.utcnow().isoformat(),
             **ponderacion_data,
-        }
+        })
         
         if self.redis_client:
             try:
@@ -53,7 +104,7 @@ class PonderacionHistory:
                 self.redis_client.expire(key, 7 * 24 * 3600)
                 return True
             except Exception as e:
-                print(f"[PonderacionHistory] Redis add_record failed: {e}")
+                logger.warning("[PonderacionHistory] Redis add_record failed: %s", e)
         
         # Fallback: in-memory deque
         if key not in self.local_history:
@@ -78,13 +129,13 @@ class PonderacionHistory:
             try:
                 # Redis LRANGE gets records (newest last, so reverse offset)
                 records_json = self.redis_client.lrange(key, -limit, -1)
-                return [_json.loads(r) for r in records_json]
+                return [self._normalize_record(_json.loads(r)) for r in records_json]
             except Exception as e:
-                print(f"[PonderacionHistory] Redis get_history failed: {e}")
+                logger.warning("[PonderacionHistory] Redis get_history failed: %s", e)
         
         # Fallback: in-memory
         if key in self.local_history:
-            return list(self.local_history[key])[-limit:]
+            return [self._normalize_record(r) for r in list(self.local_history[key])[-limit:]]
         
         return []
     
@@ -123,13 +174,8 @@ class PonderacionHistory:
         scores = []
         for record in history:
             # Try multiple field names for compatibility
-            score = (
-                record.get("ponderacion") or 
-                record.get("Ponderacion") or 
-                record.get("ponderacion_value") or 
-                0.0
-            )
-            if score:
+            score = record.get("canonical_score")
+            if score is not None:
                 scores.append(float(score))
         
         if len(scores) < 2:
