@@ -167,7 +167,7 @@ def _warmup_caches_principales():
         # Thread-safe counters
         warmed_count = [0]  # Use list to allow mutation in nested function
         failed_count = [0]
-        consecutive_failures = [0]
+        first_failure = [None]
         
         def _warmup_single_combo(symbol_tf_tuple):
             """Warmup a single (symbol, timeframe) combination."""
@@ -179,11 +179,11 @@ def _warmup_caches_principales():
                     # Calcular indicadores (popula cache de indicadores)
                     _ = calcular_indicadores(df, tf, symbol=symbol)
                     warmed_count[0] += 1
-                    consecutive_failures[0] = 0  # Reset on success
                     return True
                 else:
                     failed_count[0] += 1
-                    consecutive_failures[0] += 1
+                    if first_failure[0] is None:
+                        first_failure[0] = f"Empty history for {symbol}/{tf}"
                     if warmup_verbose:
                         logger.warning(
                             "[Warmup] Empty history for %s/%s (check FMP/network/cache)",
@@ -192,7 +192,8 @@ def _warmup_caches_principales():
                         )
                     return False
             except Exception as e:
-                consecutive_failures[0] += 1
+                if first_failure[0] is None:
+                    first_failure[0] = f"{symbol}/{tf}: {e}"
                 if warmup_verbose:
                     logger.warning(f"[Warmup] Failed to warm {symbol}/{tf}: {e}")
                 else:
@@ -204,22 +205,11 @@ def _warmup_caches_principales():
         with ThreadPoolExecutor(max_workers=warmup_concurrency) as executor:
             futures = [executor.submit(_warmup_single_combo, task) for task in tasks]
             
-            # Monitor progress and fast-fail on consecutive errors
-            max_consecutive_failures = 3
             for i, future in enumerate(futures):
                 try:
                     future.result(timeout=30)  # 30s per task timeout
                 except Exception as e:
                     logger.debug(f"[Warmup] Task {i+1}/{total_combos} failed: {e}")
-                
-                # Fast-fail if too many consecutive failures
-                if consecutive_failures[0] >= max_consecutive_failures:
-                    logger.info(
-                        f"[Warmup] {max_consecutive_failures} consecutive failures. "
-                        "Stopping warmup (likely FMP/network issue). System continues normally."
-                    )
-                    executor.shutdown(wait=False)
-                    break
         
         elapsed = (time.time() - t0) * 1000
         logger.info(
@@ -230,11 +220,17 @@ def _warmup_caches_principales():
         
         # Only warn if we got zero results (actual problem)
         if warmed_count[0] == 0 and failed_count[0] > 0:
+            key_state = "present" if fmp_api_key else "missing"
+            sample_failure = first_failure[0] or "n/a"
             logger.warning(
                 "[Warmup] ⚠️ No caches were warmed successfully. This may indicate: "
                 "1) FMP API issues or rate limits, 2) Network connectivity problems, "
-                "3) Invalid API key. The system will fall back to on-demand loading. "
-                "For diagnostics, set WARMUP_VERBOSE=1."
+                "3) Symbol/timeframe not available in provider. "
+                "The system will fall back to on-demand loading. "
+                "For diagnostics, set WARMUP_VERBOSE=1. "
+                "(FMP_API_KEY=%s, sample_failure=%s)",
+                key_state,
+                sample_failure,
             )
     except Exception as e:
         logger.info(f"[Warmup] Cache warmup skipped (non-critical): {e}")
