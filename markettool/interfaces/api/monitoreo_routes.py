@@ -124,6 +124,82 @@ def register_monitoreo_routes(app, *, services) -> None:
                 "status": "unknown",
             }
 
+    def _hist_df_to_series_ms(hist_df) -> list[dict]:
+        if hist_df is None or getattr(hist_df, "empty", True):
+            return []
+
+        hist_df_copy = hist_df.copy()
+        if hasattr(hist_df_copy.index, "timestamp"):
+            timestamps_ms = (hist_df_copy.index.astype(int) // 1e6).astype(int)
+        else:
+            timestamps_ms = (hist_df_copy.index.astype(int) // 1000).astype(int)
+
+        return [
+            {
+                "t": int(t_ms),
+                "o": float(hist_df_copy.iloc[i].get("open", 0)),
+                "h": float(hist_df_copy.iloc[i].get("high", 0)),
+                "l": float(hist_df_copy.iloc[i].get("low", 0)),
+                "c": float(hist_df_copy.iloc[i].get("close", 0)),
+                "v": float(hist_df_copy.iloc[i].get("volume", 0)) if "volume" in hist_df_copy.columns else None,
+            }
+            for i, t_ms in enumerate(timestamps_ms)
+        ]
+
+    async def _refresh_1min_series_from_fmp(
+        symbol: str,
+        timeframe: str,
+        st: dict,
+        *,
+        limit: int = 240,
+        from_ts: int | None = None,
+        to_ts: int | None = None,
+    ) -> bool:
+        tf_value = norm_tf(timeframe)
+        if tf_value != "1min" or not symbol:
+            return False
+
+        try:
+            tf_value_ms = tf_ms(tf_value)
+            if not tf_value_ms:
+                return False
+
+            limit_i = _parse_int_field(limit, 240, min_value=1, max_value=5000)
+            closed_end = current_closed_bucket_start(tf_value) - tf_value_ms
+
+            from_eff = from_ts if from_ts is not None else (closed_end - (limit_i - 1) * tf_value_ms)
+            to_eff = to_ts if to_ts is not None else closed_end
+
+            to_eff = min(to_eff, closed_end)
+            if from_eff > to_eff:
+                from_eff, to_eff = to_eff, from_eff
+
+            fetch_to = min(to_eff + tf_value_ms, closed_end + tf_value_ms)
+            hist_df = await asyncio.to_thread(
+                fetch_historical_range,
+                symbol,
+                tf_value,
+                from_eff,
+                fetch_to,
+            )
+            hist_series = snap_and_dedupe_to_minutes(_hist_df_to_series_ms(hist_df), tf_value)
+            if not hist_series:
+                return False
+
+            with mon_cache_lock:
+                st["series"] = hist_series
+                st["source"] = "fmp-1min"
+
+            logging.info(
+                "1MIN FMP REFRESH %s: loaded %d candles directly from FMP",
+                symbol,
+                len(hist_series),
+            )
+            return True
+        except Exception as exc:
+            logging.warning("1MIN FMP REFRESH %s failed: %s", symbol, exc)
+            return False
+
     @app.route("/monitoreo/eventos", methods=["POST"])
     async def monitoreo_eventos():
         """
@@ -252,6 +328,10 @@ def register_monitoreo_routes(app, *, services) -> None:
                     "INC %s %s: maybe_refresh_from_gcs fallo", symbol, timeframe
                 )
 
+            if norm_tf(timeframe) == "1min":
+                warm_limit = 600 if last_ts is None else 240
+                await _refresh_1min_series_from_fmp(symbol, timeframe, st, limit=warm_limit)
+
             # NOTE: ensure_stream_initialized removed - no longer maintains GCS stream
             # All real-time data flows through Firestore
 
@@ -278,27 +358,7 @@ def register_monitoreo_routes(app, *, services) -> None:
                     )
                     
                     if hist_df is not None and not hist_df.empty:
-                        # ✅ Vectorized conversion (no iterrows blocking)
-                        hist_df_copy = hist_df.copy()
-                        
-                        # Convert timestamps efficiently
-                        if hasattr(hist_df_copy.index, 'timestamp'):
-                            timestamps_ms = (hist_df_copy.index.astype(int) // 1e6).astype(int)
-                        else:
-                            timestamps_ms = (hist_df_copy.index.astype(int) // 1000).astype(int)
-                        
-                        # Vectorized dict creation
-                        hist_series = [
-                            {
-                                "t": int(t_ms),
-                                "o": float(hist_df_copy.iloc[i].get("open", 0)),
-                                "h": float(hist_df_copy.iloc[i].get("high", 0)),
-                                "l": float(hist_df_copy.iloc[i].get("low", 0)),
-                                "c": float(hist_df_copy.iloc[i].get("close", 0)),
-                                "v": float(hist_df_copy.iloc[i].get("volume", 0)) if "volume" in hist_df_copy.columns else None,
-                            }
-                            for i, t_ms in enumerate(timestamps_ms)
-                        ]
+                        hist_series = _hist_df_to_series_ms(hist_df)
                         
                         if hist_series:
                             st["series"] = hist_series
@@ -593,6 +653,9 @@ def register_monitoreo_routes(app, *, services) -> None:
                 max_minutes_per_call = 10_000
 
             st = await asyncio.to_thread(load_cache, exec_id, symbol, timeframe)
+            if norm_tf(timeframe) == "1min":
+                resume_limit = _parse_int_field(limit, 600, min_value=1, max_value=5000)
+                await _refresh_1min_series_from_fmp(symbol, timeframe, st, limit=resume_limit)
             series_ms = series_to_ms(st.get("series", []))
 
             gapfill_meta = {
@@ -812,6 +875,15 @@ def register_monitoreo_routes(app, *, services) -> None:
             limit = _parse_int_field(limit, 600, min_value=1, max_value=5000)
 
             st = await asyncio.to_thread(load_cache, exec_id, symbol, timeframe)
+            if norm_tf(timeframe) == "1min":
+                await _refresh_1min_series_from_fmp(
+                    symbol,
+                    timeframe,
+                    st,
+                    limit=limit,
+                    from_ts=_parse_int_field(from_ts, None) if from_ts is not None else None,
+                    to_ts=_parse_int_field(to_ts, None) if to_ts is not None else None,
+                )
 
             age_map = {
                 "1min": 300,
