@@ -65,13 +65,11 @@ def register_monitoreo_routes(app, *, services) -> None:
                     "error_code": "transacciones_insuficientes",
                     "message": message,
                 }
-                            skip_redundant_1min_fetch = (
+            ),
             402,
         )
 
-                            )
-
-                            if skip_redundant_1min_fetch:
+    async def _mark_tf_stopped_access_denied(
         exec_id: str,
         symbol: str,
         timeframe: str,
@@ -80,100 +78,53 @@ def register_monitoreo_routes(app, *, services) -> None:
     ) -> None:
         try:
             tf_value = norm_tf(timeframe)
-                            else:
-                                tf_ms_value = tf_ms(timeframe)
-                                if tf_ms_value:
-                                    try:
-                                        limit_i = int(limit) if limit is not None else 600
-                                    except Exception:
-                                        limit_i = 600
-                                    if limit_i <= 0:
-                                        limit_i = 600
+            now_ms = int(time.time() * 1000)
+            await asyncio.to_thread(
+                fs_touch_monitoreo,
+                exec_id,
+                symbol,
+                {
+                    "user_id": user_id,
+                    "last_reason": reason,
+                    "tf_states": {
+                        tf_value: {
+                            "enabled": False,
+                            "estado": "access_denied",
+                            "reason": reason,
+                            "last_heartbeat_ms": now_ms,
+                            "last_ts": now_ms,
+                        }
+                    },
+                },
+            )
+        except Exception:
+            logger.exception(
+                "No se pudo marcar monitoreo como access_denied para %s/%s/%s",
+                exec_id,
+                symbol,
+                timeframe,
+            )
 
-                                    closed_end = current_closed_bucket_start(timeframe) - tf_ms_value
-
-                                    from_in = _parse_int_field(from_ts, None) if from_ts is not None else None
-                                    to_in = _parse_int_field(to_ts, None) if to_ts is not None else None
-
-                                    if from_in is not None and to_in is not None:
-                                        lo = min(from_in, to_in)
-                                        hi = max(from_in, to_in)
-                                        if (hi - lo) > max_history_window_ms:
-                                            return (
-                                                jsonify(
-                                                    {
-                                                        "status": "error",
-                                                        "message": "Rango temporal excede el maximo de 365 dias",
-                                                        "max_window_ms": max_history_window_ms,
-                                                    }
-                                                ),
-                                                400,
-                                            )
-
-                                    from_eff = (
-                                        from_in
-                                        if from_in is not None
-                                        else (closed_end - (limit_i - 1) * tf_ms_value)
-                                    )
-                                    to_eff = to_in if to_in is not None else closed_end
-
-                                    to_eff = min(to_eff, closed_end)
-                                    if from_eff > to_eff:
-                                        from_eff, to_eff = to_eff, from_eff
-
-                                    fetch_to = min(to_eff + tf_ms_value, closed_end + tf_ms_value)
-
-                                    rng = await asyncio.to_thread(
-                                        fetch_historical_range, symbol, timeframe, from_eff, fetch_to
-                                    )
-                                    gapfill_meta["fetched"] = len(rng or [])
-
-                                    if rng:
-                                        added = merge_bars_series(series_ms, rng, timeframe)
-                                        if added:
-                                            gapfill_meta["added"] += int(added)
-                                            series_ms[:] = snap_and_dedupe_to_minutes(
-                                                series_ms, timeframe
-                                            )
-                                            with mon_cache_lock:
-                                                st["series"] = series_ms
-                                                if persist:
-                                                    st["dirty"] = True
-
-                                    if fill_gaps:
-                                        added2 = await asyncio.to_thread(
-                                            backfill_internal_gaps,
-                                            series_ms,
-                                            symbol,
-                                            timeframe,
-                                            exec_id,
-                                            max_minutes_per_call,
-                                            True,
-                                        )
-                                        if added2:
-                                            gapfill_meta["added"] += int(added2)
-                                            series_ms[:] = snap_and_dedupe_to_minutes(
-                                                series_ms, timeframe
-                                            )
-                                            with mon_cache_lock:
-                                                st["series"] = series_ms
-                                                if persist:
-                                                    st["dirty"] = True
+    def _hist_df_to_series_ms(hist_df) -> list[dict]:
+        if hist_df is None or getattr(hist_df, "empty", False):
+            return []
 
         hist_df_copy = hist_df.copy()
-        if hasattr(hist_df_copy.index, "timestamp"):
-            timestamps_ms = (hist_df_copy.index.astype(int) // 1e6).astype(int)
-        else:
-            timestamps_ms = (hist_df_copy.index.astype(int) // 1000).astype(int)
+        try:
+            timestamps_ms = (hist_df_copy.index.astype("int64") // 1_000_000).astype(int)
+        except Exception:
+            timestamps_ms = [int(getattr(idx, "timestamp")() * 1000) for idx in hist_df_copy.index]
 
         return [
             {
                 "t": int(t_ms),
-                "o": float(hist_df_copy.iloc[i].get("open", 0)),
-                "h": float(hist_df_copy.iloc[i].get("high", 0)),
-                "l": float(hist_df_copy.iloc[i].get("low", 0)),
-                "c": float(hist_df_copy.iloc[i].get("close", 0)),
-                "v": float(hist_df_copy.iloc[i].get("volume", 0)) if "volume" in hist_df_copy.columns else None,
+                "o": float(hist_df_copy.iloc[i].get("open", 0) or 0),
+                "h": float(hist_df_copy.iloc[i].get("high", 0) or 0),
+                "l": float(hist_df_copy.iloc[i].get("low", 0) or 0),
+                "c": float(hist_df_copy.iloc[i].get("close", 0) or 0),
+                "v": float(hist_df_copy.iloc[i].get("volume", 0) or 0)
+                if "volume" in getattr(hist_df_copy, "columns", [])
+                else None,
             }
             for i, t_ms in enumerate(timestamps_ms)
         ]
@@ -200,6 +151,110 @@ def register_monitoreo_routes(app, *, services) -> None:
         except Exception:
             logging.exception("Error normalizando payload historico (%s)", tf_value)
             return []
+
+    def _build_timeframe_data_quality(series_ms, timeframe: str) -> dict:
+        """Build a lightweight data-quality summary for a timeframe.
+
+        This helper is intentionally defensive because input can be partial or malformed
+        while backfill/incremental updates are in progress.
+        """
+        tf_value = norm_tf(timeframe)
+        tf_value_ms = tf_ms(tf_value)
+        rows = list(series_ms or [])
+
+        if not rows:
+            return {
+                "timeframe": tf_value,
+                "candles": 0,
+                "is_empty": True,
+                "first_ts": None,
+                "last_ts": None,
+                "expected_candles": 0,
+                "coverage_ratio": 0.0,
+                "coverage_pct": 0.0,
+                "complete_ohlc_count": 0,
+                "ohlc_completeness_ratio": 0.0,
+                "ohlc_completeness_pct": 0.0,
+                "staleness_ms": None,
+                "staleness_bars": None,
+            }
+
+        ts_values = []
+        complete_ohlc_count = 0
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            try:
+                t_raw = row.get("t")
+                t_val = int(t_raw) if t_raw is not None else None
+            except Exception:
+                t_val = None
+
+            if t_val is not None:
+                ts_values.append(t_val)
+
+            has_all_ohlc = all(row.get(k) is not None for k in ("o", "h", "l", "c"))
+            if has_all_ohlc:
+                complete_ohlc_count += 1
+
+        if not ts_values:
+            return {
+                "timeframe": tf_value,
+                "candles": len(rows),
+                "is_empty": len(rows) == 0,
+                "first_ts": None,
+                "last_ts": None,
+                "expected_candles": 0,
+                "coverage_ratio": 0.0,
+                "coverage_pct": 0.0,
+                "complete_ohlc_count": complete_ohlc_count,
+                "ohlc_completeness_ratio": round(complete_ohlc_count / max(1, len(rows)), 4),
+                "ohlc_completeness_pct": round((complete_ohlc_count / max(1, len(rows))) * 100.0, 2),
+                "staleness_ms": None,
+                "staleness_bars": None,
+            }
+
+        first_ts = min(ts_values)
+        last_ts = max(ts_values)
+        span_ms = max(0, last_ts - first_ts)
+
+        expected_candles = len(ts_values)
+        coverage_ratio = 1.0
+        if tf_value_ms and tf_value_ms > 0:
+            expected_from_span = int(span_ms // tf_value_ms) + 1
+            expected_candles = max(1, expected_from_span)
+            coverage_ratio = min(1.0, len(ts_values) / max(1, expected_candles))
+
+            try:
+                closed_bucket = current_closed_bucket_start(tf_value)
+                staleness_ms = max(0, int(closed_bucket) - int(last_ts))
+                staleness_bars = int(staleness_ms // tf_value_ms)
+            except Exception:
+                staleness_ms = None
+                staleness_bars = None
+        else:
+            staleness_ms = None
+            staleness_bars = None
+
+        ohlc_ratio = complete_ohlc_count / max(1, len(rows))
+
+        return {
+            "timeframe": tf_value,
+            "candles": len(rows),
+            "is_empty": False,
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "expected_candles": expected_candles,
+            "coverage_ratio": round(coverage_ratio, 4),
+            "coverage_pct": round(coverage_ratio * 100.0, 2),
+            "complete_ohlc_count": complete_ohlc_count,
+            "ohlc_completeness_ratio": round(ohlc_ratio, 4),
+            "ohlc_completeness_pct": round(ohlc_ratio * 100.0, 2),
+            "staleness_ms": staleness_ms,
+            "staleness_bars": staleness_bars,
+        }
 
     async def _refresh_1min_series_from_fmp(
         symbol: str,

@@ -15816,6 +15816,12 @@ async def _populate_entries_agg_from_results(df_oportunidades, exec_id: str):
             return out
 
         def _extract_source_from_row(row: pd.Series) -> str | None:
+            explicit_source_keys = {
+                'source', 'Source', 'fuente', 'Fuente', 'estrategia', 'Estrategia',
+                'strategy', 'Strategy', 'tipo_entrada', 'Tipo de Entrada',
+                'Tipo de Senal', 'Tipo de Señal', 'Tipo', 'Categoria', 'Categoría',
+                'basado_en', 'Basado En', 'Basado en', 'signal_type', 'Signal Type', 'signals', 'Signals'
+            }
             for key in (
                 'source',
                 'Source',
@@ -15832,6 +15838,11 @@ async def _populate_entries_agg_from_results(df_oportunidades, exec_id: str):
                 'Tipo',
                 'Categoria',
                 'Categoría',
+                'basado_en',
+                'Basado En',
+                'Basado en',
+                'signal_type',
+                'Signal Type',
             ):
                 if key in row and row.get(key):
                     normalized = _normalize_source(row.get(key))
@@ -15860,8 +15871,6 @@ async def _populate_entries_agg_from_results(df_oportunidades, exec_id: str):
                     return 'sr'
                 if 'tech' in col_norm or 'tecnic' in col_norm:
                     return 'tech'
-                if 'event' in col_norm:
-                    return 'eventos'
                 if 'arima' in col_norm:
                     return 'arima'
                 if 'media movil' in col_norm or 'moving average' in col_norm:
@@ -15870,9 +15879,12 @@ async def _populate_entries_agg_from_results(df_oportunidades, exec_id: str):
                     return 'mt'
 
                 if isinstance(value, str):
-                    normalized = _normalize_source(value)
-                    if normalized:
-                        return normalized
+                    # Solo inferir por valor textual si la columna sugiere explícitamente
+                    # que contiene metadata de estrategia/fuente.
+                    if col in explicit_source_keys:
+                        normalized = _normalize_source(value)
+                        if normalized:
+                            return normalized
             return None
 
         for (symbol, timeframe), group_df in grouped:
@@ -15921,6 +15933,13 @@ async def _populate_entries_agg_from_results(df_oportunidades, exec_id: str):
                         source = 'confluence'
                     else:
                         source = strategies[0]
+
+                # Si se detectó "eventos" pero hay estrategias técnicas concretas,
+                # priorizar estrategia para evitar etiquetado genérico en AllEntries.
+                if source in {'eventos', 'event'} and strategies:
+                    non_event = [s for s in strategies if s not in {'eventos', 'event'}]
+                    if non_event:
+                        source = 'confluence' if len(non_event) >= 3 and float(row.get('Ponderacion', 0) or 0) >= 85 else non_event[0]
 
                 entry_data = {
                     'side': side,
