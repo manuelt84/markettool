@@ -65,68 +65,100 @@ def register_monitoreo_routes(app, *, services) -> None:
                     "error_code": "transacciones_insuficientes",
                     "message": message,
                 }
-            ),
+                            skip_redundant_1min_fetch = (
             402,
         )
 
-    def _build_timeframe_data_quality(candles: list[dict], timeframe: str) -> dict:
+                            )
+
+                            if skip_redundant_1min_fetch:
+        exec_id: str,
+        symbol: str,
+        timeframe: str,
+        user_id: str,
+        reason: str,
+    ) -> None:
         try:
-            if not candles:
-                return {
-                    "last_candle_ts": None,
-                    "lag_seconds": None,
-                    "freshness_requirement_seconds": get_freshness_requirement_for_timeframe(timeframe),
-                    "recent_gap_count": 0,
-                    "largest_gap_bars": 0,
-                    "status": "empty",
-                }
-
             tf_value = norm_tf(timeframe)
-            freshness_req = get_freshness_requirement_for_timeframe(tf_value)
-            last_ts = int(candles[-1].get("t", 0))
-            now_ms = int(time.time() * 1000)
-            lag_seconds = max(0, int((now_ms - last_ts) / 1000)) if last_ts else None
-            tf_value_ms = tf_ms(tf_value)
+                            else:
+                                tf_ms_value = tf_ms(timeframe)
+                                if tf_ms_value:
+                                    try:
+                                        limit_i = int(limit) if limit is not None else 600
+                                    except Exception:
+                                        limit_i = 600
+                                    if limit_i <= 0:
+                                        limit_i = 600
 
-            recent = candles[-240:] if len(candles) > 240 else candles
-            gap_counts = []
-            for prev, curr in zip(recent, recent[1:]):
-                try:
-                    delta = int(curr["t"]) - int(prev["t"])
-                    if delta > tf_value_ms:
-                        gap_counts.append(max(0, (delta // tf_value_ms) - 1))
-                except Exception:
-                    continue
+                                    closed_end = current_closed_bucket_start(timeframe) - tf_ms_value
 
-            recent_gap_count = len(gap_counts)
-            largest_gap_bars = max(gap_counts) if gap_counts else 0
-            status = "fresh"
-            if lag_seconds is not None and lag_seconds > freshness_req:
-                status = "stale"
-            elif recent_gap_count > 0:
-                status = "gappy"
+                                    from_in = _parse_int_field(from_ts, None) if from_ts is not None else None
+                                    to_in = _parse_int_field(to_ts, None) if to_ts is not None else None
 
-            return {
-                "last_candle_ts": last_ts,
-                "lag_seconds": lag_seconds,
-                "freshness_requirement_seconds": freshness_req,
-                "recent_gap_count": recent_gap_count,
-                "largest_gap_bars": largest_gap_bars,
-                "status": status,
-            }
-        except Exception:
-            return {
-                "last_candle_ts": None,
-                "lag_seconds": None,
-                "freshness_requirement_seconds": get_freshness_requirement_for_timeframe(timeframe),
-                "recent_gap_count": 0,
-                "largest_gap_bars": 0,
-                "status": "unknown",
-            }
+                                    if from_in is not None and to_in is not None:
+                                        lo = min(from_in, to_in)
+                                        hi = max(from_in, to_in)
+                                        if (hi - lo) > max_history_window_ms:
+                                            return (
+                                                jsonify(
+                                                    {
+                                                        "status": "error",
+                                                        "message": "Rango temporal excede el maximo de 365 dias",
+                                                        "max_window_ms": max_history_window_ms,
+                                                    }
+                                                ),
+                                                400,
+                                            )
 
-    def _hist_df_to_series_ms(hist_df) -> list[dict]:
-        if hist_df is None or getattr(hist_df, "empty", True):
-            return []
+                                    from_eff = (
+                                        from_in
+                                        if from_in is not None
+                                        else (closed_end - (limit_i - 1) * tf_ms_value)
+                                    )
+                                    to_eff = to_in if to_in is not None else closed_end
+
+                                    to_eff = min(to_eff, closed_end)
+                                    if from_eff > to_eff:
+                                        from_eff, to_eff = to_eff, from_eff
+
+                                    fetch_to = min(to_eff + tf_ms_value, closed_end + tf_ms_value)
+
+                                    rng = await asyncio.to_thread(
+                                        fetch_historical_range, symbol, timeframe, from_eff, fetch_to
+                                    )
+                                    gapfill_meta["fetched"] = len(rng or [])
+
+                                    if rng:
+                                        added = merge_bars_series(series_ms, rng, timeframe)
+                                        if added:
+                                            gapfill_meta["added"] += int(added)
+                                            series_ms[:] = snap_and_dedupe_to_minutes(
+                                                series_ms, timeframe
+                                            )
+                                            with mon_cache_lock:
+                                                st["series"] = series_ms
+                                                if persist:
+                                                    st["dirty"] = True
+
+                                    if fill_gaps:
+                                        added2 = await asyncio.to_thread(
+                                            backfill_internal_gaps,
+                                            series_ms,
+                                            symbol,
+                                            timeframe,
+                                            exec_id,
+                                            max_minutes_per_call,
+                                            True,
+                                        )
+                                        if added2:
+                                            gapfill_meta["added"] += int(added2)
+                                            series_ms[:] = snap_and_dedupe_to_minutes(
+                                                series_ms, timeframe
+                                            )
+                                            with mon_cache_lock:
+                                                st["series"] = series_ms
+                                                if persist:
+                                                    st["dirty"] = True
 
         hist_df_copy = hist_df.copy()
         if hasattr(hist_df_copy.index, "timestamp"):
@@ -145,6 +177,29 @@ def register_monitoreo_routes(app, *, services) -> None:
             }
             for i, t_ms in enumerate(timestamps_ms)
         ]
+
+    def _history_payload_to_series_ms(payload, timeframe: str) -> list[dict]:
+        """Normalize historical payload into ms OHLCV series.
+
+        Supports both payload styles currently used by legacy services:
+        - pandas.DataFrame (index datetime)
+        - list[dict] with candles
+        """
+        tf_value = norm_tf(timeframe)
+        if payload is None:
+            return []
+
+        try:
+            if isinstance(payload, (list, tuple)):
+                return snap_and_dedupe_to_minutes(series_to_ms(list(payload)), tf_value)
+
+            if hasattr(payload, "empty") and hasattr(payload, "copy"):
+                return snap_and_dedupe_to_minutes(_hist_df_to_series_ms(payload), tf_value)
+
+            return snap_and_dedupe_to_minutes(series_to_ms(payload), tf_value)
+        except Exception:
+            logging.exception("Error normalizando payload historico (%s)", tf_value)
+            return []
 
     async def _refresh_1min_series_from_fmp(
         symbol: str,
@@ -175,14 +230,14 @@ def register_monitoreo_routes(app, *, services) -> None:
                 from_eff, to_eff = to_eff, from_eff
 
             fetch_to = min(to_eff + tf_value_ms, closed_end + tf_value_ms)
-            hist_df = await asyncio.to_thread(
+            hist_payload = await asyncio.to_thread(
                 fetch_historical_range,
                 symbol,
                 tf_value,
                 from_eff,
                 fetch_to,
             )
-            hist_series = snap_and_dedupe_to_minutes(_hist_df_to_series_ms(hist_df), tf_value)
+            hist_series = _history_payload_to_series_ms(hist_payload, tf_value)
             if not hist_series:
                 return False
 
@@ -246,6 +301,13 @@ def register_monitoreo_routes(app, *, services) -> None:
 
             ok, msg = await charge_monitoreo_per_call(user_id, origen="app")
             if not ok:
+                await _mark_tf_stopped_access_denied(
+                    exec_id=exec_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    user_id=user_id,
+                    reason=msg,
+                )
                 return _quota_error_response(msg)
 
             logging.info(
@@ -344,34 +406,46 @@ def register_monitoreo_routes(app, *, services) -> None:
                     timeframe,
                 )
                 try:
-                    # Fetch last ~300 candles (2-3 days for 1m, weeks for 4h)
-                    # This gives the frontend enough context for technical analysis
-                    hist_from = datetime.utcnow() - timedelta(days=14)  # 14 days back
-                    hist_to = datetime.utcnow()
-                    
-                    hist_df = await asyncio.to_thread(
+                    # Cold-start must use the same ms-range contract as incremental/history routes.
+                    tf_value = norm_tf(timeframe)
+                    tf_value_ms = tf_ms(tf_value)
+                    if not tf_value_ms:
+                        raise ValueError(f"tf_ms invalido para {timeframe}")
+
+                    bars_target = {
+                        "1min": 1500,
+                        "5min": 900,
+                        "15min": 750,
+                        "30min": 600,
+                        "1hour": 600,
+                        "4hour": 480,
+                    }.get(tf_value, 600)
+
+                    closed_end = current_closed_bucket_start(tf_value) - tf_value_ms
+                    hist_from_ms = closed_end - (bars_target - 1) * tf_value_ms
+                    hist_to_ms = min(closed_end + tf_value_ms, int(time.time() * 1000))
+
+                    hist_payload = await asyncio.to_thread(
                         fetch_historical_range,
                         symbol,
-                        timeframe,
-                        hist_from,
-                        hist_to,
+                        tf_value,
+                        hist_from_ms,
+                        hist_to_ms,
                     )
-                    
-                    if hist_df is not None and not hist_df.empty:
-                        hist_series = _hist_df_to_series_ms(hist_df)
-                        
-                        if hist_series:
-                            st["series"] = hist_series
-                            cache_series = hist_series
-                            logging.info(
-                                "INC %s %s: Cold-start fetched %d historical candles",
-                                symbol,
-                                timeframe,
-                                len(hist_series),
-                            )
+
+                    hist_series = _history_payload_to_series_ms(hist_payload, tf_value)
+                    if hist_series:
+                        st["series"] = hist_series
+                        cache_series = hist_series
+                        logging.info(
+                            "INC %s %s: Cold-start fetched %d historical candles",
+                            symbol,
+                            timeframe,
+                            len(hist_series),
+                        )
                     else:
                         logging.warning(
-                            "INC %s %s: Cold-start fetch returned empty DataFrame",
+                            "INC %s %s: Cold-start fetch returned empty payload",
                             symbol,
                             timeframe,
                         )
@@ -870,13 +944,21 @@ def register_monitoreo_routes(app, *, services) -> None:
 
             ok, msg = await charge_monitoreo_per_call(user_id, origen="app")
             if not ok:
+                await _mark_tf_stopped_access_denied(
+                    exec_id=exec_id,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    user_id=user_id,
+                    reason=msg,
+                )
                 return _quota_error_response(msg)
 
             limit = _parse_int_field(limit, 600, min_value=1, max_value=5000)
 
             st = await asyncio.to_thread(load_cache, exec_id, symbol, timeframe)
+            refreshed_1min_direct = False
             if norm_tf(timeframe) == "1min":
-                await _refresh_1min_series_from_fmp(
+                refreshed_1min_direct = await _refresh_1min_series_from_fmp(
                     symbol,
                     timeframe,
                     st,
@@ -911,85 +993,102 @@ def register_monitoreo_routes(app, *, services) -> None:
             }
             if force_api or fill_gaps:
                 try:
-                    tf_ms_value = tf_ms(timeframe)
-                    if tf_ms_value:
-                        try:
-                            limit_i = int(limit) if limit is not None else 600
-                        except Exception:
-                            limit_i = 600
-                        if limit_i <= 0:
-                            limit_i = 600
+                    # 1min path already did a direct FMP refresh above.
+                    # If fill_gaps is not requested, avoid a second identical fetch in the same request.
+                    skip_redundant_1min_fetch = (
+                        norm_tf(timeframe) == "1min"
+                        and refreshed_1min_direct
+                        and not fill_gaps
+                    )
 
-                        closed_end = current_closed_bucket_start(timeframe) - tf_ms_value
-
-                        from_in = _parse_int_field(from_ts, None) if from_ts is not None else None
-                        to_in = _parse_int_field(to_ts, None) if to_ts is not None else None
-
-                        if from_in is not None and to_in is not None:
-                            lo = min(from_in, to_in)
-                            hi = max(from_in, to_in)
-                            if (hi - lo) > max_history_window_ms:
-                                return (
-                                    jsonify(
-                                        {
-                                            "status": "error",
-                                            "message": "Rango temporal excede el maximo de 365 dias",
-                                            "max_window_ms": max_history_window_ms,
-                                        }
-                                    ),
-                                    400,
-                                )
-
-                        from_eff = (
-                            from_in
-                            if from_in is not None
-                            else (closed_end - (limit_i - 1) * tf_ms_value)
+                    if skip_redundant_1min_fetch:
+                        gapfill_meta["skipped_redundant_fetch"] = True
+                        logging.info(
+                            "HIST 1MIN SKIP REDUNDANT FETCH sym=%s tf=%s force_api=%s fill_gaps=%s",
+                            symbol,
+                            timeframe,
+                            force_api,
+                            fill_gaps,
                         )
-                        to_eff = to_in if to_in is not None else closed_end
+                    else:
+                        tf_ms_value = tf_ms(timeframe)
+                        if tf_ms_value:
+                            try:
+                                limit_i = int(limit) if limit is not None else 600
+                            except Exception:
+                                limit_i = 600
+                            if limit_i <= 0:
+                                limit_i = 600
 
-                        to_eff = min(to_eff, closed_end)
-                        if from_eff > to_eff:
-                            from_eff, to_eff = to_eff, from_eff
+                            closed_end = current_closed_bucket_start(timeframe) - tf_ms_value
 
-                        fetch_to = min(to_eff + tf_ms_value, closed_end + tf_ms_value)
+                            from_in = _parse_int_field(from_ts, None) if from_ts is not None else None
+                            to_in = _parse_int_field(to_ts, None) if to_ts is not None else None
 
-                        rng = await asyncio.to_thread(
-                            fetch_historical_range, symbol, timeframe, from_eff, fetch_to
-                        )
-                        gapfill_meta["fetched"] = len(rng or [])
+                            if from_in is not None and to_in is not None:
+                                lo = min(from_in, to_in)
+                                hi = max(from_in, to_in)
+                                if (hi - lo) > max_history_window_ms:
+                                    return (
+                                        jsonify(
+                                            {
+                                                "status": "error",
+                                                "message": "Rango temporal excede el maximo de 365 dias",
+                                                "max_window_ms": max_history_window_ms,
+                                            }
+                                        ),
+                                        400,
+                                    )
 
-                        if rng:
-                            added = merge_bars_series(series_ms, rng, timeframe)
-                            if added:
-                                gapfill_meta["added"] += int(added)
-                                series_ms[:] = snap_and_dedupe_to_minutes(
-                                    series_ms, timeframe
-                                )
-                                with mon_cache_lock:
-                                    st["series"] = series_ms
-                                    if persist:
-                                        st["dirty"] = True
-
-                        if fill_gaps:
-                            added2 = await asyncio.to_thread(
-                                backfill_internal_gaps,
-                                series_ms,
-                                symbol,
-                                timeframe,
-                                exec_id,
-                                max_minutes_per_call,
-                                True,
+                            from_eff = (
+                                from_in
+                                if from_in is not None
+                                else (closed_end - (limit_i - 1) * tf_ms_value)
                             )
-                            if added2:
-                                gapfill_meta["added"] += int(added2)
-                                series_ms[:] = snap_and_dedupe_to_minutes(
-                                    series_ms, timeframe
-                                )
-                                with mon_cache_lock:
-                                    st["series"] = series_ms
-                                    if persist:
-                                        st["dirty"] = True
+                            to_eff = to_in if to_in is not None else closed_end
 
+                            to_eff = min(to_eff, closed_end)
+                            if from_eff > to_eff:
+                                from_eff, to_eff = to_eff, from_eff
+
+                            fetch_to = min(to_eff + tf_ms_value, closed_end + tf_ms_value)
+
+                            rng = await asyncio.to_thread(
+                                fetch_historical_range, symbol, timeframe, from_eff, fetch_to
+                            )
+                            gapfill_meta["fetched"] = len(rng or [])
+
+                            if rng:
+                                added = merge_bars_series(series_ms, rng, timeframe)
+                                if added:
+                                    gapfill_meta["added"] += int(added)
+                                    series_ms[:] = snap_and_dedupe_to_minutes(
+                                        series_ms, timeframe
+                                    )
+                                    with mon_cache_lock:
+                                        st["series"] = series_ms
+                                        if persist:
+                                            st["dirty"] = True
+
+                            if fill_gaps:
+                                added2 = await asyncio.to_thread(
+                                    backfill_internal_gaps,
+                                    series_ms,
+                                    symbol,
+                                    timeframe,
+                                    exec_id,
+                                    max_minutes_per_call,
+                                    True,
+                                )
+                                if added2:
+                                    gapfill_meta["added"] += int(added2)
+                                    series_ms[:] = snap_and_dedupe_to_minutes(
+                                        series_ms, timeframe
+                                    )
+                                    with mon_cache_lock:
+                                        st["series"] = series_ms
+                                        if persist:
+                                            st["dirty"] = True
                 except Exception:
                     logging.exception("Gapfill/force_api fallo en /monitoreo/history")
 
@@ -1194,7 +1293,7 @@ def register_monitoreo_routes(app, *, services) -> None:
             sort_by = body.get("sort_by", "score")
             skip_expired = body.get("skip_expired", True)
             validate_freshness = body.get("validate_freshness", False)  # 🚀 OFF by default for performance
-            exec_id = body.get("exec_id")  # 🆕 Optional execution ID filter
+            exec_id = body.get("exec_id") or body.get("execution_id")  # 🆕 Optional execution ID filter
             
             # Ensure limits
             limit = min(int(limit), 500)  # Max 500 entries
@@ -1282,15 +1381,20 @@ def register_monitoreo_routes(app, *, services) -> None:
             symbol = body.get("symbol")
             timeframe = body.get("timeframe")
             side = body.get("side")
+            exec_id = body.get("exec_id") or body.get("execution_id")
             min_score = int(body.get("min_score", 0))
             max_score = int(body.get("max_score", 100))
             limit = min(int(body.get("limit", 100)), 500)
             sort_by = body.get("sort_by", "score")
+
+            if exec_id:
+                logger.info(f"[/api/entries/search] Filtering by execution_id: {exec_id}")
             
             entries = entries_agg.filter_entries(
                 symbol=symbol,
                 timeframe=timeframe,
                 side=side,
+                execution_id=exec_id,
                 min_score=min_score,
                 max_score=max_score,
                 limit=limit,
@@ -1305,6 +1409,7 @@ def register_monitoreo_routes(app, *, services) -> None:
                     "symbol": symbol,
                     "timeframe": timeframe,
                     "side": side,
+                    "execution_id": exec_id,
                     "min_score": min_score,
                     "max_score": max_score
                 },

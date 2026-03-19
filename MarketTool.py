@@ -604,6 +604,107 @@ TF_TTL_MINUTES = {
     "1w":  15120, # antes 10080 (>1 semana)
 }
 
+# Small caches to avoid repeated Firestore reads on hot paths.
+_SUBS_ACTIVE_CACHE: dict[str, tuple[float, bool]] = {}
+_SUBS_ACTIVE_CACHE_TTL_S = 30.0
+_EXEC_USER_CACHE: dict[str, tuple[float, str]] = {}
+_EXEC_USER_CACHE_TTL_S = 120.0
+
+
+def _get_exec_user_id(exec_id: str, monitor_doc: dict | None = None) -> str:
+    user_id = str((monitor_doc or {}).get("user_id") or "").strip()
+    if user_id:
+        return user_id
+
+    now_s = time.time()
+    cached = _EXEC_USER_CACHE.get(exec_id)
+    if cached and (now_s - cached[0]) < _EXEC_USER_CACHE_TTL_S:
+        return cached[1]
+
+    resolved = ""
+    try:
+        exec_snap = db.collection("ejecuciones").document(str(exec_id)).get()
+        if exec_snap.exists:
+            data = exec_snap.to_dict() or {}
+            resolved = str(
+                data.get("user_id")
+                or data.get("usuario_id")
+                or data.get("owner_id")
+                or ""
+            ).strip()
+    except Exception:
+        resolved = ""
+
+    _EXEC_USER_CACHE[exec_id] = (now_s, resolved)
+    return resolved
+
+
+def _is_subscription_active_sync(user_id: str) -> bool:
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False
+
+    now_s = time.time()
+    cached = _SUBS_ACTIVE_CACHE.get(uid)
+    if cached and (now_s - cached[0]) < _SUBS_ACTIVE_CACHE_TTL_S:
+        return cached[1]
+
+    active = False
+    try:
+        snap = _subscription_doc(uid).get()
+        if snap.exists:
+            data = snap.to_dict() or {}
+            fin = parse_iso_aware(data.get("fin") or "")
+            rest = int(data.get("transacciones_restantes", 0) or 0)
+            estado = str(data.get("estado") or "").strip().lower()
+            fin_ok = bool(fin and fin.timestamp() >= now_s)
+            active = fin_ok and rest > 0 and estado != "inactiva"
+    except Exception:
+        active = False
+
+    _SUBS_ACTIVE_CACHE[uid] = (now_s, active)
+    return active
+
+
+def _mark_tf_stopped_by_subscription(exec_id: str, symbol: str, tf_canonical: str) -> None:
+    try:
+        doc_id = f"{exec_id}__{(symbol or '').upper()}"
+        ref = db.collection("monitoreos").document(doc_id)
+        snap = ref.get()
+        cur = (snap.to_dict() if snap.exists else {}) or {}
+
+        tf_states = dict(cur.get("tf_states") or {})
+        tf_state = dict(tf_states.get(tf_canonical) or {})
+
+        already_stopped = (
+            tf_state.get("enabled") is False
+            and str(tf_state.get("estado") or "").lower() in {"stopped", "detenido", "inactivo"}
+        )
+        if already_stopped:
+            return
+
+        now_ms = int(time.time() * 1000)
+        tf_state.update(
+            {
+                "enabled": False,
+                "estado": "stopped",
+                "stop_reason": "subscription_inactive_or_expired",
+                "stopped_at_ms": now_ms,
+                "updated_at": now_ms,
+            }
+        )
+        tf_states[tf_canonical] = tf_state
+
+        ref.set(
+            {
+                "tf_states": tf_states,
+                "updated_at": now_ms,
+            },
+            merge=True,
+        )
+    except Exception:
+        pass
+
 
 def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
     """
@@ -628,6 +729,12 @@ def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
         return False
 
     doc = snap.to_dict() or {}
+
+    # Hard guard: if subscription is inactive/expired, stop this TF execution too.
+    user_id = _get_exec_user_id(exec_id, doc)
+    if user_id and not _is_subscription_active_sync(user_id):
+        _mark_tf_stopped_by_subscription(exec_id, symbol, tf_canonical)
+        return False
 
     # 1) estado global (apagado → todo False)
     estado_global = str(doc.get("estado") or doc.get("status") or "").lower()

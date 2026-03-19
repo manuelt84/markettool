@@ -20,12 +20,97 @@ class LegacyAnalisisUseCase:
     def __init__(self, services):
         self._services = services
 
+    @staticmethod
+    def _extract_requested_assets(data: dict) -> tuple[list[str], object]:
+        """Normalize requested assets from multiple payload contracts.
+
+        Supported inputs (priority order):
+        - activos_solicitados / activos / symbols / selected_symbols / selectedSymbols
+        - categoria / category
+        - activo
+        """
+
+        raw_payload = None
+        requested_assets: list[str] = []
+
+        def _append_from_value(value: object) -> None:
+            if value is None:
+                return
+            if isinstance(value, str):
+                requested_assets.extend(
+                    [p.strip().upper() for p in value.split(",") if str(p).strip()]
+                )
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    if isinstance(item, str):
+                        val = item.strip().upper()
+                        if val:
+                            requested_assets.append(val)
+                        continue
+                    if isinstance(item, dict):
+                        sym = (
+                            item.get("symbol")
+                            or item.get("id")
+                            or item.get("activo")
+                            or item.get("ticker")
+                        )
+                        if sym is not None:
+                            val = str(sym).strip().upper()
+                            if val:
+                                requested_assets.append(val)
+                        continue
+                    val = str(item).strip().upper()
+                    if val:
+                        requested_assets.append(val)
+                return
+
+            val = str(value).strip().upper()
+            if val:
+                requested_assets.append(val)
+
+        assets_candidates = (
+            "activos_solicitados",
+            "activos",
+            "symbols",
+            "selected_symbols",
+            "selectedSymbols",
+        )
+
+        for key in assets_candidates:
+            value = data.get(key)
+            if value is None:
+                continue
+            if raw_payload is None:
+                raw_payload = value
+            _append_from_value(value)
+
+        if not requested_assets:
+            category_value = data.get("categoria")
+            if category_value is None:
+                category_value = data.get("category")
+            if category_value is not None:
+                raw_payload = category_value if raw_payload is None else raw_payload
+                _append_from_value(category_value)
+
+        if not requested_assets:
+            activo_fallback = data.get("activo")
+            if activo_fallback is None:
+                return [], raw_payload
+            raw_payload = activo_fallback if raw_payload is None else raw_payload
+            _append_from_value(activo_fallback)
+
+        requested_assets = list(dict.fromkeys(requested_assets))
+        return requested_assets, raw_payload
+
     async def ejecutar(self, data: dict | None) -> Tuple[dict, int]:
         chat_id_local = None
         lock_id = None
         data = data or {}
 
         try:
+            acquired_lock = False
+            task_scheduled = False
             user_id = str(data.get("user_id") or "").strip()
             chat_id = str(data.get("chat_id") or "").strip()
             chat_id_local = chat_id
@@ -33,28 +118,19 @@ class LegacyAnalisisUseCase:
             if not user_id:
                 return {"status": "error", "message": "user_id es obligatorio"}, 400
 
-            raw_assets = data.get("activos_solicitados")
-            if raw_assets is None:
-                raw_assets = data.get("activos")
-
-            requested_assets: list[str] = []
-            if isinstance(raw_assets, str):
-                requested_assets = [p.strip().upper() for p in raw_assets.split(",") if str(p).strip()]
-            elif isinstance(raw_assets, (list, tuple, set)):
-                requested_assets = [str(p).strip().upper() for p in raw_assets if str(p).strip()]
-
+            requested_assets, raw_payload = self._extract_requested_assets(data)
             if not requested_assets:
-                activo_fallback = data.get("activo")
-                if activo_fallback is None:
-                    return {"status": "error", "message": "Falta 'activo'"}, 400
-                requested_assets = [str(activo_fallback).strip().upper()]
+                return {
+                    "status": "error",
+                    "message": "Falta activos a analizar (activos_solicitados/activos/categoria/activo)",
+                }, 400
 
             # De-duplicate preserving order for stable execution + billing estimate.
             requested_assets = list(dict.fromkeys(requested_assets))
             activo = ",".join(requested_assets)
             self._services.logger.info(
                 "[/analisis/ejecutar] activos solicitados (raw->normalized): %s -> %s",
-                data.get("activos_solicitados") if data.get("activos_solicitados") is not None else data.get("activo"),
+                raw_payload,
                 requested_assets,
             )
 
@@ -121,6 +197,7 @@ class LegacyAnalisisUseCase:
             if not acquired_lock:
                 return {"status": "busy", "message": "Ya tienes un analisis en ejecucion."}, 409
 
+            acquired_lock = True
             await asyncio.to_thread(
                 self._services.mark_user_state, user_id=user_id or chat_id, estado="ocupado"
             )
@@ -220,6 +297,7 @@ class LegacyAnalisisUseCase:
                         user_id=user_id,
                         origen="app",
                         exec_id=exec_id,
+                        lock_id=lock_id,
                         operatoria_cfg=op_cfg,
                         cfg=cfg,
                     )
@@ -285,9 +363,33 @@ class LegacyAnalisisUseCase:
                     raise
                 finally:
                     self._services.running_tasks.pop(exec_id, None)
+                    try:
+                        await asyncio.to_thread(
+                            self._services.mark_user_state,
+                            user_id=user_id or chat_id_local,
+                            estado="disponible",
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        if acquired_lock and lock_id:
+                            await asyncio.to_thread(
+                                self._services.release_user_lock,
+                                user_id=user_id,
+                                chat_id=chat_id_local or None,
+                                lock_id=lock_id,
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        if chat_id_local:
+                            self._services.clear_current_request_cfg(chat_id_local)
+                    except Exception:
+                        pass
 
             task = asyncio.create_task(_runner())
             self._services.running_tasks[exec_id] = task
+            task_scheduled = True
 
             async def _hb():
                 try:
@@ -324,23 +426,24 @@ class LegacyAnalisisUseCase:
                 pass
             return {"status": "error", "message": str(exc)}, 500
         finally:
-            try:
-                await asyncio.to_thread(
-                    self._services.mark_user_state,
-                    user_id=user_id or chat_id_local,
-                    estado="disponible",
-                )
-                if lock_id:
+            if not task_scheduled:
+                try:
                     await asyncio.to_thread(
-                        self._services.release_user_lock,
-                        user_id=user_id,
-                        chat_id=chat_id_local or None,
-                        lock_id=lock_id,
+                        self._services.mark_user_state,
+                        user_id=user_id or chat_id_local,
+                        estado="disponible",
                     )
-                if chat_id_local:
-                    self._services.clear_current_request_cfg(chat_id_local)
-            except Exception:
-                pass
+                    if acquired_lock and lock_id:
+                        await asyncio.to_thread(
+                            self._services.release_user_lock,
+                            user_id=user_id,
+                            chat_id=chat_id_local or None,
+                            lock_id=lock_id,
+                        )
+                    if chat_id_local:
+                        self._services.clear_current_request_cfg(chat_id_local)
+                except Exception:
+                    pass
 
     def resultados(self, exec_id: str, mode: str) -> Tuple[dict, int]:
         try:

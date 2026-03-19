@@ -131,6 +131,7 @@ class EntriesAggregationService:
         symbol: Optional[str] = None,
         timeframe: Optional[str] = None,
         side: Optional[str] = None,
+        execution_id: Optional[str] = None,
         min_score: int = 0,
         max_score: int = 100,
         limit: int = 100,
@@ -143,6 +144,7 @@ class EntriesAggregationService:
             symbol: Filter by symbol (e.g., 'EURUSD')
             timeframe: Filter by timeframe (e.g., '1H')
             side: Filter by side ('long', 'short', or None for all)
+            execution_id: Filter by execution ID
             min_score: Minimum confluence score
             max_score: Maximum confluence score
             limit: Max results
@@ -162,6 +164,9 @@ class EntriesAggregationService:
         
         if side:
             entries = [e for e in entries if e.side == side.lower()]
+
+        if execution_id:
+            entries = [e for e in entries if e.execution_id == execution_id]
         
         entries = [
             e for e in entries

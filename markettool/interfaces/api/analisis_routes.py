@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 pass
 pass
 pass
@@ -12,9 +13,10 @@ pass
 pass
 pass
 import threading
+import time
 pass
 
-from flask import jsonify, request
+from flask import Response, jsonify, request, stream_with_context
 
 from markettool.application.use_cases.legacy import LegacyAnalisisUseCase
 
@@ -22,6 +24,33 @@ _bg_loop = None
 _bg_thread = None
 _bg_lock = threading.Lock()
 _bg_ready = threading.Event()
+
+
+_TERMINAL_STATES = {
+    "completed",
+    "completado",
+    "failed",
+    "fallido",
+    "stopped",
+    "detenido",
+    "cancelled",
+    "cancelado",
+    "canceled",
+}
+
+
+def _sse_event(event: str, payload: dict) -> str:
+    body = json.dumps(payload, ensure_ascii=True, default=str)
+    return f"event: {event}\ndata: {body}\n\n"
+
+
+def _wants_streaming() -> bool:
+    q = str(request.args.get("stream") or "").strip().lower()
+    if q in {"1", "true", "yes", "on"}:
+        return True
+
+    accept = str(request.headers.get("Accept") or "").lower()
+    return "text/event-stream" in accept
 
 
 def _bg_loop_worker() -> None:
@@ -100,10 +129,154 @@ def register_analisis_routes(app, *, services) -> None:
         with stop_events_lock:
             stop_events_ref.pop(exec_id, None)
 
+    def _stream_analisis(payload_in: dict):
+        payload, status = _run_async_for_request(use_case.ejecutar(payload_in))
+        if status != 202:
+            yield _sse_event(
+                "error",
+                {
+                    "status": "error",
+                    "http_status": status,
+                    "payload": payload,
+                },
+            )
+            return
+
+        exec_id = (
+            (payload or {}).get("exec_id")
+            or (payload or {}).get("execution_id")
+            or (payload or {}).get("id")
+        )
+        if not exec_id:
+            yield _sse_event(
+                "error",
+                {
+                    "status": "error",
+                    "http_status": 500,
+                    "message": "No se recibio exec_id para streaming.",
+                    "payload": payload,
+                },
+            )
+            return
+
+        exec_id = str(exec_id)
+        yield _sse_event("accepted", {"status": "accepted", "exec_id": exec_id})
+
+        last_state = None
+        last_progress_hash = None
+        missing_since = None
+
+        while True:
+            try:
+                snap = db.collection("ejecuciones").document(exec_id).get()
+            except Exception as exc:
+                yield _sse_event(
+                    "warning",
+                    {
+                        "exec_id": exec_id,
+                        "message": "firestore_read_error",
+                        "detail": str(exc),
+                    },
+                )
+                time.sleep(1.5)
+                continue
+
+            if not snap.exists:
+                now_s = time.time()
+                if missing_since is None:
+                    missing_since = now_s
+                elif now_s - missing_since > 20:
+                    yield _sse_event(
+                        "error",
+                        {
+                            "exec_id": exec_id,
+                            "message": "execution_not_found",
+                        },
+                    )
+                    break
+
+                yield ": waiting_execution_doc\n\n"
+                time.sleep(1.0)
+                continue
+
+            missing_since = None
+            data = snap.to_dict() or {}
+
+            estado = str(data.get("estado") or "").strip().lower()
+            if estado and estado != last_state:
+                last_state = estado
+                yield _sse_event("state", {"exec_id": exec_id, "estado": estado})
+
+            progress = data.get("progress")
+            if isinstance(progress, dict):
+                p_hash = json.dumps(progress, sort_keys=True, ensure_ascii=True, default=str)
+                if p_hash != last_progress_hash:
+                    last_progress_hash = p_hash
+                    yield _sse_event(
+                        "progress",
+                        {
+                            "exec_id": exec_id,
+                            "progress": progress,
+                        },
+                    )
+
+            if estado in _TERMINAL_STATES:
+                resumen = data.get("resumen") if isinstance(data.get("resumen"), dict) else {}
+                urls = resumen.get("urls") if isinstance(resumen, dict) else None
+                if not isinstance(urls, list):
+                    urls = []
+
+                yield _sse_event(
+                    "done",
+                    {
+                        "exec_id": exec_id,
+                        "estado": estado,
+                        "urls": urls,
+                        "resumen": resumen,
+                        "error": (
+                            (resumen or {}).get("error")
+                            or data.get("error")
+                            or data.get("message")
+                            or ""
+                        ),
+                    },
+                )
+                break
+
+            yield ": keepalive\n\n"
+            time.sleep(1.0)
+
     @app.route("/analisis/ejecutar", methods=["POST"])
     def ejecutar_analisis_desde_app():
-        payload, status = _run_async_for_request(use_case.ejecutar(request.json or {}))
+        payload_in = request.json or {}
+        if _wants_streaming():
+            return Response(
+                stream_with_context(_stream_analisis(payload_in)),
+                status=200,
+                mimetype="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache, no-transform",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        payload, status = _run_async_for_request(use_case.ejecutar(payload_in))
         return jsonify(payload), status
+
+    @app.route("/analisis/ejecutar/stream", methods=["POST"])
+    def ejecutar_analisis_stream_desde_app():
+        payload_in = request.json or {}
+        return Response(
+            stream_with_context(_stream_analisis(payload_in)),
+            status=200,
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.route("/analisis/resultados", methods=["GET"])
     def obtener_resultados_analisis():
