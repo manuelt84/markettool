@@ -1,0 +1,39 @@
+name: CI — MarketTool (Python)
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint-and-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install flake8 pylint
+          pip install -r requirements.txt --quiet 2>&1 | tail -5 || true
+
+      - name: Lint con flake8
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics \
+            --exclude=__pycache__,.git,venv,env
+        continue-on-error: false
+
+      - name: Check syntax Python
+        run: |
+          python -m py_compile MarketTool.py && echo "✅ Sintaxis OK"
+
+      - name: Pylint (advertencias)
+        run: |
+          pylint MarketTool.py --errors-only || true
+        continue-on-error: true
