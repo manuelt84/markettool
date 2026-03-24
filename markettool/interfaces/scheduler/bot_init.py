@@ -118,8 +118,11 @@ async def initialize_bot_async(
             current_webhook = await application.bot.get_webhook_info()
             logger.info("EL Webhook configurado en telegram es: %s", current_webhook)
             if current_webhook.url != full_webhook_url:
-                await application.bot.set_webhook(full_webhook_url)
-                logger.info("Webhook configurado correctamente!")
+                await application.bot.set_webhook(
+                    full_webhook_url,
+                    drop_pending_updates=True,  # Limpiar updates acumulados al re-registrar
+                )
+                logger.info("Webhook configurado correctamente (pending updates descartados)")
             else:
                 logger.info("El webhook ya esta configurado.")
 

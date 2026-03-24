@@ -18,6 +18,7 @@ from markettool.interfaces.api.hexagonal_analysis_routes import register_hexagon
 from markettool.interfaces.api.risk_management_routes import register_risk_management_routes
 from markettool.interfaces.api.signal_validation_routes import register_signal_validation_routes
 from markettool.interfaces.api.mt5_routes import register_mt5_routes
+from markettool.interfaces.api.bot_inject_routes import register_bot_inject_routes
 from markettool.interfaces.api.ponderacion_routes import register_ponderacion_routes
 from markettool.interfaces.api.ponderacion_history import PonderacionHistory
 from markettool.interfaces.api.ponderacion_alerts import PonderacionAlert
@@ -101,8 +102,9 @@ def register_all_routes(
     register_risk_management_routes(app)
     register_signal_validation_routes(app)
     register_mt5_routes(app)
+    register_bot_inject_routes(app)
 
-    # Ponderacion API routes (available in hexagonal runtime via lightweight adapter)
+    # Ponderacion API routes
     ponderacion_cache = _PonderacionCacheAdapter(logger=logger)
     ponderacion_history = PonderacionHistory(redis_client=ponderacion_cache.redis_client)
     ponderacion_alert = PonderacionAlert(redis_client=ponderacion_cache.redis_client)

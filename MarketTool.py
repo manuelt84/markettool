@@ -21702,7 +21702,8 @@ def get_telegram_application():
                 connect_timeout=30.0,
                 read_timeout=30.0,
                 write_timeout=30.0,
-                pool_timeout=10.0,
+                pool_timeout=30.0,
+                connection_pool_size=16,
             )
             _application = Application.builder().token(token).request(_telegram_request).build()
             logger.info("Telegram bot application created")
