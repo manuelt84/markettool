@@ -54,11 +54,10 @@ def get_webhook_app(
         @_webhook_app.after_request
         def add_cors_headers(response):
             """Add CORS headers to all responses."""
-            if request.path.startswith("/api/"):
-                response.headers["Access-Control-Allow-Origin"] = "*"
-                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
-                response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-                response.headers["Access-Control-Expose-Headers"] = "Content-Type, X-Total-Count"
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+            response.headers["Access-Control-Expose-Headers"] = "Content-Type, X-Total-Count"
             return response
         
         logger.info("✅ CORS middleware enabled for all /api/* routes")

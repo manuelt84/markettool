@@ -462,7 +462,6 @@ class LegacyAnalisisUseCase:
                 return
 
             bt_service = get_backtesting_service(logger=self._services.logger)
-            COLLECTION = "backtest_results"
 
             # Read archivos_generados for this exec
             docs = await asyncio.to_thread(
@@ -511,7 +510,7 @@ class LegacyAnalisisUseCase:
                 try:
                     # Write "running" status
                     await asyncio.to_thread(
-                        db.collection(COLLECTION).document(doc_key).set,
+                        db.collection("ejecuciones").document(exec_id).collection("backtest_results").document(f"{symbol}_{timeframe}").set,
                         {
                             "status": "running",
                             "exec_id": exec_id,
@@ -552,7 +551,7 @@ class LegacyAnalisisUseCase:
 
                     # Update to completed
                     await asyncio.to_thread(
-                        db.collection(COLLECTION).document(doc_key).update,
+                        db.collection("ejecuciones").document(exec_id).collection("backtest_results").document(f"{symbol}_{timeframe}").update,
                         {
                             "status": "completed",
                             "stats": stats,
@@ -569,7 +568,7 @@ class LegacyAnalisisUseCase:
                     )
                     try:
                         await asyncio.to_thread(
-                            db.collection(COLLECTION).document(doc_key).update,
+                            db.collection("ejecuciones").document(exec_id).collection("backtest_results").document(f"{symbol}_{timeframe}").update,
                             {
                                 "status": "failed",
                                 "error": str(exc),

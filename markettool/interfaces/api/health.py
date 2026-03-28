@@ -183,7 +183,9 @@ class HealthChecker:
             if db is None:
                 return False
             # Quick ping - check if we can list collections
-            list(db.collections(max_results=1))
+            # max_results not supported in all versions; use limit via itertools
+            import itertools
+            list(itertools.islice(db.collections(), 1))
             return True
         except Exception as exc:
             logger.warning("Firestore health check failed: %s", exc)
