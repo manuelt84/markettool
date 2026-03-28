@@ -364,6 +364,200 @@ class BacktestingService:
         
         return max_streak
     
+    # ==================== ENRICHED JSON BACKTEST ====================
+
+    def run_from_enriched(
+        self,
+        candles: List[Dict[str, Any]],
+        entries: List[Dict[str, Any]],
+        symbol: str,
+        timeframe: str,
+    ) -> Dict[str, Any]:
+        """
+        Run backtest from enriched JSON data (candles + entries).
+        Produces stats compatible with the RN app's extractBacktestStats output.
+
+        Args:
+            candles: List of candle dicts with keys: t, o, h, l, c, v
+            entries: List of entry dicts with keys: source, outcome, entry, tp, sl, side, ...
+            symbol: Symbol name (e.g. 'BTCUSD')
+            timeframe: Timeframe string (e.g. '5m')
+
+        Returns:
+            Dict with backtest stats matching the RN app format.
+        """
+        ALL_SOURCE_KEYS = ["tech", "sr", "mt", "event"]
+
+        total_entries = len(entries)
+        pending_entries = [e for e in entries if (e.get("outcome") or "pending") == "pending"]
+
+        stats: Dict[str, Any] = {
+            "total_entries": total_entries,
+            "pending_entries": len(pending_entries),
+            "timestamp": int(datetime.now().timestamp() * 1000),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candles_count": len(candles),
+        }
+
+        win_rate_by_source: Dict[str, float] = {}
+
+        for source in ALL_SOURCE_KEYS:
+            source_entries = [e for e in entries if e.get("source") == source]
+
+            if not source_entries:
+                stats[source] = {
+                    "total": 0,
+                    "closed": 0,
+                    "pending": 0,
+                    "tp_hits": 0,
+                    "sl_hits": 0,
+                    "win_rate": None,
+                    "sample_size": 0,
+                }
+                continue
+
+            tp_hits = [e for e in source_entries if e.get("outcome") == "tp"]
+            sl_hits = [e for e in source_entries if e.get("outcome") == "sl"]
+            actually_closed = tp_hits + sl_hits
+            pending = [e for e in source_entries if (e.get("outcome") or "pending") == "pending"]
+
+            win_rate = (len(tp_hits) / len(actually_closed) * 100) if actually_closed else None
+
+            stats[source] = {
+                "total": len(source_entries),
+                "closed": len(actually_closed),
+                "pending": len(pending),
+                "tp_hits": len(tp_hits),
+                "sl_hits": len(sl_hits),
+                "win_rate": win_rate,
+                "sample_size": len(actually_closed),
+            }
+
+            if win_rate is not None:
+                win_rate_by_source[source] = win_rate
+
+        stats["win_rate_by_source"] = win_rate_by_source
+
+        # ATR & volatility stats
+        if candles and len(candles) >= 14:
+            try:
+                closes = [float(c.get("c") or c.get("close", 0)) for c in candles]
+                highs = [float(c.get("h") or c.get("high", 0)) for c in candles]
+                lows = [float(c.get("l") or c.get("low", 0)) for c in candles]
+
+                # ATR(14) calculation
+                tr_values = []
+                for idx in range(1, len(candles)):
+                    tr = max(
+                        highs[idx] - lows[idx],
+                        abs(highs[idx] - closes[idx - 1]),
+                        abs(lows[idx] - closes[idx - 1]),
+                    )
+                    tr_values.append(tr)
+
+                atr = sum(tr_values[-14:]) / min(14, len(tr_values)) if tr_values else 0
+                last_close = closes[-1] if closes else 1
+                atr_percent = (atr / last_close * 100) if last_close else 0
+
+                all_highs = max(highs) if highs else 0
+                all_lows = min(lows) if lows else 0
+                mid = (all_highs + all_lows) / 2 if (all_highs + all_lows) else 1
+                range_percent = ((all_highs - all_lows) / mid * 100) if mid else 0
+
+                stats["atr_avg"] = atr
+                stats["atr_percent"] = atr_percent
+                stats["range_percent"] = range_percent
+                stats["volatility_profile"] = (
+                    "tight" if atr_percent < 0.05
+                    else "low" if atr_percent < 0.1
+                    else "normal"
+                )
+            except Exception as exc:
+                self.logger.warning("ATR calculation failed: %s", exc)
+                stats["atr_avg"] = 0
+                stats["atr_percent"] = 0
+                stats["range_percent"] = 0
+                stats["volatility_profile"] = "unknown"
+        else:
+            stats["atr_avg"] = 0
+            stats["atr_percent"] = 0
+            stats["range_percent"] = 0
+            stats["volatility_profile"] = "unknown"
+
+        # Also run simulate_trades + calculate_metrics for advanced metrics
+        try:
+            if candles and entries:
+                df = pd.DataFrame(candles)
+                # Normalize column names
+                rename_map = {}
+                if "t" in df.columns:
+                    rename_map["t"] = "timestamp"
+                if "o" in df.columns:
+                    rename_map["o"] = "open"
+                if "h" in df.columns:
+                    rename_map["h"] = "high"
+                if "l" in df.columns:
+                    rename_map["l"] = "low"
+                if "c" in df.columns:
+                    rename_map["c"] = "close"
+                if "v" in df.columns:
+                    rename_map["v"] = "volume"
+                if rename_map:
+                    df = df.rename(columns=rename_map)
+
+                if "timestamp" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
+                    df = df.set_index("timestamp")
+
+                # Build signals from entries
+                signals = []
+                for e in entries:
+                    side = str(e.get("side") or e.get("tipo_operacion") or "").lower()
+                    direction = "Compra" if side in ("buy", "long", "compra") else "Venta"
+                    entry_price = float(e.get("entry") or e.get("precio_entrada") or 0)
+                    signals.append({
+                        "timestamp": pd.to_datetime(
+                            e.get("timestamp") or e.get("created_at") or 0,
+                            unit="ms",
+                            errors="coerce",
+                        ),
+                        "direction": direction,
+                        "probability": float(e.get("confidence") or e.get("probability") or 70),
+                        "symbol": symbol,
+                    })
+
+                if signals:
+                    trades = self.simulate_trades(df, signals)
+                    metrics = self.calculate_metrics(trades)
+                    stats["advanced_metrics"] = {
+                        "total_trades": metrics.total_trades,
+                        "winning_trades": metrics.winning_trades,
+                        "losing_trades": metrics.losing_trades,
+                        "win_rate": metrics.win_rate,
+                        "profit_factor": metrics.profit_factor,
+                        "sharpe_ratio": metrics.sharpe_ratio,
+                        "max_drawdown": metrics.max_drawdown,
+                        "max_drawdown_pct": metrics.max_drawdown_pct,
+                        "expectancy": metrics.expectancy,
+                        "average_win": metrics.average_win,
+                        "average_loss": metrics.average_loss,
+                    }
+        except Exception as exc:
+            self.logger.warning("Advanced metrics calculation failed: %s", exc)
+
+        # Entries summary
+        tp_count = len([e for e in entries if e.get("outcome") == "tp"])
+        sl_count = len([e for e in entries if e.get("outcome") == "sl"])
+        pending_count = len(pending_entries)
+        stats["entries_summary"] = {
+            "tp": tp_count,
+            "sl": sl_count,
+            "pending": pending_count,
+        }
+
+        return stats
+
     @staticmethod
     def _calculate_consecutive_losses(trades: List[BacktestTrade]) -> int:
         """Calculate maximum consecutive losing trades."""

@@ -22,6 +22,7 @@ from markettool.interfaces.api.bot_inject_routes import register_bot_inject_rout
 from markettool.interfaces.api.ponderacion_routes import register_ponderacion_routes
 from markettool.interfaces.api.ponderacion_history import PonderacionHistory
 from markettool.interfaces.api.ponderacion_alerts import PonderacionAlert
+from markettool.interfaces.api.backtest_routes import register_backtest_routes
 
 if TYPE_CHECKING:
     from flask import Flask
@@ -123,6 +124,7 @@ def register_all_routes(
         register_webhook_routes(app, services=legacy_services)
         register_monitoreo_routes(app, services=legacy_services)
         register_cache_routes_legacy(app, services=legacy_services)
+        register_backtest_routes(app, services=legacy_services)
         logger.info("✅ Legacy routes registered via container")
     
     # Health check endpoint
