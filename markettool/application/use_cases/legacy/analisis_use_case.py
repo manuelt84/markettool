@@ -342,6 +342,10 @@ class LegacyAnalisisUseCase:
                         {"urls": urls_local},
                     )
                     await self._services.execution_tracker.complete(exec_id, "completed")
+
+                    # Dispatch async backtest for all enriched files (fire-and-forget)
+                    asyncio.create_task(self._run_post_analysis_backtest(exec_id, user_id))
+
                     return urls_local
                 except asyncio.CancelledError:
                     await asyncio.to_thread(
@@ -444,6 +448,141 @@ class LegacyAnalisisUseCase:
                         self._services.clear_current_request_cfg(chat_id_local)
                 except Exception:
                     pass
+
+    async def _run_post_analysis_backtest(self, exec_id: str, user_id: str | None) -> None:
+        """Fire-and-forget: run backtest on all enriched files of an execution."""
+        import re
+        try:
+            from markettool.application.services.backtesting_service import get_backtesting_service
+            import json as _json
+            from datetime import datetime as _dt
+
+            db = getattr(self._services, "db", None)
+            if not db:
+                return
+
+            bt_service = get_backtesting_service(logger=self._services.logger)
+            COLLECTION = "backtest_results"
+
+            # Read archivos_generados for this exec
+            docs = await asyncio.to_thread(
+                lambda: list(
+                    db.collection("archivos_generados")
+                    .where("exec_id", "==", exec_id)
+                    .stream()
+                )
+            )
+
+            enriched_files = []
+            for doc in docs:
+                data = doc.to_dict() or {}
+                gcs_path = data.get("gcs_path") or data.get("metadata", {}).get("gcs_path") or ""
+                if "_enriched.json" in gcs_path.lower():
+                    enriched_files.append(data)
+
+            if not enriched_files:
+                self._services.logger.info(
+                    "[PostBacktest] No enriched files found for exec_id=%s", exec_id
+                )
+                return
+
+            # Get GCS bucket
+            try:
+                from google.cloud import storage as gcs_storage
+                bucket_name = getattr(self._services, "gcs_bucket_name", None) or "markettool_bucket"
+                gcs_client = gcs_storage.Client()
+                bucket = gcs_client.bucket(bucket_name)
+            except Exception as exc:
+                self._services.logger.warning("[PostBacktest] GCS not available: %s", exc)
+                return
+
+            for file_data in enriched_files:
+                gcs_path = file_data.get("gcs_path") or file_data.get("metadata", {}).get("gcs_path") or ""
+                # Extract symbol and timeframe from filename like BTCUSD_5m_enriched.json
+                filename = gcs_path.split("/")[-1] if "/" in gcs_path else gcs_path
+                match = re.match(r"^(.+?)_(\d+[mhHdDwW])_enriched\.json$", filename, re.IGNORECASE)
+                if not match:
+                    continue
+
+                symbol = match.group(1).upper()
+                timeframe = match.group(2).lower()
+                doc_key = f"{exec_id}_{symbol}_{timeframe}"
+
+                try:
+                    # Write "running" status
+                    await asyncio.to_thread(
+                        db.collection(COLLECTION).document(doc_key).set,
+                        {
+                            "status": "running",
+                            "exec_id": exec_id,
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "user_id": user_id or "",
+                            "created_at": int(_dt.now().timestamp() * 1000),
+                        },
+                    )
+
+                    # Load enriched JSON from GCS
+                    blob = bucket.blob(gcs_path)
+                    raw = await asyncio.to_thread(blob.download_as_text)
+                    enriched = _json.loads(raw)
+
+                    candles = []
+                    entries = []
+                    if isinstance(enriched, list):
+                        entries = enriched
+                    elif isinstance(enriched, dict):
+                        candles = enriched.get("candles") or enriched.get("series") or []
+                        entries = (
+                            enriched.get("entries")
+                            or enriched.get("entradas")
+                            or enriched.get("oportunidades")
+                            or enriched.get("records")
+                            or enriched.get("data")
+                            or []
+                        )
+
+                    stats = await asyncio.to_thread(
+                        bt_service.run_from_enriched,
+                        candles=candles,
+                        entries=entries,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                    )
+
+                    # Update to completed
+                    await asyncio.to_thread(
+                        db.collection(COLLECTION).document(doc_key).update,
+                        {
+                            "status": "completed",
+                            "stats": stats,
+                            "completed_at": int(_dt.now().timestamp() * 1000),
+                        },
+                    )
+                    self._services.logger.info(
+                        "[PostBacktest] Completed backtest for %s/%s/%s", exec_id, symbol, timeframe
+                    )
+                except Exception as exc:
+                    self._services.logger.warning(
+                        "[PostBacktest] Failed backtest for %s/%s/%s: %s",
+                        exec_id, symbol, timeframe, exc,
+                    )
+                    try:
+                        await asyncio.to_thread(
+                            db.collection(COLLECTION).document(doc_key).update,
+                            {
+                                "status": "failed",
+                                "error": str(exc),
+                                "completed_at": int(_dt.now().timestamp() * 1000),
+                            },
+                        )
+                    except Exception:
+                        pass
+
+        except Exception as exc:
+            self._services.logger.warning(
+                "[PostBacktest] Top-level failure for exec_id=%s: %s", exec_id, exc
+            )
 
     def resultados(self, exec_id: str, mode: str) -> Tuple[dict, int]:
         try:

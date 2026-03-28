@@ -1,11 +1,13 @@
 """Backtest API routes.
 
 Provides endpoints to run backtests and retrieve cached results.
-Results are persisted in Firestore collection ``backtest_results``.
+Results are persisted in Firestore collection ``backtest_results``
+with a ``status`` field: "running" | "completed" | "failed".
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -16,6 +18,8 @@ from flask import Flask, jsonify, request
 from markettool.application.services.backtesting_service import get_backtesting_service
 
 logger = logging.getLogger(__name__)
+
+COLLECTION = "backtest_results"
 
 
 def _get_firestore_db(services: Any):
@@ -64,7 +68,6 @@ def _find_enriched_for_symbol_tf(
     db, bucket, exec_id: str, symbol: str, timeframe: str
 ) -> Optional[Dict]:
     """Find the enriched/oportunidades JSON for a symbol+tf inside an exec."""
-    # Strategy 1: Query archivos_generados for this exec
     try:
         docs = list(
             db.collection("archivos_generados")
@@ -81,7 +84,6 @@ def _find_enriched_for_symbol_tf(
                 or data.get("gcs_path")
                 or ""
             )
-            # Match by symbol and tf in filename
             nombre_upper = nombre.upper()
             if sym_upper in nombre_upper and tf_lower.upper() in nombre_upper:
                 gcs_path = data.get("gcs_path") or data.get("metadata", {}).get("gcs_path")
@@ -89,7 +91,6 @@ def _find_enriched_for_symbol_tf(
                     payload = _load_enriched_json(bucket, gcs_path)
                     if payload is not None:
                         return payload
-                # Try signed_url
                 signed_url = data.get("metadata", {}).get("signed_url")
                 if signed_url:
                     import requests as req_lib
@@ -99,7 +100,6 @@ def _find_enriched_for_symbol_tf(
     except Exception as exc:
         logger.warning("archivos_generados query failed: %s", exc)
 
-    # Strategy 2: Try conventional GCS path
     if bucket:
         safe_sym = symbol.upper().replace("/", "_")
         safe_tf = timeframe.lower()
@@ -116,6 +116,10 @@ def _find_enriched_for_symbol_tf(
     return None
 
 
+def _make_key(exec_id: str, symbol: str, timeframe: str) -> str:
+    return f"{exec_id}_{symbol.upper()}_{timeframe.lower()}"
+
+
 def register_backtest_routes(app: Flask, *, services) -> None:
     """Register backtest API endpoints on Flask app."""
 
@@ -123,10 +127,67 @@ def register_backtest_routes(app: Flask, *, services) -> None:
     bucket = _get_gcs_bucket(services)
     bt_service = get_backtesting_service(logger=logger)
 
-    COLLECTION = "backtest_results"
+    # ─── GET /api/backtest/<exec_id> ── batch: all backtests for an exec ──
+    @app.route("/api/backtest/<exec_id>", methods=["GET"])
+    def backtest_batch_get(exec_id: str):
+        try:
+            if not db:
+                return jsonify({"status": "error", "message": "Firestore not available"}), 503
 
-    def _make_key(exec_id: str, symbol: str, timeframe: str) -> str:
-        return f"{exec_id}_{symbol.upper()}_{timeframe.lower()}"
+            docs = list(
+                db.collection(COLLECTION)
+                .where("exec_id", "==", exec_id)
+                .stream()
+            )
+
+            results: Dict[str, Any] = {}
+            for doc in docs:
+                data = doc.to_dict() or {}
+                sym = data.get("symbol", "")
+                tf = data.get("timeframe", "")
+                bt_key = f"{sym}_{tf}"
+                bt_status = data.get("status", "not_found")
+                entry: Dict[str, Any] = {"backtest_status": bt_status}
+                if bt_status == "completed" and "stats" in data:
+                    entry["stats"] = data["stats"]
+                results[bt_key] = entry
+
+            return jsonify({"status": "ok", "results": results})
+        except Exception as exc:
+            logger.exception("Error in GET /api/backtest/<exec_id>")
+            return jsonify({"status": "error", "message": str(exc)}), 500
+
+    # ─── GET /api/backtest/<exec_id>/<symbol>/<timeframe> ─────────────
+    @app.route("/api/backtest/<exec_id>/<symbol>/<timeframe>", methods=["GET"])
+    def backtest_get(exec_id: str, symbol: str, timeframe: str):
+        try:
+            doc_key = _make_key(exec_id, symbol, timeframe)
+
+            if not db:
+                return jsonify({"status": "error", "message": "Firestore not available"}), 503
+
+            doc = db.collection(COLLECTION).document(doc_key).get()
+            if not doc.exists:
+                return jsonify({
+                    "status": "ok",
+                    "backtest_status": "not_found",
+                    "key": doc_key,
+                })
+
+            data = doc.to_dict() or {}
+            bt_status = data.get("status", "not_found")
+            resp: Dict[str, Any] = {
+                "status": "ok",
+                "backtest_status": bt_status,
+                "key": doc_key,
+            }
+            if bt_status == "completed" and "stats" in data:
+                resp["stats"] = data["stats"]
+
+            return jsonify(resp)
+        except Exception as exc:
+            logger.exception("Error in GET /api/backtest/<exec_id>/<sym>/<tf>")
+            return jsonify({"status": "error", "message": str(exc)}), 500
 
     # ─── POST /api/backtest/run ───────────────────────────────────────
     @app.route("/api/backtest/run", methods=["POST"])
@@ -146,28 +207,62 @@ def register_backtest_routes(app: Flask, *, services) -> None:
 
             doc_key = _make_key(exec_id, symbol, timeframe)
 
-            # Check cache first
+            # Check existing doc
             if db:
                 try:
-                    cached = db.collection(COLLECTION).document(doc_key).get()
-                    if cached.exists:
-                        cached_data = cached.to_dict()
-                        return jsonify({
-                            "status": "ok",
-                            "key": doc_key,
-                            "stats": cached_data.get("stats", cached_data),
-                            "entries_count": cached_data.get("stats", cached_data).get("total_entries", 0),
-                            "entries_summary": cached_data.get("stats", cached_data).get("entries_summary", {}),
-                            "cached": True,
-                        })
+                    existing = db.collection(COLLECTION).document(doc_key).get()
+                    if existing.exists:
+                        existing_data = existing.to_dict() or {}
+                        ex_status = existing_data.get("status", "")
+
+                        if ex_status == "completed":
+                            return jsonify({
+                                "status": "ok",
+                                "backtest_status": "completed",
+                                "key": doc_key,
+                                "stats": existing_data.get("stats", {}),
+                                "cached": True,
+                            })
+
+                        if ex_status == "running":
+                            return jsonify({
+                                "status": "ok",
+                                "backtest_status": "running",
+                                "key": doc_key,
+                            })
                 except Exception as exc:
                     logger.warning("Cache read failed: %s", exc)
+
+            # Mark as running
+            if db:
+                try:
+                    db.collection(COLLECTION).document(doc_key).set({
+                        "status": "running",
+                        "exec_id": exec_id,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "user_id": user_id,
+                        "created_at": int(time.time() * 1000),
+                    })
+                except Exception as exc:
+                    logger.warning("Firestore running write failed: %s", exc)
 
             # Load enriched JSON
             enriched = _find_enriched_for_symbol_tf(db, bucket, exec_id, symbol, timeframe)
             if enriched is None:
+                # Mark as failed
+                if db:
+                    try:
+                        db.collection(COLLECTION).document(doc_key).update({
+                            "status": "failed",
+                            "error": f"No enriched data found for {exec_id}/{symbol}/{timeframe}",
+                            "completed_at": int(time.time() * 1000),
+                        })
+                    except Exception:
+                        pass
                 return jsonify({
                     "status": "error",
+                    "backtest_status": "failed",
                     "message": f"No enriched data found for {exec_id}/{symbol}/{timeframe}",
                 }), 404
 
@@ -176,7 +271,6 @@ def register_backtest_routes(app: Flask, *, services) -> None:
             entries: list = []
 
             if isinstance(enriched, list):
-                # Enriched is a list of records (entries/oportunidades)
                 entries = enriched
             elif isinstance(enriched, dict):
                 candles = enriched.get("candles") or enriched.get("series") or []
@@ -190,38 +284,46 @@ def register_backtest_routes(app: Flask, *, services) -> None:
                 if not entries and isinstance(enriched.get("data"), list):
                     entries = enriched["data"]
 
-            # If entries is the enriched list itself (list of dicts with outcome)
-            if not candles and entries and isinstance(entries[0], dict) and "outcome" in entries[0]:
-                pass  # entries already extracted
-
             # Run backtest
-            stats = bt_service.run_from_enriched(
-                candles=candles,
-                entries=entries,
-                symbol=symbol,
-                timeframe=timeframe,
-            )
+            try:
+                stats = bt_service.run_from_enriched(
+                    candles=candles,
+                    entries=entries,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                )
+            except Exception as exc:
+                if db:
+                    try:
+                        db.collection(COLLECTION).document(doc_key).update({
+                            "status": "failed",
+                            "error": str(exc),
+                            "completed_at": int(time.time() * 1000),
+                        })
+                    except Exception:
+                        pass
+                return jsonify({
+                    "status": "error",
+                    "backtest_status": "failed",
+                    "message": str(exc),
+                }), 500
 
-            # Persist to Firestore
+            # Persist completed to Firestore
             if db:
                 try:
-                    db.collection(COLLECTION).document(doc_key).set({
+                    db.collection(COLLECTION).document(doc_key).update({
+                        "status": "completed",
                         "stats": stats,
-                        "exec_id": exec_id,
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "user_id": user_id,
-                        "created_at": int(time.time() * 1000),
+                        "completed_at": int(time.time() * 1000),
                     })
                 except Exception as exc:
-                    logger.warning("Firestore write failed: %s", exc)
+                    logger.warning("Firestore completed write failed: %s", exc)
 
             return jsonify({
                 "status": "ok",
+                "backtest_status": "completed",
                 "key": doc_key,
                 "stats": stats,
-                "entries_count": stats.get("total_entries", 0),
-                "entries_summary": stats.get("entries_summary", {}),
                 "cached": False,
             })
 
@@ -229,37 +331,6 @@ def register_backtest_routes(app: Flask, *, services) -> None:
             logger.exception("Error in POST /api/backtest/run")
             return jsonify({"status": "error", "message": str(exc)}), 500
 
-    # ─── GET /api/backtest/<exec_id>/<symbol>/<timeframe> ─────────────
-    @app.route("/api/backtest/<exec_id>/<symbol>/<timeframe>", methods=["GET"])
-    def backtest_get(exec_id: str, symbol: str, timeframe: str):
-        try:
-            doc_key = _make_key(exec_id, symbol.upper(), timeframe.lower())
-
-            if not db:
-                return jsonify({
-                    "status": "error",
-                    "message": "Firestore not available",
-                }), 503
-
-            doc = db.collection(COLLECTION).document(doc_key).get()
-            if not doc.exists:
-                return jsonify({
-                    "status": "error",
-                    "message": f"No backtest results for {doc_key}",
-                }), 404
-
-            data = doc.to_dict()
-            stats = data.get("stats", data)
-            return jsonify({
-                "status": "ok",
-                "key": doc_key,
-                "stats": stats,
-                "entries_count": stats.get("total_entries", 0),
-                "entries_summary": stats.get("entries_summary", {}),
-            })
-
-        except Exception as exc:
-            logger.exception("Error in GET /api/backtest")
-            return jsonify({"status": "error", "message": str(exc)}), 500
-
-    logger.info("✅ Backtest routes registered (/api/backtest/run, /api/backtest/<exec_id>/<sym>/<tf>)")
+    logger.info(
+        "✅ Backtest routes registered (/api/backtest/run, /api/backtest/<exec_id>, /api/backtest/<exec_id>/<sym>/<tf>)"
+    )
