@@ -15008,10 +15008,13 @@ def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
     categorias_especiales = {
         "cruces": categorias.get("Cruces", []),
         "exóticos": categorias.get("Exóticos", []),
+        "exoticos": categorias.get("Exóticos", []),
         "oilandgas": categorias.get("OilAndGas", []),
         "agricultura": categorias.get("Agricultura", []),
         "cripto": categorias.get("Cripto", []),
-        "indices": categorias.get("Indices", [])
+        "crypto": categorias.get("Cripto", []),
+        "indices": categorias.get("Indices", []),
+        "principales": categorias.get("Principales", []),
     }
     if moneda_filtro in categorias_especiales:
         return categorias_especiales[moneda_filtro]

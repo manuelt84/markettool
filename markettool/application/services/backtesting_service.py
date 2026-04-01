@@ -388,6 +388,11 @@ class BacktestingService:
         """
         ALL_SOURCE_KEYS = ["tech", "sr", "mt", "event"]
 
+        # Filter out non-dict entries
+        entries = [e for e in entries if isinstance(e, dict)]
+        # Filter out non-dict candles
+        candles = [c for c in candles if isinstance(c, dict)]
+
         total_entries = len(entries)
         pending_entries = [e for e in entries if (e.get("outcome") or "pending") == "pending"]
 
@@ -401,6 +406,177 @@ class BacktestingService:
         }
 
         win_rate_by_source: Dict[str, float] = {}
+
+        # Normalize entries: map basado_en → source category
+        SOURCE_MAP = {
+            "soporte_resistencia": "sr", "sr": "sr",
+            "tecnico": "tech", "tech": "tech", "technical": "tech",
+            "market_tool": "mt", "mt": "mt", "markettool": "mt",
+            "evento": "event", "event": "event", "eventos": "event",
+        }
+        # Pattern-based: basado_en values like pullback_R1, scale_in_midpoint, range_upper_reversion
+        SR_PATTERNS = ["pullback", "r1", "r2", "s1", "s2", "midpoint", "range_", "reversion", "scale_in"]
+        TECH_PATTERNS = ["ema", "macd", "rsi", "bollinger", "stoch", "momentum", "breakout"]
+        EVENT_PATTERNS = ["event", "news", "economic", "calendar"]
+
+        for e in entries:
+            if not e.get("source"):
+                raw = str(e.get("basado_en") or e.get("fuente") or "").lower()
+                mapped = SOURCE_MAP.get(raw)
+                if not mapped:
+                    if any(p in raw for p in SR_PATTERNS):
+                        mapped = "sr"
+                    elif any(p in raw for p in TECH_PATTERNS):
+                        mapped = "tech"
+                    elif any(p in raw for p in EVENT_PATTERNS):
+                        mapped = "event"
+                    else:
+                        mapped = "mt"  # default to market_tool for unclassified
+                e["source"] = mapped
+
+        # ── Candle-walking: compute outcome for each entry (replicates RN computeEntradaOutcome) ──
+        STOP_PATTERNS = ["breakout"]
+        LIMIT_PATTERNS = ["pullback", "ladder", "scale_in", "midpoint", "range_", "reversion"]
+
+        # Sort candles by time (support both {t} and {timestamp} keys)
+        def _candle_time(c: Dict[str, Any]) -> float:
+            return float(c.get("t") or c.get("timestamp") or 0)
+
+        sorted_candles = sorted(candles, key=_candle_time)
+
+        for e in entries:
+            # Skip if outcome already set (tp/sl)
+            existing = e.get("outcome") or ""
+            if existing in ("tp", "sl"):
+                continue
+
+            # Price levels
+            try:
+                entry_price = float(
+                    e.get("precio_entrada") or e.get("entry_price") or e.get("entry") or 0
+                )
+                tp = float(e.get("take_profit") or e.get("tp") or 0)
+                sl = float(e.get("stop_loss") or e.get("sl") or 0)
+            except (TypeError, ValueError):
+                e["outcome"] = "pending"
+                continue
+
+            if not entry_price or not tp or not sl:
+                e["outcome"] = "pending"
+                continue
+
+            side = str(e.get("side") or "").lower()
+            if side not in ("long", "short"):
+                e["outcome"] = "pending"
+                continue
+
+            # Determine order type
+            basado_en = str(e.get("basado_en") or "").lower()
+            is_stop = any(p in basado_en for p in STOP_PATTERNS)
+            # If not explicitly STOP, default to LIMIT
+            order_type = "STOP" if is_stop else "LIMIT"
+
+            # Entry timestamp
+            entry_ts = float(e.get("timestamp") or e.get("created_at") or 0)
+
+            # Find starting candle index
+            if entry_ts:
+                start_idx = next(
+                    (i for i, c in enumerate(sorted_candles) if _candle_time(c) >= entry_ts),
+                    0,
+                )
+            else:
+                start_idx = 0
+
+            activated = False
+            outcome = "pending"
+
+            for c in sorted_candles[start_idx:]:
+                try:
+                    high = float(c.get("h") or c.get("high") or 0)
+                    low  = float(c.get("l") or c.get("low")  or 0)
+                except (TypeError, ValueError):
+                    continue
+
+                if not activated:
+                    # Check activation FIRST (like RN)
+                    activates = False
+                    if order_type == "LIMIT":
+                        if side == "long" and low <= entry_price:
+                            activates = True
+                        elif side == "short" and high >= entry_price:
+                            activates = True
+                    else:  # STOP
+                        if side == "long" and high >= entry_price:
+                            activates = True
+                        elif side == "short" and low <= entry_price:
+                            activates = True
+
+                    if not activates:
+                        # Pre-activation: check missed TP or invalidated SL
+                        if side == "long":
+                            if high >= tp:
+                                outcome = "missed_tp"
+                                break
+                            if low <= sl:
+                                outcome = "invalidated_sl"
+                                break
+                        else:  # short
+                            if low <= tp:
+                                outcome = "missed_tp"
+                                break
+                            if high >= sl:
+                                outcome = "invalidated_sl"
+                                break
+                        continue
+
+                    activated = True
+
+                    # Same candle activation + TP/SL check
+                    if side == "long":
+                        hit_tp = high >= tp
+                        hit_sl = low <= sl
+                    else:
+                        hit_tp = low <= tp
+                        hit_sl = high >= sl
+
+                    if hit_tp and hit_sl:
+                        dist_tp = abs(tp - entry_price)
+                        dist_sl = abs(sl - entry_price)
+                        outcome = "tp" if dist_tp <= dist_sl else "sl"
+                        break
+                    elif hit_tp:
+                        outcome = "tp"
+                        break
+                    elif hit_sl:
+                        outcome = "sl"
+                        break
+                    continue
+
+                if activated:
+                    # Check TP and SL hit
+                    if side == "long":
+                        hit_tp = high >= tp
+                        hit_sl = low <= sl
+                    else:
+                        hit_tp = low <= tp
+                        hit_sl = high >= sl
+
+                    if hit_tp and hit_sl:
+                        # Both same candle: closer to entry wins
+                        dist_tp = abs(entry_price - tp)
+                        dist_sl = abs(entry_price - sl)
+                        outcome = "tp" if dist_tp <= dist_sl else "sl"
+                        break
+                    elif hit_tp:
+                        outcome = "tp"
+                        break
+                    elif hit_sl:
+                        outcome = "sl"
+                        break
+
+            e["outcome"] = outcome
+        # ── End candle-walking ──
 
         for source in ALL_SOURCE_KEYS:
             source_entries = [e for e in entries if e.get("source") == source]
@@ -555,6 +731,25 @@ class BacktestingService:
             "sl": sl_count,
             "pending": pending_count,
         }
+
+        # Include resolved entries with outcomes for frontend display
+        stats["resolved_entries"] = [
+            {
+                "id": e.get("id", ""),
+                "symbol": e.get("symbol") or symbol,
+                "timeframe": e.get("timeframe") or timeframe,
+                "side": str(e.get("side") or e.get("tipo_operacion") or "").lower(),
+                "entry_price": float(e.get("precio_entrada") or e.get("entry_price") or e.get("entry") or 0),
+                "take_profit": float(e.get("take_profit") or e.get("tp") or 0),
+                "stop_loss": float(e.get("stop_loss") or e.get("sl") or 0),
+                "source": e.get("source", "unknown"),
+                "outcome": e.get("outcome", "pending"),
+                "basado_en": e.get("basado_en", ""),
+                "confluence_score": e.get("confluence_score") or e.get("score") or 0,
+                "rrr": e.get("rrr") or e.get("rr") or 0,
+            }
+            for e in entries
+        ]
 
         return stats
 

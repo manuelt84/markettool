@@ -13,6 +13,8 @@ from typing import Any, Dict, Optional
 
 from flask import Flask, jsonify, request
 
+from markettool.infra.fmp.client import normalize_tf
+
 from markettool.application.services.backtesting_service import get_backtesting_service
 
 logger = logging.getLogger(__name__)
@@ -72,9 +74,10 @@ def _find_enriched_for_symbol_tf(db, bucket, exec_id: str, symbol: str, timefram
 
     if bucket:
         safe_sym = symbol.upper().replace("/", "_")
+        gcs_tf = normalize_tf(tf_lower)
         for path in [
-            f"analisis/exec/{exec_id}/{safe_sym}_{tf_lower}_enriched.json",
-            f"exec/{exec_id}/{safe_sym}_{tf_lower}_enriched.json",
+            f"analisis/exec/{exec_id}/{safe_sym}_{gcs_tf}_enriched.json",
+            f"exec/{exec_id}/{safe_sym}_{gcs_tf}_enriched.json",
         ]:
             payload = _load_enriched_json(bucket, path)
             if payload is not None:
@@ -149,10 +152,18 @@ def register_backtest_routes(app: Flask, *, services) -> None:
             if not exec_id or not symbol or not timeframe:
                 return jsonify({"status": "error", "message": "exec_id, symbol, and timeframe are required"}), 400
 
+            force = bool(body.get("force", False))
             ref = _bt_ref(db, exec_id, symbol, timeframe) if db else None
 
-            # Check existing
-            if ref:
+            # Force: delete existing cached result first
+            if ref and force:
+                try:
+                    ref.delete()
+                except Exception:
+                    pass
+
+            # Check existing (skip if force=true)
+            if ref and not force:
                 try:
                     existing = ref.get()
                     if existing.exists:
@@ -186,7 +197,9 @@ def register_backtest_routes(app: Flask, *, services) -> None:
             if isinstance(enriched, list):
                 entries = enriched
             elif isinstance(enriched, dict):
-                candles = enriched.get("candles") or enriched.get("series") or []
+                raw_series = enriched.get("candles") or enriched.get("series") or []
+                # series can be a dict like { candles: [...] }
+                candles = raw_series.get("candles") if isinstance(raw_series, dict) else raw_series
                 entries = enriched.get("entries") or enriched.get("entradas") or enriched.get("oportunidades") or enriched.get("records") or []
                 if not entries and isinstance(enriched.get("data"), list):
                     entries = enriched["data"]
