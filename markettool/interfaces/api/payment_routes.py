@@ -39,6 +39,7 @@ MP_PUBLIC_KEY = os.getenv(
 MP_API_BASE = "https://api.mercadopago.com"
 
 PACKS: dict[str, dict] = {
+    "pack_test_1":       {"ops": 10,   "price": 1.00,   "plan": "any"},
     "pack_basic_200":    {"ops": 200,  "price": 6.47,   "plan": "premium-mensual"},
     "pack_basic_400":    {"ops": 400,  "price": 11.85,  "plan": "premium-mensual"},
     "pack_basic_800":    {"ops": 800,  "price": 21.55,  "plan": "premium-mensual"},
@@ -215,6 +216,10 @@ def mp_create_preference():
 
     pack = PACKS[pack_id]
 
+    # MercadoPago Chile only accepts CLP — convert USD price to CLP (approx rate)
+    usd_to_clp = 950  # approximate, update periodically
+    price_clp = round(pack["price"] * usd_to_clp)
+
     try:
         res = requests.post(
             f"{MP_API_BASE}/checkout/preferences",
@@ -227,8 +232,8 @@ def mp_create_preference():
                     {
                         "title": f"{pack_id} - {pack['ops']} transacciones",
                         "quantity": 1,
-                        "unit_price": pack["price"],
-                        "currency_id": "USD",
+                        "unit_price": price_clp,
+                        "currency_id": "CLP",
                     }
                 ],
                 "back_urls": {
@@ -245,7 +250,10 @@ def mp_create_preference():
         res.raise_for_status()
         pref = res.json()
         logger.info("MP preference created: %s for user %s pack %s", pref.get("id"), user_id, pack_id)
-        return jsonify({"init_point": pref["init_point"]}), 200
+        # Use sandbox_init_point for test credentials, init_point for production
+        is_test = "test" in MP_ACCESS_TOKEN.lower() or "sandbox" in MP_ACCESS_TOKEN.lower()
+        checkout_url = pref.get("sandbox_init_point", pref["init_point"]) if is_test else pref["init_point"]
+        return jsonify({"init_point": checkout_url}), 200
     except requests.HTTPError as exc:
         logger.error("MP create-preference HTTP error: %s — %s", exc, exc.response.text if exc.response else "")
         return jsonify({"error": "MercadoPago error", "detail": str(exc)}), 502

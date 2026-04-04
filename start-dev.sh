@@ -19,6 +19,16 @@ notify() {
 
 notify "🚀 Iniciando entorno MarketTool..."
 
+# ── 0. VPN WireGuard ─────────────────────────────────────────
+notify "🔒 Verificando VPN WireGuard..."
+if sudo wg show wg0 > /dev/null 2>&1; then
+  notify "✅ WireGuard ya activo"
+else
+  notify "🔄 Levantando WireGuard (wg0)..."
+  sudo wg-quick up wg0
+  notify "✅ WireGuard activo"
+fi
+
 # ── 1. Docker daemon ─────────────────────────────────────────
 notify "🐳 Verificando Docker..."
 # Intentar Docker Desktop primero, caer a dockerd del sistema
