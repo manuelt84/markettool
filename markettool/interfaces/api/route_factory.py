@@ -22,6 +22,7 @@ from markettool.interfaces.api.bot_inject_routes import register_bot_inject_rout
 from markettool.interfaces.api.ponderacion_routes import register_ponderacion_routes
 from markettool.interfaces.api.ponderacion_history import PonderacionHistory
 from markettool.interfaces.api.ponderacion_alerts import PonderacionAlert
+from markettool.interfaces.api.payment_routes import register_payment_routes
 # backtest_routes removed — backtest is now 100% client-side
 
 if TYPE_CHECKING:
@@ -116,6 +117,10 @@ def register_all_routes(
         ponderacion_alert=ponderacion_alert,
     )
     logger.info("✅ Hexagonal API routes registered")
+
+    # Payment routes (PayPal)
+    register_payment_routes(app)
+    logger.info("✅ Payment routes registered")
 
     # Legacy routes migrated into hexagonal registration
     legacy_services = getattr(container, "legacy_services", None)
