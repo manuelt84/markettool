@@ -39,7 +39,6 @@ MP_PUBLIC_KEY = os.getenv(
 MP_API_BASE = "https://api.mercadopago.com"
 
 PACKS: dict[str, dict] = {
-    "pack_test_1":       {"ops": 10,   "price": 1.00,   "plan": "any"},
     "pack_basic_200":    {"ops": 200,  "price": 6.47,   "plan": "premium-mensual"},
     "pack_basic_400":    {"ops": 400,  "price": 11.85,  "plan": "premium-mensual"},
     "pack_basic_800":    {"ops": 800,  "price": 21.55,  "plan": "premium-mensual"},
