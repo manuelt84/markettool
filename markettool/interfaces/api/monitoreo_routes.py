@@ -595,16 +595,18 @@ def register_monitoreo_routes(app, *, services) -> None:
                 )
                 # 1MIN HOTFIX: If we're waiting for a new 1m candle and cache shows no change,
                 # double-check by looking at time gap - if >= 60s, last_server might be valid
+                # ✅ FIX: Only return last_server if price ACTUALLY CHANGED (not just timestamp)
                 if (
                     timeframe == "1min"
                     and not inc
                     and last_ts
                     and last_server_t
                     and (last_server_t - last_ts) >= 55000  # Within 5 seconds of expected 60s boundary
+                    and changed  # ← Added: Validate actual price change, not just time gap
                 ):
-                    inc = [last_server]  # Return the last_server even if "changed" is False
+                    inc = [last_server]  # Return the last_server only if "changed" is True
                     logging.info(
-                        "INC 1min HOTFIX %s: Returning last_server (time gap %.0fs suggests new candle)",
+                        "INC 1min HOTFIX %s: Returning last_server (time gap %.0fs + price change)",
                         symbol,
                         (last_server_t - last_ts) / 1000.0
                     )
@@ -1333,4 +1335,102 @@ def register_monitoreo_routes(app, *, services) -> None:
         
         except Exception as exc:
             logger.exception("Error en /api/monitoreos/list")
+            return jsonify({"status": "error", "message": str(exc)}), 500
+
+    # ── Live-candle cache ──────────────────────────────────────────────────────
+    # Short-lived per (symbol, tf) cache so consecutive polls within the same
+    # second reuse the last FMP response instead of hitting the API again.
+    _lc_cache: dict = {}
+    _lc_cache_ttl = {
+        "1min":  5,
+        "5min":  10,
+        "15min": 20,
+        "30min": 30,
+        "1hour": 60,
+        "4hour": 120,
+    }
+
+    @app.route("/monitoreo/live-candle", methods=["GET"])
+    async def monitoreo_live_candle():
+        """
+        GET /monitoreo/live-candle?symbol=BTCUSD&timeframe=1min
+
+        Returns the current *building* candle (open period) for the requested
+        symbol / timeframe by fetching the most recent bar from FMP's intraday
+        historical endpoint.  The frontend overlays this on top of the closed
+        historical series so the live candle always shows a proper body + wicks
+        instead of a flat dash.
+
+        Response:
+          {
+            "status": "ok",
+            "symbol": "BTCUSD",
+            "timeframe": "1min",
+            "candle": { "t": <ms>, "o": ..., "h": ..., "l": ..., "c": ..., "v": ... }
+                        | null
+          }
+        """
+        try:
+            symbol    = request.args.get("symbol",    "").strip().upper()
+            timeframe = norm_tf(request.args.get("timeframe", "1min"))
+
+            if not symbol or not timeframe:
+                return jsonify({"status": "error",
+                                "message": "symbol y timeframe son obligatorios"}), 400
+
+            cache_key = (symbol, timeframe)
+            now       = time.time()
+            ttl       = _lc_cache_ttl.get(timeframe, 10)
+            cached    = _lc_cache.get(cache_key)
+
+            if cached and (now - cached["ts"]) < ttl:
+                return jsonify({
+                    "status":    "ok",
+                    "symbol":    symbol,
+                    "timeframe": timeframe,
+                    "candle":    cached["data"],
+                    "cached":    True,
+                }), 200
+
+            tf_ms_value = tf_ms(timeframe)
+            if not tf_ms_value:
+                return jsonify({"status": "ok", "symbol": symbol,
+                                "timeframe": timeframe, "candle": None}), 200
+
+            now_ms      = int(now * 1000)
+            # Fetch from the start of the current open bucket plus a small look-
+            # back (one extra bar) so we definitely capture the building candle.
+            bucket_start = current_closed_bucket_start(timeframe)  # last CLOSED
+            from_ms      = bucket_start - tf_ms_value               # one bar back
+            to_ms        = now_ms + tf_ms_value                     # a bit ahead
+
+            candles = await asyncio.to_thread(
+                fetch_historical_range, symbol, timeframe, from_ms, to_ms
+            )
+
+            if not candles:
+                _lc_cache[cache_key] = {"data": None, "ts": now}
+                return jsonify({"status": "ok", "symbol": symbol,
+                                "timeframe": timeframe, "candle": None}), 200
+
+            # fetch_historical_range returns bars in ascending order (oldest→newest).
+            # The last bar is either the last closed bar or the currently building one.
+            live = candles[-1]
+
+            _lc_cache[cache_key] = {"data": live, "ts": now}
+            logging.info(
+                "LIVE-CANDLE %s %s t=%s o=%.5f h=%.5f l=%.5f c=%.5f",
+                symbol, timeframe,
+                live.get("t"), live.get("o", 0), live.get("h", 0),
+                live.get("l", 0), live.get("c", 0),
+            )
+            return jsonify({
+                "status":    "ok",
+                "symbol":    symbol,
+                "timeframe": timeframe,
+                "candle":    live,
+            }), 200
+
+        except Exception as exc:
+            logging.exception("Error en /monitoreo/live-candle")
             return jsonify({"status": "error", "message": str(exc)}), 500
