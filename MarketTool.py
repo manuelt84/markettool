@@ -15612,10 +15612,12 @@ _CORE_FIELDS = {
 
 # Campos "extended" (detalle completo con técnica + Monte Carlo)
 _EXTENDED_FIELDS = _CORE_FIELDS | {
-    'Patrones Detectados',
+    'Patrones Detectados', 'patrones_detectados',
     'Rebotes', 'Rango_Dinamico', 'Es_Rango_Repetitivo', 'Estructura_Tendencia',
-    'Probabilidad Alza (Montecarlo)', 'Probabilidad Baja (Montecarlo)',
+    'Probabilidad Alza (Montecarlo)', 'probabilidad_alza',
+    'Probabilidad Baja (Montecarlo)', 'probabilidad_baja',
     'MACD Tendencia Predicha',
+    'zona_sobreventa', 'zona_sobrecompra', 'macd_cerca_de_cruzar',
 }
 
 # Campos que NUNCA subir (internos)
