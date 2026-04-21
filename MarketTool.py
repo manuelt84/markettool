@@ -10048,9 +10048,7 @@ def calcular_indicadores_impl(df, temporalidad, window: int | None = None):
     )
 
     # Detectar si el MACD está cerca de cruzar la señal
-    df['macd_cerca_de_cruzar'] = np.where(
-        (macd_cur - sig_cur).abs() < (df['macd'].std() * 0.05), 'Cerca del cruce', 'No cerca'
-    )
+    df['macd_cerca_de_cruzar'] = (macd_cur - sig_cur).abs() < (df['macd'].std() * 0.05)
 
     # Cálculo de RSI
     delta = df['close'].diff(1)
