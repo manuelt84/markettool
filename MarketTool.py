@@ -21123,6 +21123,8 @@ async def calcular_entradas_async(
             "bollinger_signal": df["bollinger_signal"].iloc[-1] if "bollinger_signal" in df.columns else None,
             "bollinger_upper": last_of(df, "bollinger_upper", default=None) if "bollinger_upper" in df.columns else None,
             "bollinger_lower": last_of(df, "bollinger_lower", default=None) if "bollinger_lower" in df.columns else None,
+            "zona_sobreventa": zona_sobreventa,
+            "zona_sobrecompra": zona_sobrecompra,
             "tendencia_predicha": tendencia_predicha,
             "volatilidad": volatilidad,
             "volatilidad_alta": volatilidad_alta,
