@@ -15602,6 +15602,7 @@ _CORE_FIELDS = {
     # Meta para Operational Summary
     'Rebotes', 'Es_Rango_Repetitivo', 'Rango_Dinamico', 'Estructura_Tendencia',
     'Volatilidad', 'Volatilidad Alta', 'Volatilidad Baja',
+    'MACD Tendencia Predicha',
 }
 
 # Campos "extended" (detalle completo con técnica + Monte Carlo)
