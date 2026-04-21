@@ -15587,10 +15587,11 @@ _CORE_FIELDS = {
     'probabilidad_tecnica', 'probabilidad_fundamental',
     # Technical Signals
     'Cruce MACD', 'Bollinger Signal', 'Ultimo Valor', 'ultimo',
+    'zona_sobreventa', 'zona_sobrecompra', 'macd_cerca_de_cruzar',
     # Support/Resistance Levels (CRITICAL for DetalleEjecucionScreen)
     'Soportes Alcanzados', 'Resistencias Alcanzadas',
     'Soportes Importantes Alcanzados', 'Resistencias Importantes Alcanzadas',
-    'Cerca de Soporte Resistencia', 'Cerca de S/R',
+    'Cerca de Soporte Resistencia', 'Cerca de S/R', 'cerca_de_soporte_resistencia',
     'Soporte Nivel 1', 'Soporte Nivel 2', 'Resistencia Nivel 1', 'Resistencia Nivel 2',
     'soporte_nivel_1', 'soporte_nivel_2', 'resistencia_nivel_1', 'resistencia_nivel_2',
     # Leverage (safe + theoretical)
@@ -15603,6 +15604,10 @@ _CORE_FIELDS = {
     'Rebotes', 'Es_Rango_Repetitivo', 'Rango_Dinamico', 'Estructura_Tendencia',
     'Volatilidad', 'Volatilidad Alta', 'Volatilidad Baja',
     'MACD Tendencia Predicha',
+    # Patrones y probabilidades avanzadas
+    'Patrones Detectados', 'patrones_detectados',
+    'Probabilidad Alza (Montecarlo)', 'Probabilidad Baja (Montecarlo)',
+    'probabilidad_alza', 'probabilidad_baja',
 }
 
 # Campos "extended" (detalle completo con técnica + Monte Carlo)
