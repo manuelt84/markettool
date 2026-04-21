@@ -15618,6 +15618,7 @@ _EXTENDED_FIELDS = _CORE_FIELDS | {
     'Probabilidad Baja (Montecarlo)', 'probabilidad_baja',
     'MACD Tendencia Predicha',
     'zona_sobreventa', 'zona_sobrecompra', 'macd_cerca_de_cruzar',
+    'MACD Cerca', 'Zona Sobreventa RSI-Stochastic', 'Zona Sobrecompra RSI-Stochastic',
 }
 
 # Campos que NUNCA subir (internos)
