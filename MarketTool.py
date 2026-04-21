@@ -12718,7 +12718,7 @@ def detectar_rango_zigzag(
 
     return {
         "es_rango_repetitivo": es_rango_repetitivo,
-        "estructura_tendencia": estructura_tendencia,
+        "estructura_tendencia": estructura_tendencia.capitalize() if estructura_tendencia else "Indefinida",  # ✅ FIX: capitalize for RN parsing
         "rango_dinamico": (float(round(rango_min, 5)), float(round(rango_max, 5))),
         "rebotes": rebotes_validos
     }
