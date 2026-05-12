@@ -29,9 +29,29 @@ logger = logging.getLogger("MarketTool")
 # ─────────────────────────────────────────────
 ENTRY_TTL_S = 300          # 5 min en Redis
 WORKER_IDLE_TIMEOUT_S = 300  # mata el worker si nadie hace GET en 5 min
-BEAT_INTERVAL_S = 30         # frecuencia del ciclo por TF
 LIVE_WINDOW = 3              # candles finales a evaluar (homologa generateLiveEntries)
 MIN_CANDLES = 30
+
+# Intervalo de beat por TF — homologa TF_POLL_MS del cliente (Web/RN)
+TF_BEAT_S: dict[str, float] = {
+    "1m":   5.0,
+    "1min": 5.0,
+    "5m":   20.0,
+    "5min": 20.0,
+    "15m":  45.0,
+    "15min": 45.0,
+    "30m":  90.0,
+    "30min": 90.0,
+    "1h":   180.0,
+    "1hour": 180.0,
+    "4h":   600.0,
+    "4hour": 600.0,
+    "1d":   6_000.0,
+    "1day": 6_000.0,
+    "1w":   18_000.0,
+    "1week": 18_000.0,
+}
+_DEFAULT_BEAT_S = 60.0
 
 # ─────────────────────────────────────────────
 # Estado global de workers
@@ -289,102 +309,124 @@ async def _live_worker(
     calcular_entradas_sync_wrapper,
 ):
     """
-    Worker asyncio. Corre indefinidamente hasta:
-      - recibir stop explícito (CancelledError)
-      - idle timeout (nadie hace GET en WORKER_IDLE_TIMEOUT_S)
+    Worker asyncio. Lanza un sub-task por TF, cada uno con su propio intervalo.
+    Homologa TF_POLL_MS del cliente (1m=5s, 5m=20s, 15m=45s, ...).
+    Se cancela entero cuando se llama /stop o se alcanza idle timeout.
     """
     logger.info("[LiveWorker] START %s tfs=%s", worker_key, tfs)
-    loop = asyncio.get_event_loop()
 
-    while True:
-        # ── idle check ──────────────────────────────────
-        last_poll = _WORKER_LAST_POLL.get(worker_key, time.time())
-        if time.time() - last_poll > WORKER_IDLE_TIMEOUT_S:
-            logger.info("[LiveWorker] IDLE TIMEOUT %s — stopping", worker_key)
-            break
-
-        beat_ts = int(time.time() * 1000)
-        sr_by_tf: dict[str, dict] = {}
-
-        for tf in tfs:
-            try:
-                norm = norm_tf_fn(tf)
-
-                # 1. Obtener candles del mon_cache (ya los tiene el backend)
-                st: dict = await asyncio.to_thread(load_cache, exec_id, symbol, norm)
-                series_ms: list[dict] = st.get("series") or []
-
-                # 2. Refrescar desde GCS si hay seed disponible (igual que incremental)
-                await asyncio.to_thread(maybe_refresh_from_gcs, exec_id, symbol, norm, st)
-                series_ms = st.get("series") or series_ms
-
-                # Si no hay candles, intentar FMP directo
-                if len(series_ms) < MIN_CANDLES:
-                    tf_ms = tf_ms_fn(norm) or 60_000
-                    closed_end = current_closed_bucket_start(norm) - tf_ms
-                    from_ms = closed_end - 300 * tf_ms
-                    hist = await asyncio.to_thread(fetch_historical_range, symbol, norm, from_ms, closed_end)
-                    if hist:
-                        series_ms = hist
-
-                if len(series_ms) < MIN_CANDLES:
-                    logger.info("[LiveWorker] %s/%s no hay suficientes candles (%d)", symbol, norm, len(series_ms))
-                    continue
-
-                # 3. Obtener niveles del indicators cache
-                niveles: dict | None = None
-                try:
-                    from markettool.infra.cache.indicators_cache import _INDICATORS_CACHE
-                    cached = _INDICATORS_CACHE.get(symbol, norm)
-                    if cached and isinstance(cached, dict):
-                        niveles = cached.get("niveles") or cached.get("levels")
-                except Exception:
-                    pass
-
-                # 4. Obtener eventos económicos
-                df_eventos = pd.DataFrame()
-                try:
-                    events_raw = await asyncio.to_thread(fetch_events_for, symbol, hours_back=6)
-                    if events_raw:
-                        df_eventos = pd.DataFrame(events_raw) if isinstance(events_raw, list) else events_raw
-                except Exception:
-                    pass
-
-                # 5. Generar entradas live
-                entries, sr_levels = await asyncio.to_thread(
-                    _generate_live_entries_sync,
-                    symbol, norm, series_ms, niveles, df_eventos,
-                    calcular_entradas_sync_wrapper, norm_tf_fn,
-                )
-
-                sr_by_tf[norm] = sr_levels
-
-                # 6. Persistir en Redis
-                if entries:
-                    added = _push_entries_to_redis(redis_client, exec_id, symbol, norm, entries)
-                    if added:
-                        logger.info("[LiveWorker] %s/%s +%d nuevas entradas → Redis", symbol, norm, added)
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("[LiveWorker] Error beat %s/%s: %s", symbol, tf, exc, exc_info=True)
-
-        # Actualizar beat timestamp
+    async def _run_beat(tf: str):
         try:
-            beat_data = {"ts": beat_ts, "sr_levels": sr_by_tf, "tfs": tfs, "symbol": symbol}
-            redis_client.setex(_redis_beat_key(exec_id, symbol), WORKER_IDLE_TIMEOUT_S, json.dumps(beat_data))
-        except Exception:
-            pass
+            norm = norm_tf_fn(tf)
 
-        await asyncio.sleep(BEAT_INTERVAL_S)
+            # 1. Candles del mon_cache
+            st: dict = await asyncio.to_thread(load_cache, exec_id, symbol, norm)
+            series_ms: list[dict] = st.get("series") or []
 
-    logger.info("[LiveWorker] STOP %s", worker_key)
-    async with _WORKER_LOCK:
-        _WORKERS.pop(worker_key, None)
-        _WORKER_LAST_POLL.pop(worker_key, None)
+            # 2. Refrescar GCS seed
+            await asyncio.to_thread(maybe_refresh_from_gcs, exec_id, symbol, norm, st)
+            series_ms = st.get("series") or series_ms
+
+            # 3. Fallback FMP si faltan candles
+            if len(series_ms) < MIN_CANDLES:
+                tf_ms_val = tf_ms_fn(norm) or 60_000
+                closed_end = current_closed_bucket_start(norm) - tf_ms_val
+                from_ms = closed_end - 300 * tf_ms_val
+                hist = await asyncio.to_thread(fetch_historical_range, symbol, norm, from_ms, closed_end)
+                if hist:
+                    series_ms = hist
+
+            if len(series_ms) < MIN_CANDLES:
+                logger.info("[LiveWorker] %s/%s sin candles suficientes (%d)", symbol, norm, len(series_ms))
+                return
+
+            # 4. Niveles del indicators cache
+            niveles: dict | None = None
+            try:
+                from markettool.infra.cache.indicators_cache import _INDICATORS_CACHE
+                cached = _INDICATORS_CACHE.get(symbol, norm)
+                if cached and isinstance(cached, dict):
+                    niveles = cached.get("niveles") or cached.get("levels")
+            except Exception:
+                pass
+
+            # 5. Eventos económicos
+            df_eventos = pd.DataFrame()
+            try:
+                events_raw = await asyncio.to_thread(fetch_events_for, symbol, hours_back=6)
+                if events_raw:
+                    df_eventos = pd.DataFrame(events_raw) if isinstance(events_raw, list) else events_raw
+            except Exception:
+                pass
+
+            # 6. Generar entradas
+            entries, sr_levels = await asyncio.to_thread(
+                _generate_live_entries_sync,
+                symbol, norm, series_ms, niveles, df_eventos,
+                calcular_entradas_sync_wrapper, norm_tf_fn,
+            )
+
+            # 7. Persistir en Redis
+            if entries:
+                added = _push_entries_to_redis(redis_client, exec_id, symbol, norm, entries)
+                if added:
+                    logger.info("[LiveWorker] %s/%s +%d nuevas entradas", symbol, norm, added)
+
+            # 8. Actualizar beat timestamp + sr_levels en Redis
+            try:
+                beat_key = _redis_beat_key(exec_id, symbol)
+                beat_raw = redis_client.get(beat_key)
+                beat_data: dict = json.loads(beat_raw) if beat_raw else {"tfs": tfs, "symbol": symbol, "sr_levels": {}}
+                beat_data["ts"] = int(time.time() * 1000)
+                beat_data["sr_levels"][norm] = sr_levels
+                redis_client.setex(beat_key, WORKER_IDLE_TIMEOUT_S, json.dumps(beat_data))
+            except Exception:
+                pass
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[LiveWorker] Error beat %s/%s: %s", symbol, tf, exc, exc_info=True)
+
+    async def _tf_beat_loop(tf: str):
+        """Loop independiente por TF con su propio intervalo."""
+        interval_s = TF_BEAT_S.get(norm_tf_fn(tf), _DEFAULT_BEAT_S)
+        # Primer beat inmediato (seed sin stagger, igual que el cliente)
+        await _run_beat(tf)
+        while True:
+            await asyncio.sleep(interval_s)
+            await _run_beat(tf)
+
+    # Lanzar un task por TF con stagger de 1s entre ellos
+    tf_tasks: list[asyncio.Task] = []
+    for i, tf in enumerate(tfs):
+        if i > 0:
+            await asyncio.sleep(1.0)
+        task = asyncio.get_event_loop().create_task(_tf_beat_loop(tf))
+        tf_tasks.append(task)
+
+    # Idle monitor — mata todo si nadie hace GET en WORKER_IDLE_TIMEOUT_S
+    try:
+        while True:
+            await asyncio.sleep(30)
+            last_poll = _WORKER_LAST_POLL.get(worker_key, time.time())
+            if time.time() - last_poll > WORKER_IDLE_TIMEOUT_S:
+                logger.info("[LiveWorker] IDLE TIMEOUT %s — stopping", worker_key)
+                break
+    except asyncio.CancelledError:
+        pass
+    finally:
+        for t in tf_tasks:
+            t.cancel()
+        logger.info("[LiveWorker] STOP %s", worker_key)
+        async with _WORKER_LOCK:
+            _WORKERS.pop(worker_key, None)
+            _WORKER_LAST_POLL.pop(worker_key, None)
 
 
+# ─────────────────────────────────────────────
+# Registro de rutas Flask
+# ─────────────────────────────────────────────
 # ─────────────────────────────────────────────
 # Registro de rutas Flask
 # ─────────────────────────────────────────────
