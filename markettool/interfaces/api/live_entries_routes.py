@@ -455,26 +455,60 @@ async def _live_worker(
             await asyncio.sleep(interval_s)
             await _run_beat(tf)
 
-    # Lanzar un task por TF con stagger de 1s entre ellos
-    tf_tasks: list[asyncio.Task] = []
+    # tf_tasks_map: tf → Task (para poder agregar/quitar dinámicamente)
+    tf_tasks_map: dict[str, asyncio.Task] = {}
+
+    async def _start_tf_task(tf: str):
+        if tf not in tf_tasks_map or tf_tasks_map[tf].done():
+            task = asyncio.get_event_loop().create_task(_tf_beat_loop(tf))
+            tf_tasks_map[tf] = task
+            logger.info("[LiveWorker] TF task iniciado: %s/%s", symbol, tf)
+
+    # Lanzar tasks iniciales con stagger de 1s
     for i, tf in enumerate(tfs):
         if i > 0:
             await asyncio.sleep(1.0)
-        task = asyncio.get_event_loop().create_task(_tf_beat_loop(tf))
-        tf_tasks.append(task)
+        await _start_tf_task(tf)
 
-    # Idle monitor — mata todo si nadie hace GET en WORKER_IDLE_TIMEOUT_S
+    # Monitor loop — cada 30s:
+    #   1. Idle check (mata el worker si nadie hace GET)
+    #   2. TF reconciliation — agrega/quita tasks según Firestore
     try:
         while True:
             await asyncio.sleep(30)
+
+            # 1. Idle check
             last_poll = _WORKER_LAST_POLL.get(worker_key, time.time())
             if time.time() - last_poll > WORKER_IDLE_TIMEOUT_S:
                 logger.info("[LiveWorker] IDLE TIMEOUT %s — stopping", worker_key)
                 break
+
+            # 2. Re-leer TFs activos desde Firestore
+            try:
+                current_tfs = set(await asyncio.to_thread(
+                    _get_active_tfs, exec_id, symbol, norm_tf_fn
+                ))
+                running_tfs = set(tf_tasks_map.keys())
+
+                # TFs nuevos → arrancar
+                for tf in current_tfs - running_tfs:
+                    logger.info("[LiveWorker] %s nuevo TF detectado: %s — arrancando task", symbol, tf)
+                    await _start_tf_task(tf)
+
+                # TFs removidos → cancelar
+                for tf in running_tfs - current_tfs:
+                    task = tf_tasks_map.pop(tf, None)
+                    if task and not task.done():
+                        task.cancel()
+                        logger.info("[LiveWorker] %s TF removido: %s — task cancelado", symbol, tf)
+
+            except Exception as exc:
+                logger.warning("[LiveWorker] Error en TF reconciliation %s: %s", worker_key, exc)
+
     except asyncio.CancelledError:
         pass
     finally:
-        for t in tf_tasks:
+        for t in tf_tasks_map.values():
             t.cancel()
         logger.info("[LiveWorker] STOP %s", worker_key)
         async with _WORKER_LOCK:
