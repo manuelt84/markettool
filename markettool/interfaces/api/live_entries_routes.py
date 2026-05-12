@@ -290,6 +290,55 @@ def _generate_live_entries_sync(
 
 
 # ─────────────────────────────────────────────
+# Descubrimiento de TFs activos desde Firestore
+# ─────────────────────────────────────────────
+
+def _get_active_tfs(exec_id: str, symbol: str, norm_tf_fn) -> list[str]:
+    """
+    Lee monitoreos/{exec_id}__{SYMBOL} en Firestore y devuelve los TFs activos.
+    Usa allowed_timeframes + tf_states para filtrar TFs detenidos.
+    Fallback: si no hay doc en Firestore, devuelve lista vacía.
+    """
+    try:
+        from MarketTool import db, _tf_is_enabled
+        doc_id = f"{exec_id}__{symbol.upper()}"
+        snap = db.collection("monitoreos").document(doc_id).get()
+        if not snap.exists:
+            logger.warning("[LiveWorker] No hay doc monitoreos/%s en Firestore", doc_id)
+            return []
+
+        doc = snap.to_dict() or {}
+        estado_global = str(doc.get("estado") or "").lower()
+        stop_words = {"stopped", "detenido", "inactivo", "cancelado", "finalizado"}
+        if any(w in estado_global for w in stop_words):
+            logger.info("[LiveWorker] %s estado global=%s — sin TFs", doc_id, estado_global)
+            return []
+
+        allowed: list[str] = doc.get("allowed_timeframes") or []
+        # Si no hay allowed_timeframes, intentar desde tf_states
+        if not allowed:
+            tf_states = doc.get("tf_states") or {}
+            allowed = list(tf_states.keys())
+
+        active_tfs = []
+        for tf_raw in allowed:
+            tf = norm_tf_fn(tf_raw)
+            try:
+                if _tf_is_enabled(exec_id, symbol, tf):
+                    active_tfs.append(tf)
+            except Exception as exc:
+                logger.debug("[LiveWorker] tf_is_enabled error %s/%s: %s", symbol, tf, exc)
+                active_tfs.append(tf)  # incluir por defecto si no se puede verificar
+
+        logger.info("[LiveWorker] %s TFs activos desde Firestore: %s", doc_id, active_tfs)
+        return active_tfs
+
+    except Exception as exc:
+        logger.warning("[LiveWorker] Error obteniendo TFs activos %s/%s: %s", exec_id, symbol, exc)
+        return []
+
+
+# ─────────────────────────────────────────────
 # Worker asyncio por exec_id+symbol
 # ─────────────────────────────────────────────
 
@@ -313,6 +362,15 @@ async def _live_worker(
     Homologa TF_POLL_MS del cliente (1m=5s, 5m=20s, 15m=45s, ...).
     Se cancela entero cuando se llama /stop o se alcanza idle timeout.
     """
+    # Auto-descubrir TFs desde Firestore si no se pasaron explícitamente
+    if not tfs:
+        tfs = _get_active_tfs(exec_id, symbol, norm_tf_fn)
+        if not tfs:
+            logger.warning("[LiveWorker] %s sin TFs activos — worker no arranca", worker_key)
+            async with _WORKER_LOCK:
+                _WORKERS.pop(worker_key, None)
+            return
+
     logger.info("[LiveWorker] START %s tfs=%s", worker_key, tfs)
 
     async def _run_beat(tf: str):
@@ -464,13 +522,14 @@ def register_live_entries_routes(app, *, services) -> None:
         body = request.get_json(force=True) or {}
         exec_id = body.get("exec_id", "").strip()
         symbol = (body.get("symbol") or "").upper().strip()
-        tfs_raw: list[str] = body.get("tfs") or []
+        tfs_raw: list[str] = body.get("tfs") or []   # opcional — si vacío, auto-descubre desde Firestore
         platform = body.get("platform", "UNKNOWN")
 
-        if not exec_id or not symbol or not tfs_raw:
-            return jsonify({"error": "exec_id, symbol y tfs son requeridos"}), 400
+        if not exec_id or not symbol:
+            return jsonify({"error": "exec_id y symbol son requeridos"}), 400
 
-        tfs = [norm_tf(t) for t in tfs_raw]
+        # Si el cliente pasa TFs explícitamente, los normaliza; si no, el worker los descubre
+        tfs = [norm_tf(t) for t in tfs_raw] if tfs_raw else []
         wid = _worker_id(exec_id, symbol)
 
         async with _WORKER_LOCK:
