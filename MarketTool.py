@@ -21171,7 +21171,37 @@ async def calcular_entradas_async(
             "zona_sobrecompra": zona_sobrecompra,
             "entradas": entradas_mult,
         }
-        
+
+        # ✅ CONSISTENCIA: Si entradas_mult vacío pero hay entry legacy, empaquetarlo en el array
+        # Esto garantiza que "entradas" SIEMPRE sea un array con al menos 1 elemento cuando hay señal
+        if not entradas_mult and precio_entrada is not None:
+            import math as _math
+            def _finite(v):
+                try: return v is not None and not _math.isnan(v) and not _math.isinf(v)
+                except: return False
+            if _finite(precio_entrada):
+                _rrr = None
+                try:
+                    if _finite(take_profit) and _finite(stop_loss):
+                        _diff_tp = abs(take_profit - precio_entrada)
+                        _diff_sl = abs(precio_entrada - stop_loss)
+                        _rrr = round(_diff_tp / _diff_sl, 3) if _diff_sl > 0 else None
+                except Exception:
+                    pass
+                _side = "long" if tipo_operacion in ("Compra",) else "short" if tipo_operacion in ("Venta",) else "neutral"
+                salida["entradas"] = [{
+                    "precio_entrada": precio_entrada,
+                    "take_profit": take_profit if _finite(take_profit) else None,
+                    "stop_loss": stop_loss if _finite(stop_loss) else None,
+                    "side": _side,
+                    "rrr": _rrr,
+                    "score": salida.get("confianza"),
+                    "basado_en": "legacy_fallback",
+                    "rebotes": salida.get("rebotes"),
+                    "ultimo_valor": precio_actual,
+                    "meta": {},
+                }]
+
         # ✅ NIVEL 0.5: Guardar resultado en Redis para próxima vez (non-blocking)
         try:
             entradas_cache = get_entradas_cache()
