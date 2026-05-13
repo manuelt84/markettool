@@ -537,8 +537,10 @@ def register_live_entries_routes(app, *, services) -> None:
 
     # Redis client
     try:
-        from markettool.infra.cache.redis_cache import get_redis_client
-        redis_client = get_redis_client()
+        import os, redis as _redis
+        _redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+        redis_client = _redis.Redis.from_url(_redis_url, decode_responses=True, socket_connect_timeout=3)
+        redis_client.ping()  # verificar conexión
     except Exception:
         redis_client = None
         logger.warning("[LiveEntries] Redis no disponible — entradas no se persistirán")
