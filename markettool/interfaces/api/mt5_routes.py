@@ -393,6 +393,17 @@ def register_mt5_routes(app: Flask) -> None:
             logger.error(f"MT5 result error: {e}", exc_info=True)
             return jsonify({"error": str(e)}), 500
     
+    @app.route("/api/v1/broker/mt5/open-positions", methods=["GET"])
+    def mt5_open_positions():
+        """Get the latest open positions reported by the EA via /poll."""
+        try:
+            service = get_mt5_service()
+            positions = service.get_ea_open_positions()
+            return jsonify({"open_positions": positions, "count": len(positions)}), 200
+        except Exception as e:
+            logger.error(f"MT5 open positions error: {e}", exc_info=True)
+            return jsonify({"error": str(e)}), 500
+
     @app.route("/api/v1/broker/mt5/order-status/<order_id>", methods=["GET"])
     def mt5_order_status(order_id: str):
         """Get status of a specific order by UUID."""

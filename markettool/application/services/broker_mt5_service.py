@@ -290,8 +290,15 @@ class BrokerMT5Service:
     
     def update_ea_account_info(self, account_info: dict) -> None:
         """Update account info received from EA."""
+        # Si el EA envía open_positions, las guardamos separado para que la app pueda consultarlas
+        if 'open_positions' in account_info:
+            self.ea_open_positions = account_info.get('open_positions', [])
         self.ea_account_info = account_info
         self.ea_last_poll = time.time()
+
+    def get_ea_open_positions(self) -> list:
+        """Return the last list of open positions reported by the EA."""
+        return getattr(self, 'ea_open_positions', [])
     
     def report_order_result(self, order_id: str, result: dict) -> None:
         """
