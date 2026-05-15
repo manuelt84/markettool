@@ -21176,13 +21176,13 @@ async def calcular_entradas_async(
         # Esto garantiza que "entradas" SIEMPRE sea un array con al menos 1 elemento cuando hay señal
         if not entradas_mult and precio_entrada is not None:
             import math as _math
-            def _finite(v):
+            def _finite_local(v):
                 try: return v is not None and not _math.isnan(v) and not _math.isinf(v)
                 except: return False
-            if _finite(precio_entrada):
+            if _finite_local(precio_entrada):
                 _rrr = None
                 try:
-                    if _finite(take_profit) and _finite(stop_loss):
+                    if _finite_local(take_profit) and _finite_local(stop_loss):
                         _diff_tp = abs(take_profit - precio_entrada)
                         _diff_sl = abs(precio_entrada - stop_loss)
                         _rrr = round(_diff_tp / _diff_sl, 3) if _diff_sl > 0 else None
@@ -21191,8 +21191,8 @@ async def calcular_entradas_async(
                 _side = "long" if tipo_operacion in ("Compra",) else "short" if tipo_operacion in ("Venta",) else "neutral"
                 salida["entradas"] = [{
                     "precio_entrada": precio_entrada,
-                    "take_profit": take_profit if _finite(take_profit) else None,
-                    "stop_loss": stop_loss if _finite(stop_loss) else None,
+                    "take_profit": take_profit if _finite_local(take_profit) else None,
+                    "stop_loss": stop_loss if _finite_local(stop_loss) else None,
                     "side": _side,
                     "rrr": _rrr,
                     "score": salida.get("confianza"),
@@ -23386,4 +23386,3 @@ if __name__ == "__main__":
     # Only import here to avoid circular dependencies
     from markettool.bootstrap import main
     main()
-
