@@ -251,3 +251,38 @@ seenFPs.add(fp);
 - **Uso:** `pollIncremental` para actualización incremental de candles
 - **Timeout:** 8 segundos
 - **Base URL:** `https://api.mtlabsx.com`
+
+---
+
+## 13. Backend QA Audit — 2026-05-15
+
+Detalle completo: [BACKEND_QA_AUDIT_2026-05-15.md](./BACKEND_QA_AUDIT_2026-05-15.md)
+
+### Contratos monitoreados
+
+- `POST /monitoreo/incremental`: requiere `user_id`, `exec_id`, `symbol`, `timeframe`; opcionales `last_ts` y `persist`. Respuesta nominal: `status`, `symbol`, `timeframe`, `exec_id`, `from_ts`, `to_ts`, `candles`, `data_quality`; puede agregar `cold_start` o `empty_response`.
+- `POST /monitoreo/history`: requiere los mismos campos; opcionales `limit`, `from_ts`, `to_ts`, `persist`, `fill_gaps`, `force_api`, `max_minutes_per_call`. Respuesta nominal: `status`, `symbol`, `timeframe`, `exec_id`, `from_ts`, `to_ts`, `count`, `candles`, `gapfill`, `data_quality`.
+- Ambas rutas devuelven `402 INSUFFICIENT_TRANSACTIONS` cuando falla cuota y pueden devolver `status=ok` con `candles=[]` si el TF queda deshabilitado o detenido explicitamente.
+
+### `calcular_entradas_async`
+
+- Entrada: `df`, `df_eventos`, `symbol`, `temporalidad`, `user_chat_id?`, `calc_windows?`, `cfg?`.
+- Salida nominal: formato legacy + `entradas` como lista de candidatos. Si no hay `entradas_mult` pero existe `precio_entrada` finito, empaqueta fallback `legacy_fallback`.
+- Fix `6859f5b`: renombra el helper local `_finite` a `_finite_local` para que el calculo ATR use el helper global y no dispare `UnboundLocalError`.
+
+### Campos de broker esperados
+
+RN/Web esperan que la apertura o el status final preserven:
+
+| Campo canonico | Aliases tolerados | Motivo |
+|---|---|---|
+| `openPrice` | `open_price`, `price` | Fill real para PnL/risk guard. |
+| `executedVolume` | `executed_volume`, `volume` | Volumen real tras ajuste del broker. |
+| `openCommission` | `open_commission`, `commission` | Comision de apertura para `commPct` y PnL neto. |
+
+### Riesgos QA pendientes
+
+- Faltan tests de contrato para `history/incremental` con cuota, TF deshabilitado, cold-start, rangos y `data_quality`.
+- Faltan tests de regresion para `calcular_entradas_async` con ATR faltante/no finito y shape `entradas=[]` en fallback/exception.
+- Faltan logs reales que prueben propagacion broker -> backend -> RN/Web de `openPrice`, `openCommission` y `executedVolume`.
+- El compose vivo esta fuera del repo (`localnginx_balancer/maquina-a_test`); los scripts historicos del repo no representan por completo el deploy actual.

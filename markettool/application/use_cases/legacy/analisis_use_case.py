@@ -631,8 +631,15 @@ class LegacyAnalisisUseCase:
                 }
 
                 try:
-                    signed_url = data.get("metadata", {}).get("signed_url") or data.get(
-                        "gcs_path"
+                    gcs_path = data.get("gcs_path")
+                    signed_url = (
+                        data.get("signed_url")
+                        or data.get("metadata", {}).get("signed_url")
+                        or (
+                            f"https://storage.googleapis.com/markettool_bucket/{gcs_path}"
+                            if isinstance(gcs_path, str) and gcs_path
+                            else None
+                        )
                     )
                     if signed_url:
                         resp = requests.get(signed_url, timeout=10)

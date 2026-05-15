@@ -3729,7 +3729,7 @@ async def guardar_json_en_storage_y_registrar(
         chat_id=chat_id, 
         tipo="json", 
         nombre=nombre, 
-        gcs_path=object_path,
+        gcs_path=f"analisis/{object_path}",
         signed_url=url_publica, 
         content_type="application/json",
         metadata=metadata or {},
@@ -21027,14 +21027,17 @@ async def calcular_entradas_async(
         
         # ===== LEGACY ENTRY SELECTION (fallback if no entries) =====
         best = entradas_mult[0] if entradas_mult else None
+        legacy_side = None
         if best:
             precio_entrada = best.get("precio_entrada")
             take_profit = best.get("take_profit")
             stop_loss = best.get("stop_loss")
+            legacy_side = best.get("side")
         else:
             if tipo_operacion in señales_compra or (
                 tipo_operacion == "Neutral" and en_rango["estructura_tendencia"] in ("alcista", "indefinida")
             ):
+                legacy_side = "long"
                 precio_entrada = (
                     (niveles_clave["resistencia_nivel_1"] + niveles_clave["soporte_nivel_1"]) / 2
                     if niveles_clave["resistencia_nivel_1"] and niveles_clave["soporte_nivel_1"]
@@ -21049,6 +21052,7 @@ async def calcular_entradas_async(
             elif tipo_operacion in señales_venta or (
                 tipo_operacion == "Neutral" and en_rango["estructura_tendencia"] in ("bajista", "indefinida")
             ):
+                legacy_side = "short"
                 precio_entrada = (
                     (niveles_clave["resistencia_nivel_1"] + niveles_clave["soporte_nivel_1"]) / 2
                     if niveles_clave["resistencia_nivel_1"] and niveles_clave["soporte_nivel_1"]
@@ -21061,6 +21065,7 @@ async def calcular_entradas_async(
                     )
                     stop_loss, take_profit = np.nan, np.nan
             else:
+                legacy_side = None
                 precio_entrada = None
                 take_profit = None
                 stop_loss = None
@@ -21188,7 +21193,7 @@ async def calcular_entradas_async(
                         _rrr = round(_diff_tp / _diff_sl, 3) if _diff_sl > 0 else None
                 except Exception:
                     pass
-                _side = "long" if tipo_operacion in ("Compra",) else "short" if tipo_operacion in ("Venta",) else "neutral"
+                _side = legacy_side if legacy_side in ("long", "short") else "long" if tipo_operacion in ("Compra",) else "short" if tipo_operacion in ("Venta",) else "neutral"
                 salida["entradas"] = [{
                     "precio_entrada": precio_entrada,
                     "take_profit": take_profit if _finite_local(take_profit) else None,
@@ -21224,7 +21229,7 @@ async def calcular_entradas_async(
         if not salida:
             salida = {}
         salida.setdefault("entradas_multiples", [])
-        salida.setdefault("entradas", {"lista": []})
+        salida.setdefault("entradas", [])
         return json_safe(salida)
 
 
@@ -21880,10 +21885,11 @@ def fs_touch_monitoreo(exec_id: str, symbol: str, data: Dict[str, Any]) -> None:
 def _maybe_refresh_from_gcs(exec_id: str, symbol: str, timeframe: str, st: dict, max_age_s: int = 30):
     try:
         client = storage.Client()
-        for path in (
-            _gcs_stream_path(exec_id, symbol, timeframe),  # type: ignore[name-defined]
-            f"{_gcs_exec_base(exec_id)}{_gcs_file_name_for(symbol, timeframe)}",
-        ):
+        paths = [f"{_gcs_exec_base(exec_id)}{_gcs_file_name_for(symbol, timeframe)}"]
+        stream_path_fn = globals().get("_gcs_stream_path")
+        if callable(stream_path_fn):
+            paths.insert(0, stream_path_fn(exec_id, symbol, timeframe))
+        for path in paths:
             bucket = client.bucket(BUCKET_NAME)
             blob = bucket.blob(path)
             if not blob.exists():

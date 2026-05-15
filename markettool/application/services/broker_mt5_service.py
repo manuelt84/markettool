@@ -333,6 +333,15 @@ class BrokerMT5Service:
             return
         
         # Store result and mark as completed/failed
+        open_price = result.get("openPrice") or result.get("open_price") or result.get("price")
+        if open_price is not None:
+            result["openPrice"] = open_price
+            result["open_price"] = open_price
+            result["brokerOpenPrice"] = open_price
+        open_commission = result.get("openCommission") or result.get("open_commission") or result.get("commission")
+        if open_commission is not None:
+            result["openCommission"] = open_commission
+            result["open_commission"] = open_commission
         pending.result = result
         success = result.get("success", False)
         pending.state = OrderState.COMPLETED if success else OrderState.FAILED

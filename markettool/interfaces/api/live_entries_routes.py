@@ -247,13 +247,25 @@ def _generate_live_entries_sync(
         entradas_raw = result.get("entradas") or result.get("resumen_senal") or result.get("resumen") or []
     elif isinstance(result, list):
         entradas_raw = result
+    if isinstance(entradas_raw, dict):
+        entradas_raw = entradas_raw.get("lista") or []
 
     now_ts = int(time.time() * 1000)
     entries: list[dict] = []
     for e in entradas_raw:
+        if not isinstance(e, dict):
+            continue
         side = e.get("tipo_operacion") or e.get("side") or e.get("direction", "")
         if isinstance(side, str):
-            side = "long" if "compra" in side.lower() or "long" in side.lower() or "buy" in side.lower() else "short"
+            side_raw = side.lower()
+            if "compra" in side_raw or "long" in side_raw or "buy" in side_raw:
+                side = "long"
+            elif "venta" in side_raw or "short" in side_raw or "sell" in side_raw:
+                side = "short"
+            else:
+                continue
+        elif side not in ("long", "short"):
+            continue
         entry_price = e.get("precio_entrada") or e.get("entry_price") or e.get("precio") or 0.0
         tp = e.get("take_profit") or e.get("tp") or 0.0
         sl = e.get("stop_loss") or e.get("sl") or 0.0

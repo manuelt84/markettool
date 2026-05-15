@@ -69,6 +69,38 @@ def register_monitoreo_routes(app, *, services) -> None:
             402,
         )
 
+    def _tf_has_explicit_stop(exec_id: str, symbol: str, timeframe: str) -> bool:
+        try:
+            doc_id = f"{exec_id}__{(symbol or '').upper()}"
+            snap = db.collection("monitoreos").document(doc_id).get()
+            if not snap.exists:
+                return False
+            data = snap.to_dict() or {}
+            tf_states = data.get("tf_states") or {}
+            tf_canonical = norm_tf(timeframe)
+            state = (
+                tf_states.get(tf_canonical)
+                or tf_states.get(timeframe)
+                or data.get(tf_canonical)
+                or data.get(timeframe)
+                or {}
+            )
+            if not isinstance(state, dict):
+                return False
+            estado = str(state.get("estado") or state.get("status") or "").strip().lower()
+            if estado in {"stopped", "detenido", "inactivo", "access_denied", "denied"}:
+                return True
+            return state.get("enabled") is False
+        except Exception as exc:
+            logger.debug(
+                "TF explicit stop lookup failed exec=%s symbol=%s tf=%s: %s",
+                exec_id,
+                symbol,
+                timeframe,
+                exc,
+            )
+            return False
+
     async def _mark_tf_stopped_access_denied(
         exec_id: str,
         symbol: str,
@@ -388,7 +420,7 @@ def register_monitoreo_routes(app, *, services) -> None:
 
             # Auto-renovar heartbeat solo si está cerca de expirar (optimización de Firestore)
             # Simplificado: siempre renovar si enabled es False, para recuperación rápida
-            if exec_id and symbol and not enabled:
+            if exec_id and symbol and not enabled and not _tf_has_explicit_stop(exec_id, symbol, tf_api):
                 try:
                     now_ms = int(time.time() * 1000)
                     
@@ -958,7 +990,7 @@ def register_monitoreo_routes(app, *, services) -> None:
 
             # Auto-renovar heartbeat solo si está cerca de expirar (optimización de Firestore)
             # Simplificado: siempre renovar si enabled es False, para recuperación rápida
-            if exec_id and symbol and not enabled:
+            if exec_id and symbol and not enabled and not _tf_has_explicit_stop(exec_id, symbol, tf_api):
                 try:
                     now_ms = int(time.time() * 1000)
                     

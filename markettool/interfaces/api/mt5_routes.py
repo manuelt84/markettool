@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 from flask import request, jsonify
 
@@ -399,7 +400,16 @@ def register_mt5_routes(app: Flask) -> None:
         try:
             service = get_mt5_service()
             positions = service.get_ea_open_positions()
-            return jsonify({"open_positions": positions, "count": len(positions)}), 200
+            last_poll_ts = service.ea_last_poll
+            stale = not service.ea_online
+            return jsonify({
+                "open_positions": positions,
+                "count": len(positions),
+                "ea_online": service.ea_online,
+                "last_poll_ts": last_poll_ts,
+                "last_poll_age_s": (time.time() - last_poll_ts) if last_poll_ts else None,
+                "stale": stale,
+            }), 200
         except Exception as e:
             logger.error(f"MT5 open positions error: {e}", exc_info=True)
             return jsonify({"error": str(e)}), 500

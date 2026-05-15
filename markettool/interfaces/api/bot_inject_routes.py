@@ -72,7 +72,7 @@ def register_bot_inject_routes(app) -> None:
         """Delegar al endpoint MT5 existente."""
         try:
             from markettool.interfaces.api.mt5_routes import get_mt5_service  # type: ignore[import]
-            from markettool.domain.services.mt5_service import MT5OrderRequest  # type: ignore[import]
+            from markettool.application.services.broker_mt5_service import MT5OrderRequest  # type: ignore[import]
 
             service = get_mt5_service()
             order = MT5OrderRequest(
@@ -92,6 +92,7 @@ def register_bot_inject_routes(app) -> None:
                 "status": "success" if response.success else "failed",
                 "broker": "mt5",
                 "order_id": str(response.order_id) if response.order_id else None,
+                "orderId": str(response.order_id) if response.order_id else None,
                 "message": response.message,
             }), 200 if response.success else 400
         except Exception as e:
@@ -144,14 +145,22 @@ def register_bot_inject_routes(app) -> None:
             result = resp.json()
 
             if result.get("status") == "ok":
-                invest_id = result.get("result", {}).get("investId")
+                raw_result = result.get("result", {}) or {}
+                invest_id = raw_result.get("investId")
+                open_price = raw_result.get("openPrice") or raw_result.get("open_price") or raw_result.get("price")
+                open_commission = raw_result.get("openCommission") or raw_result.get("open_commission") or raw_result.get("commission")
                 return jsonify({
                     "status": "success",
                     "broker": "libertex",
                     "invest_id": invest_id,
-                    "open_commission": result.get("result", {}).get("openCommission"),
+                    "investId": invest_id,
+                    "open_price": open_price,
+                    "openPrice": open_price,
+                    "brokerOpenPrice": open_price,
+                    "open_commission": open_commission,
+                    "openCommission": open_commission,
                     "message": f"Position opened: investId={invest_id}",
-                    "raw": result.get("result"),
+                    "raw": raw_result,
                 }), 200
             else:
                 return jsonify({
