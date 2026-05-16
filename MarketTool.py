@@ -9067,6 +9067,7 @@ def obtener_eventos_economicos(
     desde_inicio: bool = False,
     last_days: int | None = None,
     grace_minutes: int = 10,
+    allow_investing_fallback: bool = True,
 ) -> pd.DataFrame:
     """
     Pulls economic events around the FX window:
@@ -9123,7 +9124,7 @@ def obtener_eventos_economicos(
         logger.info("[Eventos] %s; enabling Investing fallback", need_reason)
 
     # Try investing.com only if enabled and missing actuals for past events
-    if need_investing and APP_CONFIG.investing_scraping_enabled:
+    if need_investing and allow_investing_fallback and APP_CONFIG.investing_scraping_enabled:
         try:
             inv_com = _investing_com_econ_fetch(
                 timeout=APP_CONFIG.http_timeout,
@@ -9136,13 +9137,14 @@ def obtener_eventos_economicos(
             logger.warning("[Eventos] investing.com scraping failed: %s", e)
 
     # Fallback to investiny
-    try:
-        inv = _investing_econ_fetch()
-        if not inv.empty:
-            logger.info("[Eventos] Got %d events from investiny", len(inv))
-            parts.append(inv)
-    except Exception as e:
-        logger.warning("[Eventos] investiny failed: %s", e)
+    if allow_investing_fallback:
+        try:
+            inv = _investing_econ_fetch()
+            if not inv.empty:
+                logger.info("[Eventos] Got %d events from investiny", len(inv))
+                parts.append(inv)
+        except Exception as e:
+            logger.warning("[Eventos] investiny failed: %s", e)
 
     if not parts:
         return pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
@@ -22933,39 +22935,42 @@ def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) ->
     # ⚠️ IMPORTANTE: No usar desde_inicio=True que hace queries desde 1900 (200+ requests)
     # En su lugar, traer últimos 12 meses que es suficiente para backtesting normal
     is_backtest = hours_back > 720  # 30 dias
+    memo_key = f"{symbol}|hb={int(hours_back)}|mf={int(minutes_fwd)}|bt={int(is_backtest)}"
     
     logger.info("[eventos] Backtest detection: hours_back=%d > 720? is_backtest=%s", hours_back, is_backtest)
+
+    memo = _EVENTS_MEMO.get(memo_key)
+    if memo:
+        df_cached = memo.get("df")
+        cache_age = time.time() - memo.get("ts", 0)
+        ttl = 1800.0 if is_backtest else _calculate_adaptive_ttl(df_cached, now)
+        if cache_age < ttl:
+            logger.info("[eventos] Cache HIT %s age=%.1fs ttl=%.1fs", memo_key, cache_age, ttl)
+            return df_cached.copy()
+        logger.info("[eventos] Cache EXPIRED %s age=%.1fs ttl=%.1fs", memo_key, cache_age, ttl)
     
     if is_backtest:
-        # Para backtesting: obtener eventos de últimos 12 meses (NO desde 1900!)
-        # Esto evita 200+ requests FMP que generan timeouts en nginx
-        # last_days=365 trae ~4-5 requests FMP (una por ~85 días)
-        logger.info("[eventos] BACKTEST MODE detected (hours_back=%d > 720), fetching last 365 days of events", hours_back)
+        # Para backtesting: respetar la ventana pedida por el cliente.
+        # No usar 365d fijo ni fallbacks de Investing: esos caminos pueden superar
+        # el timeout de nginx/RN y terminan devolviendo [] en la app.
+        backtest_days = max(7, min(120, int(math.ceil(int(hours_back) / 24)) + 2))
+        logger.info(
+            "[eventos] BACKTEST MODE detected (hours_back=%d > 720), fetching last %d days of FMP events",
+            hours_back,
+            backtest_days,
+        )
         df = obtener_eventos_economicos(
             plan=APP_CONFIG.fmp_plan,
-            last_days=365,  # ← últimos 12 meses en lugar de desde 1900
+            last_days=backtest_days,
             grace_minutes=0,
+            allow_investing_fallback=False,
         )
-        logger.info("[eventos] Got %d events for backtest (last 12 months)", len(df))
+        logger.info("[eventos] Got %d events for backtest (last %d days)", len(df), backtest_days)
     else:
         # Para live trading: ventana de ±6 horas
         a = now - timedelta(hours=int(hours_back))
         b = now + timedelta(minutes=int(minutes_fwd))
 
-        memo = _EVENTS_MEMO.get(symbol)
-        
-        # Verificar cache con TTL adaptativo
-        if memo:
-            df_cached = memo.get("df")
-            cache_age = time.time() - memo.get("ts", 0)
-            ttl = _calculate_adaptive_ttl(df_cached, now)
-            
-            if cache_age < ttl:
-                logger.info("[eventos] Cache HIT %s age=%.1fs ttl=%.1fs", symbol, cache_age, ttl)
-                return df_cached.copy()
-            else:
-                logger.info("[eventos] Cache EXPIRED %s age=%.1fs ttl=%.1fs", symbol, cache_age, ttl)
-        
         # Cache miss o expirado - fetch nuevo
         df = obtener_eventos_guardados_o_futuros(
             _iso(a),
@@ -22982,7 +22987,7 @@ def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) ->
     df = df.sort_values("date", ascending=True).reset_index(drop=True)
     
     # Guardar en cache con nuevo TTL
-    _EVENTS_MEMO[symbol] = {"df": df.copy(), "ts": time.time()}
+    _EVENTS_MEMO[memo_key] = {"df": df.copy(), "ts": time.time()}
     
     new_ttl = _calculate_adaptive_ttl(df, now)
     logger.info("[eventos] _fetch_events_for %s tardó %.3fs - nuevo TTL: %.1fs", symbol, time.time() - t0, new_ttl)
