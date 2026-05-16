@@ -15,9 +15,9 @@ class LegacyMonitoreoUseCase:
     async def eventos(self, body: dict | None) -> Tuple[dict, int]:
         try:
             body = body or {}
-            user_id = str(body.get("user_id") or "").strip()
-            exec_id = str(body.get("exec_id") or "").strip()
-            symbol = str(body.get("symbol") or "").strip().upper()
+            user_id = str(body.get("user_id") or body.get("usuario_id") or "").strip()
+            exec_id = str(body.get("exec_id") or body.get("id_ejecucion") or "").strip()
+            symbol = str(body.get("symbol") or body.get("simbolo") or "").strip().upper()
             hours_back = int(body.get("hours_back", 6))
             minutes_fwd = int(body.get("minutes_fwd", 5))
             cursor_hash = str(body.get("cursor_hash") or "").strip()
