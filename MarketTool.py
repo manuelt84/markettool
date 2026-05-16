@@ -15213,31 +15213,39 @@ async def ejecutar_analisis_con_hilos(
             )
 
     # --- Análisis principal (PARALELIZACIÓN OPTIMIZADA) ---
-    # Opción 2: asyncio.gather() con return_exceptions=True
-    # Beneficio: Procesa todos los resultados, capturando excepciones sin perder contexto
+    # Cada task devuelve su metadata junto al resultado. Eso permite reportar
+    # progreso por finalización real sin bloquearse por un chunk lento.
     analisis_tasks = []
-    task_meta = []  # Parallel list: task_meta[i] = (symbol, temporalidad) for task i
+    task_meta = []  # Se conserva para logs/compatibilidad con el procesamiento final.
+
+    async def _bounded_analysis_with_meta(symbol, temporalidad):
+        try:
+            result = await bounded_analysis(symbol, temporalidad)
+        except Exception as exc:
+            result = exc
+        return symbol, temporalidad, result
 
     for symbol in activos_filtrados:
         for temporalidad in temps:
-            task = asyncio.create_task(bounded_analysis(symbol, temporalidad))
+            task = asyncio.create_task(_bounded_analysis_with_meta(symbol, temporalidad))
             analisis_tasks.append(task)
             task_meta.append((symbol, temporalidad))
 
-    # 🚀 Ejecutar todas las tareas con gather (return_exceptions=True para capturar errores)
-    # Cada resultado se alinea con su correspondiente (symbol, temporalidad) por índice
+    # 🚀 Ejecutar todas las tareas en paralelo y mantener metadata por resultado.
     if analisis_tasks:
         t_gather_start = time.time()
         logger.info(
-            f"[Analisis] 🚀 Iniciando gather() de {len(analisis_tasks)} tasks "
+            f"[Analisis] 🚀 Iniciando análisis paralelo de {len(analisis_tasks)} tasks "
             f"(sem={_ANALYSIS_SEM}, per_symbol={per_symbol_concurrency}, workers={max_workers})"
         )
         
-        # ✅ Progress tracking: Process in chunks with periodic updates (safe + reactive)
+        completed_with_meta = []
+
+        # ✅ Progress tracking reactivo: actualiza cada vez que termina cualquier task.
+        # Antes se esperaba por chunks en orden; si el primer chunk incluía un TF lento,
+        # la UI podía quedar en 0% aunque otros análisis ya hubieran terminado.
         if exec_id:
             total_tasks = len(analisis_tasks)
-            chunk_size = max(1, total_tasks // 10)  # Divide into ~10 chunks for updates
-            results = []
             
             # Update progress at start
             try:
@@ -15256,20 +15264,12 @@ async def ejecutar_analisis_con_hilos(
             except Exception as e:
                 logger.error(f"[Progress] CRITICAL: Error updating INITIAL progress - exec_id={exec_id}, error={type(e).__name__}: {e}", exc_info=True)
             
-            # Process in chunks for periodic progress updates
-            for chunk_idx in range(0, len(analisis_tasks), chunk_size):
-                chunk_end = min(chunk_idx + chunk_size, len(analisis_tasks))
-                chunk = analisis_tasks[chunk_idx:chunk_end]
-                
-                # Execute this chunk
-                chunk_results = await asyncio.gather(*chunk, return_exceptions=True)
-                results.extend(chunk_results)
-                
-                # Update progress after chunk completes
-                completed_count = len(results)
+            for finished in asyncio.as_completed(analisis_tasks):
+                symbol_done, tf_done, result = await finished
+                completed_with_meta.append((symbol_done, tf_done, result))
+                completed_count = len(completed_with_meta)
                 if completed_count < total_tasks:  # Don't update at 100% yet
                     try:
-                        current_symbol, current_tf = task_meta[min(completed_count - 1, len(task_meta) - 1)] if task_meta else (None, None)
                         await asyncio.to_thread(
                             fs_heartbeat,
                             exec_id,
@@ -15277,15 +15277,20 @@ async def ejecutar_analisis_con_hilos(
                                 "analyzed": completed_count,
                                 "total": total_tasks,
                                 "percentage": round((completed_count / total_tasks) * 100, 1),
-                                "current_symbol": current_symbol,
-                                "current_tf": current_tf
+                                "current_symbol": symbol_done,
+                                "current_tf": tf_done
                             }
                         )
                     except Exception as e:
-                        logger.debug(f"[Progress] Skipped progress update (chunk {chunk_idx}): {type(e).__name__}")
+                        logger.debug(f"[Progress] Skipped progress update ({completed_count}/{total_tasks}): {type(e).__name__}")
             
             # Final progress update at 100%
             try:
+                final_symbol, final_tf = (
+                    (completed_with_meta[-1][0], completed_with_meta[-1][1])
+                    if completed_with_meta
+                    else (None, None)
+                )
                 await asyncio.to_thread(
                     fs_heartbeat,
                     exec_id,
@@ -15293,15 +15298,17 @@ async def ejecutar_analisis_con_hilos(
                         "analyzed": total_tasks,
                         "total": total_tasks,
                         "percentage": 100.0,
-                        "current_symbol": task_meta[-1][0] if task_meta else None,
-                        "current_tf": task_meta[-1][1] if task_meta else None
+                        "current_symbol": final_symbol,
+                        "current_tf": final_tf
                     }
                 )
             except Exception as e:
                 logger.error(f"[Progress] CRITICAL: Error updating FINAL progress - {type(e).__name__}: {e}", exc_info=True)
         else:
-            # Original behavior: simple gather without progress tracking
-            results = await asyncio.gather(*analisis_tasks, return_exceptions=True)
+            completed_with_meta = await asyncio.gather(*analisis_tasks, return_exceptions=False)
+
+        task_meta = [(symbol, temporalidad) for symbol, temporalidad, _ in completed_with_meta]
+        results = [result for _, _, result in completed_with_meta]
         
         t_gather_elapsed = (time.time() - t_gather_start)
         avg_time_per_task = (t_gather_elapsed / len(analisis_tasks)) if analisis_tasks else 0
