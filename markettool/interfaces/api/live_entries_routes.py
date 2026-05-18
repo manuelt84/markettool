@@ -1057,10 +1057,12 @@ def register_live_entries_routes(app, *, services) -> None:
     current_closed_bucket_start = services.current_closed_bucket_start
     mon_cache_lock = services.mon_cache_lock
 
-    # Redis client
+    # Redis client for live entries state/coordination.
+    # REDIS_URL remains available for hot local caches; LIVE_ENTRIES_REDIS_URL can point
+    # to a shared Redis when multiple machines sit behind the global load balancer.
     try:
         import os, redis as _redis
-        _redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+        _redis_url = os.getenv("LIVE_ENTRIES_REDIS_URL") or os.getenv("REDIS_URL", "redis://redis:6379/0")
         redis_client = _redis.Redis.from_url(_redis_url, decode_responses=True, socket_connect_timeout=3)
         redis_client.ping()  # verificar conexión
     except Exception:
