@@ -30,10 +30,32 @@ logger = logging.getLogger("MarketTool")
 # ─────────────────────────────────────────────
 # TTL y constantes
 # ─────────────────────────────────────────────
-ENTRY_TTL_S = 300          # 5 min en Redis
+EVENT_REPLAY_TTL_S = 300     # 5 min para replay SSE corto
 WORKER_IDLE_TIMEOUT_S = 300  # mata el worker si nadie hace GET en 5 min
 LIVE_WINDOW = 3              # candles finales a evaluar (homologa generateLiveEntries)
 MIN_CANDLES = 30
+
+# Homologa LIVE_TTL_BY_TF de RN/Web para que el backend no expire señales antes
+# que el cliente cuando se activa el push/poll backend.
+ENTRY_TTL_BY_TF_S: dict[str, int] = {
+    "1m": 30 * 60,
+    "1min": 30 * 60,
+    "5m": 2 * 3600,
+    "5min": 2 * 3600,
+    "15m": 6 * 3600,
+    "15min": 6 * 3600,
+    "30m": 12 * 3600,
+    "30min": 12 * 3600,
+    "1h": 24 * 3600,
+    "1hour": 24 * 3600,
+    "4h": 3 * 86400,
+    "4hour": 3 * 86400,
+    "1d": 7 * 86400,
+    "1day": 7 * 86400,
+    "1w": 30 * 86400,
+    "1week": 30 * 86400,
+}
+_DEFAULT_ENTRY_TTL_S = 24 * 3600
 
 # Intervalo de beat por TF — homologa TF_POLL_MS del cliente (Web/RN)
 TF_BEAT_S: dict[str, float] = {
@@ -99,6 +121,80 @@ def _event_id(exec_id: str, symbol: str, tf: str, ts_ms: int) -> str:
     return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
 
 
+def _entry_ttl_s(tf: str) -> int:
+    return ENTRY_TTL_BY_TF_S.get(str(tf or "").lower(), _DEFAULT_ENTRY_TTL_S)
+
+
+def _normalize_source(raw: Any) -> str:
+    """Mapea fuentes legacy del motor Python a los SourceKey compartidos RN/Web."""
+    value = str(raw or "").strip().lower()
+    if not value:
+        return "mt"
+
+    direct = {
+        "soporte_resistencia": "sr",
+        "sr": "sr",
+        "tecnico": "tech",
+        "technical": "tech",
+        "tech": "tech",
+        "market_tool": "mt",
+        "markettool": "mt",
+        "mt": "mt",
+        "evento": "event",
+        "eventos": "event",
+        "event": "event",
+        "fibonacci": "fibonacci",
+        "fib": "fibonacci",
+        "breaker": "breaker",
+        "inducement": "inducement",
+        "divergence": "divergence",
+        "divergencia": "divergence",
+        "confluence": "confluence",
+        "confluencia": "confluence",
+        "ob": "ob",
+        "order_block": "ob",
+        "order_blocks": "ob",
+        "fvg": "fvg",
+        "smc": "smc",
+        "ema_cross_3_9": "ema_cross_3_9",
+        "triada": "triada",
+        "engulfing_reclaim": "engulfing_reclaim",
+        "inside_bar_breakout": "inside_bar_breakout",
+        "opening_reclaim": "opening_reclaim",
+        "pinbar_reversal": "pinbar_reversal",
+        "three_bar_reversal": "three_bar_reversal",
+    }
+    if value in direct:
+        return direct[value]
+
+    # Orden intencional: patrones basados en niveles se clasifican como S/R
+    # aunque incluyan palabras como breakout/breakdown.
+    patterns: tuple[tuple[tuple[str, ...], str], ...] = (
+        (("pullback", "r1", "r2", "s1", "s2", "midpoint", "scale_in", "range_", "reversion"), "sr"),
+        (("fibonacci", "fib_"), "fibonacci"),
+        (("breaker",), "breaker"),
+        (("inducement",), "inducement"),
+        (("diverg",), "divergence"),
+        (("conflu",), "confluence"),
+        (("order_block", "orderblock"), "ob"),
+        (("fvg", "imbalance"), "fvg"),
+        (("smc", "smart_money"), "smc"),
+        (("ema_cross_3_9", "ema_3_9"), "ema_cross_3_9"),
+        (("triada",), "triada"),
+        (("engulfing_reclaim",), "engulfing_reclaim"),
+        (("inside_bar_breakout",), "inside_bar_breakout"),
+        (("opening_reclaim",), "opening_reclaim"),
+        (("pinbar",), "pinbar_reversal"),
+        (("three_bar",), "three_bar_reversal"),
+        (("event", "news", "economic", "calendar"), "event"),
+        (("ema", "macd", "rsi", "bollinger", "stoch", "momentum", "breakout", "breakdown"), "tech"),
+    )
+    for needles, source in patterns:
+        if any(needle in value for needle in needles):
+            return source
+    return "mt"
+
+
 def _store_event_for_replay(redis_client, exec_id: str, symbol: str, event: dict) -> None:
     key = _redis_event_log_key(exec_id, symbol)
     if redis_client is None:
@@ -108,7 +204,7 @@ def _store_event_for_replay(redis_client, exec_id: str, symbol: str, event: dict
     try:
         redis_client.rpush(key, json.dumps(event, separators=(",", ":")))
         redis_client.ltrim(key, -50, -1)
-        redis_client.expire(key, ENTRY_TTL_S)
+        redis_client.expire(key, EVENT_REPLAY_TTL_S)
     except Exception as exc:
         logger.warning("[LiveEntries] Redis replay log failed %s: %s", key, exc)
 
@@ -140,6 +236,7 @@ def _get_events_for_replay(redis_client, exec_id: str, symbol: str, last_event_i
 
 def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, entries: list[dict]) -> list[dict]:
     """Persiste entradas nuevas con TTL. Dedup por id y devuelve solo las nuevas."""
+    ttl_s = _entry_ttl_s(tf)
     if redis_client is None:
         key = _redis_entries_key(exec_id, symbol, tf)
         now = time.time()
@@ -151,7 +248,7 @@ def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, ent
             return []
         merged = (existing + new_entries)[-100:]
         _MEM_ENTRIES[key] = merged
-        _MEM_EXPIRY[key] = now + ENTRY_TTL_S
+        _MEM_EXPIRY[key] = now + ttl_s
         return new_entries
 
     key = _redis_entries_key(exec_id, symbol, tf)
@@ -168,7 +265,7 @@ def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, ent
     if len(merged) > 100:
         merged = merged[-100:]
 
-    redis_client.setex(key, ENTRY_TTL_S, json.dumps(merged))
+    redis_client.setex(key, ttl_s, json.dumps(merged))
     return new_entries
 
 
@@ -195,6 +292,7 @@ def _get_entries_from_redis(redis_client, exec_id: str, symbol: str, tfs: list[s
 
 def _set_outcome_in_redis(redis_client, exec_id: str, symbol: str, tfs: list[str], entry_id: str, outcome: str, close_price: float, closed_at: str):
     for tf in tfs:
+        ttl_s = _entry_ttl_s(tf)
         key = _redis_entries_key(exec_id, symbol, tf)
         if redis_client is None:
             entries = list(_MEM_ENTRIES.get(key, []))
@@ -215,9 +313,9 @@ def _set_outcome_in_redis(redis_client, exec_id: str, symbol: str, tfs: list[str
         if updated:
             if redis_client is None:
                 _MEM_ENTRIES[key] = entries
-                _MEM_EXPIRY[key] = time.time() + ENTRY_TTL_S
+                _MEM_EXPIRY[key] = time.time() + ttl_s
             else:
-                redis_client.setex(key, ENTRY_TTL_S, json.dumps(entries))
+                redis_client.setex(key, ttl_s, json.dumps(entries))
 
 
 def _set_beat(redis_client, exec_id: str, symbol: str, beat_data: dict) -> None:
@@ -455,7 +553,7 @@ def _generate_live_entries_sync(
         if entry_price and tp and sl and abs(entry_price - sl) > 0:
             rrr = round(abs(tp - entry_price) / abs(entry_price - sl), 2)
 
-        source = e.get("fuente") or e.get("source") or "backend"
+        source = _normalize_source(e.get("source") or e.get("fuente") or e.get("basado_en"))
         entry_ts = int(e.get("timestamp") or (series_ms[-1].get("t") if series_ms else now_ts) or now_ts)
         entry_id = _build_entry_id(symbol, tf, side, entry_ts, float(entry_price or 0), float(sl or 0), float(tp or 0), str(source))
 
