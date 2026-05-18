@@ -125,6 +125,114 @@ def _entry_ttl_s(tf: str) -> int:
     return ENTRY_TTL_BY_TF_S.get(str(tf or "").lower(), _DEFAULT_ENTRY_TTL_S)
 
 
+def _norm_tf_for_fp(tf: Any) -> str:
+    value = str(tf or "").strip().lower()
+    value = value.replace("minute", "min").replace("minutes", "min")
+    value = value.replace("hour", "h").replace("hours", "h")
+    value = value.replace("day", "d").replace("days", "d")
+    value = value.replace("week", "w").replace("weeks", "w")
+    if value.endswith("min"):
+        value = value[:-3] + "m"
+    return value
+
+
+def _norm_symbol_for_fp(symbol: Any) -> str:
+    return str(symbol or "").replace("/", "").strip().upper()
+
+
+def _norm_side_for_fp(side: Any) -> str:
+    value = str(side or "").strip().lower()
+    if value in {"long", "buy", "compra"}:
+        return "long"
+    if value in {"short", "sell", "venta"}:
+        return "short"
+    return value
+
+
+def _price_ticks(value: Any) -> str:
+    try:
+        return str(round(float(value) * 1e5))
+    except Exception:
+        return "na"
+
+
+def _time_bucket(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(int(value)) if value > 0 else ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    try:
+        parsed = pd.Timestamp(raw)
+        if not pd.isna(parsed):
+            return str(int(parsed.timestamp() * 1000))
+    except Exception:
+        pass
+    return raw
+
+
+def _entry_fingerprint(entry: dict) -> str:
+    entry_price = entry.get("entry_price", entry.get("entry", entry.get("precio")))
+    take_profit = entry.get("take_profit", entry.get("tp"))
+    stop_loss = entry.get("stop_loss", entry.get("sl"))
+    ts = entry.get("timestamp", entry.get("created_at", entry.get("createdAt")))
+    return "|".join([
+        _norm_symbol_for_fp(entry.get("symbol")),
+        _norm_tf_for_fp(entry.get("timeframe", entry.get("tf"))),
+        str(entry.get("source") or "").strip().lower(),
+        _norm_side_for_fp(entry.get("side")),
+        _price_ticks(entry_price),
+        _price_ticks(take_profit),
+        _price_ticks(stop_loss),
+        _time_bucket(ts),
+    ])
+
+
+def _entry_created_ms(entry: dict) -> int:
+    for value in (entry.get("created_at"), entry.get("createdAt"), entry.get("timestamp")):
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            return int(value if value > 1e12 else value * 1000)
+        try:
+            parsed = pd.Timestamp(str(value))
+            if not pd.isna(parsed):
+                return int(parsed.timestamp() * 1000)
+        except Exception:
+            continue
+    return int(time.time() * 1000)
+
+
+def _is_entry_expired(entry: dict, tf: str, now_ms: int | None = None) -> bool:
+    now_ms = now_ms or int(time.time() * 1000)
+    return now_ms - _entry_created_ms(entry) > _entry_ttl_s(tf) * 1000
+
+
+def _dedupe_entries(entries: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    result: list[dict] = []
+    for entry in entries:
+        fp = _entry_fingerprint(entry)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        result.append(entry)
+    return result
+
+
+def _persist_entries(redis_client, key: str, entries: list[dict], ttl_s: int) -> None:
+    if redis_client is None:
+        _MEM_ENTRIES[key] = entries
+        _MEM_EXPIRY[key] = time.time() + ttl_s
+        return
+    if entries:
+        redis_client.setex(key, ttl_s, json.dumps(entries))
+    else:
+        redis_client.delete(key)
+
+
 def _normalize_source(raw: Any) -> str:
     """Mapea fuentes legacy del motor Python a los SourceKey compartidos RN/Web."""
     value = str(raw or "").strip().lower()
@@ -235,43 +343,44 @@ def _get_events_for_replay(redis_client, exec_id: str, symbol: str, last_event_i
 
 
 def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, entries: list[dict]) -> list[dict]:
-    """Persiste entradas nuevas con TTL. Dedup por id y devuelve solo las nuevas."""
+    """Persiste entradas nuevas con TTL por entrada. Dedup igual que RN/Web."""
     ttl_s = _entry_ttl_s(tf)
+    key = _redis_entries_key(exec_id, symbol, tf)
+    now_ms = int(time.time() * 1000)
     if redis_client is None:
-        key = _redis_entries_key(exec_id, symbol, tf)
-        now = time.time()
         existing = _MEM_ENTRIES.get(key, [])
-        existing = [e for e in existing if now < _MEM_EXPIRY.get(key, 0)]
-        existing_ids = {e.get("id") for e in existing}
-        new_entries = [e for e in entries if e.get("id") not in existing_ids]
+        if time.time() >= _MEM_EXPIRY.get(key, 0):
+            existing = []
+        existing = _dedupe_entries([e for e in existing if not _is_entry_expired(e, tf, now_ms)])
+        existing_fps = {_entry_fingerprint(e) for e in existing}
+        new_entries = [e for e in _dedupe_entries(entries) if _entry_fingerprint(e) not in existing_fps]
         if not new_entries:
+            _persist_entries(redis_client, key, existing, ttl_s)
             return []
-        merged = (existing + new_entries)[-100:]
-        _MEM_ENTRIES[key] = merged
-        _MEM_EXPIRY[key] = now + ttl_s
+        merged = _dedupe_entries(existing + new_entries)
+        _persist_entries(redis_client, key, merged, ttl_s)
         return new_entries
 
-    key = _redis_entries_key(exec_id, symbol, tf)
     existing_raw = redis_client.get(key)
     existing: list[dict] = json.loads(existing_raw) if existing_raw else []
+    existing = _dedupe_entries([e for e in existing if not _is_entry_expired(e, tf, now_ms)])
 
-    existing_ids = {e["id"] for e in existing}
-    new_entries = [e for e in entries if e["id"] not in existing_ids]
+    existing_fps = {_entry_fingerprint(e) for e in existing}
+    new_entries = [e for e in _dedupe_entries(entries) if _entry_fingerprint(e) not in existing_fps]
     if not new_entries:
+        _persist_entries(redis_client, key, existing, ttl_s)
         return []
 
-    merged = existing + new_entries
-    # mantener solo las últimas 100 entradas por TF
-    if len(merged) > 100:
-        merged = merged[-100:]
-
-    redis_client.setex(key, ttl_s, json.dumps(merged))
+    merged = _dedupe_entries(existing + new_entries)
+    _persist_entries(redis_client, key, merged, ttl_s)
     return new_entries
 
 
 def _get_entries_from_redis(redis_client, exec_id: str, symbol: str, tfs: list[str], since_ts: int | None) -> list[dict]:
     result = []
+    now_ms = int(time.time() * 1000)
     for tf in tfs:
+        ttl_s = _entry_ttl_s(tf)
         key = _redis_entries_key(exec_id, symbol, tf)
         if redis_client is None:
             if time.time() >= _MEM_EXPIRY.get(key, 0):
@@ -284,10 +393,12 @@ def _get_entries_from_redis(redis_client, exec_id: str, symbol: str, tfs: list[s
             if not raw:
                 continue
             entries = json.loads(raw)
+        entries = _dedupe_entries([e for e in entries if not _is_entry_expired(e, tf, now_ms)])
+        _persist_entries(redis_client, key, entries, ttl_s)
         if since_ts:
             entries = [e for e in entries if e.get("timestamp", 0) > since_ts]
         result.extend(entries)
-    return result
+    return _dedupe_entries(result)
 
 
 def _set_outcome_in_redis(redis_client, exec_id: str, symbol: str, tfs: list[str], entry_id: str, outcome: str, close_price: float, closed_at: str):
@@ -531,6 +642,7 @@ def _generate_live_entries_sync(
         entradas_raw = entradas_raw.get("lista") or []
 
     now_ts = int(time.time() * 1000)
+    now_iso = pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z")
     entries: list[dict] = []
     for e in entradas_raw:
         if not isinstance(e, dict):
@@ -571,7 +683,7 @@ def _generate_live_entries_sync(
             "outcome": "pending",
             "_origin": "live",
             "_backend_live": True,
-            "created_at": pd.Timestamp.utcnow().isoformat() + "Z",
+            "created_at": now_iso,
             "timestamp": entry_ts,
             "nivel_confirmado": bool(e.get("nivel_confirmado") or e.get("confirmado")),
             "dentro_rango": bool(e.get("dentro_rango") or e.get("en_rango")),
