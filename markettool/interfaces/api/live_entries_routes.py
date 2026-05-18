@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -114,6 +115,18 @@ def _redis_events_channel(exec_id: str, symbol: str) -> str:
 
 def _redis_event_log_key(exec_id: str, symbol: str) -> str:
     return f"live_entries_event_log:{exec_id}:{symbol.upper()}"
+
+
+def _redis_worker_touch_key(worker_key: str) -> str:
+    return f"live_worker_touch:{worker_key}"
+
+
+def _redis_worker_owner_key(worker_key: str) -> str:
+    return f"live_worker_owner:{worker_key}"
+
+
+def _redis_worker_stop_key(worker_key: str) -> str:
+    return f"live_worker_stop:{worker_key}"
 
 
 def _event_id(exec_id: str, symbol: str, tf: str, ts_ms: int) -> str:
@@ -446,6 +459,100 @@ def _get_beat(redis_client, exec_id: str, symbol: str) -> dict:
     return json.loads(raw) if raw else {}
 
 
+def _touch_worker(redis_client, worker_key: str) -> None:
+    now = time.time()
+    _WORKER_LAST_POLL[worker_key] = now
+    if redis_client is not None:
+        try:
+            redis_client.setex(_redis_worker_touch_key(worker_key), WORKER_IDLE_TIMEOUT_S, str(now))
+        except Exception as exc:
+            logger.debug("[LiveEntries] touch worker redis failed %s: %s", worker_key, exc)
+
+
+def _get_worker_last_touch(redis_client, worker_key: str) -> float:
+    if redis_client is not None:
+        try:
+            raw = redis_client.get(_redis_worker_touch_key(worker_key))
+            if raw:
+                return float(raw)
+        except Exception as exc:
+            logger.debug("[LiveEntries] read worker touch redis failed %s: %s", worker_key, exc)
+    return _WORKER_LAST_POLL.get(worker_key, time.time())
+
+
+def _claim_worker_owner(redis_client, worker_key: str) -> bool:
+    if redis_client is None:
+        return True
+    owner = os.getenv("POD_NAME") or os.getenv("HOSTNAME") or "unknown"
+    try:
+        redis_client.delete(_redis_worker_stop_key(worker_key))
+        return bool(redis_client.set(_redis_worker_owner_key(worker_key), owner, nx=True, ex=WORKER_IDLE_TIMEOUT_S))
+    except Exception as exc:
+        logger.warning("[LiveEntries] Redis owner claim failed %s: %s", worker_key, exc)
+        return True
+
+
+def _refresh_worker_owner(redis_client, worker_key: str) -> None:
+    if redis_client is None:
+        return
+    try:
+        redis_client.expire(_redis_worker_owner_key(worker_key), WORKER_IDLE_TIMEOUT_S)
+    except Exception as exc:
+        logger.debug("[LiveEntries] Redis owner refresh failed %s: %s", worker_key, exc)
+
+
+def _clear_worker_owner(redis_client, worker_key: str) -> None:
+    if redis_client is None:
+        return
+    try:
+        redis_client.delete(
+            _redis_worker_owner_key(worker_key),
+            _redis_worker_touch_key(worker_key),
+            _redis_worker_stop_key(worker_key),
+        )
+    except Exception as exc:
+        logger.debug("[LiveEntries] Redis owner clear failed %s: %s", worker_key, exc)
+
+
+def _has_worker_owner(redis_client, worker_key: str) -> bool:
+    if redis_client is None:
+        return worker_key in _WORKERS and not _WORKERS[worker_key].done()
+    try:
+        return bool(redis_client.exists(_redis_worker_owner_key(worker_key)))
+    except Exception as exc:
+        logger.debug("[LiveEntries] Redis owner exists failed %s: %s", worker_key, exc)
+        return worker_key in _WORKERS and not _WORKERS[worker_key].done()
+
+
+def _worker_status(redis_client, worker_key: str, beat_data: dict | None = None) -> str:
+    if worker_key in _WORKERS and not _WORKERS[worker_key].done():
+        return "running"
+    if _has_worker_owner(redis_client, worker_key):
+        return "running"
+    beat_ts = int((beat_data or {}).get("ts") or 0)
+    if beat_ts and int(time.time() * 1000) - beat_ts <= WORKER_IDLE_TIMEOUT_S * 1000:
+        return "running"
+    return "stopped"
+
+
+def _request_worker_stop(redis_client, worker_key: str) -> None:
+    if redis_client is not None:
+        try:
+            redis_client.setex(_redis_worker_stop_key(worker_key), WORKER_IDLE_TIMEOUT_S, "1")
+        except Exception as exc:
+            logger.debug("[LiveEntries] Redis stop request failed %s: %s", worker_key, exc)
+
+
+def _is_worker_stop_requested(redis_client, worker_key: str) -> bool:
+    if redis_client is None:
+        return False
+    try:
+        return bool(redis_client.exists(_redis_worker_stop_key(worker_key)))
+    except Exception as exc:
+        logger.debug("[LiveEntries] Redis stop read failed %s: %s", worker_key, exc)
+        return False
+
+
 def _subscribe_local(exec_id: str, symbol: str) -> tuple[str, queue.Queue]:
     """Suscripción in-process para entornos sin Redis o instancia única."""
     worker_key = _worker_id(exec_id, symbol)
@@ -768,6 +875,7 @@ async def _live_worker(
     Homologa TF_POLL_MS del cliente (1m=5s, 5m=20s, 15m=45s, ...).
     Se cancela entero cuando se llama /stop o se alcanza idle timeout.
     """
+    _refresh_worker_owner(redis_client, worker_key)
     # Auto-descubrir TFs desde Firestore si no se pasaron explícitamente
     if not tfs:
         tfs = _get_active_tfs(exec_id, symbol, norm_tf_fn)
@@ -775,6 +883,7 @@ async def _live_worker(
             logger.warning("[LiveWorker] %s sin TFs activos — worker no arranca", worker_key)
             async with _WORKER_LOCK:
                 _WORKERS.pop(worker_key, None)
+                _clear_worker_owner(redis_client, worker_key)
             return
 
     logger.info("[LiveWorker] START %s tfs=%s", worker_key, tfs)
@@ -882,6 +991,10 @@ async def _live_worker(
     try:
         while True:
             await asyncio.sleep(30)
+            _refresh_worker_owner(redis_client, worker_key)
+            if _is_worker_stop_requested(redis_client, worker_key):
+                logger.info("[LiveWorker] STOP solicitado por Redis %s — stopping", worker_key)
+                break
 
             current_tfs: set[str] = set()
 
@@ -908,7 +1021,7 @@ async def _live_worker(
                 logger.warning("[LiveWorker] Error en TF reconciliation %s: %s", worker_key, exc)
 
             # 2. Idle check: si Firestore mantiene TFs activos, el backend sigue aunque iOS suspenda el polling.
-            last_poll = _WORKER_LAST_POLL.get(worker_key, time.time())
+            last_poll = _get_worker_last_touch(redis_client, worker_key)
             if not current_tfs and time.time() - last_poll > WORKER_IDLE_TIMEOUT_S:
                 logger.info("[LiveWorker] IDLE TIMEOUT sin TFs activos %s — stopping", worker_key)
                 break
@@ -922,6 +1035,7 @@ async def _live_worker(
         async with _WORKER_LOCK:
             _WORKERS.pop(worker_key, None)
             _WORKER_LAST_POLL.pop(worker_key, None)
+            _clear_worker_owner(redis_client, worker_key)
 
 
 # ─────────────────────────────────────────────
@@ -980,7 +1094,13 @@ def register_live_entries_routes(app, *, services) -> None:
 
         async with _WORKER_LOCK:
             if wid in _WORKERS and not _WORKERS[wid].done():
-                _WORKER_LAST_POLL[wid] = time.time()
+                _touch_worker(redis_client, wid)
+                return jsonify({"ok": True, "worker_id": wid, "status": "already_running"}), 200
+            if _has_worker_owner(redis_client, wid):
+                _touch_worker(redis_client, wid)
+                return jsonify({"ok": True, "worker_id": wid, "status": "already_running"}), 200
+            if not _claim_worker_owner(redis_client, wid):
+                _touch_worker(redis_client, wid)
                 return jsonify({"ok": True, "worker_id": wid, "status": "already_running"}), 200
 
             loop = asyncio.get_event_loop()
@@ -1002,7 +1122,7 @@ def register_live_entries_routes(app, *, services) -> None:
                 )
             )
             _WORKERS[wid] = task
-            _WORKER_LAST_POLL[wid] = time.time()
+            _touch_worker(redis_client, wid)
 
         logger.info("[LiveEntries] Worker iniciado: %s platform=%s tfs=%s", wid, platform, tfs)
         return jsonify({"ok": True, "worker_id": wid, "status": "started"}), 200
@@ -1023,8 +1143,8 @@ def register_live_entries_routes(app, *, services) -> None:
         since_ts = int(since_ts_raw) if since_ts_raw else None
         wid = _worker_id(exec_id, symbol)
 
-        # Actualizar last poll para evitar idle timeout
-        _WORKER_LAST_POLL[wid] = time.time()
+        # Actualizar last poll para evitar idle timeout incluso si GET cae en otro pod
+        _touch_worker(redis_client, wid)
 
         # Entradas del Redis
         entries = _get_entries_from_redis(redis_client, exec_id, symbol, tfs, since_ts)
@@ -1043,10 +1163,7 @@ def register_live_entries_routes(app, *, services) -> None:
             except Exception:
                 candles_count[tf] = 0
 
-        # worker status
-        worker_status = "stopped"
-        if wid in _WORKERS:
-            worker_status = "running" if not _WORKERS[wid].done() else "stopped"
+        worker_status = _worker_status(redis_client, wid, beat_data)
 
         return jsonify({
             "entries": entries,
@@ -1076,7 +1193,8 @@ def register_live_entries_routes(app, *, services) -> None:
 
         wid = _worker_id(exec_id, symbol)
         tfs_filter = {norm_tf(t) for t in tfs_raw.split(",") if t.strip()} if tfs_raw else set()
-        _WORKER_LAST_POLL[wid] = time.time()
+        _touch_worker(redis_client, wid)
+        ready_beat_data = _get_beat(redis_client, exec_id, symbol)
 
         def _sse(event_name: str, payload: dict) -> str:
             event_id = payload.get("id")
@@ -1094,7 +1212,7 @@ def register_live_entries_routes(app, *, services) -> None:
                     "type": "ready",
                     "exec_id": exec_id,
                     "symbol": symbol,
-                    "worker_status": "running" if wid in _WORKERS and not _WORKERS[wid].done() else "stopped",
+                    "worker_status": _worker_status(redis_client, wid, ready_beat_data),
                     "ts": int(time.time() * 1000),
                 })
                 for replay_event in _get_events_for_replay(redis_client, exec_id, symbol, last_event_id, tfs_filter, norm_tf):
@@ -1107,7 +1225,7 @@ def register_live_entries_routes(app, *, services) -> None:
                     local_key, local_q = _subscribe_local(exec_id, symbol)
 
                 while True:
-                    _WORKER_LAST_POLL[wid] = time.time()
+                    _touch_worker(redis_client, wid)
                     payload = None
                     if pubsub is not None:
                         msg = pubsub.get_message(timeout=1.0)
@@ -1165,11 +1283,13 @@ def register_live_entries_routes(app, *, services) -> None:
             return jsonify({"error": "exec_id y symbol son requeridos"}), 400
 
         wid = _worker_id(exec_id, symbol)
+        _request_worker_stop(redis_client, wid)
         async with _WORKER_LOCK:
             task = _WORKERS.pop(wid, None)
             _WORKER_LAST_POLL.pop(wid, None)
             if task and not task.done():
                 task.cancel()
+                _clear_worker_owner(redis_client, wid)
                 logger.info("[LiveEntries] Worker detenido: %s", wid)
                 return jsonify({"ok": True, "stopped": wid}), 200
 
