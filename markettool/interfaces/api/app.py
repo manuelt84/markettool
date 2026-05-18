@@ -6,7 +6,8 @@ import logging
 from typing import TYPE_CHECKING
 
 from flask import Flask, request, make_response
-from asgiref.wsgi import WsgiToAsgi
+from asgiref.sync import sync_to_async
+from asgiref.wsgi import WsgiToAsgi, WsgiToAsgiInstance
 
 if TYPE_CHECKING:
     from markettool.interfaces.containers import DIContainer
@@ -17,6 +18,17 @@ logger = logging.getLogger(__name__)
 _webhook_app: Flask | None = None
 _asgi_app: WsgiToAsgi | None = None
 _routes_registered: bool = False
+
+
+class ConcurrentWsgiToAsgiInstance(WsgiToAsgiInstance):
+    @sync_to_async(thread_sensitive=False)
+    def run_wsgi_app(self, body):  # type: ignore[override]
+        return super().run_wsgi_app.__wrapped__(self, body)
+
+
+class ConcurrentWsgiToAsgi(WsgiToAsgi):
+    async def __call__(self, scope, receive, send):
+        await ConcurrentWsgiToAsgiInstance(self.wsgi_application)(scope, receive, send)
 
 
 def get_webhook_app(
@@ -96,10 +108,10 @@ def get_asgi_app(
     global _asgi_app
     
     if _asgi_app is None:
-        _asgi_app = WsgiToAsgi(
+        _asgi_app = ConcurrentWsgiToAsgi(
             get_webhook_app(container=container)
         )
-        logger.info("✅ ASGI app (WsgiToAsgi wrapper) created")
+        logger.info("✅ ASGI app (concurrent WsgiToAsgi wrapper) created")
     
     return _asgi_app
 

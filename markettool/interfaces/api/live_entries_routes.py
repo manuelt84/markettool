@@ -1069,6 +1069,7 @@ def register_live_entries_routes(app, *, services) -> None:
         exec_id = request.args.get("exec_id", "").strip()
         symbol = (request.args.get("symbol") or "").upper().strip()
         tfs_raw = request.args.get("tfs", "")
+        last_event_id = request.headers.get("Last-Event-ID") or request.args.get("last_event_id")
 
         if not exec_id or not symbol:
             return jsonify({"error": "exec_id y symbol son requeridos"}), 400
