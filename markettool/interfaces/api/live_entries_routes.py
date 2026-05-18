@@ -7,6 +7,7 @@ Usa los mismos candles/niveles que ya tiene el backend para backtest.
 Contrato API:
   POST /monitoreo/live-entries/start
   GET  /monitoreo/live-entries
+  GET  /monitoreo/live-entries/stream
   POST /monitoreo/live-entries/stop
   POST /monitoreo/live-entries/outcome
 """
@@ -17,6 +18,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import queue
+import threading
 import time
 from typing import Any
 
@@ -59,6 +62,11 @@ _DEFAULT_BEAT_S = 60.0
 _WORKERS: dict[str, asyncio.Task] = {}          # worker_id → Task
 _WORKER_LAST_POLL: dict[str, float] = {}        # worker_id → ts último GET
 _WORKER_LOCK = asyncio.Lock()
+_MEM_ENTRIES: dict[str, list[dict]] = {}        # fallback when Redis is unavailable
+_MEM_EXPIRY: dict[str, float] = {}
+_MEM_BEATS: dict[str, dict] = {}
+_SUBSCRIBERS: dict[str, list[queue.Queue]] = {}
+_SUBSCRIBERS_LOCK = threading.Lock()
 
 
 def _worker_id(exec_id: str, symbol: str) -> str:
@@ -77,8 +85,26 @@ def _redis_beat_key(exec_id: str, symbol: str) -> str:
     return f"live_beat:{exec_id}:{symbol.upper()}"
 
 
-def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, entries: list[dict]):
-    """Persiste entradas nuevas en Redis con TTL. Dedup por id."""
+def _redis_events_channel(exec_id: str, symbol: str) -> str:
+    return f"live_entries_events:{exec_id}:{symbol.upper()}"
+
+
+def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, entries: list[dict]) -> list[dict]:
+    """Persiste entradas nuevas con TTL. Dedup por id y devuelve solo las nuevas."""
+    if redis_client is None:
+        key = _redis_entries_key(exec_id, symbol, tf)
+        now = time.time()
+        existing = _MEM_ENTRIES.get(key, [])
+        existing = [e for e in existing if now < _MEM_EXPIRY.get(key, 0)]
+        existing_ids = {e.get("id") for e in existing}
+        new_entries = [e for e in entries if e.get("id") not in existing_ids]
+        if not new_entries:
+            return []
+        merged = (existing + new_entries)[-100:]
+        _MEM_ENTRIES[key] = merged
+        _MEM_EXPIRY[key] = now + ENTRY_TTL_S
+        return new_entries
+
     key = _redis_entries_key(exec_id, symbol, tf)
     existing_raw = redis_client.get(key)
     existing: list[dict] = json.loads(existing_raw) if existing_raw else []
@@ -86,7 +112,7 @@ def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, ent
     existing_ids = {e["id"] for e in existing}
     new_entries = [e for e in entries if e["id"] not in existing_ids]
     if not new_entries:
-        return 0
+        return []
 
     merged = existing + new_entries
     # mantener solo las últimas 100 entradas por TF
@@ -94,17 +120,24 @@ def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, ent
         merged = merged[-100:]
 
     redis_client.setex(key, ENTRY_TTL_S, json.dumps(merged))
-    return len(new_entries)
+    return new_entries
 
 
 def _get_entries_from_redis(redis_client, exec_id: str, symbol: str, tfs: list[str], since_ts: int | None) -> list[dict]:
     result = []
     for tf in tfs:
         key = _redis_entries_key(exec_id, symbol, tf)
-        raw = redis_client.get(key)
-        if not raw:
-            continue
-        entries: list[dict] = json.loads(raw)
+        if redis_client is None:
+            if time.time() >= _MEM_EXPIRY.get(key, 0):
+                _MEM_ENTRIES.pop(key, None)
+                _MEM_EXPIRY.pop(key, None)
+                continue
+            entries = list(_MEM_ENTRIES.get(key, []))
+        else:
+            raw = redis_client.get(key)
+            if not raw:
+                continue
+            entries = json.loads(raw)
         if since_ts:
             entries = [e for e in entries if e.get("timestamp", 0) > since_ts]
         result.extend(entries)
@@ -114,10 +147,15 @@ def _get_entries_from_redis(redis_client, exec_id: str, symbol: str, tfs: list[s
 def _set_outcome_in_redis(redis_client, exec_id: str, symbol: str, tfs: list[str], entry_id: str, outcome: str, close_price: float, closed_at: str):
     for tf in tfs:
         key = _redis_entries_key(exec_id, symbol, tf)
-        raw = redis_client.get(key)
-        if not raw:
-            continue
-        entries: list[dict] = json.loads(raw)
+        if redis_client is None:
+            entries = list(_MEM_ENTRIES.get(key, []))
+            if not entries:
+                continue
+        else:
+            raw = redis_client.get(key)
+            if not raw:
+                continue
+            entries = json.loads(raw)
         updated = False
         for e in entries:
             if e["id"] == entry_id:
@@ -126,7 +164,79 @@ def _set_outcome_in_redis(redis_client, exec_id: str, symbol: str, tfs: list[str
                 e["closed_at"] = closed_at
                 updated = True
         if updated:
-            redis_client.setex(key, ENTRY_TTL_S, json.dumps(entries))
+            if redis_client is None:
+                _MEM_ENTRIES[key] = entries
+                _MEM_EXPIRY[key] = time.time() + ENTRY_TTL_S
+            else:
+                redis_client.setex(key, ENTRY_TTL_S, json.dumps(entries))
+
+
+def _set_beat(redis_client, exec_id: str, symbol: str, beat_data: dict) -> None:
+    beat_data = dict(beat_data or {})
+    beat_data["ts"] = int(time.time() * 1000)
+    if redis_client is None:
+        _MEM_BEATS[_redis_beat_key(exec_id, symbol)] = beat_data
+        return
+    redis_client.setex(_redis_beat_key(exec_id, symbol), WORKER_IDLE_TIMEOUT_S, json.dumps(beat_data))
+
+
+def _get_beat(redis_client, exec_id: str, symbol: str) -> dict:
+    key = _redis_beat_key(exec_id, symbol)
+    if redis_client is None:
+        return dict(_MEM_BEATS.get(key) or {})
+    raw = redis_client.get(key)
+    return json.loads(raw) if raw else {}
+
+
+def _subscribe_local(exec_id: str, symbol: str) -> tuple[str, queue.Queue]:
+    """Suscripción in-process para entornos sin Redis o instancia única."""
+    worker_key = _worker_id(exec_id, symbol)
+    q: queue.Queue = queue.Queue(maxsize=100)
+    with _SUBSCRIBERS_LOCK:
+        _SUBSCRIBERS.setdefault(worker_key, []).append(q)
+    return worker_key, q
+
+
+def _unsubscribe_local(worker_key: str, q: queue.Queue) -> None:
+    with _SUBSCRIBERS_LOCK:
+        subscribers = _SUBSCRIBERS.get(worker_key) or []
+        if q in subscribers:
+            subscribers.remove(q)
+        if subscribers:
+            _SUBSCRIBERS[worker_key] = subscribers
+        else:
+            _SUBSCRIBERS.pop(worker_key, None)
+
+
+def _publish_live_entries(redis_client, exec_id: str, symbol: str, tf: str, entries: list[dict]) -> None:
+    """Publica nuevas entradas para clientes push sin acoplar RN/Web todavía."""
+    if not entries:
+        return
+
+    event = {
+        "type": "entries",
+        "exec_id": exec_id,
+        "symbol": symbol.upper(),
+        "timeframe": tf,
+        "entries": entries,
+        "ts": int(time.time() * 1000),
+    }
+
+    if redis_client is not None:
+        try:
+            redis_client.publish(_redis_events_channel(exec_id, symbol), json.dumps(event))
+            return
+        except Exception as exc:
+            logger.warning("[LiveEntries] Redis publish failed %s/%s: %s", symbol, tf, exc)
+
+    worker_key = _worker_id(exec_id, symbol)
+    with _SUBSCRIBERS_LOCK:
+        subscribers = list(_SUBSCRIBERS.get(worker_key) or [])
+    for q in subscribers:
+        try:
+            q.put_nowait(event)
+        except queue.Full:
+            logger.warning("[LiveEntries] subscriber queue full %s/%s — event skipped", symbol, tf)
 
 
 # ─────────────────────────────────────────────
@@ -177,8 +287,20 @@ def _extract_sr_seed(niveles: dict | None) -> dict | None:
     return None
 
 
-def _build_entry_id(symbol: str, tf: str, side: str, ts: int) -> str:
-    return f"live|{symbol}|{tf}|{side}|{ts}"
+def _build_entry_id(symbol: str, tf: str, side: str, ts: int, entry: float, sl: float, tp: float, source: str) -> str:
+    payload = "|".join(
+        [
+            symbol.upper(),
+            tf,
+            side,
+            str(int(ts or 0)),
+            str(round(float(entry or 0) * 1e5)),
+            str(round(float(sl or 0) * 1e5)),
+            str(round(float(tp or 0) * 1e5)),
+            str(source or "backend").lower(),
+        ]
+    )
+    return "live|" + hashlib.sha1(payload.encode("utf-8")).hexdigest()[:24]
 
 
 def _generate_live_entries_sync(
@@ -219,6 +341,14 @@ def _generate_live_entries_sync(
     sr_levels = _extract_sr_seed(niveles) or {}
 
     try:
+        try:
+            from MarketTool import calcular_indicadores
+            df_ind = calcular_indicadores(df, norm_tf_fn(tf), symbol=symbol)
+            if df_ind is not None and not getattr(df_ind, "empty", False):
+                df = df_ind
+        except Exception as ind_exc:
+            logger.warning("[LiveWorker] indicadores no disponibles %s/%s: %s", symbol, tf, ind_exc)
+
         result = calcular_entradas_sync_wrapper(
             df,
             df_eventos if df_eventos is not None else pd.DataFrame(),
@@ -273,8 +403,9 @@ def _generate_live_entries_sync(
         if entry_price and tp and sl and abs(entry_price - sl) > 0:
             rrr = round(abs(tp - entry_price) / abs(entry_price - sl), 2)
 
-        entry_ts = e.get("timestamp") or now_ts
-        entry_id = _build_entry_id(symbol, tf, side, entry_ts)
+        source = e.get("fuente") or e.get("source") or "backend"
+        entry_ts = int(e.get("timestamp") or (series_ms[-1].get("t") if series_ms else now_ts) or now_ts)
+        entry_id = _build_entry_id(symbol, tf, side, entry_ts, float(entry_price or 0), float(sl or 0), float(tp or 0), str(source))
 
         entries.append({
             "id": entry_id,
@@ -286,9 +417,10 @@ def _generate_live_entries_sync(
             "stop_loss": float(sl),
             "rrr": rrr,
             "confluence_score": int(e.get("confluencia") or e.get("confluence_score") or e.get("score") or 0),
-            "source": e.get("fuente") or e.get("source") or "BACKEND",
+            "source": source,
             "outcome": "pending",
             "_origin": "live",
+            "_backend_live": True,
             "created_at": pd.Timestamp.utcnow().isoformat() + "Z",
             "timestamp": entry_ts,
             "nivel_confirmado": bool(e.get("nivel_confirmado") or e.get("confirmado")),
@@ -326,7 +458,7 @@ def _get_active_tfs(exec_id: str, symbol: str, norm_tf_fn) -> list[str]:
             logger.info("[LiveWorker] %s estado global=%s — sin TFs", doc_id, estado_global)
             return []
 
-        allowed: list[str] = doc.get("allowed_timeframes") or []
+        allowed: list[str] = doc.get("running") or doc.get("allowed_timeframes") or []
         # Si no hay allowed_timeframes, intentar desde tf_states
         if not allowed:
             tf_states = doc.get("tf_states") or {}
@@ -438,18 +570,18 @@ async def _live_worker(
 
             # 7. Persistir en Redis
             if entries:
-                added = _push_entries_to_redis(redis_client, exec_id, symbol, norm, entries)
-                if added:
-                    logger.info("[LiveWorker] %s/%s +%d nuevas entradas", symbol, norm, added)
+                new_entries = _push_entries_to_redis(redis_client, exec_id, symbol, norm, entries)
+                if new_entries:
+                    logger.info("[LiveWorker] %s/%s +%d nuevas entradas", symbol, norm, len(new_entries))
+                    _publish_live_entries(redis_client, exec_id, symbol, norm, new_entries)
 
             # 8. Actualizar beat timestamp + sr_levels en Redis
             try:
-                beat_key = _redis_beat_key(exec_id, symbol)
-                beat_raw = redis_client.get(beat_key)
-                beat_data: dict = json.loads(beat_raw) if beat_raw else {"tfs": tfs, "symbol": symbol, "sr_levels": {}}
-                beat_data["ts"] = int(time.time() * 1000)
+                beat_data: dict = _get_beat(redis_client, exec_id, symbol) or {"tfs": [], "symbol": symbol, "sr_levels": {}}
+                beat_data["tfs"] = list(sorted(tf_tasks_map.keys()))
+                beat_data["symbol"] = symbol
                 beat_data["sr_levels"][norm] = sr_levels
-                redis_client.setex(beat_key, WORKER_IDLE_TIMEOUT_S, json.dumps(beat_data))
+                _set_beat(redis_client, exec_id, symbol, beat_data)
             except Exception:
                 pass
 
@@ -483,19 +615,15 @@ async def _live_worker(
         await _start_tf_task(tf)
 
     # Monitor loop — cada 30s:
-    #   1. Idle check (mata el worker si nadie hace GET)
-    #   2. TF reconciliation — agrega/quita tasks según Firestore
+    #   1. TF reconciliation — agrega/quita tasks según Firestore
+    #   2. Idle check — solo mata el worker si ya no hay TFs activos ni frontend consultando
     try:
         while True:
             await asyncio.sleep(30)
 
-            # 1. Idle check
-            last_poll = _WORKER_LAST_POLL.get(worker_key, time.time())
-            if time.time() - last_poll > WORKER_IDLE_TIMEOUT_S:
-                logger.info("[LiveWorker] IDLE TIMEOUT %s — stopping", worker_key)
-                break
+            current_tfs: set[str] = set()
 
-            # 2. Re-leer TFs activos desde Firestore
+            # 1. Re-leer TFs activos desde Firestore
             try:
                 current_tfs = set(await asyncio.to_thread(
                     _get_active_tfs, exec_id, symbol, norm_tf_fn
@@ -517,6 +645,12 @@ async def _live_worker(
             except Exception as exc:
                 logger.warning("[LiveWorker] Error en TF reconciliation %s: %s", worker_key, exc)
 
+            # 2. Idle check: si Firestore mantiene TFs activos, el backend sigue aunque iOS suspenda el polling.
+            last_poll = _WORKER_LAST_POLL.get(worker_key, time.time())
+            if not current_tfs and time.time() - last_poll > WORKER_IDLE_TIMEOUT_S:
+                logger.info("[LiveWorker] IDLE TIMEOUT sin TFs activos %s — stopping", worker_key)
+                break
+
     except asyncio.CancelledError:
         pass
     finally:
@@ -536,7 +670,7 @@ async def _live_worker(
 # ─────────────────────────────────────────────
 
 def register_live_entries_routes(app, *, services) -> None:
-    from flask import jsonify, request
+    from flask import Response, jsonify, request, stream_with_context
 
     load_cache = services.load_cache
     maybe_refresh_from_gcs = services.maybe_refresh_from_gcs
@@ -555,7 +689,7 @@ def register_live_entries_routes(app, *, services) -> None:
         redis_client.ping()  # verificar conexión
     except Exception:
         redis_client = None
-        logger.warning("[LiveEntries] Redis no disponible — entradas no se persistirán")
+        logger.warning("[LiveEntries] Redis no disponible — usando fallback en memoria del proceso")
 
     # calcular_entradas_sync_wrapper
     try:
@@ -575,6 +709,8 @@ def register_live_entries_routes(app, *, services) -> None:
 
         if not exec_id or not symbol:
             return jsonify({"error": "exec_id y symbol son requeridos"}), 400
+        if calcular_entradas_sync_wrapper is None:
+            return jsonify({"error": "Motor de entradas no disponible"}), 503
 
         # Si el cliente pasa TFs explícitamente, los normaliza; si no, el worker los descubre
         tfs = [norm_tf(t) for t in tfs_raw] if tfs_raw else []
@@ -627,15 +763,11 @@ def register_live_entries_routes(app, *, services) -> None:
         # Actualizar last poll para evitar idle timeout
         _WORKER_LAST_POLL[wid] = time.time()
 
-        if not redis_client:
-            return jsonify({"error": "Redis no disponible"}), 503
-
         # Entradas del Redis
         entries = _get_entries_from_redis(redis_client, exec_id, symbol, tfs, since_ts)
 
         # Beat info + sr_levels
-        beat_raw = redis_client.get(_redis_beat_key(exec_id, symbol))
-        beat_data: dict = json.loads(beat_raw) if beat_raw else {}
+        beat_data: dict = _get_beat(redis_client, exec_id, symbol)
         last_beat_ts = beat_data.get("ts", 0)
         sr_levels = beat_data.get("sr_levels", {})
 
@@ -660,6 +792,99 @@ def register_live_entries_routes(app, *, services) -> None:
             "candles_count": candles_count,
             "sr_levels": sr_levels,
         }), 200
+
+    # ── GET /monitoreo/live-entries/stream ───────────────────────────────────
+    @app.route("/monitoreo/live-entries/stream", methods=["GET"])
+    def live_entries_stream():
+        """
+        Canal push SSE para RN/Web futuro.
+
+        No migra el frontend actual: solo expone eventos cuando el worker backend
+        ya está generando entradas para exec_id+symbol. Redis Pub/Sub se usa si
+        está disponible; si no, queda un bus in-process para desarrollo/instancia única.
+        """
+        exec_id = request.args.get("exec_id", "").strip()
+        symbol = (request.args.get("symbol") or "").upper().strip()
+        tfs_raw = request.args.get("tfs", "")
+
+        if not exec_id or not symbol:
+            return jsonify({"error": "exec_id y symbol son requeridos"}), 400
+
+        wid = _worker_id(exec_id, symbol)
+        tfs_filter = {norm_tf(t) for t in tfs_raw.split(",") if t.strip()} if tfs_raw else set()
+        _WORKER_LAST_POLL[wid] = time.time()
+
+        def _sse(event_name: str, payload: dict) -> str:
+            return f"event: {event_name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+        def _event_stream():
+            pubsub = None
+            local_key = None
+            local_q = None
+            last_heartbeat = 0.0
+            try:
+                yield "retry: 5000\n\n"
+                yield _sse("ready", {
+                    "type": "ready",
+                    "exec_id": exec_id,
+                    "symbol": symbol,
+                    "worker_status": "running" if wid in _WORKERS and not _WORKERS[wid].done() else "stopped",
+                    "ts": int(time.time() * 1000),
+                })
+
+                if redis_client is not None:
+                    pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+                    pubsub.subscribe(_redis_events_channel(exec_id, symbol))
+                else:
+                    local_key, local_q = _subscribe_local(exec_id, symbol)
+
+                while True:
+                    _WORKER_LAST_POLL[wid] = time.time()
+                    payload = None
+                    if pubsub is not None:
+                        msg = pubsub.get_message(timeout=1.0)
+                        if msg and msg.get("type") == "message":
+                            try:
+                                payload = json.loads(msg.get("data") or "{}")
+                            except Exception:
+                                payload = None
+                    elif local_q is not None:
+                        try:
+                            payload = local_q.get(timeout=1.0)
+                        except queue.Empty:
+                            payload = None
+
+                    if payload:
+                        tf = norm_tf(payload.get("timeframe") or payload.get("tf") or "")
+                        if not tfs_filter or tf in tfs_filter:
+                            yield _sse("entries", payload)
+
+                    now = time.time()
+                    if now - last_heartbeat >= 25:
+                        last_heartbeat = now
+                        yield _sse("heartbeat", {
+                            "type": "heartbeat",
+                            "exec_id": exec_id,
+                            "symbol": symbol,
+                            "ts": int(now * 1000),
+                        })
+            finally:
+                if pubsub is not None:
+                    try:
+                        pubsub.close()
+                    except Exception:
+                        pass
+                if local_key and local_q is not None:
+                    _unsubscribe_local(local_key, local_q)
+
+        return Response(
+            stream_with_context(_event_stream()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     # ── POST /monitoreo/live-entries/stop ──────────────────────────────────
     @app.route("/monitoreo/live-entries/stop", methods=["POST"])
@@ -696,12 +921,8 @@ def register_live_entries_routes(app, *, services) -> None:
         if not entry_id or outcome not in ("tp", "sl", "expired"):
             return jsonify({"error": "entry_id y outcome (tp|sl|expired) son requeridos"}), 400
 
-        if not redis_client:
-            return jsonify({"error": "Redis no disponible"}), 503
-
         # Buscar en todos los TFs conocidos para este exec+symbol
-        beat_raw = redis_client.get(_redis_beat_key(exec_id, symbol))
-        beat_data = json.loads(beat_raw) if beat_raw else {}
+        beat_data = _get_beat(redis_client, exec_id, symbol)
         tfs = beat_data.get("tfs") or []
 
         _set_outcome_in_redis(redis_client, exec_id, symbol, tfs, entry_id, outcome, close_price, closed_at)
