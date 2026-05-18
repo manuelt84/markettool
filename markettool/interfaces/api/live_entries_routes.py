@@ -65,6 +65,7 @@ _WORKER_LOCK = asyncio.Lock()
 _MEM_ENTRIES: dict[str, list[dict]] = {}        # fallback when Redis is unavailable
 _MEM_EXPIRY: dict[str, float] = {}
 _MEM_BEATS: dict[str, dict] = {}
+_MEM_EVENTS: dict[str, list[dict]] = {}         # short replay buffer for SSE when Redis is unavailable
 _SUBSCRIBERS: dict[str, list[queue.Queue]] = {}
 _SUBSCRIBERS_LOCK = threading.Lock()
 
@@ -87,6 +88,54 @@ def _redis_beat_key(exec_id: str, symbol: str) -> str:
 
 def _redis_events_channel(exec_id: str, symbol: str) -> str:
     return f"live_entries_events:{exec_id}:{symbol.upper()}"
+
+
+def _redis_event_log_key(exec_id: str, symbol: str) -> str:
+    return f"live_entries_event_log:{exec_id}:{symbol.upper()}"
+
+
+def _event_id(exec_id: str, symbol: str, tf: str, ts_ms: int) -> str:
+    base = f"{exec_id}|{symbol.upper()}|{tf}|{ts_ms}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
+
+
+def _store_event_for_replay(redis_client, exec_id: str, symbol: str, event: dict) -> None:
+    key = _redis_event_log_key(exec_id, symbol)
+    if redis_client is None:
+        events = (_MEM_EVENTS.get(key) or [])[-49:] + [event]
+        _MEM_EVENTS[key] = events
+        return
+    try:
+        redis_client.rpush(key, json.dumps(event, separators=(",", ":")))
+        redis_client.ltrim(key, -50, -1)
+        redis_client.expire(key, ENTRY_TTL_S)
+    except Exception as exc:
+        logger.warning("[LiveEntries] Redis replay log failed %s: %s", key, exc)
+
+
+def _get_events_for_replay(redis_client, exec_id: str, symbol: str, last_event_id: str | None, tfs_filter: set[str], norm_tf_fn) -> list[dict]:
+    if not last_event_id:
+        return []
+    key = _redis_event_log_key(exec_id, symbol)
+    if redis_client is None:
+        events = list(_MEM_EVENTS.get(key) or [])
+    else:
+        try:
+            events = [json.loads(raw) for raw in (redis_client.lrange(key, 0, -1) or [])]
+        except Exception:
+            events = []
+    found = False
+    replay: list[dict] = []
+    for event in events:
+        if event.get("id") == last_event_id:
+            found = True
+            continue
+        if not found:
+            continue
+        tf = norm_tf_fn(event.get("timeframe") or event.get("tf") or "")
+        if not tfs_filter or tf in tfs_filter:
+            replay.append(event)
+    return replay
 
 
 def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, entries: list[dict]) -> list[dict]:
@@ -213,14 +262,17 @@ def _publish_live_entries(redis_client, exec_id: str, symbol: str, tf: str, entr
     if not entries:
         return
 
+    ts_ms = int(time.time() * 1000)
     event = {
+        "id": _event_id(exec_id, symbol, tf, ts_ms),
         "type": "entries",
         "exec_id": exec_id,
         "symbol": symbol.upper(),
         "timeframe": tf,
         "entries": entries,
-        "ts": int(time.time() * 1000),
+        "ts": ts_ms,
     }
+    _store_event_for_replay(redis_client, exec_id, symbol, event)
 
     if redis_client is not None:
         try:
@@ -751,6 +803,7 @@ def register_live_entries_routes(app, *, services) -> None:
         exec_id = request.args.get("exec_id", "").strip()
         symbol = (request.args.get("symbol") or "").upper().strip()
         tfs_raw = request.args.get("tfs", "")
+        last_event_id = request.headers.get("Last-Event-ID") or request.args.get("last_event_id")
         since_ts_raw = request.args.get("since_ts")
 
         if not exec_id or not symbol:
@@ -815,7 +868,9 @@ def register_live_entries_routes(app, *, services) -> None:
         _WORKER_LAST_POLL[wid] = time.time()
 
         def _sse(event_name: str, payload: dict) -> str:
-            return f"event: {event_name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+            event_id = payload.get("id")
+            prefix = f"id: {event_id}\n" if event_id else ""
+            return f"{prefix}event: {event_name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
         def _event_stream():
             pubsub = None
@@ -831,6 +886,8 @@ def register_live_entries_routes(app, *, services) -> None:
                     "worker_status": "running" if wid in _WORKERS and not _WORKERS[wid].done() else "stopped",
                     "ts": int(time.time() * 1000),
                 })
+                for replay_event in _get_events_for_replay(redis_client, exec_id, symbol, last_event_id, tfs_filter, norm_tf):
+                    yield _sse("entries", replay_event)
 
                 if redis_client is not None:
                     pubsub = redis_client.pubsub(ignore_subscribe_messages=True)

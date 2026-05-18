@@ -7,7 +7,7 @@
 
 ## Estado Actual 2026-05-16
 
-Este endpoint ya existe en backend y quedó en desarrollo **sin migrar RN/Web todavía**. La pantalla actual de Monitoreo en Web y RN debe seguir funcionando como está hasta que se active explícitamente un modo nuevo en el frontend.
+Este endpoint existe en backend y RN/Web lo consumen solo mediante modo opt-in (`Backend live`). El cálculo local sigue siendo el comportamiento base.
 
 ### Implementado
 
@@ -22,22 +22,21 @@ Este endpoint ya existe en backend y quedó en desarrollo **sin migrar RN/Web to
 - Deduplicación backend por `id` estable con fingerprint `symbol/tf/side/timestamp/prices/source`.
 - Persistencia de entradas con TTL 5 min en Redis y fallback en memoria si Redis no está disponible.
 - Publicación de nuevas entradas por Redis Pub/Sub si hay Redis, o bus in-process si no hay Redis.
-- Canal push SSE `GET /monitoreo/live-entries/stream` para consumo futuro de RN/Web.
+- Canal push SSE `GET /monitoreo/live-entries/stream` consumido por RN/Web cuando el chip `Backend live` está activo.
+- Eventos SSE con `id` para reconexión y replay corto.
 - El worker no depende de que iOS mantenga un loop largo de frontend: si Firestore sigue indicando TFs activos, el backend continúa aunque el cliente deje de hacer polling.
 
 ### Decisión de alcance
 
-- **No enlazar todavía Web/RN al endpoint.**
-- Web/RN no deben llamar `/monitoreo/live-entries` ni `/monitoreo/live-entries/stream` hasta que se implemente un modo seleccionable.
-- La futura migración debe ser opt-in, idealmente con chip/radio button: `Generar en pantalla` vs `Entradas desde backend`.
+- Web/RN pueden llamar `/monitoreo/live-entries/start`, `/monitoreo/live-entries` y `/monitoreo/live-entries/stream` solo si el chip `Backend live` está activo.
+- La migración es opt-in: `Backend live` agrega entradas remotas, pero no elimina el cálculo local.
 - El backend solo debe monitorear el activo que el usuario está viendo. El cliente futuro debe iniciar/suscribirse al `symbol` visible y detener/cambiar al cambiar de activo.
 
 ### Validación ejecutada
 
 - `python3 -m py_compile markettool/interfaces/api/live_entries_routes.py` OK.
 - `git diff --check -- markettool/interfaces/api/live_entries_routes.py` OK.
-- Scan en Web/RN sin llamadas a `/monitoreo/live-entries`.
-- Web y RN se mantienen sin integración al nuevo endpoint.
+- Web/RN integrados al stream SSE con fallback polling moderado por temporalidad/backoff.
 
 ### Pendiente para retomar
 
@@ -45,7 +44,7 @@ Este endpoint ya existe en backend y quedó en desarrollo **sin migrar RN/Web to
 - Validar Cloud Run/nginx para SSE sin buffering ni cortes.
 - Definir si producción multi-instancia exige Redis obligatorio para Pub/Sub.
 - Diseñar el modo frontend opt-in sin alterar el comportamiento actual.
-- Crear hook futuro RN/Web para `Entradas desde backend`: abrir stream solo para el activo visible, mezclar entradas con el dedupe actual y cerrar/cambiar al cambiar de activo.
+- Endurecer replay multinodo si no hay afinidad de sesión: cursor durable en almacenamiento compartido o stickiness por `exec_id+symbol`.
 - Decidir si outcome TP/SL queda en cliente vía `POST /outcome` o migra también al backend.
 - Definir persistencia durable si se requiere historial más allá del TTL de 5 min.
 
