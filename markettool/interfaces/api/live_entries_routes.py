@@ -878,21 +878,27 @@ def _ensure_market_pool_started(
     if not enabled:
         logger.info("[MarketPool] disabled by MARKET_POOL_ENABLED")
         return
+    loop_kwargs = dict(
+        redis_client=redis_client,
+        fetch_historical_range=fetch_historical_range,
+        norm_tf_fn=norm_tf_fn,
+        tf_ms_fn=tf_ms_fn,
+        current_closed_bucket_start=current_closed_bucket_start,
+    )
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
+        def _run_pool_thread():
+            asyncio.run(_market_pool_loop(**loop_kwargs))
+
+        thread = threading.Thread(target=_run_pool_thread, daemon=True, name="market-pool")
+        thread.start()
+        logger.info("[MarketPool] started in background thread")
         return
     if _MARKET_POOL_TASK is not None and not _MARKET_POOL_TASK.done():
         return
-    _MARKET_POOL_TASK = loop.create_task(
-        _market_pool_loop(
-            redis_client=redis_client,
-            fetch_historical_range=fetch_historical_range,
-            norm_tf_fn=norm_tf_fn,
-            tf_ms_fn=tf_ms_fn,
-            current_closed_bucket_start=current_closed_bucket_start,
-        )
-    )
+    _MARKET_POOL_TASK = loop.create_task(_market_pool_loop(**loop_kwargs))
+    logger.info("[MarketPool] started in asyncio loop")
 
 
 async def _charge_live_data_once(
