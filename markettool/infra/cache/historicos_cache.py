@@ -1180,7 +1180,11 @@ def save_to_gcs(symbol: str, tf: str, df: pd.DataFrame) -> bool:
             if c not in out.columns:
                 out[c] = np.nan
 
-        payload = out[["time", "open", "high", "low", "close", "volume"]].tail(1000).to_dict(orient="records")
+        payload_df = out[["time", "open", "high", "low", "close", "volume"]]
+        max_rows = int(os.getenv("GCS_HISTORY_MAX_ROWS", "1000"))
+        if max_rows > 0 and len(payload_df) > max_rows:
+            payload_df = payload_df.tail(max_rows)
+        payload = payload_df.to_dict(orient="records")
 
         blob = bucket.blob(gcs_path)
         blob.upload_from_string(

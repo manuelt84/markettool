@@ -967,6 +967,51 @@ ANALYSIS_GAP_LOOKBACK_BARS = {
     "1week": 12,
 }
 
+ANALYSIS_DEEP_GAPFILL_ENABLED = (
+    os.environ.get("ANALYSIS_DEEP_GAPFILL_ENABLED", "false").strip().lower() == "true"
+)
+ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_MIN = int(
+    os.environ.get("ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_MIN", "12")
+)
+ANALYSIS_DEEP_GAPFILL_MIN_SECONDS_BETWEEN_CALLS = float(
+    os.environ.get("ANALYSIS_DEEP_GAPFILL_MIN_SECONDS_BETWEEN_CALLS", "3")
+)
+ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_RUN = int(
+    os.environ.get("ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_RUN", "3")
+)
+ANALYSIS_GAPFILL_TIME_BUDGET_SECONDS = float(
+    os.environ.get("ANALYSIS_GAPFILL_TIME_BUDGET_SECONDS", "5")
+)
+_DEEP_GAPFILL_RATE_LOCK = threading.Lock()
+_DEEP_GAPFILL_RATE_MINUTE = -1
+_DEEP_GAPFILL_RATE_COUNT = 0
+_DEEP_GAPFILL_LAST_CALL_TS = 0.0
+_DEEP_GAPFILL_REDIS_CLIENT = None
+FMP_RANGE_VALIDATION_ENABLED = (
+    os.environ.get("FMP_RANGE_VALIDATION_ENABLED", "true").strip().lower() == "true"
+)
+FMP_RANGE_OUT_OF_RANGE_WARN_RATIO = float(
+    os.environ.get("FMP_RANGE_OUT_OF_RANGE_WARN_RATIO", "0.25")
+)
+FMP_RANGE_ADAPTIVE_ENABLED = (
+    os.environ.get("FMP_RANGE_ADAPTIVE_ENABLED", "true").strip().lower() == "true"
+)
+FMP_RANGE_ADAPTIVE_CLIP_RATIO = float(
+    os.environ.get("FMP_RANGE_ADAPTIVE_CLIP_RATIO", "0.75")
+)
+FMP_RANGE_ADAPTIVE_MIN_BARS = int(
+    os.environ.get("FMP_RANGE_ADAPTIVE_MIN_BARS", "30")
+)
+FMP_RANGE_ADAPTIVE_TTL_SECONDS = int(
+    os.environ.get("FMP_RANGE_ADAPTIVE_TTL_SECONDS", "21600")
+)
+FMP_RANGE_ADAPTIVE_DEFAULT_MAX_BARS = int(
+    os.environ.get("FMP_RANGE_ADAPTIVE_DEFAULT_MAX_BARS", "180")
+)
+_FMP_RANGE_ADAPTIVE_HINTS: dict[tuple[str, str], tuple[int, float]] = {}
+_FMP_RANGE_STATS_LOCK = threading.Lock()
+_FMP_RANGE_STATS: dict[tuple[str, str], dict[str, Any]] = {}
+
 
 def _should_force_fresh_intraday(tf: str) -> bool:
     return normalize_tf(tf) in ANALYSIS_STRICT_REFRESH_TFS
@@ -6560,6 +6605,178 @@ def hash_dataframe(df: pd.DataFrame) -> str:
         return hashlib.sha256(f"{df.shape}_{time.time()}".encode()).hexdigest()[:16]
 
 
+def _history_expected_step_ms(tf: str) -> Optional[int]:
+    tf_norm = normalize_tf(tf)
+    return {
+        "1min": 60_000,
+        "5min": 300_000,
+        "15min": 900_000,
+        "30min": 1_800_000,
+        "1hour": 3_600_000,
+        "4hour": 14_400_000,
+        "1day": 86_400_000,
+        "1week": 604_800_000,
+    }.get(tf_norm)
+
+
+def _validate_history_series_for_persist(
+    df: pd.DataFrame,
+    symbol: str,
+    tf: str,
+    *,
+    source: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Normalize and score a full OHLCV series before local/Redis/GCS persistence."""
+    diag: dict[str, Any] = {
+        "symbol": str(symbol).upper(),
+        "tf": normalize_tf(tf),
+        "source": source,
+        "valid": False,
+        "rows": 0,
+        "first_ts": None,
+        "last_ts": None,
+        "duplicates_removed": 0,
+        "invalid_rows_removed": 0,
+        "gap_count": 0,
+        "max_gap_ms": 0,
+        "coverage_ratio": 0.0,
+        "span_ms": 0,
+    }
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]), diag
+
+    try:
+        out = df.copy()
+        if not isinstance(out.index, pd.DatetimeIndex):
+            if "time" in out.columns:
+                out["time"] = pd.to_datetime(out["time"], utc=True, errors="coerce")
+                out = out.dropna(subset=["time"]).set_index("time")
+            elif "date" in out.columns:
+                out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
+                out = out.dropna(subset=["date"]).set_index("date")
+            else:
+                out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
+
+        idx = pd.DatetimeIndex(pd.to_datetime(out.index, utc=True, errors="coerce"))
+        valid_idx = ~idx.isna()
+        diag["invalid_rows_removed"] += int((~valid_idx).sum())
+        out = out.loc[valid_idx].copy()
+        idx = idx[valid_idx]
+        if out.empty:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]), diag
+
+        out.index = idx
+        out = _ensure_cols(out).sort_index()
+        before_dupes = len(out)
+        out = out[~out.index.duplicated(keep="last")]
+        diag["duplicates_removed"] = int(before_dupes - len(out))
+
+        price_cols = ["open", "high", "low", "close"]
+        finite_price = np.isfinite(out[price_cols]).all(axis=1)
+        positive_price = (out[price_cols] > 0).all(axis=1)
+        high_ok = out["high"] >= out[["open", "close"]].max(axis=1)
+        low_ok = out["low"] <= out[["open", "close"]].min(axis=1)
+        volume_ok = out["volume"].isna() | (out["volume"] >= 0)
+        valid_rows = finite_price & positive_price & high_ok & low_ok & volume_ok
+        diag["invalid_rows_removed"] += int((~valid_rows).sum())
+        out = out.loc[valid_rows].copy()
+        if out.empty:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]), diag
+
+        first = out.index[0]
+        last = out.index[-1]
+        diag["valid"] = True
+        diag["rows"] = int(len(out))
+        diag["first_ts"] = first.isoformat()
+        diag["last_ts"] = last.isoformat()
+        diag["span_ms"] = int(max(0, (last - first).total_seconds() * 1000))
+
+        step_ms = _history_expected_step_ms(tf)
+        if len(out) > 1 and step_ms:
+            diffs_ms = pd.Series(out.index).diff().dropna().dt.total_seconds().mul(1000)
+            gaps = diffs_ms[diffs_ms > (step_ms * 1.5)]
+            diag["gap_count"] = int(len(gaps))
+            diag["max_gap_ms"] = int(diffs_ms.max()) if not diffs_ms.empty else 0
+            expected_rows = int(diag["span_ms"] // step_ms) + 1
+            if expected_rows > 0:
+                diag["coverage_ratio"] = round(float(max(0.0, min(1.0, len(out) / expected_rows))), 6)
+        else:
+            diag["coverage_ratio"] = 1.0
+
+        return out, diag
+    except Exception as exc:
+        logger.warning("[HIST][SERIES_VALIDATE] failed for %s/%s source=%s: %s", symbol, tf, source, exc)
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]), diag
+
+
+def _history_quality_score(diag: dict[str, Any]) -> tuple:
+    if not diag or not diag.get("valid"):
+        return (0, 0.0, 0, 0, 0, "")
+    last_ts = diag.get("last_ts") or ""
+    return (
+        1,
+        int(diag.get("rows") or 0),
+        int(diag.get("span_ms") or 0),
+        float(diag.get("coverage_ratio") or 0.0),
+        -int(diag.get("gap_count") or 0),
+        str(last_ts),
+    )
+
+
+def _select_history_for_persistence(
+    symbol: str,
+    tf: str,
+    candidate_df: pd.DataFrame,
+) -> tuple[Optional[pd.DataFrame], dict[str, Any]]:
+    """Pick the best full series to persist without overwriting GCS with worse data."""
+    candidate, cand_diag = _validate_history_series_for_persist(candidate_df, symbol, tf, source="candidate")
+    decision: dict[str, Any] = {
+        "action": "skip_invalid_candidate",
+        "candidate": cand_diag,
+        "existing": None,
+        "selected": None,
+    }
+    if candidate.empty:
+        return None, decision
+
+    existing_df = None
+    try:
+        existing_df = load_from_gcs(symbol, tf)
+    except Exception as exc:
+        logger.debug("[HIST][PERSIST_SELECT] GCS load failed for %s/%s: %s", symbol, tf, exc)
+
+    if existing_df is None or getattr(existing_df, "empty", True):
+        decision["action"] = "save_candidate_no_existing"
+        decision["selected"] = cand_diag
+        return candidate, decision
+
+    existing, existing_diag = _validate_history_series_for_persist(existing_df, symbol, tf, source="gcs_existing")
+    decision["existing"] = existing_diag
+    if existing.empty:
+        decision["action"] = "replace_invalid_existing"
+        decision["selected"] = cand_diag
+        return candidate, decision
+
+    merged = merge_histories(existing, candidate)
+    merged, merged_diag = _validate_history_series_for_persist(merged, symbol, tf, source="merged")
+    merged_score = _history_quality_score(merged_diag)
+    existing_score = _history_quality_score(existing_diag)
+    candidate_score = _history_quality_score(cand_diag)
+
+    if merged_score > existing_score:
+        decision["action"] = "save_merged_improved"
+        decision["selected"] = merged_diag
+        return merged, decision
+    if candidate_score > existing_score:
+        decision["action"] = "replace_with_candidate_better"
+        decision["selected"] = cand_diag
+        return candidate, decision
+
+    decision["action"] = "skip_existing_better_or_equal"
+    decision["selected"] = existing_diag
+    return None, decision
+
+
 def merge_indicators_incremental(cached: dict, new: dict, split_index: int, window_context: int) -> dict:
     """
     Combina indicadores cacheados + nuevos calculados incrementalmente.
@@ -9984,6 +10201,43 @@ def obtener_datos_con_hilos(
         diag = _build_analysis_data_quality_diag(df_out, symbol, tf)
         diag["gaps_filled"] = int(gapfill_added)
         df_out.attrs["analysis_data_quality"] = diag
+
+        persist_df = None
+        persist_decision = None
+        if gapfill_added > 0:
+            try:
+                # Persist only a validated full series. If GCS already has a
+                # better version, keep the current analysis result in memory but
+                # do not downgrade local/Redis/GCS persistence.
+                persist_df, persist_decision = _select_history_for_persistence(symbol, tf, df_out)
+                if persist_df is not None and not persist_df.empty:
+                    save_cached_history(symbol, tf, persist_df)
+                    selected = (persist_decision or {}).get("selected") or {}
+                    logger.info(
+                        "[ANALYSIS_GAPFILL] %s/%s persisted validated local/redis rows=%d added=%d action=%s coverage=%.4f gaps=%d",
+                        symbol,
+                        tf,
+                        len(persist_df),
+                        gapfill_added,
+                        (persist_decision or {}).get("action"),
+                        float(selected.get("coverage_ratio") or 0.0),
+                        int(selected.get("gap_count") or 0),
+                    )
+                else:
+                    logger.info(
+                        "[ANALYSIS_GAPFILL] %s/%s skipped local/redis persist after validation action=%s added=%d",
+                        symbol,
+                        tf,
+                        (persist_decision or {}).get("action"),
+                        gapfill_added,
+                    )
+            except Exception as cache_exc:
+                logger.warning(
+                    "[ANALYSIS_GAPFILL] local/redis persist failed for %s/%s: %s",
+                    symbol,
+                    tf,
+                    cache_exc,
+                )
         
         # ✅ NIVEL 1.5: Guardar en Redis para próxima vez (non-blocking)
         try:
@@ -10003,32 +10257,60 @@ def obtener_datos_con_hilos(
         last_backup = _last_gcs_backup_time.get(backup_key, 0)
         now_ts = datetime.now(UTC).timestamp()
         time_since_last_backup = now_ts - last_backup
-        should_backup = cold_start or (time_since_last_backup > _GCS_BACKUP_THROTTLE_SECONDS)
+        should_backup = cold_start or gapfill_added > 0 or (time_since_last_backup > _GCS_BACKUP_THROTTLE_SECONDS)
         
         if should_backup:
             try:
-                # ✅ LAZY-LOAD: Only persist if data actually changed (delta detection)
-                current_hash = hash_dataframe(df_out)
-                last_hash = _last_gcs_backup_hash.get(backup_key)
-                
-                if cold_start or last_hash is None or current_hash != last_hash:
-                    # Only save if cold_start or data has delta
-                    success = save_to_gcs(symbol, tf, df_out)
-                    if success:
-                        _save_local_history_df(symbol, tf, df_out)
-                        # Update Firestore metadata so other pods know data is fresh
-                        safe_sym = _safe_symbol_for_filename(symbol)
-                        safe_tf = normalize_tf(tf)
-                        gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
-                        rows_to_persist = min(1000, len(df_out))
-                        set_historicos_metadata(symbol, tf, gcs_path, rows_to_persist, ttl_seconds=1800)
-                        _last_gcs_backup_time[backup_key] = now_ts
-                        _last_gcs_backup_hash[backup_key] = current_hash
-                        reason = "cold_start" if cold_start else f"periodic (delta detected, last={int(time_since_last_backup)}s ago)"
-                        logging.info("[HIST][GCS_BACKUP] %s-%s → %d rows (%s)", symbol, tf, len(df_out), reason)
+                if persist_df is None:
+                    persist_df, persist_decision = _select_history_for_persistence(symbol, tf, df_out)
+                skip_gcs_after_validation = persist_df is None or persist_df.empty
+                if skip_gcs_after_validation:
+                    logger.info(
+                        "[HIST][GCS_BACKUP] Skipped %s/%s after validation action=%s",
+                        symbol,
+                        tf,
+                        (persist_decision or {}).get("action"),
+                    )
                 else:
-                    # Data hasn't changed, skip GCS save
-                    logger.info(f"[HIST][GCS_BACKUP] Skipped {symbol}/{tf} (no delta, hash unchanged)")
+                    # ✅ LAZY-LOAD: Only persist if data actually changed (delta detection)
+                    current_hash = hash_dataframe(persist_df)
+                    last_hash = _last_gcs_backup_hash.get(backup_key)
+
+                    if cold_start or last_hash is None or current_hash != last_hash:
+                        # Only save if cold_start or data has delta, and the chosen
+                        # series is at least as complete as what GCS already has.
+                        success = save_to_gcs(symbol, tf, persist_df)
+                        if success:
+                            _save_local_history_df(symbol, tf, persist_df)
+                            # Update Firestore metadata so other pods know data is fresh
+                            safe_sym = _safe_symbol_for_filename(symbol)
+                            safe_tf = normalize_tf(tf)
+                            gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
+                            max_gcs_rows = int(os.getenv("GCS_HISTORY_MAX_ROWS", "1000"))
+                            rows_to_persist = len(persist_df) if max_gcs_rows <= 0 else min(max_gcs_rows, len(persist_df))
+                            set_historicos_metadata(symbol, tf, gcs_path, rows_to_persist, ttl_seconds=1800)
+                            _last_gcs_backup_time[backup_key] = now_ts
+                            _last_gcs_backup_hash[backup_key] = current_hash
+                            if cold_start:
+                                reason = "cold_start"
+                            elif gapfill_added > 0:
+                                reason = f"gapfill_added={gapfill_added}"
+                            else:
+                                reason = f"periodic (delta detected, last={int(time_since_last_backup)}s ago)"
+                            selected = (persist_decision or {}).get("selected") or {}
+                            logging.info(
+                                "[HIST][GCS_BACKUP] %s-%s → %d rows (%s, action=%s, coverage=%.4f, gaps=%d)",
+                                symbol,
+                                tf,
+                                len(persist_df),
+                                reason,
+                                (persist_decision or {}).get("action"),
+                                float(selected.get("coverage_ratio") or 0.0),
+                                int(selected.get("gap_count") or 0),
+                            )
+                    else:
+                        # Data hasn't changed, skip GCS save
+                        logger.info(f"[HIST][GCS_BACKUP] Skipped {symbol}/{tf} (no delta, hash unchanged)")
             except Exception as e:
                 logger.warning(f"[HIST][GCS_BACKUP] Failed to persist {symbol}/{tf}: {e}")
                 # Don't fail analysis, just log the issue
@@ -22545,6 +22827,212 @@ def _normalize_fmp_bars(raw: list) -> list:
     out.sort(key=lambda x: x["t"])
     return out
 
+
+def _validate_fmp_range_bars(
+    bars: list[dict],
+    symbol: str,
+    tf: str,
+    from_ms: int,
+    to_ms: int,
+    source: str,
+) -> list[dict]:
+    """Keep only valid bars inside the requested range before merging/persisting."""
+    if not FMP_RANGE_VALIDATION_ENABLED or not bars:
+        return bars or []
+
+    tfms = _tf_ms(tf)
+    # FMP boundaries can be inclusive/exclusive depending on endpoint; allow one
+    # bucket of tolerance, then snap/dedupe after filtering.
+    lower = int(from_ms) - tfms
+    upper = int(to_ms) + tfms
+    valid: list[dict] = []
+    out_of_range = 0
+    invalid_ohlc = 0
+
+    for bar in bars:
+        try:
+            ts = int(bar.get("t", 0))
+            o = float(bar.get("o"))
+            h = float(bar.get("h"))
+            l = float(bar.get("l"))
+            c = float(bar.get("c"))
+            v = float(bar.get("v", 0) or 0)
+            if not all(math.isfinite(x) for x in (o, h, l, c, v)):
+                invalid_ohlc += 1
+                continue
+            if h < max(o, c) or l > min(o, c):
+                invalid_ohlc += 1
+                continue
+            if ts < lower or ts > upper:
+                out_of_range += 1
+                continue
+            valid.append({"t": ts, "o": o, "h": h, "l": l, "c": c, "v": v})
+        except Exception:
+            invalid_ohlc += 1
+
+    if not valid:
+        _record_fmp_range_stats(
+            symbol,
+            tf,
+            source,
+            raw_count=len(bars),
+            kept_count=0,
+            out_of_range_count=out_of_range,
+            invalid_ohlc_count=invalid_ohlc,
+            from_ms=from_ms,
+            to_ms=to_ms,
+        )
+        logging.warning(
+            "[FMP_RANGE_VALIDATE] rejected %s/%s source=%s: no bars in requested range "
+            "UTC:[%s -> %s], raw=%d, out_of_range=%d, invalid_ohlc=%d",
+            symbol,
+            tf,
+            source,
+            _ms_to_iso_utc(from_ms),
+            _ms_to_iso_utc(to_ms),
+            len(bars),
+            out_of_range,
+            invalid_ohlc,
+        )
+        return []
+
+    total = max(1, len(bars))
+    out_ratio = out_of_range / total
+    _record_fmp_range_stats(
+        symbol,
+        tf,
+        source,
+        raw_count=len(bars),
+        kept_count=len(valid),
+        out_of_range_count=out_of_range,
+        invalid_ohlc_count=invalid_ohlc,
+        from_ms=from_ms,
+        to_ms=to_ms,
+    )
+    if out_ratio > FMP_RANGE_OUT_OF_RANGE_WARN_RATIO:
+        logging.warning(
+            "[FMP_RANGE_VALIDATE] clipped %s/%s source=%s: kept=%d raw=%d out_of_range=%d "
+            "invalid_ohlc=%d requested_UTC:[%s -> %s]",
+            symbol,
+            tf,
+            source,
+            len(valid),
+            len(bars),
+            out_of_range,
+            invalid_ohlc,
+            _ms_to_iso_utc(from_ms),
+            _ms_to_iso_utc(to_ms),
+        )
+
+    return _snap_and_dedupe_to_minutes(valid, tf)
+
+
+def _record_fmp_range_stats(
+    symbol: str,
+    tf: str,
+    source: str,
+    *,
+    raw_count: int,
+    kept_count: int,
+    out_of_range_count: int,
+    invalid_ohlc_count: int,
+    from_ms: int,
+    to_ms: int,
+) -> None:
+    if raw_count <= 0:
+        return
+    tf_norm = _norm_tf(tf)
+    key = (str(symbol).upper(), tf_norm)
+    clip_ratio = float(out_of_range_count) / float(max(1, raw_count))
+    try:
+        with _FMP_RANGE_STATS_LOCK:
+            stats = _FMP_RANGE_STATS.setdefault(
+                key,
+                {
+                    "calls": 0,
+                    "raw": 0,
+                    "kept": 0,
+                    "out_of_range": 0,
+                    "invalid_ohlc": 0,
+                    "last_clip_ratio": 0.0,
+                    "last_requested_bars": 0,
+                    "last_source": source,
+                },
+            )
+            stats["calls"] = int(stats.get("calls") or 0) + 1
+            stats["raw"] = int(stats.get("raw") or 0) + int(raw_count)
+            stats["kept"] = int(stats.get("kept") or 0) + int(kept_count)
+            stats["out_of_range"] = int(stats.get("out_of_range") or 0) + int(out_of_range_count)
+            stats["invalid_ohlc"] = int(stats.get("invalid_ohlc") or 0) + int(invalid_ohlc_count)
+            stats["last_clip_ratio"] = round(clip_ratio, 6)
+            stats["last_requested_bars"] = max(1, int((int(to_ms) - int(from_ms)) // max(1, _tf_ms(tf_norm))) + 1)
+            stats["last_source"] = source
+    except Exception:
+        pass
+
+    if not FMP_RANGE_ADAPTIVE_ENABLED:
+        return
+    if clip_ratio < FMP_RANGE_ADAPTIVE_CLIP_RATIO:
+        return
+    try:
+        requested_bars = max(1, int((int(to_ms) - int(from_ms)) // max(1, _tf_ms(tf_norm))) + 1)
+        current_hint = _get_fmp_range_adaptive_max_bars(symbol, tf_norm)
+        next_hint = max(FMP_RANGE_ADAPTIVE_MIN_BARS, min(current_hint, requested_bars // 2 or requested_bars))
+        if next_hint < current_hint:
+            _set_fmp_range_adaptive_max_bars(symbol, tf_norm, next_hint)
+            logging.info(
+                "[FMP_RANGE_ADAPT] %s/%s source=%s clip_ratio=%.3f raw=%d kept=%d requested_bars=%d next_max_bars=%d",
+                symbol,
+                tf_norm,
+                source,
+                clip_ratio,
+                raw_count,
+                kept_count,
+                requested_bars,
+                next_hint,
+            )
+    except Exception as exc:
+        logging.debug("[FMP_RANGE_ADAPT] failed for %s/%s: %s", symbol, tf, exc)
+
+
+def _get_fmp_range_adaptive_max_bars(symbol: str, tf: str) -> int:
+    if not FMP_RANGE_ADAPTIVE_ENABLED:
+        return max(1, FMP_RANGE_ADAPTIVE_DEFAULT_MAX_BARS)
+    symbol_key = str(symbol).upper()
+    tf_norm = _norm_tf(tf)
+    cache_key = (symbol_key, tf_norm)
+    now = time.time()
+    hint = _FMP_RANGE_ADAPTIVE_HINTS.get(cache_key)
+    if hint and hint[1] > now:
+        return max(1, int(hint[0]))
+
+    try:
+        client = _get_deep_gapfill_redis_client()
+        if client is not None:
+            raw = client.get(f"fmp_range_adapt:max_bars:{symbol_key}:{tf_norm}")
+            if raw:
+                val = max(1, int(raw))
+                _FMP_RANGE_ADAPTIVE_HINTS[cache_key] = (val, now + min(FMP_RANGE_ADAPTIVE_TTL_SECONDS, 600))
+                return val
+    except Exception:
+        pass
+
+    return max(1, FMP_RANGE_ADAPTIVE_DEFAULT_MAX_BARS)
+
+
+def _set_fmp_range_adaptive_max_bars(symbol: str, tf: str, max_bars: int) -> None:
+    symbol_key = str(symbol).upper()
+    tf_norm = _norm_tf(tf)
+    val = max(1, int(max_bars))
+    expires_at = time.time() + max(60, FMP_RANGE_ADAPTIVE_TTL_SECONDS)
+    _FMP_RANGE_ADAPTIVE_HINTS[(symbol_key, tf_norm)] = (val, expires_at)
+    try:
+        client = _get_deep_gapfill_redis_client()
+        if client is not None:
+            client.setex(f"fmp_range_adapt:max_bars:{symbol_key}:{tf_norm}", max(60, FMP_RANGE_ADAPTIVE_TTL_SECONDS), val)
+    except Exception:
+        pass
+
 # ---------- paths ----------
 def _gcs_enriched_path(exec_id: str, symbol: str, tf: str) -> str:
     # gs://markettool_bucket/analisis/exec/{exec_id}/{SYMBOL}_{TF}_enriched.json
@@ -22971,12 +23459,117 @@ def _current_closed_bucket_start(tf: str) -> int:
 def _ms_to_iso_utc(ts_ms: int) -> str:
     # "YYYY-MM-DD HH:MM:SS" en UTC (formato que acepta FMP en historical-chart)
     return datetime.utcfromtimestamp(ts_ms/1000).strftime("%Y-%m-%d %H:%M:%S")
-def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> list[dict]:
+
+def _get_deep_gapfill_redis_client():
+    global _DEEP_GAPFILL_REDIS_CLIENT
+    if _DEEP_GAPFILL_REDIS_CLIENT is not None:
+        return _DEEP_GAPFILL_REDIS_CLIENT
+    if redis is None:
+        return None
+    redis_url = (
+        os.getenv("MARKET_DATA_REDIS_URL")
+        or os.getenv("LIVE_ENTRIES_REDIS_URL")
+        or os.getenv("REDIS_URL")
+    )
+    if not redis_url:
+        return None
+    try:
+        client = redis.Redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=1, socket_timeout=2)
+        client.ping()
+        _DEEP_GAPFILL_REDIS_CLIENT = client
+        return client
+    except Exception:
+        return None
+
+
+def _deep_gapfill_acquire_fmp_slot(symbol: str, tf: str) -> bool:
+    if not ANALYSIS_DEEP_GAPFILL_ENABLED:
+        return True
+    max_per_min = max(0, ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_MIN)
+    if max_per_min <= 0:
+        logging.info("[DeepGapfill] FMP call skipped: disabled by ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_MIN=0")
+        return False
+
+    min_gap = max(0.0, ANALYSIS_DEEP_GAPFILL_MIN_SECONDS_BETWEEN_CALLS)
+    client = _get_deep_gapfill_redis_client()
+    if client is not None:
+        try:
+            if min_gap > 0:
+                lock_key = "deep_gapfill:fmp_spacing"
+                sleep_until = time.time() + min(min_gap, 30.0)
+                while not client.set(lock_key, f"{symbol}:{tf}:{time.time():.3f}", nx=True, ex=max(1, int(math.ceil(min_gap)))):
+                    remaining = sleep_until - time.time()
+                    if remaining <= 0:
+                        logging.info("[DeepGapfill] FMP call skipped by spacing throttle %s/%s", symbol, tf)
+                        return False
+                    time.sleep(min(0.25, remaining))
+
+            minute = int(time.time() // 60)
+            key = f"deep_gapfill:fmp_calls:{minute}"
+            count = int(client.incr(key))
+            if count == 1:
+                client.expire(key, 120)
+            if count > max_per_min:
+                logging.info(
+                    "[DeepGapfill] FMP call skipped by per-minute throttle %s/%s count=%s limit=%s",
+                    symbol, tf, count, max_per_min,
+                )
+                return False
+            return True
+        except Exception as exc:
+            logging.debug("[DeepGapfill] Redis throttle unavailable: %s", exc)
+
+    global _DEEP_GAPFILL_RATE_MINUTE, _DEEP_GAPFILL_RATE_COUNT, _DEEP_GAPFILL_LAST_CALL_TS
+    with _DEEP_GAPFILL_RATE_LOCK:
+        now = time.time()
+        wait_s = (_DEEP_GAPFILL_LAST_CALL_TS + min_gap) - now
+        if wait_s > 0:
+            time.sleep(min(wait_s, 30.0))
+            now = time.time()
+        minute = int(now // 60)
+        if minute != _DEEP_GAPFILL_RATE_MINUTE:
+            _DEEP_GAPFILL_RATE_MINUTE = minute
+            _DEEP_GAPFILL_RATE_COUNT = 0
+        if _DEEP_GAPFILL_RATE_COUNT >= max_per_min:
+            logging.info(
+                "[DeepGapfill] FMP call skipped by in-memory per-minute throttle %s/%s count=%s limit=%s",
+                symbol, tf, _DEEP_GAPFILL_RATE_COUNT, max_per_min,
+            )
+            return False
+        _DEEP_GAPFILL_RATE_COUNT += 1
+        _DEEP_GAPFILL_LAST_CALL_TS = now
+        return True
+
+
+def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int, source: str = "historical_range") -> list[dict]:
     if not API_KEY: return []
     try:
         iv = _fmp_interval(tf)
         if to_ms <= from_ms:
             return []
+        if source == "deep_gapfill" and not _deep_gapfill_acquire_fmp_slot(symbol, tf):
+            return []
+        tfms = _tf_ms(tf)
+        requested_from_ms = int(from_ms)
+        requested_to_ms = int(to_ms)
+        if FMP_RANGE_ADAPTIVE_ENABLED:
+            max_bars = max(1, _get_fmp_range_adaptive_max_bars(symbol, tf))
+            max_span_ms = max_bars * tfms
+            if (requested_to_ms - requested_from_ms) > max_span_ms:
+                # Query the oldest missing slice first so every successful
+                # call makes deterministic progress through the gap.
+                to_ms = min(requested_to_ms, requested_from_ms + max_span_ms)
+                logging.info(
+                    "[FMP_RANGE_ADAPT] capped request %s/%s source=%s requested_UTC:[%s -> %s] capped_UTC:[%s -> %s] max_bars=%d",
+                    symbol,
+                    tf,
+                    source,
+                    _ms_to_iso_utc(requested_from_ms),
+                    _ms_to_iso_utc(requested_to_ms),
+                    _ms_to_iso_utc(requested_from_ms),
+                    _ms_to_iso_utc(to_ms),
+                    max_bars,
+                )
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}"
         params = {
             "apikey": API_KEY,
@@ -22984,11 +23577,12 @@ def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> l
             "to":   _ms_to_fmp_local(to_ms)
         }
         logging.info(f"[Historical-Range] URL: {url} params: from={params['from']} to={params['to']}")
-        r = _fmp_http_get(url, params=params, timeout=5, symbol=symbol, timeframe=tf, source="historical_range")
+        r = _fmp_http_get(url, params=params, timeout=5, symbol=symbol, timeframe=tf, source=source)
         if not r.ok:
             logging.info(f"[Historical-Range] HTTP {r.status_code}: {r.text[:200]}")
             return []
-        return _normalize_fmp_bars(r.json())
+        bars = _normalize_fmp_bars(r.json())
+        return _validate_fmp_range_bars(bars, symbol, tf, from_ms, to_ms, source)
     except Exception as e:
         logging.warning(f"[Historical-Range] Error: {e}")
         return []
@@ -23008,17 +23602,23 @@ def _backfill_internal_gaps(
         return 0
     tfms = _tf_ms(tf)
     closed_end = _current_closed_bucket_start(tf) - tfms
+    min_backfill_ms = None
+    if not ANALYSIS_DEEP_GAPFILL_ENABLED:
+        lookback_bars = ANALYSIS_GAP_LOOKBACK_BARS.get(normalize_tf(tf), 120)
+        min_backfill_ms = closed_end - (lookback_bars * tfms)
     total_added = 0
 
     cooldown = _INTERNAL_GAP_COOLDOWN_S.get(tf, 300)
     now_s = time.time()
 
     start = now_s
+    max_calls_per_run = max(1, ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_RUN) if ANALYSIS_DEEP_GAPFILL_ENABLED else 1_000_000
+    attempted_calls = 0
 
     i = 0
     while i < len(base_ms) - 1:
 
-        if time.time() - start > 5:  # o 8, como prefieras
+        if time.time() - start > ANALYSIS_GAPFILL_TIME_BUDGET_SECONDS:
             logging.info(
                 "BACKFILL_INTERNAL_GAPS time budget exceeded (%.3fs), "
                 "symbol=%s tf=%s total_added=%d; saliendo",
@@ -23041,6 +23641,11 @@ def _backfill_internal_gaps(
         if gap_buckets > 0:
             from_ms = a["t"] + tfms
             to_ms   = min(b["t"] - tfms, closed_end)
+            if min_backfill_ms is not None and to_ms < min_backfill_ms:
+                i += 1
+                continue
+            if min_backfill_ms is not None:
+                from_ms = max(from_ms, min_backfill_ms)
             if to_ms >= from_ms:
                 cap_to_ms = min(from_ms + max_minutes_per_call * tfms, to_ms)
 
@@ -23053,7 +23658,15 @@ def _backfill_internal_gaps(
 
                 _LAST_INTERNAL_GAP_ATTEMPT[key] = now_s
                 logging.info(f"GAPFILL {symbol} {tf} from={_ms_to_iso_utc(from_ms)} to={_ms_to_iso_utc(cap_to_ms)} gap_bars={gap_buckets} (INT)")
-                rng = _fetch_historical_range(symbol, tf, from_ms, cap_to_ms)
+                if attempted_calls >= max_calls_per_run:
+                    logging.info(
+                        "BACKFILL_INTERNAL_GAPS call budget exceeded, symbol=%s tf=%s attempts=%d limit=%d",
+                        symbol, tf, attempted_calls, max_calls_per_run,
+                    )
+                    break
+                attempted_calls += 1
+                source = "deep_gapfill" if ANALYSIS_DEEP_GAPFILL_ENABLED else "historical_range"
+                rng = _fetch_historical_range(symbol, tf, from_ms, cap_to_ms, source=source)
 
                 # después (muestra UTC y lo que se envía a FMP en ET)
                 et_from = _ms_to_fmp_local(from_ms)     # UTC -> America/New_York "YYYY-MM-DD HH:MM:SS"

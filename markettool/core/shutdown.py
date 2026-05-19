@@ -149,7 +149,13 @@ class GracefulShutdownHandler:
         
         def signal_handler(sig: signal.Signals, frame) -> None:
             """Handle shutdown signals."""
-            logger.info(f"Received signal {sig.name}, initiating graceful shutdown...")
+            sig_name = getattr(sig, "name", None)
+            if sig_name is None:
+                try:
+                    sig_name = signal.Signals(sig).name
+                except Exception:
+                    sig_name = str(sig)
+            logger.info(f"Received signal {sig_name}, initiating graceful shutdown...")
             
             # Create a new event loop if needed
             try:
