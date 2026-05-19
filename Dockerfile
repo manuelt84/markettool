@@ -47,6 +47,7 @@ ENV PYTHONOPTIMIZE=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV MALLOC_TRIM_THRESHOLD_=100000
 ENV MALLOC_MMAP_THRESHOLD_=100000
+ENV MPLCONFIGDIR=/tmp/matplotlib
 
 # 🔐 THREAD SAFETY: Enable ProcessPoolExecutor with spawn context (safer than fork with gRPC)
 # spawn creates fresh Python interpreter, avoiding fork() issues with gRPC threads
@@ -64,6 +65,16 @@ ENV UPLOAD_SEM=200
 # GCP/gRPC thread safety settings
 ENV GRPC_PYTHON_BUILD_WITH_CYTHON=false
 ENV GRPC_WORKER_THREADS=1
+
+# Prebuild Matplotlib font cache so first charts do not block on runtime cache writes.
+RUN mkdir -p /tmp/matplotlib && python - <<'PY'
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+fig = plt.figure()
+plt.plot([0, 1], [0, 1])
+plt.close(fig)
+PY
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
 	CMD curl -fsS http://localhost:8080/healthz || exit 1

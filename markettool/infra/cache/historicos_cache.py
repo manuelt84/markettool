@@ -17,6 +17,7 @@ import pandas as pd
 import pytz
 from google.cloud import firestore
 from google.cloud import storage
+from requests.adapters import HTTPAdapter
 
 from markettool.core.config import load_config
 from markettool.infra.fmp import normalize_tf
@@ -931,6 +932,24 @@ _LAZY_HIST_LOADER = LazyHistoricosLoader(
 _GCS_CLIENT = None
 _GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
 _GCS_ENABLED = os.environ.get("GCS_ENABLED", "true").lower() == "true"
+_GCS_POOL_CONNECTIONS = int(os.environ.get("GCS_POOL_CONNECTIONS", "64"))
+_GCS_POOL_MAXSIZE = int(os.environ.get("GCS_POOL_MAXSIZE", "64"))
+
+
+def _tune_gcs_client(client: storage.Client) -> storage.Client:
+    try:
+        adapter = HTTPAdapter(
+            pool_connections=_GCS_POOL_CONNECTIONS,
+            pool_maxsize=_GCS_POOL_MAXSIZE,
+            pool_block=False,
+        )
+        http = getattr(client, "_http", None)
+        if http is not None and hasattr(http, "mount"):
+            http.mount("https://", adapter)
+            http.mount("http://", adapter)
+    except Exception as exc:
+        logger.debug("[GCS] Could not tune HTTP pool: %s", exc)
+    return client
 
 
 def _get_gcs_bucket():
@@ -939,7 +958,7 @@ def _get_gcs_bucket():
         return None
     try:
         if _GCS_CLIENT is None:
-            _GCS_CLIENT = storage.Client()
+            _GCS_CLIENT = _tune_gcs_client(storage.Client())
         return _GCS_CLIENT.bucket(_GCS_BUCKET_NAME)
     except Exception as exc:
         logger.warning("[GCS] Client initialization failed: %s. GCS disabled.", exc)

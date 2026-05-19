@@ -17,6 +17,7 @@ from typing import Callable, Optional, Tuple
 import pandas as pd
 from google.cloud import firestore
 from google.cloud import storage
+from requests.adapters import HTTPAdapter
 
 from markettool.infra.fmp import normalize_tf
 from markettool.core.cache_config import CACHE_CONFIG
@@ -31,6 +32,8 @@ _INDICATORS_MEMORY_CACHE_SIZE = int(os.environ.get("INDICATORS_MEMORY_CACHE_SIZE
 _INDICATORS_LOCK_TIMEOUT_SEC = int(os.environ.get("INDICATORS_LOCK_TIMEOUT_SEC", "180"))
 
 _GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
+_GCS_POOL_CONNECTIONS = int(os.environ.get("GCS_POOL_CONNECTIONS", "64"))
+_GCS_POOL_MAXSIZE = int(os.environ.get("GCS_POOL_MAXSIZE", "64"))
 _FIRESTORE_CLIENT = None
 _FIRESTORE_ENABLED = os.environ.get("FIRESTORE_ENABLED", "true").lower() == "true"
 
@@ -67,6 +70,22 @@ def hash_dataframe(df: pd.DataFrame) -> str:
     except Exception as exc:
         logger.warning("[IndicatorsCache] Error hashing DataFrame: %s", exc)
         return hashlib.sha256(f"{df.shape}_{time.time()}".encode()).hexdigest()[:16]
+
+
+def _tune_storage_client(client: storage.Client) -> storage.Client:
+    try:
+        adapter = HTTPAdapter(
+            pool_connections=_GCS_POOL_CONNECTIONS,
+            pool_maxsize=_GCS_POOL_MAXSIZE,
+            pool_block=False,
+        )
+        http = getattr(client, "_http", None)
+        if http is not None and hasattr(http, "mount"):
+            http.mount("https://", adapter)
+            http.mount("http://", adapter)
+    except Exception as exc:
+        logger.debug("[IndicatorsCache] Could not tune GCS HTTP pool: %s", exc)
+    return client
 
 
 def merge_indicators_incremental(cached: dict, new: dict, split_index: int, window_context: int) -> dict:
@@ -122,7 +141,7 @@ class IndicatorsCache:
     def bucket(self):
         if self._bucket is None and self._enabled:
             try:
-                self._bucket = storage.Client().bucket(self.bucket_name)
+                self._bucket = _tune_storage_client(storage.Client()).bucket(self.bucket_name)
             except Exception as exc:
                 logger.warning("[IndicatorsCache] GCS not available: %s", exc)
         return self._bucket
@@ -845,6 +864,36 @@ class IndicatorsCache:
                 if lock_acquired:
                     self._release_lock(symbol, tf)
 
+        if 0 < current_rows < cached_rows:
+            tail_indicators = self._slice_indicators_tail(cached["indicators"], current_rows)
+            if tail_indicators is not None:
+                df_result, override = self._apply_indicators_or_recalc(
+                    df_historicos,
+                    tail_indicators,
+                    symbol,
+                    tf,
+                    calc_func,
+                )
+                if override is not None:
+                    return df_result, override
+                logger.info(
+                    "[IndicatorsCache] Tail slice hit: %s/%s (cached=%d, current=%d, pod=%s)",
+                    symbol,
+                    tf,
+                    cached_rows,
+                    current_rows,
+                    self._pod_id,
+                )
+                return df_result, {
+                    "cache_hit": True,
+                    "incremental": False,
+                    "calc_time_ms": 0,
+                    "source": "cache_tail_slice",
+                    "cached_rows": cached_rows,
+                    "total_rows": current_rows,
+                    "pod_id": self._pod_id,
+                }
+
         lock_acquired = self._acquire_lock(symbol, tf)
 
         try:
@@ -915,6 +964,16 @@ class IndicatorsCache:
         if mismatch:
             raise ValueError("indicator_length_mismatch")
         return df
+
+    def _slice_indicators_tail(self, indicators: dict, rows: int) -> dict | None:
+        if rows <= 0:
+            return None
+        sliced: dict = {}
+        for col, values in indicators.items():
+            if not isinstance(values, list) or len(values) < rows:
+                return None
+            sliced[col] = values[-rows:]
+        return sliced
 
     def _apply_indicators_or_recalc(
         self,
