@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from flask import Flask, request, make_response
@@ -18,12 +20,29 @@ logger = logging.getLogger(__name__)
 _webhook_app: Flask | None = None
 _asgi_app: WsgiToAsgi | None = None
 _routes_registered: bool = False
+_wsgi_executor: ThreadPoolExecutor | None = None
+
+
+def _get_wsgi_executor() -> ThreadPoolExecutor:
+    global _wsgi_executor
+    if _wsgi_executor is None:
+        max_workers = int(os.getenv("ASGI_WSGI_MAX_WORKERS", "256"))
+        _wsgi_executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="wsgi-request",
+        )
+        logger.info("✅ ASGI WSGI executor created max_workers=%s", max_workers)
+    return _wsgi_executor
 
 
 class ConcurrentWsgiToAsgiInstance(WsgiToAsgiInstance):
-    @sync_to_async(thread_sensitive=False)
-    def run_wsgi_app(self, body):  # type: ignore[override]
-        return super().run_wsgi_app.__wrapped__(self, body)
+    async def run_wsgi_app(self, body):  # type: ignore[override]
+        run_sync = sync_to_async(
+            super().run_wsgi_app.__wrapped__,
+            thread_sensitive=False,
+            executor=_get_wsgi_executor(),
+        )
+        return await run_sync(self, body)
 
 
 class ConcurrentWsgiToAsgi(WsgiToAsgi):
