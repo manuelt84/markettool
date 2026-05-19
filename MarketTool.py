@@ -19558,6 +19558,58 @@ async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen
         return False, f"❌ Error inesperado al descontar transacción: {e}"
 
 
+async def reponer_transaccion(user_key: str, numero_transacciones_in=1, origen="telegram") -> Tuple[bool, str]:
+    """
+    Repone transacciones cobradas por llamadas externas que no llegaron a entregar datos.
+    Usa el mismo doc canónico/alias que descontar_transaccion para mantener el saldo coherente.
+    """
+    try:
+        inc = int(numero_transacciones_in) if int(numero_transacciones_in) > 0 else 1
+    except Exception:
+        inc = 1
+
+    canon_ref, alias_ref, _ = _resolve_refs_from_key(user_key)
+    if not canon_ref:
+        return False, f"❌ No se encontró suscripción para {user_key}."
+
+    @firestore.transactional
+    def _tx(transaction: firestore.Transaction):
+        canon_snap = canon_ref.get(transaction=transaction)
+        if not canon_snap.exists:
+            raise ValueError("No existe el documento canónico.")
+
+        sus = canon_snap.to_dict() or {}
+        curr = int(sus.get("transacciones_restantes") or 0)
+        nuevo = curr + inc
+
+        fin = parse_iso_aware(sus.get("fin") or "")
+        estado = "activa" if fin and fin >= _now_utc() and nuevo > 0 else sus.get("estado", "activa")
+        payload = {
+            "transacciones_restantes": nuevo,
+            "estado": estado,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        transaction.set(canon_ref, payload, merge=True)
+        if alias_ref is not None:
+            transaction.set(
+                alias_ref,
+                {
+                    "user_id": sus.get("user_id") or canon_ref.id,
+                    "doc_alias_of": sus.get("user_id") or canon_ref.id,
+                    **payload,
+                },
+                merge=True,
+            )
+        return {"ok": True, "remaining": nuevo}
+
+    try:
+        result = _tx(db.transaction())
+        remaining = int((result or {}).get("remaining") or 0)
+        return True, f"✅ Transacción repuesta. Te quedan {remaining}."
+    except Exception as e:
+        return False, f"❌ Error inesperado al reponer transacción: {e}"
+
+
 # =========================
 # Monitoreo: cobro por llamada
 # =========================

@@ -639,6 +639,124 @@ def _build_candles_payload(series_ms: list[dict], tail: int = 240) -> dict:
     }
 
 
+def _tf_to_resample_rule(tf: str) -> str | None:
+    mapping = {
+        "5m": "5min",
+        "5min": "5min",
+        "15m": "15min",
+        "15min": "15min",
+        "30m": "30min",
+        "30min": "30min",
+        "1h": "1h",
+        "1hour": "1h",
+        "4h": "4h",
+        "4hour": "4h",
+        "1d": "1d",
+        "1day": "1d",
+        "1w": "1W",
+        "1week": "1W",
+    }
+    return mapping.get(str(tf or "").lower())
+
+
+def _tf_rank(tf: str) -> int:
+    order = {
+        "1m": 1,
+        "1min": 1,
+        "5m": 5,
+        "5min": 5,
+        "15m": 15,
+        "15min": 15,
+        "30m": 30,
+        "30min": 30,
+        "1h": 60,
+        "1hour": 60,
+        "4h": 240,
+        "4hour": 240,
+        "1d": 1440,
+        "1day": 1440,
+        "1w": 10080,
+        "1week": 10080,
+    }
+    return order.get(str(tf or "").lower(), 0)
+
+
+def _resample_series_ms(series_ms: list[dict], target_tf: str) -> list[dict]:
+    """Forma velas de una TF mayor desde una serie menor ya disponible."""
+    rule = _tf_to_resample_rule(target_tf)
+    if not rule or not series_ms:
+        return []
+    df = _series_to_df(series_ms)
+    if df.empty:
+        return []
+    try:
+        agg = df.resample(rule, label="left", closed="left").agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        agg = agg.dropna(subset=["open", "high", "low", "close"])
+        result: list[dict] = []
+        for ts, row in agg.iterrows():
+            result.append(
+                {
+                    "t": int(ts.timestamp() * 1000),
+                    "o": float(row["open"]),
+                    "h": float(row["high"]),
+                    "l": float(row["low"]),
+                    "c": float(row["close"]),
+                    "v": float(row.get("volume", 0) or 0),
+                }
+            )
+        return result
+    except Exception as exc:
+        logger.debug("[LiveWorker] resample failed target=%s: %s", target_tf, exc)
+        return []
+
+
+async def _load_resampled_from_lower_tfs(
+    *,
+    exec_id: str,
+    symbol: str,
+    target_tf: str,
+    active_tfs: list[str],
+    load_cache,
+    maybe_refresh_from_gcs,
+    norm_tf_fn,
+) -> tuple[list[dict], str | None]:
+    target_rank = _tf_rank(norm_tf_fn(target_tf))
+    candidates = sorted(
+        {
+            norm_tf_fn(tf)
+            for tf in active_tfs
+            if _tf_rank(norm_tf_fn(tf)) and _tf_rank(norm_tf_fn(tf)) < target_rank
+        },
+        key=_tf_rank,
+        reverse=True,
+    )
+    for lower_tf in candidates:
+        try:
+            lower_st: dict = await asyncio.to_thread(load_cache, exec_id, symbol, lower_tf)
+            await asyncio.to_thread(maybe_refresh_from_gcs, exec_id, symbol, lower_tf, lower_st)
+            lower_series = lower_st.get("series") or []
+            derived = _resample_series_ms(lower_series, target_tf)
+            if len(derived) >= MIN_CANDLES:
+                return derived, lower_tf
+        except Exception as exc:
+            logger.debug(
+                "[LiveWorker] lower-TF derive failed %s/%s from %s: %s",
+                symbol,
+                target_tf,
+                lower_tf,
+                exc,
+            )
+    return [], None
+
+
 def _publish_live_candles(redis_client, exec_id: str, symbol: str, tf: str, candles_payload: dict) -> None:
     if not candles_payload.get("live_candle") and not candles_payload.get("candles"):
         return
@@ -845,18 +963,28 @@ def _generate_live_entries_sync(
             "id": entry_id,
             "symbol": symbol,
             "timeframe": tf,
+            "tf": tf,
             "side": side,
             "entry_price": float(entry_price),
+            "entry": float(entry_price),
+            "precio": float(entry_price),
             "take_profit": float(tp),
+            "tp": float(tp),
             "stop_loss": float(sl),
+            "sl": float(sl),
             "rrr": rrr,
+            "rr": rrr,
             "confluence_score": int(e.get("confluencia") or e.get("confluence_score") or e.get("score") or 0),
             "source": source,
+            "status": "open",
             "outcome": "pending",
             "_origin": "live",
             "_backend_live": True,
             "created_at": now_iso,
+            "createdAt": now_ts,
             "timestamp": entry_ts,
+            "rawText": e.get("rawText") or e.get("text") or "Backend live",
+            "text": e.get("text") or e.get("rawText") or "Backend live",
             "nivel_confirmado": bool(e.get("nivel_confirmado") or e.get("confirmado")),
             "dentro_rango": bool(e.get("dentro_rango") or e.get("en_rango")),
             "early_detection": False,
@@ -925,6 +1053,7 @@ async def _live_worker(
     exec_id: str,
     symbol: str,
     tfs: list[str],
+    user_id: str | None,
     redis_client,
     load_cache,
     maybe_refresh_from_gcs,
@@ -934,6 +1063,8 @@ async def _live_worker(
     tf_ms_fn,
     current_closed_bucket_start,
     calcular_entradas_sync_wrapper,
+    charge_monitoreo_per_call,
+    reponer_transaccion,
 ):
     """
     Worker asyncio. Lanza un sub-task por TF, cada uno con su propio intervalo.
@@ -965,20 +1096,57 @@ async def _live_worker(
             await asyncio.to_thread(maybe_refresh_from_gcs, exec_id, symbol, norm, st)
             series_ms = st.get("series") or series_ms
 
-            # 3. Fallback FMP si faltan candles
+            # 3. Antes de ir a FMP, inferir TF mayor desde una TF menor ya cacheada.
+            derived_from_tf = None
             if len(series_ms) < MIN_CANDLES:
+                derived, derived_from_tf = await _load_resampled_from_lower_tfs(
+                    exec_id=exec_id,
+                    symbol=symbol,
+                    target_tf=norm,
+                    active_tfs=list(tf_tasks_map.keys()),
+                    load_cache=load_cache,
+                    maybe_refresh_from_gcs=maybe_refresh_from_gcs,
+                    norm_tf_fn=norm_tf_fn,
+                )
+                if derived:
+                    series_ms = derived
+                    logger.info(
+                        "[LiveWorker] %s/%s derived %d candles from %s cache",
+                        symbol,
+                        norm,
+                        len(series_ms),
+                        derived_from_tf,
+                    )
+
+            # 4. Fallback FMP si faltan candles. Se cobra solo cuando realmente
+            # se intenta salir a FMP; si falla o no entrega datos, se repone.
+            if len(series_ms) < MIN_CANDLES:
+                charged_for_fmp = False
+                if user_id and charge_monitoreo_per_call is not None:
+                    ok, msg = await charge_monitoreo_per_call(user_id, origen="app")
+                    if not ok:
+                        logger.warning("[LiveWorker] FMP fallback blocked by quota %s/%s user=%s: %s", symbol, norm, user_id, msg)
+                        return
+                    charged_for_fmp = True
                 tf_ms_val = tf_ms_fn(norm) or 60_000
                 closed_end = current_closed_bucket_start(norm) - tf_ms_val
                 from_ms = closed_end - 300 * tf_ms_val
-                hist = await asyncio.to_thread(fetch_historical_range, symbol, norm, from_ms, closed_end)
-                if hist:
-                    series_ms = hist
+                try:
+                    hist = await asyncio.to_thread(fetch_historical_range, symbol, norm, from_ms, closed_end)
+                    if hist:
+                        series_ms = hist
+                    elif charged_for_fmp and reponer_transaccion is not None:
+                        await reponer_transaccion(user_id, 1, origen="app")
+                except Exception:
+                    if charged_for_fmp and reponer_transaccion is not None:
+                        await reponer_transaccion(user_id, 1, origen="app")
+                    raise
 
             if len(series_ms) < MIN_CANDLES:
                 logger.info("[LiveWorker] %s/%s sin candles suficientes (%d)", symbol, norm, len(series_ms))
                 return
 
-            # 4. Niveles del indicators cache
+            # 5. Niveles del indicators cache
             niveles: dict | None = None
             try:
                 from markettool.infra.cache.indicators_cache import _INDICATORS_CACHE
@@ -988,7 +1156,7 @@ async def _live_worker(
             except Exception:
                 pass
 
-            # 5. Eventos económicos
+            # 6. Eventos económicos
             df_eventos = pd.DataFrame()
             try:
                 events_raw = await asyncio.to_thread(fetch_events_for, symbol, hours_back=6)
@@ -997,14 +1165,14 @@ async def _live_worker(
             except Exception:
                 pass
 
-            # 6. Generar entradas
+            # 7. Generar entradas
             entries, sr_levels = await asyncio.to_thread(
                 _generate_live_entries_sync,
                 symbol, norm, series_ms, niveles, df_eventos,
                 calcular_entradas_sync_wrapper, norm_tf_fn,
             )
 
-            # 7. Persistir en Redis
+            # 8. Persistir en Redis
             if entries:
                 new_entries = _push_entries_to_redis(redis_client, exec_id, symbol, norm, entries)
                 if new_entries:
@@ -1014,7 +1182,7 @@ async def _live_worker(
             candles_payload = _build_candles_payload(series_ms)
             _publish_live_candles(redis_client, exec_id, symbol, norm, candles_payload)
 
-            # 8. Actualizar beat timestamp + sr_levels + candles en Redis
+            # 9. Actualizar beat timestamp + sr_levels + candles en Redis
             try:
                 beat_data: dict = _get_beat(redis_client, exec_id, symbol) or {
                     "tfs": [],
@@ -1125,6 +1293,8 @@ def register_live_entries_routes(app, *, services) -> None:
     load_cache = services.load_cache
     maybe_refresh_from_gcs = services.maybe_refresh_from_gcs
     fetch_historical_range = services.fetch_historical_range
+    charge_monitoreo_per_call = getattr(services, "charge_monitoreo_per_call", None)
+    reponer_transaccion = getattr(services, "reponer_transaccion", None)
     fetch_events_for = services.fetch_events_for
     norm_tf = services.norm_tf
     tf_ms = services.tf_ms
@@ -1155,6 +1325,7 @@ def register_live_entries_routes(app, *, services) -> None:
     async def live_entries_start():
         body = request.get_json(force=True) or {}
         exec_id = body.get("exec_id", "").strip()
+        user_id = str(body.get("user_id") or "").strip()
         symbol = (body.get("symbol") or "").upper().strip()
         tfs_raw: list[str] = body.get("tfs") or []   # opcional — si vacío, auto-descubre desde Firestore
         platform = body.get("platform", "UNKNOWN")
@@ -1186,6 +1357,7 @@ def register_live_entries_routes(app, *, services) -> None:
                     exec_id=exec_id,
                     symbol=symbol,
                     tfs=tfs,
+                    user_id=user_id,
                     redis_client=redis_client,
                     load_cache=load_cache,
                     maybe_refresh_from_gcs=maybe_refresh_from_gcs,
@@ -1195,6 +1367,8 @@ def register_live_entries_routes(app, *, services) -> None:
                     tf_ms_fn=tf_ms,
                     current_closed_bucket_start=current_closed_bucket_start,
                     calcular_entradas_sync_wrapper=calcular_entradas_sync_wrapper,
+                    charge_monitoreo_per_call=charge_monitoreo_per_call,
+                    reponer_transaccion=reponer_transaccion,
                 )
             )
             _WORKERS[wid] = task

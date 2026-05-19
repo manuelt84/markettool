@@ -38,6 +38,7 @@ class LegacyServices:
     es_grafico_de_velas: Callable[..., Any]
     analizar_con_yolo: Callable[..., Any]
     descontar_transaccion: Callable[..., Any]
+    reponer_transaccion: Callable[..., Any]
     stop_events_ref: dict
     stop_events_lock: Any
     optimize_records_for_upload: Callable[..., Any]
