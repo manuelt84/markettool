@@ -3872,6 +3872,39 @@ def _memory_usage_percent() -> Optional[float]:
     except Exception:
         return None
 
+
+def _acquire_cache_warmup_distributed_lock(reason: str) -> bool:
+    if str(os.getenv("CACHE_WARMUP_DISTRIBUTED_LOCK", "true")).strip().lower() not in {"1", "true", "yes", "on"}:
+        return True
+    if redis is None:
+        logger.info("[Warmup] %s: Redis no disponible para lock distribuido; continua con coordinador local", reason)
+        return True
+    redis_url = (
+        os.getenv("MARKET_DATA_REDIS_URL")
+        or os.getenv("LIVE_ENTRIES_REDIS_URL")
+        or os.getenv("REDIS_URL")
+        or ""
+    ).strip()
+    if not redis_url:
+        logger.info("[Warmup] %s: sin Redis compartido para lock distribuido; continua", reason)
+        return True
+    ttl = max(300, int(os.getenv("CACHE_WARMUP_DISTRIBUTED_LOCK_TTL_SECONDS", "3600")))
+    key = os.getenv("CACHE_WARMUP_DISTRIBUTED_LOCK_KEY", "cache_warmup:distributed_lock")
+    owner = f"{os.getenv('MARKET_DATA_NODE_ID') or os.getenv('WORKER_ID') or os.getpid()}:{reason}:{int(time.time())}"
+    try:
+        client = redis.Redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=1, socket_timeout=2)
+        acquired = bool(client.set(key, owner, nx=True, ex=ttl))
+        if not acquired:
+            current = client.get(key) or "unknown"
+            logger.info("[Warmup] %s: SKIPPED por lock distribuido activo owner=%s", reason, current)
+            return False
+        logger.info("[Warmup] %s: lock distribuido adquirido owner=%s ttl=%ss", reason, owner, ttl)
+        return True
+    except Exception as exc:
+        logger.info("[Warmup] %s: lock distribuido no disponible (%s); continua", reason, exc)
+        return True
+
+
 async def warmup_cache_all_assets(reason: str = "scheduled"):
     """
     Precalienta cachés para historicos, indicadores, noticias y eventos.
@@ -3886,6 +3919,9 @@ async def warmup_cache_all_assets(reason: str = "scheduled"):
     # Verificación de liderazgo: solo si EXPLÍCITAMENTE está configurado que solo el líder lo haga
     if APP_CONFIG.cache_warmup_leader_only and not _POD_COORDINATOR.should_run_scheduled_task("warmup_cache"):
         logger.info("[Warmup] %s: SKIPPED (leader-only mode, this pod is not the leader)", reason)
+        return
+
+    if not _acquire_cache_warmup_distributed_lock(reason):
         return
 
     _ensure_globals_loaded()
