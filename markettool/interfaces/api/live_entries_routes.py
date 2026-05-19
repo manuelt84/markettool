@@ -889,6 +889,45 @@ def _market_pool_symbols(norm_tf_fn) -> list[str]:
     return symbols[:max(1, max_symbols)]
 
 
+def _market_pool_status(redis_client, norm_tf_fn) -> dict[str, Any]:
+    base_tfs = [
+        norm_tf_fn(tf)
+        for tf in os.getenv("MARKET_POOL_BASE_TFS", "1min").split(",")
+        if tf.strip()
+    ]
+    symbols = _market_pool_symbols(norm_tf_fn)
+    status: dict[str, Any] = {
+        "enabled": str(os.getenv("MARKET_POOL_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"},
+        "producer_enabled": str(os.getenv("MARKET_POOL_PRODUCER_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"},
+        "redis": redis_client is not None,
+        "symbols": len(symbols),
+        "base_tfs": base_tfs,
+        "expected_pairs": len(symbols) * len(base_tfs),
+        "memory_candles": len(_MEM_MARKET_POOL),
+        "memory_cooldowns": len(_MEM_MARKET_POOL_COOLDOWN),
+        "current_minute_fmp_calls": 0,
+        "redis_candles": 0,
+        "redis_cooldowns": 0,
+    }
+    if redis_client is None:
+        now_min = int(time.time() // 60)
+        status["current_minute_fmp_calls"] = int(_MEM_MARKET_POOL_RATE.get(now_min, 0) or 0)
+        return status
+    try:
+        status["current_minute_fmp_calls"] = int(redis_client.get(_redis_market_pool_rate_key()) or 0)
+    except Exception:
+        pass
+    try:
+        status["redis_candles"] = sum(1 for _ in redis_client.scan_iter("market_pool:candles:*", count=500))
+    except Exception as exc:
+        status["redis_candles_error"] = str(exc)[:160]
+    try:
+        status["redis_cooldowns"] = sum(1 for _ in redis_client.scan_iter("market_pool:cooldown:*", count=500))
+    except Exception as exc:
+        status["redis_cooldowns_error"] = str(exc)[:160]
+    return status
+
+
 async def _refresh_market_pool_symbol_tf(
     *,
     redis_client,
@@ -1843,6 +1882,11 @@ def register_live_entries_routes(app, *, services) -> None:
         tf_ms_fn=tf_ms,
         current_closed_bucket_start=current_closed_bucket_start,
     )
+
+    @app.route("/monitoreo/market-pool/status", methods=["GET"])
+    @app.route("/api/market-pool/status", methods=["GET"])
+    def market_pool_status():
+        return jsonify(_market_pool_status(redis_client, norm_tf)), 200
 
     # ── POST /monitoreo/live-entries/start ──────────────────────────────────
     @app.route("/monitoreo/live-entries/start", methods=["POST"])
