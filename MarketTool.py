@@ -15027,9 +15027,11 @@ def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
 
     # Filtros específicos por divisas principales
     if moneda_filtro.upper() == "USD":
-        return relacionados_usd
+        return _currency_filter_assets("USD", lista_activos) or relacionados_usd
     if moneda_filtro.upper() in categorias.get("Principales", []):
-        return [activo for activo in forex if moneda_filtro.upper() in activo]
+        return _currency_filter_assets(moneda_filtro.upper(), lista_activos) or [
+            activo for activo in forex if moneda_filtro.upper() in activo
+        ]
 
     # Verificar si es un par específico o un símbolo no conocido
     if moneda_filtro.upper() not in [activo.upper() for activo in lista_activos]:
@@ -15061,8 +15063,42 @@ def _category_key_map() -> dict[str, str]:
         return {}
 
 
+def _currency_filter_assets(currency_code: str, lista_activos=None) -> list[str]:
+    """Expand menu currency filters such as Principales -> USD/EUR to pairs."""
+    code = _asset_key(currency_code)
+    if len(code) != 3 or code not in _CURRENCY_CODES:
+        return []
+    universe = list(lista_activos or [])
+    try:
+        if not universe:
+            universe.extend(forex or [])
+    except Exception:
+        pass
+    try:
+        if code == "USD" and relacionados_usd:
+            universe.extend(relacionados_usd)
+    except Exception:
+        pass
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in universe:
+        sym = _asset_key(item)
+        if not sym or sym in seen:
+            continue
+        if len(sym) == 3:
+            continue
+        if code in sym:
+            seen.add(sym)
+            out.append(sym)
+    return out
+
+
 def _resolve_category_assets(category_name, _seen: set[str] | None = None) -> list[str]:
-    """Resolve a Firestore category/subcategory to leaf symbols only."""
+    """Resolve a Firestore category/subcategory to executable symbols.
+
+    Some menus intentionally contain currency filters (Principales -> USD/EUR).
+    Those are not assets, but they must expand to their related pairs.
+    """
     key_map = _category_key_map()
     category_key = _asset_key(category_name)
     real_name = key_map.get(category_key)
@@ -15091,7 +15127,14 @@ def _resolve_category_assets(category_name, _seen: set[str] | None = None) -> li
                     seen_symbols.add(nested_key)
                     out.append(nested_key)
             continue
-        if item_key in {"TODOS", "ALL"} or (len(item_key) == 3 and item_key in _CURRENCY_CODES):
+        if item_key in {"TODOS", "ALL"}:
+            continue
+        if len(item_key) == 3 and item_key in _CURRENCY_CODES:
+            for sym in _currency_filter_assets(item_key):
+                sym_key = _asset_key(sym)
+                if sym_key and sym_key not in seen_symbols:
+                    seen_symbols.add(sym_key)
+                    out.append(sym_key)
             continue
         if item_key not in seen_symbols:
             seen_symbols.add(item_key)
