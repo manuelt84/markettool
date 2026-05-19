@@ -609,6 +609,69 @@ def _publish_live_entries(redis_client, exec_id: str, symbol: str, tf: str, entr
             logger.warning("[LiveEntries] subscriber queue full %s/%s — event skipped", symbol, tf)
 
 
+def _normalize_candle_for_payload(candle: dict) -> dict | None:
+    try:
+        raw_t = candle.get("t", candle.get("timestamp", candle.get("time")))
+        t_ms = int(raw_t if float(raw_t) > 1e12 else float(raw_t) * 1000)
+        return {
+            "t": t_ms,
+            "o": float(candle.get("o", candle.get("open", 0)) or 0),
+            "h": float(candle.get("h", candle.get("high", 0)) or 0),
+            "l": float(candle.get("l", candle.get("low", 0)) or 0),
+            "c": float(candle.get("c", candle.get("close", 0)) or 0),
+            "v": float(candle.get("v", candle.get("volume", 0)) or 0),
+        }
+    except Exception:
+        return None
+
+
+def _build_candles_payload(series_ms: list[dict], tail: int = 240) -> dict:
+    candles = [
+        c for c in (_normalize_candle_for_payload(raw) for raw in (series_ms or [])[-tail:])
+        if c is not None
+    ]
+    live_candle = candles[-1] if candles else None
+    return {
+        "candles": candles,
+        "live_candle": live_candle,
+        "last_ts": live_candle.get("t") if live_candle else 0,
+        "count": len(series_ms or []),
+    }
+
+
+def _publish_live_candles(redis_client, exec_id: str, symbol: str, tf: str, candles_payload: dict) -> None:
+    if not candles_payload.get("live_candle") and not candles_payload.get("candles"):
+        return
+
+    ts_ms = int(time.time() * 1000)
+    event = {
+        "id": _event_id(exec_id, symbol, tf, ts_ms),
+        "type": "candles",
+        "exec_id": exec_id,
+        "symbol": symbol.upper(),
+        "timeframe": tf,
+        **candles_payload,
+        "ts": ts_ms,
+    }
+    _store_event_for_replay(redis_client, exec_id, symbol, event)
+
+    if redis_client is not None:
+        try:
+            redis_client.publish(_redis_events_channel(exec_id, symbol), json.dumps(event))
+            return
+        except Exception as exc:
+            logger.warning("[LiveEntries] Redis candle publish failed %s/%s: %s", symbol, tf, exc)
+
+    worker_key = _worker_id(exec_id, symbol)
+    with _SUBSCRIBERS_LOCK:
+        subscribers = list(_SUBSCRIBERS.get(worker_key) or [])
+    for q in subscribers:
+        try:
+            q.put_nowait(event)
+        except queue.Full:
+            logger.warning("[LiveEntries] subscriber queue full %s/%s — candle skipped", symbol, tf)
+
+
 # ─────────────────────────────────────────────
 # Motor de entradas live — corazón del worker
 # ─────────────────────────────────────────────
@@ -948,12 +1011,21 @@ async def _live_worker(
                     logger.info("[LiveWorker] %s/%s +%d nuevas entradas", symbol, norm, len(new_entries))
                     _publish_live_entries(redis_client, exec_id, symbol, norm, new_entries)
 
-            # 8. Actualizar beat timestamp + sr_levels en Redis
+            candles_payload = _build_candles_payload(series_ms)
+            _publish_live_candles(redis_client, exec_id, symbol, norm, candles_payload)
+
+            # 8. Actualizar beat timestamp + sr_levels + candles en Redis
             try:
-                beat_data: dict = _get_beat(redis_client, exec_id, symbol) or {"tfs": [], "symbol": symbol, "sr_levels": {}}
+                beat_data: dict = _get_beat(redis_client, exec_id, symbol) or {
+                    "tfs": [],
+                    "symbol": symbol,
+                    "sr_levels": {},
+                    "candles": {},
+                }
                 beat_data["tfs"] = list(sorted(tf_tasks_map.keys()))
                 beat_data["symbol"] = symbol
-                beat_data["sr_levels"][norm] = sr_levels
+                beat_data.setdefault("sr_levels", {})[norm] = sr_levels
+                beat_data.setdefault("candles", {})[norm] = candles_payload
                 _set_beat(redis_client, exec_id, symbol, beat_data)
             except Exception:
                 pass
@@ -1157,6 +1229,7 @@ def register_live_entries_routes(app, *, services) -> None:
         beat_data: dict = _get_beat(redis_client, exec_id, symbol)
         last_beat_ts = beat_data.get("ts", 0)
         sr_levels = beat_data.get("sr_levels", {})
+        candles_payload = beat_data.get("candles", {})
 
         # candles_count por TF
         candles_count: dict[str, int] = {}
@@ -1175,6 +1248,7 @@ def register_live_entries_routes(app, *, services) -> None:
             "worker_status": worker_status,
             "candles_count": candles_count,
             "sr_levels": sr_levels,
+            "candles": candles_payload,
         }), 200
 
     # ── GET /monitoreo/live-entries/stream ───────────────────────────────────
@@ -1217,10 +1291,11 @@ def register_live_entries_routes(app, *, services) -> None:
                     "exec_id": exec_id,
                     "symbol": symbol,
                     "worker_status": _worker_status(redis_client, wid, ready_beat_data),
+                    "candles": ready_beat_data.get("candles", {}),
                     "ts": int(time.time() * 1000),
                 })
                 for replay_event in _get_events_for_replay(redis_client, exec_id, symbol, last_event_id, tfs_filter, norm_tf):
-                    yield _sse("entries", replay_event)
+                    yield _sse(replay_event.get("type") or "entries", replay_event)
 
                 if redis_client is not None:
                     pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
@@ -1247,15 +1322,17 @@ def register_live_entries_routes(app, *, services) -> None:
                     if payload:
                         tf = norm_tf(payload.get("timeframe") or payload.get("tf") or "")
                         if not tfs_filter or tf in tfs_filter:
-                            yield _sse("entries", payload)
+                            yield _sse(payload.get("type") or "entries", payload)
 
                     now = time.time()
                     if now - last_heartbeat >= 25:
                         last_heartbeat = now
+                        heartbeat_beat_data = _get_beat(redis_client, exec_id, symbol)
                         yield _sse("heartbeat", {
                             "type": "heartbeat",
                             "exec_id": exec_id,
                             "symbol": symbol,
+                            "candles": heartbeat_beat_data.get("candles", {}),
                             "ts": int(now * 1000),
                         })
             finally:
@@ -1291,9 +1368,9 @@ def register_live_entries_routes(app, *, services) -> None:
         async with _WORKER_LOCK:
             task = _WORKERS.pop(wid, None)
             _WORKER_LAST_POLL.pop(wid, None)
+            _clear_worker_owner(redis_client, wid)
             if task and not task.done():
                 task.cancel()
-                _clear_worker_owner(redis_client, wid)
                 logger.info("[LiveEntries] Worker detenido: %s", wid)
                 return jsonify({"ok": True, "stopped": wid}), 200
 
