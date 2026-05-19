@@ -123,29 +123,22 @@ def _warmup_caches_principales():
                 "This is fine if using pre-cached data or local history."
             )
             return
-        
+
         t0 = time.time()
-        
+
         # Import functions that naturally populate caches
-        from MarketTool import obtener_datos_con_hilos, calcular_indicadores
-        
-        # ✅ EXPANDED WARMUP: Activos más líquidos y frecuentemente analizados
-        # Categorías:
-        # - Majors (7): EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD, NZDUSD
-        # - Cruces (3): EURGBP, EURJPY, GBPJPY
-        # - Crypto (2): BTCUSD, ETHUSD
-        # - Commodities (1): XAUUSD (oro)
-        # Total: 13 activos × 2 timeframes = 26 combinaciones
-        main_assets = [
-            # Forex Majors (más volumen y liquidez)
-            'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
-            # Cruces importantes
-            'EURGBP', 'EURJPY', 'GBPJPY',
-            # Crypto
-            'BTCUSD', 'ETHUSD',
-            # Commodities
-            'XAUUSD'
-        ]
+        from MarketTool import obtener_datos_con_hilos, calcular_indicadores, _ensure_globals_loaded, _universe_symbols
+
+        # Activos comunes: salen del mismo config/categorias que usan RN/Web
+        # para los menús. Los símbolos fuera de categorías son exclusivos y no
+        # se precalientan aquí salvo override explícito por env.
+        _ensure_globals_loaded()
+        main_assets = sorted(_universe_symbols())[: int(os.getenv("CACHE_WARMUP_MAX_SYMBOLS", "80"))]
+        if not main_assets:
+            main_assets = [
+                'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
+                'EURGBP', 'EURJPY', 'GBPJPY', 'BTCUSD', 'ETHUSD', 'XAUUSD'
+            ]
         env_assets = [
             s.strip().upper()
             for s in os.getenv("CACHE_WARMUP_SYMBOLS", "").split(",")
@@ -349,6 +342,7 @@ def main() -> None:
             temporalidades,
             _ensure_globals_loaded,
             filtrar_activos_por_moneda,
+            compute_analysis_transaction_units,
             activos,
             compute_lock_ttl,
             acquire_user_lock,
@@ -507,6 +501,7 @@ def main() -> None:
             temporalidades=temporalidades,
             ensure_globals_loaded=_ensure_globals_loaded,
             filtrar_activos_por_moneda=filtrar_activos_por_moneda,
+            compute_analysis_transaction_units=compute_analysis_transaction_units,
             activos_ref=activos,
             compute_lock_ttl=compute_lock_ttl,
             acquire_user_lock=acquire_user_lock,

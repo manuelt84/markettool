@@ -3809,11 +3809,10 @@ def _universe_symbols() -> set:
         out.update(forex or [])
     except Exception:
         pass
-    # si tienes categorías, agrega todo
+    # si tienes categorías, agrega solo activos hoja; las categorías/subcategorías
+    # son navegación de menú, no símbolos para precalentar.
     try:
-        for k, arr in (categorias or {}).items():
-            if isinstance(arr, list):
-                out.update(arr)
+        out.update(_categorized_assets())
     except Exception:
         pass
     cleaned = set(s.strip().upper() for s in out if isinstance(s, str) and s.strip())
@@ -15002,9 +15001,16 @@ def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
 
     # Filtro especial para todas las monedas
     if moneda_filtro in {"all", "todos"}:
-        return lista_activos
+        categorized = _categorized_assets()
+        return sorted(categorized) if categorized else lista_activos
 
-    # Filtros por categorías específicas
+    # Filtros por categorías dinámicas de Firestore. Esto evita confundir
+    # nombres de categorías/subcategorías con símbolos exclusivos.
+    dynamic_category = _resolve_category_assets(raw_filter)
+    if dynamic_category:
+        return dynamic_category
+
+    # Filtros por categorías específicas legacy
     categorias_especiales = {
         "cruces": categorias.get("Cruces", []),
         "exóticos": categorias.get("Exóticos", []),
@@ -15032,6 +15038,118 @@ def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
 
     # Filtrar activos que contengan la moneda o parte del nombre
     return [activo for activo in lista_activos if moneda_filtro.upper() in activo]
+
+
+def _asset_key(value) -> str:
+    import unicodedata
+    text = str(value or "").strip().upper()
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(ch)
+    )
+    return text
+
+
+def _category_key_map() -> dict[str, str]:
+    try:
+        return {
+            _asset_key(name): str(name)
+            for name in (categorias or {}).keys()
+            if isinstance(name, str) and str(name).strip()
+        }
+    except Exception:
+        return {}
+
+
+def _resolve_category_assets(category_name, _seen: set[str] | None = None) -> list[str]:
+    """Resolve a Firestore category/subcategory to leaf symbols only."""
+    key_map = _category_key_map()
+    category_key = _asset_key(category_name)
+    real_name = key_map.get(category_key)
+    if not real_name:
+        return []
+
+    _seen = _seen or set()
+    if category_key in _seen:
+        return []
+    _seen.add(category_key)
+
+    out: list[str] = []
+    seen_symbols: set[str] = set()
+    values = (categorias or {}).get(real_name, [])
+    if not isinstance(values, list):
+        return []
+
+    for item in values:
+        item_key = _asset_key(item)
+        if not item_key:
+            continue
+        if item_key in key_map:
+            for nested in _resolve_category_assets(key_map[item_key], _seen):
+                nested_key = _asset_key(nested)
+                if nested_key and nested_key not in seen_symbols:
+                    seen_symbols.add(nested_key)
+                    out.append(nested_key)
+            continue
+        if item_key in {"TODOS", "ALL"} or (len(item_key) == 3 and item_key in _CURRENCY_CODES):
+            continue
+        if item_key not in seen_symbols:
+            seen_symbols.add(item_key)
+            out.append(item_key)
+    return out
+
+
+def _categorized_assets() -> set[str]:
+    """All menu/category leaf assets. Anything outside this set is exclusive."""
+    out: set[str] = set()
+    try:
+        for category_name in (categorias or {}).keys():
+            out.update(_resolve_category_assets(category_name))
+    except Exception:
+        pass
+    return set(s for s in out if s and s not in {"TODOS", "ALL"})
+
+
+def classify_common_exclusive_assets(resolved_assets: list[str] | tuple[str, ...] | set[str]) -> dict:
+    common_set = _categorized_assets()
+    resolved = []
+    for item in resolved_assets or []:
+        key = _asset_key(item)
+        if key and key not in resolved:
+            resolved.append(key)
+    common = [sym for sym in resolved if sym in common_set]
+    exclusive = [sym for sym in resolved if sym not in common_set]
+    return {
+        "common": common,
+        "exclusive": exclusive,
+        "common_count": len(common),
+        "exclusive_count": len(exclusive),
+        "known_common_universe": len(common_set),
+    }
+
+
+def compute_analysis_transaction_units(resolved_assets, tfs) -> tuple[int, dict]:
+    """Commercial billing units for analysis.
+
+    Common assets are those present in Firestore menu categories. Symbols not
+    categorized there are treated as exclusive and charged with a higher unit
+    multiplier because they tend to require private FMP/cache work.
+    """
+    tfs_count = max(1, len(list(tfs or [])))
+    classification = classify_common_exclusive_assets(list(resolved_assets or []))
+    exclusive_multiplier = max(1, int(os.getenv("EXCLUSIVE_ASSET_TRANSACTION_MULTIPLIER", "3")))
+    common_units = classification["common_count"] * tfs_count
+    exclusive_units = classification["exclusive_count"] * tfs_count * exclusive_multiplier
+    total = max(1, common_units + exclusive_units)
+    metadata = {
+        **classification,
+        "timeframes_count": tfs_count,
+        "exclusive_multiplier": exclusive_multiplier,
+        "common_units": common_units,
+        "exclusive_units": exclusive_units,
+        "total_units": total,
+    }
+    return total, metadata
 
 # Función principal para ejecutar el análisis usando hilos
 #@profile
@@ -18109,8 +18227,10 @@ async def ejecutar_recurrente(
     cfg_overrides = operatoria_cfg or {}
     temps = cfg_overrides.get("tfs") or temporalidades
 
-    # Contabilizar transacciones (activo x tf) - protegido con lock
-    n = len(activos_filtrados) * len(temps)
+    # Contabilizar transacciones comerciales:
+    # activos de menú/categoría = comunes; símbolos fuera de categorías = exclusivos.
+    n, billing_meta = compute_analysis_transaction_units(activos_filtrados, temps)
+    logger.info("[Billing] analysis units=%s meta=%s", n, billing_meta)
     with user_states_lock:
         if user_id:
             user_states.setdefault(str(user_id), {})["numero_transacciones"] = n
@@ -18266,6 +18386,7 @@ async def ejecutar_recurrente(
                 exec_id,
                 activos_resueltos=activos_filtrados,
                 numero_transacciones=n,
+                billing_meta=billing_meta,
             )
         except Exception as e:
             logger.warning(f"No se pudo actualizar ejecución {exec_id}: {e}")

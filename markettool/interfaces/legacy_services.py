@@ -20,6 +20,7 @@ class LegacyServices:
     temporalidades: Any
     ensure_globals_loaded: Callable[..., Any]
     filtrar_activos_por_moneda: Callable[..., Any]
+    compute_analysis_transaction_units: Callable[..., Any]
     activos_ref: Any
     compute_lock_ttl: Callable[..., Any]
     acquire_user_lock: Callable[..., Any]

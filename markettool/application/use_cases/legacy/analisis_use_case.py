@@ -155,9 +155,13 @@ class LegacyAnalisisUseCase:
                     "[/analisis/ejecutar] activos resueltos tras filtro: %s",
                     list(activos_filtrados_est or []),
                 )
-                n_transacciones_req = max(
-                    1,
-                    len(list(activos_filtrados_est or [])) * len(list(tfs_est or [])),
+                n_transacciones_req, billing_meta = self._services.compute_analysis_transaction_units(
+                    list(activos_filtrados_est or []),
+                    list(tfs_est or []),
+                )
+                self._services.logger.info(
+                    "[/analisis/ejecutar] billing estimate: %s",
+                    billing_meta,
                 )
             except Exception as exc:
                 self._services.logger.debug(
