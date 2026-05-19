@@ -1008,6 +1008,12 @@ FMP_RANGE_ADAPTIVE_TTL_SECONDS = int(
 FMP_RANGE_ADAPTIVE_DEFAULT_MAX_BARS = int(
     os.environ.get("FMP_RANGE_ADAPTIVE_DEFAULT_MAX_BARS", "180")
 )
+GCS_HISTORY_INCREMENTAL_MIN_COVERAGE = float(
+    os.environ.get("GCS_HISTORY_INCREMENTAL_MIN_COVERAGE", "0.20")
+)
+GCS_HISTORY_INCREMENTAL_ALLOW_INVALID = (
+    os.environ.get("GCS_HISTORY_INCREMENTAL_ALLOW_INVALID", "false").strip().lower() == "true"
+)
 _FMP_RANGE_ADAPTIVE_HINTS: dict[tuple[str, str], tuple[int, float]] = {}
 _FMP_RANGE_STATS_LOCK = threading.Lock()
 _FMP_RANGE_STATS: dict[tuple[str, str], dict[str, Any]] = {}
@@ -10053,6 +10059,27 @@ def _get_last_timestamp_from_gcs(symbol: str, tf: str) -> Optional[pd.Timestamp]
         # Try to load GCS with only last row to get timestamp efficiently
         df_gcs = load_from_gcs(symbol, tf)
         if df_gcs is not None and not df_gcs.empty:
+            _, gcs_diag = _validate_history_series_for_persist(df_gcs, symbol, tf, source="gcs_peek")
+            invalid_rows = int(gcs_diag.get("invalid_rows_removed") or 0)
+            coverage = float(gcs_diag.get("coverage_ratio") or 0.0)
+            if invalid_rows > 0 and not GCS_HISTORY_INCREMENTAL_ALLOW_INVALID:
+                logger.info(
+                    "[GCS_PEEK] %s/%s skipped incremental: invalid_rows=%d coverage=%.4f",
+                    symbol,
+                    tf,
+                    invalid_rows,
+                    coverage,
+                )
+                return None
+            if coverage < GCS_HISTORY_INCREMENTAL_MIN_COVERAGE:
+                logger.info(
+                    "[GCS_PEEK] %s/%s skipped incremental: coverage=%.4f < min=%.4f",
+                    symbol,
+                    tf,
+                    coverage,
+                    GCS_HISTORY_INCREMENTAL_MIN_COVERAGE,
+                )
+                return None
             last_ts = df_gcs.index[-1]
             logger.debug(f"[GCS_PEEK] Got last_ts from {symbol}/{tf}: {last_ts}")
             return last_ts
