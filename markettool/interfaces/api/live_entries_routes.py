@@ -92,6 +92,7 @@ _MEM_EVENTS: dict[str, list[dict]] = {}         # short replay buffer for SSE wh
 _MEM_BILLING_KEYS: dict[str, float] = {}
 _MEM_MARKET_POOL: dict[str, dict] = {}
 _MEM_MARKET_POOL_RATE: dict[str, int] = {}
+_MEM_MARKET_POOL_COOLDOWN: dict[str, float] = {}
 _MARKET_POOL_TASK: asyncio.Task | None = None
 _SUBSCRIBERS: dict[str, list[queue.Queue]] = {}
 _SUBSCRIBERS_LOCK = threading.Lock()
@@ -144,6 +145,10 @@ def _redis_market_pool_key(symbol: str, tf: str) -> str:
 
 def _redis_market_pool_lock_key(symbol: str, tf: str) -> str:
     return f"market_pool:lock:{symbol.upper()}:{tf}"
+
+
+def _redis_market_pool_cooldown_key(symbol: str, tf: str) -> str:
+    return f"market_pool:cooldown:{symbol.upper()}:{tf}"
 
 
 def _redis_market_pool_rate_key() -> str:
@@ -747,6 +752,43 @@ def _market_pool_acquire_fmp_slot(redis_client) -> bool:
     return count <= limit
 
 
+def _market_pool_cooldown_seconds(tf: str, tf_ms_fn=None) -> int:
+    base = int(os.getenv("MARKET_POOL_REFRESH_COOLDOWN_SECONDS", "900"))
+    try:
+        tf_ms_val = int(tf_ms_fn(tf)) if callable(tf_ms_fn) else 0
+    except Exception:
+        tf_ms_val = 0
+    if not tf_ms_val:
+        tf_ms_val = 60_000
+    return max(base, int((tf_ms_val / 1000) * 4))
+
+
+def _market_pool_in_cooldown(redis_client, symbol: str, tf: str) -> bool:
+    key = _redis_market_pool_cooldown_key(symbol, tf)
+    if redis_client is not None:
+        try:
+            return bool(redis_client.exists(key))
+        except Exception as exc:
+            logger.debug("[MarketPool] cooldown check failed %s/%s: %s", symbol, tf, exc)
+    expires_at = float(_MEM_MARKET_POOL_COOLDOWN.get(key, 0) or 0)
+    if expires_at <= time.time():
+        _MEM_MARKET_POOL_COOLDOWN.pop(key, None)
+        return False
+    return True
+
+
+def _market_pool_set_cooldown(redis_client, symbol: str, tf: str, seconds: int | None = None, tf_ms_fn=None) -> None:
+    ttl = max(1, int(seconds or _market_pool_cooldown_seconds(tf, tf_ms_fn)))
+    key = _redis_market_pool_cooldown_key(symbol, tf)
+    if redis_client is not None:
+        try:
+            redis_client.setex(key, ttl, "1")
+            return
+        except Exception as exc:
+            logger.debug("[MarketPool] cooldown set failed %s/%s: %s", symbol, tf, exc)
+    _MEM_MARKET_POOL_COOLDOWN[key] = time.time() + ttl
+
+
 async def _load_from_market_pool(
     *,
     redis_client,
@@ -816,6 +858,8 @@ async def _refresh_market_pool_symbol_tf(
     existing = await asyncio.to_thread(_load_market_pool_series, redis_client, symbol, tf, tf_ms_fn)
     if existing:
         return False
+    if await asyncio.to_thread(_market_pool_in_cooldown, redis_client, symbol, tf):
+        return False
 
     lock_key = _redis_market_pool_lock_key(symbol, tf)
     lock_ttl = int(os.getenv("MARKET_POOL_LOCK_TTL_SECONDS", "45"))
@@ -839,6 +883,7 @@ async def _refresh_market_pool_symbol_tf(
             return False
         bars = int(os.getenv("MARKET_POOL_FETCH_BARS", "180"))
         from_ms = closed_end - max(MIN_CANDLES + 10, bars) * tf_ms_val
+        await asyncio.to_thread(_market_pool_set_cooldown, redis_client, symbol, tf, None, tf_ms_fn)
         hist = await asyncio.to_thread(fetch_historical_range, symbol, tf, from_ms, closed_end)
         if not hist:
             return False
