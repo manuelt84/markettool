@@ -148,7 +148,7 @@ class PonderacionCache:
     Falls back to in-memory dict if Redis unavailable.
     Includes Pub/Sub for inter-pod cache invalidation.
     """
-    
+
     def __init__(self):
         self.redis_url = os.getenv("REDIS_URL", None)
         self.redis_client = None
@@ -170,7 +170,7 @@ class PonderacionCache:
                 print(f"[PonderacionCache] Redis connection failed ({e}). Using in-memory fallback.")
                 self.redis_client = None
                 self.pubsub_client = None
-    
+
     def _get_ttl_seconds(self, timeframe: str) -> int:
         """Returns TTL in seconds based on timeframe."""
         ttl_map = {
@@ -22912,8 +22912,18 @@ def obtener_monedas(symbol: str) -> Tuple[str,str]:
 # - Future events (>2h) or old: 30 min
 # This maintains reactivity for critical events while reducing API load
 _EVENTS_MEMO: Dict[str, Dict[str, Any]] = {}  # {symbol: {"df":DataFrame,"ts":epoch}}
+_EVENTS_MEMO_LOCK = threading.Lock()
+_EVENTS_FETCH_LOCKS: Dict[str, threading.Lock] = {}
 _LAST_ACTUAL: Dict[Tuple[str, Tuple[str,str,int]], float] = {}  # (symbol,(cur,event,ms)) -> actual
 _LAST_HASH: Dict[Tuple[str,str], str] = {}  # (exec_id,symbol) -> hash
+
+def _get_events_fetch_lock(memo_key: str) -> threading.Lock:
+    with _EVENTS_MEMO_LOCK:
+        lock = _EVENTS_FETCH_LOCKS.get(memo_key)
+        if lock is None:
+            lock = threading.Lock()
+            _EVENTS_FETCH_LOCKS[memo_key] = lock
+        return lock
 
 def _event_row_key(row: pd.Series) -> Tuple[str,str,int]:
     """ Llave estable por fila de evento (currency, event, date_ms UTC). """
@@ -23068,60 +23078,75 @@ def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) ->
     
     logger.info("[eventos] Backtest detection: hours_back=%d > 720? is_backtest=%s", hours_back, is_backtest)
 
-    memo = _EVENTS_MEMO.get(memo_key)
-    if memo:
+    def _read_events_memo() -> tuple[pd.DataFrame | None, bool]:
+        with _EVENTS_MEMO_LOCK:
+            memo = _EVENTS_MEMO.get(memo_key)
+        if not memo:
+            return None, False
         df_cached = memo.get("df")
         cache_age = time.time() - memo.get("ts", 0)
         ttl = 1800.0 if is_backtest else _calculate_adaptive_ttl(df_cached, now)
         if cache_age < ttl:
             logger.info("[eventos] Cache HIT %s age=%.1fs ttl=%.1fs", memo_key, cache_age, ttl)
-            return df_cached.copy()
+            return df_cached.copy(), True
         logger.info("[eventos] Cache EXPIRED %s age=%.1fs ttl=%.1fs", memo_key, cache_age, ttl)
-    
-    if is_backtest:
-        # Para backtesting: respetar la ventana pedida por el cliente.
-        # No usar 365d fijo ni fallbacks de Investing: esos caminos pueden superar
-        # el timeout de nginx/RN y terminan devolviendo [] en la app.
-        backtest_days = max(7, min(120, int(math.ceil(int(hours_back) / 24)) + 2))
-        logger.info(
-            "[eventos] BACKTEST MODE detected (hours_back=%d > 720), fetching last %d days of FMP events",
-            hours_back,
-            backtest_days,
-        )
-        df = obtener_eventos_economicos(
-            plan=APP_CONFIG.fmp_plan,
-            last_days=backtest_days,
-            grace_minutes=0,
-            allow_investing_fallback=False,
-        )
-        logger.info("[eventos] Got %d events for backtest (last %d days)", len(df), backtest_days)
-    else:
-        # Para live trading: ventana de ±6 horas
-        a = now - timedelta(hours=int(hours_back))
-        b = now + timedelta(minutes=int(minutes_fwd))
+        return None, False
 
-        # Cache miss o expirado - fetch nuevo
-        df = obtener_eventos_guardados_o_futuros(
-            _iso(a),
-            _iso(b),
-            grace_minutes=0,
-        )
-    if df is None or df.empty:
-        df = pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
-    # normaliza tipos
-    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-    for c in ["actual","estimate","previous"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["impact"] = df["impact"].astype(str).str.capitalize()
-    df = df.sort_values("date", ascending=True).reset_index(drop=True)
-    
-    # Guardar en cache con nuevo TTL
-    _EVENTS_MEMO[memo_key] = {"df": df.copy(), "ts": time.time()}
-    
-    new_ttl = _calculate_adaptive_ttl(df, now)
-    logger.info("[eventos] _fetch_events_for %s tardó %.3fs - nuevo TTL: %.1fs", symbol, time.time() - t0, new_ttl)
+    cached_df, hit = _read_events_memo()
+    if hit and cached_df is not None:
+        return cached_df
 
-    return df
+    fetch_lock = _get_events_fetch_lock(memo_key)
+    with fetch_lock:
+        cached_df, hit = _read_events_memo()
+        if hit and cached_df is not None:
+            return cached_df
+
+        if is_backtest:
+            # Para backtesting: respetar la ventana pedida por el cliente.
+            # No usar 365d fijo ni fallbacks de Investing: esos caminos pueden superar
+            # el timeout de nginx/RN y terminan devolviendo [] en la app.
+            backtest_days = max(7, min(120, int(math.ceil(int(hours_back) / 24)) + 2))
+            logger.info(
+                "[eventos] BACKTEST MODE detected (hours_back=%d > 720), fetching last %d days of FMP events",
+                hours_back,
+                backtest_days,
+            )
+            df = obtener_eventos_economicos(
+                plan=APP_CONFIG.fmp_plan,
+                last_days=backtest_days,
+                grace_minutes=0,
+                allow_investing_fallback=False,
+            )
+            logger.info("[eventos] Got %d events for backtest (last %d days)", len(df), backtest_days)
+        else:
+            # Para live trading: ventana de ±6 horas
+            a = now - timedelta(hours=int(hours_back))
+            b = now + timedelta(minutes=int(minutes_fwd))
+
+            # Cache miss o expirado - fetch nuevo
+            df = obtener_eventos_guardados_o_futuros(
+                _iso(a),
+                _iso(b),
+                grace_minutes=0,
+            )
+        if df is None or df.empty:
+            df = pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
+        # normaliza tipos
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+        for c in ["actual","estimate","previous"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["impact"] = df["impact"].astype(str).str.capitalize()
+        df = df.sort_values("date", ascending=True).reset_index(drop=True)
+
+        # Guardar en cache con nuevo TTL
+        with _EVENTS_MEMO_LOCK:
+            _EVENTS_MEMO[memo_key] = {"df": df.copy(), "ts": time.time()}
+
+        new_ttl = _calculate_adaptive_ttl(df, now)
+        logger.info("[eventos] _fetch_events_for %s tardó %.3fs - nuevo TTL: %.1fs", symbol, time.time() - t0, new_ttl)
+
+        return df
 
 def _detect_new_results(symbol: str, df: pd.DataFrame) -> List[dict]:
     """
