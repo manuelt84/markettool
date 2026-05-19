@@ -7,7 +7,6 @@ import logging
 import os
 import time
 import threading
-pass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -229,6 +228,7 @@ _REDIS_HIST_CACHE = RedisHistoricosCache()
 _FILE_LOCKS_DICT: Dict[str, threading.RLock] = {}
 _LOCKS_MUTEX = threading.RLock()  # Protects the locks dictionary itself
 _MAX_LOCKS = 4096  # Max locks to prevent memory leak (32 symbols × 128 TFs or similar)
+_HISTORY_MANIFEST_SCHEMA_VERSION = 1
 
 # Maximum rows to keep in local cache (0 = unlimited)
 _MAX_HISTORICO_CACHE_ROWS = int(os.environ.get("MAX_HISTORICO_CACHE_ROWS", "0"))
@@ -344,10 +344,146 @@ def _hist_path_json(symbol: str, tf: str) -> str:
     return _hist_base(symbol, tf) + ".json"
 
 
+def _hist_path_manifest(symbol: str, tf: str) -> str:
+    return _hist_base(symbol, tf) + ".manifest.json"
+
+
 def _hist_path(symbol: str, tf: str) -> str:
     if hasattr(APP_CONFIG, "storage_format") and APP_CONFIG.storage_format == "json":
         return _hist_path_json(symbol, tf)
     return _hist_path_csv(symbol, tf)
+
+
+def _timeframe_step_ms(tf: str) -> int | None:
+    """Expected candle spacing for quality manifests."""
+    tf_norm = normalize_tf(tf)
+    step_seconds = {
+        "1min": 60,
+        "5min": 300,
+        "15min": 900,
+        "30min": 1800,
+        "1hour": 3600,
+        "4hour": 14400,
+        "1day": 86400,
+        "1week": 604800,
+        "1month": 2592000,
+    }.get(tf_norm)
+    return step_seconds * 1000 if step_seconds else None
+
+
+def _history_manifest_from_df(symbol: str, tf: str, df: pd.DataFrame, *, source: str = "local_incremental") -> dict[str, Any]:
+    """Build a compact quality manifest for persisted historical candles."""
+    tf_norm = normalize_tf(tf)
+    manifest: dict[str, Any] = {
+        "schema_version": _HISTORY_MANIFEST_SCHEMA_VERSION,
+        "symbol": str(symbol).upper(),
+        "tf": tf_norm,
+        "rows": 0,
+        "first_ts": None,
+        "last_ts": None,
+        "expected_step_ms": _timeframe_step_ms(tf_norm),
+        "gap_count": 0,
+        "max_gap_ms": 0,
+        "coverage_ratio": 0.0,
+        "source": source,
+        "node_id": os.getenv("MARKET_DATA_NODE_ID") or os.getenv("WORKER_ID") or os.getenv("HOSTNAME"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if df is None or getattr(df, "empty", True):
+        return manifest
+
+    try:
+        idx = pd.DatetimeIndex(pd.to_datetime(df.index, errors="coerce", utc=True)).dropna().sort_values()
+        if len(idx) == 0:
+            return manifest
+        idx = idx.drop_duplicates()
+        rows = len(idx)
+        first = idx[0]
+        last = idx[-1]
+        step_ms = manifest["expected_step_ms"]
+        gap_count = 0
+        max_gap_ms = 0
+        coverage_ratio = 1.0
+        if rows > 1 and step_ms:
+            diffs_ms = pd.Series(idx).diff().dropna().dt.total_seconds().mul(1000)
+            gap_threshold = step_ms * 1.5
+            gaps = diffs_ms[diffs_ms > gap_threshold]
+            gap_count = int(len(gaps))
+            max_gap_ms = int(diffs_ms.max()) if not diffs_ms.empty else 0
+            expected_rows = int(((last - first).total_seconds() * 1000) // step_ms) + 1
+            if expected_rows > 0:
+                coverage_ratio = max(0.0, min(1.0, rows / expected_rows))
+        manifest.update({
+            "rows": int(rows),
+            "first_ts": first.isoformat(),
+            "last_ts": last.isoformat(),
+            "gap_count": gap_count,
+            "max_gap_ms": max_gap_ms,
+            "coverage_ratio": round(float(coverage_ratio), 6),
+        })
+    except Exception as exc:
+        logger.debug("[HistCache] Manifest calculation failed for %s/%s: %s", symbol, tf, exc)
+    return manifest
+
+
+def _publish_history_manifest(symbol: str, tf: str, manifest: dict[str, Any]) -> None:
+    """Publish only metadata to shared Redis so other machines know cache quality.
+
+    The historical payload can be large, so cross-machine sync uses files/GCS and
+    Redis carries a lightweight index instead of duplicating heavy candles there.
+    """
+    if not redis:
+        return
+    redis_url = os.getenv("MARKET_DATA_REDIS_URL") or os.getenv("LIVE_ENTRIES_REDIS_URL")
+    if not redis_url:
+        return
+    try:
+        client = redis.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=float(os.getenv("MARKET_DATA_REDIS_CONNECT_TIMEOUT", "1.5")),
+            socket_timeout=float(os.getenv("MARKET_DATA_REDIS_SOCKET_TIMEOUT", "2.0")),
+        )
+        symbol_key = str(symbol).upper()
+        tf_norm = normalize_tf(tf)
+        node_id = manifest.get("node_id") or "unknown"
+        payload = json.dumps(manifest, ensure_ascii=False, default=str)
+        ttl_seconds = int(os.getenv("MARKET_DATA_MANIFEST_TTL_SECONDS", "2592000"))
+        client.setex(f"hist_manifest:{symbol_key}:{tf_norm}:{node_id}", ttl_seconds, payload)
+        latest_key = f"hist_manifest_latest:{symbol_key}:{tf_norm}"
+        previous_raw = client.get(latest_key)
+        previous = json.loads(previous_raw) if previous_raw else None
+        def _score(item: dict[str, Any] | None) -> tuple:
+            if not item:
+                return (0, 0.0, 0, 0, "")
+            return (
+                int(item.get("rows") or 0),
+                float(item.get("coverage_ratio") or 0.0),
+                -int(item.get("gap_count") or 0),
+                int(pd.Timestamp(item.get("last_ts")).timestamp()) if item.get("last_ts") else 0,
+                str(item.get("updated_at") or ""),
+            )
+        if _score(manifest) >= _score(previous):
+            client.setex(latest_key, ttl_seconds, payload)
+    except Exception as exc:
+        logger.debug("[HistCache] Shared manifest publish failed for %s/%s: %s", symbol, tf, exc)
+
+
+def _write_history_manifest(symbol: str, tf: str, df: pd.DataFrame, *, source: str = "local_incremental") -> None:
+    manifest = _history_manifest_from_df(symbol, tf, df, source=source)
+    manifest_path = _hist_path_manifest(symbol, tf)
+    tmp_path = manifest_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp_path, manifest_path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+    _publish_history_manifest(symbol, tf, manifest)
 
 
 def _merge_local_data(existing_df: Optional[pd.DataFrame], new_df: pd.DataFrame) -> pd.DataFrame:
@@ -486,6 +622,13 @@ def _save_local_history_df(symbol: str, tf: str, df: pd.DataFrame) -> None:
             
             # Atomic replacement
             os.replace(temp_file, local_hist)
+            try:
+                manifest_df = new_data_df.copy()
+                manifest_df["time"] = pd.to_datetime(manifest_df["time"], errors="coerce", utc=True)
+                manifest_df = manifest_df.dropna(subset=["time"]).set_index("time").sort_index()
+                _write_history_manifest(symbol, tf, manifest_df, source="local_incremental")
+            except Exception as manifest_exc:
+                logger.debug("[HistCache] Manifest write skipped for %s/%s: %s", symbol, tf, manifest_exc)
             
             # Calculate net new rows from merge
             net_new_rows = total_rows - (len(existing_df) if existing_df is not None else 0)
@@ -501,6 +644,10 @@ def _save_local_history_df(symbol: str, tf: str, df: pd.DataFrame) -> None:
                 os.makedirs(APP_CONFIG.hist_dir, exist_ok=True)
                 with open(local_hist, "w", encoding="utf-8") as f:
                     json.dump(simple_payload, f, ensure_ascii=False)
+                try:
+                    _write_history_manifest(symbol, tf, out.set_index(pd.DatetimeIndex(pd.to_datetime(out["time"], utc=True))), source="fallback_simple")
+                except Exception:
+                    pass
                 logger.debug("[HistCache] Fallback save succeeded: %d rows", len(simple_payload))
             except Exception as fallback_exc:
                 logger.debug("[HistCache] Fallback save also failed: %s", fallback_exc)
