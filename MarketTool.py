@@ -2036,6 +2036,8 @@ _analysis_pred_monitor = ExecutorHealthMonitor("ANALYSIS_PRED")
 subscriptions = {}
 subscriptions_type = {}
 admin_ids = {}
+_admin_role_cache: dict[str, tuple[float, bool]] = {}
+_admin_role_cache_lock = threading.Lock()
 
 # ✅ FIX: Use RLock (Reentrant Lock) to allow same thread to acquire lock multiple times
 user_states_lock = threading.RLock()  # Reentrant: safe for nested lock acquisitions
@@ -19439,7 +19441,68 @@ async def guardar_datos(data: dict):
 # Función para verificar si un usuario es administrador
 #@profile
 def es_administrador(user_id):
-    return user_id in admin_ids
+    key = str(user_id or "").strip()
+    if not key:
+        return False
+    if key in admin_ids:
+        return True
+
+    now_ts = time.time()
+    with _admin_role_cache_lock:
+        cached = _admin_role_cache.get(key)
+        if cached and cached[0] > now_ts:
+            return cached[1]
+
+    def _role_from_doc(data):
+        if not isinstance(data, dict):
+            return ""
+        for field in ("role", "rol", "perfil", "user_role"):
+            value = data.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+        roles = data.get("roles")
+        if isinstance(roles, list):
+            for role in roles:
+                role_s = str(role).strip().lower()
+                if role_s in {"admin", "administrator", "administrador", "owner", "superadmin"}:
+                    return role_s
+        if data.get("is_admin") is True or data.get("admin") is True:
+            return "admin"
+        return ""
+
+    try:
+        candidates = []
+        for col_name in ("suscripciones_user", "user_ids", "chat_ids"):
+            try:
+                snap = db.collection(col_name).document(key).get()
+                if snap.exists:
+                    candidates.append(snap.to_dict() or {})
+            except Exception:
+                pass
+
+        for data in list(candidates):
+            for linked in (data.get("user_id"), data.get("telegram_id"), data.get("doc_alias_of")):
+                linked_key = str(linked or "").strip()
+                if not linked_key or linked_key == key:
+                    continue
+                for col_name in ("suscripciones_user", "user_ids"):
+                    try:
+                        snap = db.collection(col_name).document(linked_key).get()
+                        if snap.exists:
+                            candidates.append(snap.to_dict() or {})
+                    except Exception:
+                        pass
+
+        is_admin = any(
+            _role_from_doc(data) in {"admin", "administrator", "administrador", "owner", "superadmin"}
+            for data in candidates
+        )
+    except Exception:
+        is_admin = False
+
+    with _admin_role_cache_lock:
+        _admin_role_cache[key] = (now_ts + 300, is_admin)
+    return is_admin
 
 
 def parse_iso_aware(s: str):
