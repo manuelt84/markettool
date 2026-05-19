@@ -15847,6 +15847,31 @@ async def procesar_resultado(
             out[sym] = str(top_tf)
         return out
 
+    def _build_monitoring_selection(row: dict | None, source: str) -> dict:
+        if not isinstance(row, dict) or not row:
+            return {}
+        symbol = str(row.get("Activo") or "").strip().upper()
+        timeframe = str(row.get("Temporalidad") or "").strip()
+        if not symbol or not timeframe:
+            return {}
+        score = (
+            row.get("Ponderacion")
+            if row.get("Ponderacion") is not None
+            else row.get("Score Final")
+        )
+        try:
+            score = float(score) if score is not None else None
+        except Exception:
+            score = None
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "source": source,
+            "score": score,
+            "tipo_operacion": row.get("Tipo de Operacion"),
+            "oportunidad": bool(row.get("Oportunidad")) if row.get("Oportunidad") is not None else None,
+        }
+
     async def _upload_enriched(res: dict):
         if not isinstance(res, dict):
             return None
@@ -16249,6 +16274,8 @@ async def procesar_resultado(
     t_ui_final_start = time.time()
     # ✅ Esto permite navegación inmediata con el activo top seleccionado
     top_asset = None
+    selected_timeframe_final = None
+    monitoring_selection = {}
     if can_archive:
 
         cols_ui = [
@@ -16323,11 +16350,28 @@ async def procesar_resultado(
         except Exception:
             pass
 
-        top_timeframe_final = _pick_top_timeframe(ordenados_top)
+        # Selección única para monitoreo: preferir la mejor oportunidad final.
+        # Si no hay oportunidad válida, caer al top general final. Esto evita que
+        # el preview/warmup o la frecuencia de TFs contradigan el par que se abre
+        # al volver a entrar.
+        selection_source = "final_opportunity"
+        selection_row = None
+        if not df_filtrado.empty:
+            try:
+                selection_row = df_filtrado.iloc[0].to_dict()
+            except Exception:
+                selection_row = None
+        if not selection_row and ordenados_top:
+            selection_source = "final_ranking"
+            selection_row = ordenados_top[0]
+
+        monitoring_selection = _build_monitoring_selection(selection_row, selection_source)
+        selected_timeframe_final = monitoring_selection.get("timeframe") or _pick_top_timeframe(ordenados_top)
+        top_timeframe_final = selected_timeframe_final
         top_timeframe_by_asset_final = _pick_top_timeframe_by_asset(ordenados_top)
         if ordenados_top:
             try:
-                top_asset = str(ordenados_top[0].get("Activo") or "").strip().upper() or None
+                top_asset = monitoring_selection.get("symbol") or str(ordenados_top[0].get("Activo") or "").strip().upper() or None
             except Exception:
                 top_asset = None
 
@@ -16349,8 +16393,12 @@ async def procesar_resultado(
             },
             "top_timeframe": top_timeframe_final,
             "top_timeframe_by_asset": top_timeframe_by_asset_final,
+            "selected_symbol": monitoring_selection.get("symbol"),
+            "selected_timeframe": monitoring_selection.get("timeframe"),
+            "selection": monitoring_selection,
             "priority_assets": priority_assets,  # ✅ Activos prioritarios para monitoreo
             "ready_for_monitoring": [],  # Se actualizará a medida que se suban
+            "ready_for_monitoring_pairs": [],
         }
 
         # ✅ DEBUG: Verificar que ordenados_top[0] tiene niveles antes de sanitizar
@@ -16368,7 +16416,7 @@ async def procesar_resultado(
             logger.info(
                 f"[ui_resumen final] top_timeframe={top_timeframe_final} "
                 f"top_timeframe_by_asset={top_timeframe_by_asset_final} "
-                f"priority_assets={priority_assets}"
+                f"priority_assets={priority_assets} selection={monitoring_selection}"
             )
         except Exception:
             pass
@@ -16393,6 +16441,7 @@ async def procesar_resultado(
     rest_tasks = []
     json_tasks = []
     ready_for_monitoring = []
+    ready_for_monitoring_pairs = []
     resultados_selected_sorted = []
     resultados_priority_sorted = []
     resultados_rest_sorted = []
@@ -16411,6 +16460,7 @@ async def procesar_resultado(
     if not selected_asset and top_asset:
         selected_asset = top_asset
         logger.info(f"ℹ️ Sin activo seleccionado; usando más optado para prioridad: {selected_asset}")
+    selected_tf = selected_timeframe_final
 
     # === FASE DE PREPARACIÓN ===
     # 7) Preparar uploads de enriquecidos con orden:
@@ -16437,7 +16487,10 @@ async def procesar_resultado(
 
         resultados_selected_sorted = sorted(
             resultados_selected,
-            key=lambda r: _tf_priority(r.get("Temporalidad"))
+            key=lambda r: (
+                0 if selected_tf and str(r.get("Temporalidad") or "").strip() == str(selected_tf).strip() else 1,
+                _tf_priority(r.get("Temporalidad")),
+            )
         )
         resultados_priority_sorted = sorted(
             resultados_priority,
@@ -16590,14 +16643,20 @@ async def procesar_resultado(
                 elif result:
                     urls_generadas.append(result)
                     sym = resultados_selected_sorted[i].get("Activo")
+                    tf = resultados_selected_sorted[i].get("Temporalidad")
                     if sym and sym not in ready_for_monitoring:
                         ready_for_monitoring.append(sym)
+                    if sym and tf:
+                        pair = {"symbol": str(sym).strip().upper(), "timeframe": str(tf).strip()}
+                        if pair not in ready_for_monitoring_pairs:
+                            ready_for_monitoring_pairs.append(pair)
 
             if ready_for_monitoring:
                 # ✅ FIX: Usar dot-notation para merge en lugar de sobrescribir ui_resumen completo
                 fs_actualizar_ejecucion(
                     exec_id,
                     **{"ui_resumen.ready_for_monitoring": ready_for_monitoring},
+                    **{"ui_resumen.ready_for_monitoring_pairs": ready_for_monitoring_pairs},
                     upload_state={
                         "status": "publishing",
                         "phase": "priority_ready",
@@ -16622,14 +16681,20 @@ async def procesar_resultado(
                 elif result:
                     urls_generadas.append(result)
                     sym = resultados_priority_sorted[i].get("Activo")
+                    tf = resultados_priority_sorted[i].get("Temporalidad")
                     if sym and sym not in ready_for_monitoring:
                         ready_for_monitoring.append(sym)
+                    if sym and tf:
+                        pair = {"symbol": str(sym).strip().upper(), "timeframe": str(tf).strip()}
+                        if pair not in ready_for_monitoring_pairs:
+                            ready_for_monitoring_pairs.append(pair)
 
             if ready_for_monitoring:
                 # ✅ FIX: Usar dot-notation para merge en lugar de sobrescribir ui_resumen completo
                 fs_actualizar_ejecucion(
                     exec_id,
                     **{"ui_resumen.ready_for_monitoring": ready_for_monitoring},
+                    **{"ui_resumen.ready_for_monitoring_pairs": ready_for_monitoring_pairs},
                 )
 
             logger.info("✅ uploads de principales completados en %.1fs", time.time() - t_priority_start)
@@ -16663,8 +16728,13 @@ async def procesar_resultado(
                     elif result:
                         urls_generadas.append(result)
                         sym = resultados_rest_sorted[i].get("Activo")
+                        tf = resultados_rest_sorted[i].get("Temporalidad")
                         if sym and sym not in ready_for_monitoring:
                             ready_for_monitoring.append(sym)
+                        if sym and tf:
+                            pair = {"symbol": str(sym).strip().upper(), "timeframe": str(tf).strip()}
+                            if pair not in ready_for_monitoring_pairs:
+                                ready_for_monitoring_pairs.append(pair)
                     rest_count += 1
                 else:
                     if isinstance(result, Exception):
@@ -16678,6 +16748,7 @@ async def procesar_resultado(
                 fs_actualizar_ejecucion(
                     exec_id,
                     **{"ui_resumen.ready_for_monitoring": ready_for_monitoring},
+                    **{"ui_resumen.ready_for_monitoring_pairs": ready_for_monitoring_pairs},
                 )
 
             logger.info(
