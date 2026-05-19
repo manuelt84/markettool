@@ -111,12 +111,12 @@ def _ledger_now() -> datetime:
         os.getenv("FMP_LEDGER_DAY_TZ")
         or os.getenv("MARKET_TIMEZONE")
         or os.getenv("FMP_DAILY_SOURCE_TZ")
-        or "UTC"
+        or "America/New_York"
     )
     try:
         return datetime.now(ZoneInfo(tz_name))
     except Exception:
-        return datetime.now(timezone.utc)
+        return datetime.now(ZoneInfo("America/New_York"))
 
 
 def current_context() -> dict[str, Any]:
