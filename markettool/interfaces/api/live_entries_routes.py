@@ -91,6 +91,7 @@ _MEM_BEATS: dict[str, dict] = {}
 _MEM_EVENTS: dict[str, list[dict]] = {}         # short replay buffer for SSE when Redis is unavailable
 _MEM_BILLING_KEYS: dict[str, float] = {}
 _MEM_MARKET_POOL: dict[str, dict] = {}
+_MEM_MARKET_POOL_RATE: dict[str, int] = {}
 _MARKET_POOL_TASK: asyncio.Task | None = None
 _SUBSCRIBERS: dict[str, list[queue.Queue]] = {}
 _SUBSCRIBERS_LOCK = threading.Lock()
@@ -143,6 +144,10 @@ def _redis_market_pool_key(symbol: str, tf: str) -> str:
 
 def _redis_market_pool_lock_key(symbol: str, tf: str) -> str:
     return f"market_pool:lock:{symbol.upper()}:{tf}"
+
+
+def _redis_market_pool_rate_key() -> str:
+    return f"market_pool:fmp_calls:{int(time.time() // 60)}"
 
 
 def _event_id(exec_id: str, symbol: str, tf: str, ts_ms: int) -> str:
@@ -713,6 +718,35 @@ def _store_market_pool_series(redis_client, symbol: str, tf: str, series_ms: lis
         _MEM_MARKET_POOL[key] = payload
 
 
+def _market_pool_acquire_fmp_slot(redis_client) -> bool:
+    """Global FMP guard shared by all pool producers.
+
+    FMP plan limit is currently 750 calls/min. The default leaves large headroom
+    for user-triggered exclusive calls, analysis, events and retries.
+    """
+    limit = int(os.getenv("MARKET_POOL_GLOBAL_MAX_FMP_CALLS_PER_MIN", "300"))
+    if limit <= 0:
+        return False
+    key = _redis_market_pool_rate_key()
+    if redis_client is not None:
+        try:
+            count = int(redis_client.incr(key))
+            if count == 1:
+                redis_client.expire(key, 75)
+            if count > limit:
+                logger.debug("[MarketPool] global FMP/min limit reached count=%d limit=%d", count, limit)
+                return False
+            return True
+        except Exception as exc:
+            logger.debug("[MarketPool] redis rate limiter failed: %s", exc)
+
+    now_min = str(int(time.time() // 60))
+    count = int(_MEM_MARKET_POOL_RATE.get(now_min, 0)) + 1
+    _MEM_MARKET_POOL_RATE.clear()
+    _MEM_MARKET_POOL_RATE[now_min] = count
+    return count <= limit
+
+
 async def _load_from_market_pool(
     *,
     redis_client,
@@ -801,7 +835,9 @@ async def _refresh_market_pool_symbol_tf(
         closed_end = current_closed_bucket_start(tf) - tf_ms_val
         if closed_end <= 0:
             closed_end = int(time.time() * 1000)
-        bars = int(os.getenv("MARKET_POOL_FETCH_BARS", "320"))
+        if not _market_pool_acquire_fmp_slot(redis_client):
+            return False
+        bars = int(os.getenv("MARKET_POOL_FETCH_BARS", "180"))
         from_ms = closed_end - max(MIN_CANDLES + 10, bars) * tf_ms_val
         hist = await asyncio.to_thread(fetch_historical_range, symbol, tf, from_ms, closed_end)
         if not hist:
