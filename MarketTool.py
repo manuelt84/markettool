@@ -19444,7 +19444,7 @@ def es_administrador(user_id):
     key = str(user_id or "").strip()
     if not key:
         return False
-    if key in admin_ids:
+    if any(str(admin_id) == key for admin_id in (admin_ids or [])):
         return True
 
     now_ts = time.time()
@@ -19453,50 +19453,35 @@ def es_administrador(user_id):
         if cached and cached[0] > now_ts:
             return cached[1]
 
-    def _role_from_doc(data):
-        if not isinstance(data, dict):
-            return ""
-        for field in ("role", "rol", "perfil", "user_role"):
-            value = data.get(field)
-            if isinstance(value, str) and value.strip():
-                return value.strip().lower()
-        roles = data.get("roles")
-        if isinstance(roles, list):
-            for role in roles:
-                role_s = str(role).strip().lower()
-                if role_s in {"admin", "administrator", "administrador", "owner", "superadmin"}:
-                    return role_s
-        if data.get("is_admin") is True or data.get("admin") is True:
-            return "admin"
-        return ""
-
     try:
-        candidates = []
+        candidate_ids = {key}
         for col_name in ("suscripciones_user", "user_ids", "chat_ids"):
             try:
                 snap = db.collection(col_name).document(key).get()
                 if snap.exists:
-                    candidates.append(snap.to_dict() or {})
+                    data = snap.to_dict() or {}
+                    for linked in (data.get("user_id"), data.get("telegram_id"), data.get("doc_alias_of"), data.get("chat_id")):
+                        if linked:
+                            candidate_ids.add(str(linked))
             except Exception:
                 pass
 
-        for data in list(candidates):
-            for linked in (data.get("user_id"), data.get("telegram_id"), data.get("doc_alias_of")):
-                linked_key = str(linked or "").strip()
-                if not linked_key or linked_key == key:
+        for linked_key in list(candidate_ids):
+            for col_name in ("suscripciones_user", "user_ids", "chat_ids"):
+                if not linked_key:
                     continue
-                for col_name in ("suscripciones_user", "user_ids"):
-                    try:
-                        snap = db.collection(col_name).document(linked_key).get()
-                        if snap.exists:
-                            candidates.append(snap.to_dict() or {})
-                    except Exception:
-                        pass
+                try:
+                    snap = db.collection(col_name).document(linked_key).get()
+                    if snap.exists:
+                        data = snap.to_dict() or {}
+                        for linked in (data.get("user_id"), data.get("telegram_id"), data.get("doc_alias_of"), data.get("chat_id")):
+                            if linked:
+                                candidate_ids.add(str(linked))
+                except Exception:
+                    pass
 
-        is_admin = any(
-            _role_from_doc(data) in {"admin", "administrator", "administrador", "owner", "superadmin"}
-            for data in candidates
-        )
+        admin_set = {str(admin_id) for admin_id in (admin_ids or [])}
+        is_admin = bool(candidate_ids & admin_set)
     except Exception:
         is_admin = False
 

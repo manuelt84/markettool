@@ -134,56 +134,43 @@ def _item_definition(item_type: str, item_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _normalize_role(data: dict[str, Any] | None) -> str:
-    if not data:
-        return ""
-    for key in ("role", "rol", "perfil", "user_role"):
-        value = data.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip().lower()
-    roles = data.get("roles")
-    if isinstance(roles, list):
-        for role in roles:
-            role_s = str(role).strip().lower()
-            if role_s in {"admin", "administrator", "administrador", "owner", "superadmin"}:
-                return role_s
-    if data.get("is_admin") is True or data.get("admin") is True:
-        return "admin"
-    return ""
-
-
-def _is_admin_role(role: str) -> bool:
-    return role in {"admin", "administrator", "administrador", "owner", "superadmin"}
-
-
 def _is_admin_user(user_id: str) -> bool:
     if not user_id:
         return False
     try:
         db = _firestore_client()
-        candidates: list[dict[str, Any]] = []
+        candidate_ids = {str(user_id)}
         for collection_name in ("suscripciones_user", "user_ids", "chat_ids"):
             try:
                 snap = db.collection(collection_name).document(str(user_id)).get()
                 if snap.exists:
-                    candidates.append(snap.to_dict() or {})
+                    data = snap.to_dict() or {}
+                    for linked in (data.get("user_id"), data.get("telegram_id"), data.get("doc_alias_of"), data.get("chat_id")):
+                        if linked:
+                            candidate_ids.add(str(linked))
             except Exception:
                 pass
 
-        for data in list(candidates):
-            for linked in (data.get("user_id"), data.get("telegram_id"), data.get("doc_alias_of")):
-                if linked and str(linked) != str(user_id):
-                    for collection_name in ("suscripciones_user", "user_ids"):
-                        try:
-                            snap = db.collection(collection_name).document(str(linked)).get()
-                            if snap.exists:
-                                candidates.append(snap.to_dict() or {})
-                        except Exception:
-                            pass
+        for linked_key in list(candidate_ids):
+            for collection_name in ("suscripciones_user", "user_ids", "chat_ids"):
+                try:
+                    snap = db.collection(collection_name).document(str(linked_key)).get()
+                    if snap.exists:
+                        data = snap.to_dict() or {}
+                        for linked in (data.get("user_id"), data.get("telegram_id"), data.get("doc_alias_of"), data.get("chat_id")):
+                            if linked:
+                                candidate_ids.add(str(linked))
+                except Exception:
+                    pass
 
-        return any(_is_admin_role(_normalize_role(data)) for data in candidates)
+        for snap in db.collection("admin_ids").stream():
+            data = snap.to_dict() or {}
+            admin_id = data.get("chat_id") or snap.id
+            if str(admin_id) in candidate_ids:
+                return True
+        return False
     except Exception as exc:
-        logger.warning("Admin role lookup failed for %s: %s", user_id, exc)
+        logger.warning("Admin ids lookup failed for %s: %s", user_id, exc)
         return False
 
 
