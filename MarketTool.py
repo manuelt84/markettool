@@ -115,6 +115,7 @@ import warnings
 from markettool.core.config import AppConfig, load_config
 from markettool.infra.http.session import build_session
 from markettool.infra.fmp import FMPClient, FMPError, FMPPlanNotAllowed, normalize_tf
+from markettool.infra.fmp.ledger import fmp_context, get_fmp_ledger_summary, record_fmp_call
 from markettool.infra.cache.redis_cache import (
     get_indicators_cache,
     get_ohlcv_cache,
@@ -369,9 +370,36 @@ def _fmp_http_get(
     params: Dict[str, Any] | None = None,
     timeout: int | None = None,
     symbol: str | None = None,
+    source: str | None = None,
+    timeframe: str | None = None,
 ) -> requests.Response:
-    with _fmp_http_guard(symbol):
-        return HTTP_SESSION.get(url, params=params, timeout=timeout or APP_CONFIG.http_timeout)
+    start = time.perf_counter()
+    status_code = None
+    response_bytes = 0
+    error = None
+    try:
+        with _fmp_http_guard(symbol):
+            resp = HTTP_SESSION.get(url, params=params, timeout=timeout or APP_CONFIG.http_timeout)
+        status_code = resp.status_code
+        try:
+            response_bytes = len(resp.content or b"")
+        except Exception:
+            response_bytes = 0
+        return resp
+    except Exception as exc:
+        error = exc
+        raise
+    finally:
+        record_fmp_call(
+            url=url,
+            status_code=status_code,
+            elapsed_ms=int((time.perf_counter() - start) * 1000),
+            response_bytes=response_bytes,
+            symbol=symbol,
+            timeframe=timeframe,
+            source=source,
+            error=str(error) if error else None,
+        )
 
 
 # Structured logging
@@ -1674,11 +1702,13 @@ class HistoryManager:
                     try:
                         if _is_intraday(tf):
                             base_tf = self._base_interval_for(tf)
-                            raw = self.client.historical_intraday(symbol, base_tf, from_dt, to_dt)
+                            with fmp_context(source="history_manager", symbol=symbol, timeframe=base_tf):
+                                raw = self.client.historical_intraday(symbol, base_tf, from_dt, to_dt)
                             raw = ensure_utc_index(raw)
                             new_df = self._maybe_resample(raw, tf)
                         else:
-                            raw = self.client.historical_eod(symbol, from_dt, to_dt)
+                            with fmp_context(source="history_manager", symbol=symbol, timeframe=tf):
+                                raw = self.client.historical_eod(symbol, from_dt, to_dt)
                             raw = ensure_utc_index(raw)
                             new_df = self._maybe_resample_eod(raw, tf) if tf in EOD_RESAMPLE_RULE else raw
                     except FMPPlanNotAllowed:
@@ -19777,7 +19807,7 @@ async def reponer_transaccion(user_key: str, numero_transacciones_in=1, origen="
 # =========================
 # Monitoreo: cobro por llamada
 # =========================
-async def _charge_monitoreo_per_call(user_id: str, origen: str = "app") -> Tuple[bool, str]:
+async def _charge_monitoreo_per_call(user_id: str, origen: str = "app", units: int = 1) -> Tuple[bool, str]:
     """
     Cobra 1 transacción por cada llamada a endpoints de monitoreo.
     - Se cobra por cada consulta de activo_temporalidad
@@ -19788,7 +19818,11 @@ async def _charge_monitoreo_per_call(user_id: str, origen: str = "app") -> Tuple
         return False, "user_id es obligatorio"
     if es_administrador(user_id):
         return True, "admin"
-    return await descontar_transaccion(user_id, 1, origen=origen)
+    try:
+        dec = max(1, int(units))
+    except Exception:
+        dec = 1
+    return await descontar_transaccion(user_id, dec, origen=origen)
 
 
 # =========================
@@ -22618,7 +22652,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
         # 1) estable/realtime (forex)
         url1 = f"https://financialmodelingprep.com/stable/quote?symbol={symbol}&apikey={API_KEY}"
         logging.info(f"[Quote-Fallback-v4] URL: {url1}")
-        r = _fmp_http_get(url1, timeout=8, symbol=symbol)
+        r = _fmp_http_get(url1, timeout=8, symbol=symbol, source="quote_stable")
         if r.ok:
             arr = r.json() or []
             if isinstance(arr, list) and arr:
@@ -22627,7 +22661,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
         # 2) fallback v3
         url2 = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={API_KEY}"
         logging.info(f"[Quote-Fallback-v3] URL: {url2}")
-        r = _fmp_http_get(url2, timeout=8, symbol=symbol)
+        r = _fmp_http_get(url2, timeout=8, symbol=symbol, source="quote_v3")
         if r.ok:
             arr = r.json() or []
             if isinstance(arr, list) and arr:
@@ -22645,7 +22679,7 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
         iv = _fmp_interval(tf)
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}?apikey={API_KEY}"
         logging.info(f"[Historical-Fetch] URL: {url}")
-        r = _fmp_http_get(url, timeout=5, symbol=symbol)
+        r = _fmp_http_get(url, timeout=5, symbol=symbol, timeframe=tf, source="live_historical")
         if not r.ok:
             return []
         arr = r.json() or []
@@ -22914,7 +22948,7 @@ def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> l
             "to":   _ms_to_fmp_local(to_ms)
         }
         logging.info(f"[Historical-Range] URL: {url} params: from={params['from']} to={params['to']}")
-        r = _fmp_http_get(url, params=params, timeout=5, symbol=symbol)
+        r = _fmp_http_get(url, params=params, timeout=5, symbol=symbol, timeframe=tf, source="historical_range")
         if not r.ok:
             logging.info(f"[Historical-Range] HTTP {r.status_code}: {r.text[:200]}")
             return []

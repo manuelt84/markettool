@@ -7,11 +7,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 import threading
 import logging
+import time
 import requests
 import pandas as pd
 import pytz
 from zoneinfo import ZoneInfo
 from datetime import datetime
+
+from markettool.infra.fmp.ledger import record_fmp_call
 
 
 class FMPError(Exception):
@@ -77,8 +80,30 @@ class FMPClient:
         params.setdefault("apikey", self.api_key)
         if self.http_session is None:
             self.http_session = requests.Session()
-        with self._http_guard(symbol):
-            r = self.http_session.get(url, params=params, timeout=self.timeout)
+        start = time.perf_counter()
+        status_code = None
+        response_bytes = 0
+        error = None
+        try:
+            with self._http_guard(symbol):
+                r = self.http_session.get(url, params=params, timeout=self.timeout)
+            status_code = r.status_code
+            try:
+                response_bytes = len(r.content or b"")
+            except Exception:
+                response_bytes = 0
+        except Exception as exc:
+            error = exc
+            raise
+        finally:
+            record_fmp_call(
+                url=url,
+                status_code=status_code,
+                elapsed_ms=int((time.perf_counter() - start) * 1000),
+                response_bytes=response_bytes,
+                symbol=symbol,
+                error=str(error) if error else None,
+            )
         if r.status_code == 402:
             raise FMPPlanNotAllowed(f"402 Payment Required: {url}")
         return r

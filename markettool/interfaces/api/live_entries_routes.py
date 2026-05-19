@@ -22,7 +22,9 @@ import os
 import queue
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -789,6 +791,40 @@ def _market_pool_set_cooldown(redis_client, symbol: str, tf: str, seconds: int |
     _MEM_MARKET_POOL_COOLDOWN[key] = time.time() + ttl
 
 
+_CRYPTO_BASES = {
+    "ADA", "BCH", "BNB", "BTC", "DOGE", "DOT", "ETH", "LINK", "LTC",
+    "MATIC", "SOL", "TRX", "XLM", "XRP",
+}
+_FX_CODES = {
+    "AUD", "CAD", "CHF", "EUR", "GBP", "JPY", "MXN", "NOK", "NZD",
+    "SEK", "USD", "ZAR",
+}
+
+
+def _market_pool_symbol_market_open(symbol: str) -> bool:
+    if str(os.getenv("MARKET_POOL_RESPECT_MARKET_HOURS", "true")).strip().lower() not in {"1", "true", "yes", "on"}:
+        return True
+    sym = str(symbol or "").upper().replace("/", "").replace("-", "")
+    if len(sym) >= 6 and sym[-3:] == "USD" and sym[:-3] in _CRYPTO_BASES:
+        return True
+    now_utc = datetime.now(timezone.utc)
+    try:
+        now_ny = now_utc.astimezone(ZoneInfo(os.getenv("FMP_INTRADAY_SOURCE_TZ", "America/New_York")))
+    except Exception:
+        now_ny = now_utc
+    weekday = now_ny.weekday()  # Monday=0, Sunday=6
+    hour = now_ny.hour + now_ny.minute / 60
+    if weekday == 5:
+        return False
+    if weekday == 6:
+        return hour >= 17
+    if weekday == 4:
+        return hour < 17
+    if len(sym) == 6 and sym[:3] in _FX_CODES and sym[3:] in _FX_CODES:
+        return True
+    return weekday < 5
+
+
 async def _load_from_market_pool(
     *,
     redis_client,
@@ -857,6 +893,9 @@ async def _refresh_market_pool_symbol_tf(
 ) -> bool:
     existing = await asyncio.to_thread(_load_market_pool_series, redis_client, symbol, tf, tf_ms_fn)
     if existing:
+        return False
+    if not _market_pool_symbol_market_open(symbol):
+        await asyncio.to_thread(_market_pool_set_cooldown, redis_client, symbol, tf, 3600, tf_ms_fn)
         return False
     if await asyncio.to_thread(_market_pool_in_cooldown, redis_client, symbol, tf):
         return False
@@ -956,8 +995,12 @@ def _ensure_market_pool_started(
 ) -> None:
     global _MARKET_POOL_TASK
     enabled = str(os.getenv("MARKET_POOL_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    producer_enabled = str(os.getenv("MARKET_POOL_PRODUCER_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
     if not enabled:
         logger.info("[MarketPool] disabled by MARKET_POOL_ENABLED")
+        return
+    if not producer_enabled:
+        logger.info("[MarketPool] producer disabled by MARKET_POOL_PRODUCER_ENABLED")
         return
     loop_kwargs = dict(
         redis_client=redis_client,
@@ -1023,14 +1066,15 @@ async def _charge_live_data_once(
             return True, "already_billed"
         _MEM_BILLING_KEYS[key] = now + ttl_s
 
-    ok, msg = await charge_monitoreo_per_call(user_id, origen="app")
+    units = _live_data_units_for_source(source)
+    ok, msg = await charge_monitoreo_per_call(user_id, origen="app", units=units)
     if ok:
         if redis_client is not None:
             try:
                 redis_client.setex(key, ttl_s, "charged")
             except Exception:
                 pass
-        logger.info("[LiveBilling] charged user=%s %s/%s source=%s bucket=%s", user_id, symbol, tf, source, bucket_ms)
+        logger.info("[LiveBilling] charged user=%s %s/%s source=%s units=%d bucket=%s", user_id, symbol, tf, source, units, bucket_ms)
         return True, msg
 
     if redis_client is not None:
@@ -1042,6 +1086,26 @@ async def _charge_live_data_once(
         _MEM_BILLING_KEYS.pop(key, None)
     logger.warning("[LiveBilling] blocked user=%s %s/%s source=%s: %s", user_id, symbol, tf, source, msg)
     return False, msg
+
+
+def _live_data_units_for_source(source: str) -> int:
+    source_norm = str(source or "").lower()
+    if source_norm == "fmp":
+        env_key = "LIVE_DATA_UNITS_FMP"
+        default = "3"
+    elif "derived" in source_norm:
+        env_key = "LIVE_DATA_UNITS_DERIVED"
+        default = "1"
+    elif "market_pool" in source_norm:
+        env_key = "LIVE_DATA_UNITS_POOL"
+        default = "1"
+    else:
+        env_key = "LIVE_DATA_UNITS_CACHE"
+        default = "1"
+    try:
+        return max(1, int(os.getenv(env_key, default)))
+    except Exception:
+        return max(1, int(default))
 
 
 def _tf_to_resample_rule(tf: str) -> str | None:

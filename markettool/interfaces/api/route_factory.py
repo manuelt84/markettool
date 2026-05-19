@@ -24,6 +24,7 @@ from markettool.interfaces.api.ponderacion_history import PonderacionHistory
 from markettool.interfaces.api.ponderacion_alerts import PonderacionAlert
 from markettool.interfaces.api.payment_routes import register_payment_routes
 from markettool.interfaces.api.live_entries_routes import register_live_entries_routes
+from markettool.interfaces.api.fmp_ledger_routes import register_fmp_ledger_routes
 # backtest_routes removed — backtest is now 100% client-side
 
 if TYPE_CHECKING:
@@ -106,6 +107,7 @@ def register_all_routes(
     register_signal_validation_routes(app)
     register_mt5_routes(app)
     register_bot_inject_routes(app)
+    register_fmp_ledger_routes(app)
 
     # Ponderacion API routes
     ponderacion_cache = _PonderacionCacheAdapter(logger=logger)
