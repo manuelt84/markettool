@@ -147,10 +147,10 @@ def validate_data_freshness(
                     last_time = pd.Timestamp(last_time).tz_localize('UTC', ambiguous='raise', nonexistent='raise')
         else:
             # Assume it's a timestamp
-            last_time = pd.Timestamp(data_timestamp, unit='s', tz='UTC') if data_timestamp else pd.Timestamp.utcnow(tz='UTC')
+            last_time = pd.Timestamp(data_timestamp, unit='s', tz='UTC') if data_timestamp else pd.Timestamp.now(tz='UTC')
         
         # Current time
-        now = pd.Timestamp.utcnow(tz='UTC')
+        now = pd.Timestamp.now(tz='UTC')
         
         # Calculate age
         age = (now - last_time).total_seconds()
