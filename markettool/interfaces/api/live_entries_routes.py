@@ -173,7 +173,9 @@ def _time_bucket(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, (int, float)):
-        return str(int(value)) if value > 0 else ""
+        if value <= 0:
+            return ""
+        return str(int(value if value > 1e12 else value * 1000))
     raw = str(value).strip()
     if not raw:
         return ""
@@ -409,7 +411,7 @@ def _get_entries_from_redis(redis_client, exec_id: str, symbol: str, tfs: list[s
         entries = _dedupe_entries([e for e in entries if not _is_entry_expired(e, tf, now_ms)])
         _persist_entries(redis_client, key, entries, ttl_s)
         if since_ts:
-            entries = [e for e in entries if e.get("timestamp", 0) > since_ts]
+            entries = [e for e in entries if _entry_created_ms(e) > since_ts]
         result.extend(entries)
     return _dedupe_entries(result)
 
