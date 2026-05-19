@@ -143,6 +143,50 @@ def _billable_units_for_usage_kind(usage_kind: str, *, ok: bool, rows: int | Non
     return max(0, _env_int(env_name, default)), ""
 
 
+def get_fmp_usage_policy() -> dict[str, Any]:
+    """Return the active FMP commercial usage policy.
+
+    This is operational metadata for dashboards/admins. It intentionally does
+    not include secrets and mirrors the same env/default mapping used when
+    recording calls.
+    """
+    mapping = {
+        "monitoring_live_refresh": ("FMP_USAGE_UNITS_MONITORING_LIVE_REFRESH", 0, "Live monitoring refresh"),
+        "monitoring_history_refresh": ("FMP_USAGE_UNITS_MONITORING_HISTORY_REFRESH", 0, "Monitoring history/gap refresh"),
+        "market_pool_refresh": ("FMP_USAGE_UNITS_MARKET_POOL_REFRESH", 0, "Central MarketPool refresh"),
+        "historical_backfill": ("FMP_USAGE_UNITS_HISTORICAL_BACKFILL", 0, "Historical cache/backfill"),
+        "asset_analysis_basic": ("FMP_USAGE_UNITS_ASSET_ANALYSIS_BASIC", 1, "Basic asset analysis"),
+        "asset_analysis_full": ("FMP_USAGE_UNITS_ASSET_ANALYSIS_FULL", 5, "Full/premium asset analysis"),
+        "bot_context_analysis": ("FMP_USAGE_UNITS_BOT_CONTEXT_ANALYSIS", 2, "Bot contextual analysis"),
+        "market_quote": ("FMP_USAGE_UNITS_MARKET_QUOTE", 0, "Single quote lookup"),
+        "unknown": ("FMP_USAGE_UNITS_UNKNOWN", 1, "Unclassified FMP call"),
+    }
+    usage_kinds: dict[str, dict[str, Any]] = {}
+    for usage_kind, (env_name, default, label) in mapping.items():
+        usage_kinds[usage_kind] = {
+            "label": label,
+            "env": env_name,
+            "default_units": default,
+            "active_units": max(0, _env_int(env_name, default)),
+        }
+    return {
+        "enabled": _enabled(),
+        "namespace": _namespace(),
+        "redis_url_configured": bool(_redis_url()),
+        "ledger_day_tz": (
+            os.getenv("FMP_LEDGER_DAY_TZ")
+            or os.getenv("MARKET_TIMEZONE")
+            or os.getenv("FMP_DAILY_SOURCE_TZ")
+            or "America/New_York"
+        ),
+        "refunds": {
+            "provider_error": "0 units when FMP/network returns an error",
+            "empty_response": "0 units when FMP returns a successful empty payload",
+        },
+        "usage_kinds": usage_kinds,
+    }
+
+
 def _ledger_now() -> datetime:
     tz_name = (
         os.getenv("FMP_LEDGER_DAY_TZ")

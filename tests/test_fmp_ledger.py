@@ -1,7 +1,12 @@
 import os
 import unittest
 
-from markettool.infra.fmp.ledger import fmp_context, get_fmp_ledger_summary, record_fmp_call
+from markettool.infra.fmp.ledger import (
+    fmp_context,
+    get_fmp_ledger_summary,
+    get_fmp_usage_policy,
+    record_fmp_call,
+)
 
 
 class FmpLedgerTests(unittest.TestCase):
@@ -42,6 +47,17 @@ class FmpLedgerTests(unittest.TestCase):
 
         self.assertEqual(recent["billable_units"], 0)
         self.assertEqual(recent["refund_reason"], "empty_response")
+
+    def test_usage_policy_exposes_active_env_units(self):
+        os.environ["FMP_USAGE_UNITS_HISTORICAL_BACKFILL"] = "0"
+        os.environ["FMP_USAGE_UNITS_UNKNOWN"] = "3"
+
+        policy = get_fmp_usage_policy()
+
+        self.assertTrue(policy["enabled"])
+        self.assertEqual(policy["usage_kinds"]["historical_backfill"]["active_units"], 0)
+        self.assertEqual(policy["usage_kinds"]["unknown"]["active_units"], 3)
+        self.assertNotIn("apikey", str(policy).lower())
 
 
 if __name__ == "__main__":

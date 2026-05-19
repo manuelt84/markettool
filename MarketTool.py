@@ -377,6 +377,7 @@ def _fmp_http_get(
     status_code = None
     response_bytes = 0
     error = None
+    rows = None
     try:
         with _fmp_http_guard(symbol):
             resp = HTTP_SESSION.get(url, params=params, timeout=timeout or APP_CONFIG.http_timeout)
@@ -385,6 +386,18 @@ def _fmp_http_get(
             response_bytes = len(resp.content or b"")
         except Exception:
             response_bytes = 0
+        try:
+            payload = resp.json()
+            if isinstance(payload, list):
+                rows = len(payload)
+            elif isinstance(payload, dict):
+                historical = payload.get("historical")
+                if isinstance(historical, list):
+                    rows = len(historical)
+                else:
+                    rows = 1 if payload else 0
+        except Exception:
+            rows = None
         return resp
     except Exception as exc:
         error = exc
@@ -397,6 +410,7 @@ def _fmp_http_get(
             response_bytes=response_bytes,
             symbol=symbol,
             timeframe=timeframe,
+            rows=rows,
             source=source,
             error=str(error) if error else None,
         )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from flask import jsonify, request
 
-from markettool.infra.fmp.ledger import get_fmp_ledger_summary
+from markettool.infra.fmp.ledger import get_fmp_ledger_summary, get_fmp_usage_policy
 
 
 def _redact_private_fields(payload: dict) -> dict:
@@ -30,6 +30,10 @@ def register_fmp_ledger_routes(app) -> None:
         except Exception:
             limit_recent = 20
         return jsonify(_redact_private_fields(get_fmp_ledger_summary(limit_recent=limit_recent))), 200
+
+    @app.route("/api/fmp-ledger/policy", methods=["GET"])
+    def fmp_ledger_policy():
+        return jsonify(get_fmp_usage_policy()), 200
 
 
 __all__ = ["register_fmp_ledger_routes"]
