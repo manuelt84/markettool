@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Tuple
@@ -31,6 +32,41 @@ RESAMPLE_PLAN: Dict[str, Tuple[str, str]] = {
 }
 
 EOD_RESAMPLE_RULE: Dict[str, str] = {"1week": "W", "1month": "M"}
+
+DEFAULT_FMP_WINDOWS: Dict[str, int] = {
+    "1min": 2400,
+    "5min": 2000,
+    "15min": 1600,
+    "30min": 1600,
+    "1hour": 1200,
+    "4hour": 900,
+    "1day": 800,
+    "1week": 520,
+}
+
+
+def _parse_initial_fmp_windows(defaults: Dict[str, int]) -> Dict[str, int]:
+    """Env override: HISTORY_INITIAL_FMP_WINDOWS='1min:240,5min:288,1hour:240'."""
+    out = dict(defaults)
+    raw = str(os.getenv("HISTORY_INITIAL_FMP_WINDOWS", "")).strip()
+    if not raw:
+        return out
+    for token in raw.split(","):
+        token = token.strip()
+        if not token or ":" not in token:
+            continue
+        key, value = token.split(":", 1)
+        try:
+            tf = normalize_tf(key.strip())
+            bars = int(value.strip())
+            if tf and bars > 0:
+                out[tf] = bars
+        except Exception:
+            continue
+    return out
+
+
+INITIAL_FMP_WINDOWS: Dict[str, int] = _parse_initial_fmp_windows(DEFAULT_FMP_WINDOWS)
 
 
 @dataclass
@@ -120,6 +156,18 @@ class HistoryManager:
             "1week": timedelta(weeks=units),
             "1month": timedelta(days=30 * units),
         }.get(tf, timedelta(days=units))
+
+    def _initial_fetch_window_bars(self, tf: str, cfg: HistoryConfig) -> int:
+        tf_norm = normalize_tf(tf)
+        try:
+            if cfg.fmp_window and int(cfg.fmp_window) > 0:
+                return int(cfg.fmp_window)
+        except Exception:
+            pass
+        try:
+            return int(INITIAL_FMP_WINDOWS.get(tf_norm) or INITIAL_FMP_WINDOWS.get(self._base_interval_for(tf_norm)) or 500)
+        except Exception:
+            return 500
 
     def _maybe_resample(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
         tf = normalize_tf(tf)
@@ -221,7 +269,16 @@ class HistoryManager:
                 from_dt = from_dt.astimezone(pytz.UTC)
             logger.info(f"[HIST] Incremental fetch override: from_timestamp={from_dt} for {symbol}/{tf}")
         elif cache_df.empty:
-            from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
+            base_tf = self._base_interval_for(tf)
+            initial_bars = self._initial_fetch_window_bars(base_tf, cfg)
+            from_dt = now - self._timedelta_for(base_tf, initial_bars)
+            logger.info(
+                "[HIST] %s/%s no cache; initial FMP window=%d bars from=%s",
+                symbol,
+                tf,
+                initial_bars,
+                from_dt.isoformat(),
+            )
         else:
             try:
                 last = cache_df.index[-1]
@@ -239,9 +296,28 @@ class HistoryManager:
                 from_dt = last + self._timedelta_for(base_tf, 1)
             except Exception as idx_err:
                 logger.warning("[HIST][ERROR] Index parsing failed for %s/%s: %s. Using fallback (1900).", symbol, tf, idx_err)
-                from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
+                base_tf = self._base_interval_for(tf)
+                initial_bars = self._initial_fetch_window_bars(base_tf, cfg)
+                from_dt = now - self._timedelta_for(base_tf, initial_bars)
 
         to_dt = now
+        if self._is_intraday(tf):
+            try:
+                base_tf = self._base_interval_for(tf)
+                initial_bars = self._initial_fetch_window_bars(base_tf, cfg)
+                min_from_dt = now - self._timedelta_for(base_tf, initial_bars)
+                if from_dt < min_from_dt:
+                    logger.warning(
+                        "[HIST] %s/%s clamped stale/ancient FMP range from=%s to=%s window=%d bars",
+                        symbol,
+                        tf,
+                        from_dt.isoformat(),
+                        min_from_dt.isoformat(),
+                        initial_bars,
+                    )
+                    from_dt = min_from_dt
+            except Exception:
+                pass
         new_df = pd.DataFrame()
         if cfg.allow_refresh and from_dt < to_dt:
             try:
