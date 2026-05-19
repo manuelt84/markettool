@@ -28,6 +28,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from markettool.infra.fmp.ledger import fmp_context
+
 logger = logging.getLogger("MarketTool")
 
 # ─────────────────────────────────────────────
@@ -928,7 +930,8 @@ async def _refresh_market_pool_symbol_tf(
         bars = int(os.getenv("MARKET_POOL_FETCH_BARS", "180"))
         from_ms = closed_end - max(MIN_CANDLES + 10, bars) * tf_ms_val
         await asyncio.to_thread(_market_pool_set_cooldown, redis_client, symbol, tf, None, tf_ms_fn)
-        hist = await asyncio.to_thread(fetch_historical_range, symbol, tf, from_ms, closed_end)
+        with fmp_context(usage_kind="market_pool_refresh", source="market_pool", symbol=symbol, timeframe=tf):
+            hist = await asyncio.to_thread(fetch_historical_range, symbol, tf, from_ms, closed_end)
         if not hist:
             return False
         await asyncio.to_thread(_store_market_pool_series, redis_client, symbol, tf, hist)
@@ -1615,7 +1618,15 @@ async def _live_worker(
                 closed_end = current_closed_bucket_start(norm) - tf_ms_val
                 from_ms = closed_end - 300 * tf_ms_val
                 try:
-                    hist = await asyncio.to_thread(fetch_historical_range, symbol, norm, from_ms, closed_end)
+                    with fmp_context(
+                        usage_kind="monitoring_live_refresh",
+                        source="live_entries_fallback",
+                        user_id=user_id,
+                        exec_id=exec_id,
+                        symbol=symbol,
+                        timeframe=norm,
+                    ):
+                        hist = await asyncio.to_thread(fetch_historical_range, symbol, norm, from_ms, closed_end)
                     if hist:
                         series_ms = hist
                         data_source = "fmp"

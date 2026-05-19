@@ -106,6 +106,43 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _default_usage_kind(endpoint: str) -> str:
+    if endpoint.startswith("historical-chart"):
+        return "historical_backfill"
+    if endpoint in {"historical-price-full"}:
+        return "historical_backfill"
+    if endpoint in {"quote"}:
+        return "market_quote"
+    return "unknown"
+
+
+def _billable_units_for_usage_kind(usage_kind: str, *, ok: bool, rows: int | None) -> tuple[int, str]:
+    if not ok:
+        return 0, "provider_error"
+    if rows is not None and rows <= 0:
+        return 0, "empty_response"
+    mapping = {
+        "monitoring_live_refresh": ("FMP_USAGE_UNITS_MONITORING_LIVE_REFRESH", 0),
+        "monitoring_history_refresh": ("FMP_USAGE_UNITS_MONITORING_HISTORY_REFRESH", 0),
+        "market_pool_refresh": ("FMP_USAGE_UNITS_MARKET_POOL_REFRESH", 0),
+        "historical_backfill": ("FMP_USAGE_UNITS_HISTORICAL_BACKFILL", 0),
+        "asset_analysis_basic": ("FMP_USAGE_UNITS_ASSET_ANALYSIS_BASIC", 1),
+        "asset_analysis_full": ("FMP_USAGE_UNITS_ASSET_ANALYSIS_FULL", 5),
+        "bot_context_analysis": ("FMP_USAGE_UNITS_BOT_CONTEXT_ANALYSIS", 2),
+        "market_quote": ("FMP_USAGE_UNITS_MARKET_QUOTE", 0),
+        "unknown": ("FMP_USAGE_UNITS_UNKNOWN", 1),
+    }
+    env_name, default = mapping.get(usage_kind, mapping["unknown"])
+    return max(0, _env_int(env_name, default)), ""
+
+
 def _ledger_now() -> datetime:
     tz_name = (
         os.getenv("FMP_LEDGER_DAY_TZ")
@@ -153,6 +190,9 @@ def record_fmp_call(
     ctx = current_context()
     endpoint = _endpoint_from_url(url)
     status = _safe_int(status_code, 0)
+    ok = 200 <= status < 400
+    usage_kind = str(ctx.get("usage_kind") or _default_usage_kind(endpoint))
+    billable_units, refund_reason = _billable_units_for_usage_kind(usage_kind, ok=ok, rows=rows)
     byte_count = max(0, _safe_int(response_bytes, 0))
     now_local = _ledger_now()
     now_utc = datetime.now(timezone.utc)
@@ -166,7 +206,10 @@ def record_fmp_call(
         "endpoint": endpoint,
         "url": _sanitize_url(url),
         "status": status,
-        "ok": 200 <= status < 400,
+        "ok": ok,
+        "usage_kind": usage_kind,
+        "billable_units": billable_units,
+        "refund_reason": refund_reason,
         "elapsed_ms": max(0, _safe_int(elapsed_ms, 0)),
         "bytes": byte_count,
         "symbol": (symbol or ctx.get("symbol") or "").upper(),
@@ -192,12 +235,17 @@ def record_fmp_call(
             increments: dict[str, int] = {
                 "calls": 1,
                 "bytes": byte_count,
+                "billable_units": billable_units,
                 f"status:{status}": 1,
                 f"endpoint:{endpoint}:calls": 1,
                 f"endpoint:{endpoint}:bytes": byte_count,
+                f"usage_kind:{usage_kind}:calls": 1,
+                f"usage_kind:{usage_kind}:billable_units": billable_units,
             }
             if not rec["ok"] or rec["error"]:
                 increments["errors"] = 1
+            if refund_reason:
+                increments[f"refund:{refund_reason}:calls"] = 1
             if rec["source"]:
                 increments[f"source:{rec['source']}:calls"] = 1
                 increments[f"source:{rec['source']}:bytes"] = byte_count
@@ -219,6 +267,7 @@ def record_fmp_call(
     with _LOCAL_LOCK:
         _LOCAL_SUMMARY["calls"] = _LOCAL_SUMMARY.get("calls", 0) + 1
         _LOCAL_SUMMARY["bytes"] = _LOCAL_SUMMARY.get("bytes", 0) + byte_count
+        _LOCAL_SUMMARY["billable_units"] = _LOCAL_SUMMARY.get("billable_units", 0) + billable_units
         if not rec["ok"] or rec["error"]:
             _LOCAL_SUMMARY["errors"] = _LOCAL_SUMMARY.get("errors", 0) + 1
         _LOCAL_RECENT.insert(0, rec)

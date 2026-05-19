@@ -13,6 +13,7 @@ from flask import jsonify, request
 
 from markettool.application.use_cases.legacy import LegacyMonitoreoUseCase
 from markettool.core.cache_config import get_freshness_requirement_for_timeframe
+from markettool.infra.fmp.ledger import fmp_context
 
 
 def register_monitoreo_routes(app, *, services) -> None:
@@ -317,13 +318,14 @@ def register_monitoreo_routes(app, *, services) -> None:
                 from_eff, to_eff = to_eff, from_eff
 
             fetch_to = min(to_eff + tf_value_ms, closed_end + tf_value_ms)
-            hist_payload = await asyncio.to_thread(
-                fetch_historical_range,
-                symbol,
-                tf_value,
-                from_eff,
-                fetch_to,
-            )
+            with fmp_context(usage_kind="monitoring_history_refresh", source="monitoreo_1min_refresh", symbol=symbol, timeframe=tf_value):
+                hist_payload = await asyncio.to_thread(
+                    fetch_historical_range,
+                    symbol,
+                    tf_value,
+                    from_eff,
+                    fetch_to,
+                )
             hist_series = _history_payload_to_series_ms(hist_payload, tf_value)
             if not hist_series:
                 return False
@@ -512,13 +514,14 @@ def register_monitoreo_routes(app, *, services) -> None:
                     hist_from_ms = closed_end - (bars_target - 1) * tf_value_ms
                     hist_to_ms = min(closed_end + tf_value_ms, int(time.time() * 1000))
 
-                    hist_payload = await asyncio.to_thread(
-                        fetch_historical_range,
-                        symbol,
-                        tf_value,
-                        hist_from_ms,
-                        hist_to_ms,
-                    )
+                    with fmp_context(usage_kind="monitoring_history_refresh", source="monitoreo_cold_start", symbol=symbol, timeframe=tf_value):
+                        hist_payload = await asyncio.to_thread(
+                            fetch_historical_range,
+                            symbol,
+                            tf_value,
+                            hist_from_ms,
+                            hist_to_ms,
+                        )
 
                     hist_series = _history_payload_to_series_ms(hist_payload, tf_value)
                     if hist_series:
@@ -865,9 +868,10 @@ def register_monitoreo_routes(app, *, services) -> None:
 
                         fetch_to = min(to_eff + tf_ms_value, closed_end + tf_ms_value)
 
-                        rng = await asyncio.to_thread(
-                            fetch_historical_range, symbol, timeframe, from_eff, fetch_to
-                        )
+                        with fmp_context(usage_kind="monitoring_history_refresh", source="monitoreo_gapfill", symbol=symbol, timeframe=timeframe):
+                            rng = await asyncio.to_thread(
+                                fetch_historical_range, symbol, timeframe, from_eff, fetch_to
+                            )
                         gapfill_meta["fetched"] = len(rng or [])
 
                         if rng:
@@ -1142,9 +1146,10 @@ def register_monitoreo_routes(app, *, services) -> None:
 
                             fetch_to = min(to_eff + tf_ms_value, closed_end + tf_ms_value)
 
-                            rng = await asyncio.to_thread(
-                                fetch_historical_range, symbol, timeframe, from_eff, fetch_to
-                            )
+                            with fmp_context(usage_kind="monitoring_history_refresh", source="monitoreo_gapfill", symbol=symbol, timeframe=timeframe):
+                                rng = await asyncio.to_thread(
+                                    fetch_historical_range, symbol, timeframe, from_eff, fetch_to
+                                )
                             gapfill_meta["fetched"] = len(rng or [])
 
                             if rng:
@@ -1436,9 +1441,10 @@ def register_monitoreo_routes(app, *, services) -> None:
             from_ms      = bucket_start - tf_ms_value               # one bar back
             to_ms        = now_ms + tf_ms_value                     # a bit ahead
 
-            candles = await asyncio.to_thread(
-                fetch_historical_range, symbol, timeframe, from_ms, to_ms
-            )
+            with fmp_context(usage_kind="monitoring_live_refresh", source="live_candle", symbol=symbol, timeframe=timeframe):
+                candles = await asyncio.to_thread(
+                    fetch_historical_range, symbol, timeframe, from_ms, to_ms
+                )
 
             if not candles:
                 _lc_cache[cache_key] = {"data": None, "ts": now}

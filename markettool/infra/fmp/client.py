@@ -88,6 +88,7 @@ class FMPClient:
         status_code = None
         response_bytes = 0
         error = None
+        rows = None
         try:
             with self._http_guard(symbol):
                 r = self.http_session.get(url, params=params, timeout=self.timeout)
@@ -96,6 +97,18 @@ class FMPClient:
                 response_bytes = len(r.content or b"")
             except Exception:
                 response_bytes = 0
+            try:
+                payload = r.json()
+                if isinstance(payload, list):
+                    rows = len(payload)
+                elif isinstance(payload, dict):
+                    historical = payload.get("historical")
+                    if isinstance(historical, list):
+                        rows = len(historical)
+                    else:
+                        rows = 1 if payload else 0
+            except Exception:
+                rows = None
         except Exception as exc:
             error = exc
             raise
@@ -106,6 +119,7 @@ class FMPClient:
                 elapsed_ms=int((time.perf_counter() - start) * 1000),
                 response_bytes=response_bytes,
                 symbol=symbol,
+                rows=rows,
                 error=str(error) if error else None,
             )
         if r.status_code == 402:
