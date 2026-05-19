@@ -480,28 +480,6 @@ DEFAULT_FMP_WINDOWS: Dict[str, int] = {
     "1min":  2400, "5min": 2000, "15min": 1600, "30min": 1600,
     "1hour": 1600, "4hour": 2200, "1day": 2000, "1week": 520, "1month": 240
 }
-
-def _parse_initial_fmp_windows(defaults: Dict[str, int]) -> Dict[str, int]:
-    """Env override: HISTORY_INITIAL_FMP_WINDOWS='1min:240,5min:288,1hour:240'."""
-    out = dict(defaults)
-    raw = str(os.getenv("HISTORY_INITIAL_FMP_WINDOWS", "")).strip()
-    if not raw:
-        return out
-    for token in raw.split(","):
-        token = token.strip()
-        if not token or ":" not in token:
-            continue
-        key, value = token.split(":", 1)
-        try:
-            tf = normalize_tf(key.strip())
-            bars = int(value.strip())
-            if tf and bars > 0:
-                out[tf] = bars
-        except Exception:
-            continue
-    return out
-
-INITIAL_FMP_WINDOWS: Dict[str, int] = _parse_initial_fmp_windows(DEFAULT_FMP_WINDOWS)
 RESAMPLE_PLAN: Dict[str, Tuple[str, str]] = {
     "15min": ("5min",  "15min"),
     "30min": ("5min",  "30min"),
@@ -1599,18 +1577,6 @@ class HistoryManager:
             "1month": timedelta(days=30*units),
         }.get(tf, timedelta(days=units))
 
-    def _initial_fetch_window_bars(self, tf: str, cfg: HistoryConfig) -> int:
-        tf_norm = normalize_tf(tf)
-        try:
-            if cfg.fmp_window and int(cfg.fmp_window) > 0:
-                return int(cfg.fmp_window)
-        except Exception:
-            pass
-        try:
-            return int(INITIAL_FMP_WINDOWS.get(tf_norm) or INITIAL_FMP_WINDOWS.get(self._base_interval_for(tf_norm)) or 500)
-        except Exception:
-            return 500
-
     def _maybe_resample(self, df: pd.DataFrame, tf: str) -> pd.DataFrame:
         tf = normalize_tf(tf)
         if df is None or df.empty: return df
@@ -1702,16 +1668,8 @@ class HistoryManager:
         now = utc_now()
         allow_refresh = cfg.allow_refresh
         if cache_df.empty:
-            base_tf = self._base_interval_for(tf)
-            initial_bars = self._initial_fetch_window_bars(base_tf, cfg)
-            from_dt = now - self._timedelta_for(base_tf, initial_bars)
-            logger.info(
-                "[CACHE-FIRST] %s/%s: no local cache, initial FMP window=%d bars from=%s",
-                symbol,
-                tf,
-                initial_bars,
-                from_dt.isoformat(),
-            )
+            from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
+            logger.info(f"[CACHE-FIRST] {symbol}/{tf}: no local cache, will fetch from FMP")
         else:
             try:
                 last = cache_df.index[-1]
@@ -1760,28 +1718,9 @@ class HistoryManager:
                 from_dt = last + self._timedelta_for(base_tf, 1)
             except Exception as idx_err:
                 logging.warning(f"[HIST][ERROR] Index parsing failed for {symbol}/{tf}: {idx_err}. Using fallback (1900).")
-                base_tf = self._base_interval_for(tf)
-                initial_bars = self._initial_fetch_window_bars(base_tf, cfg)
-                from_dt = now - self._timedelta_for(base_tf, initial_bars)
+                from_dt = datetime(1900, 1, 1, tzinfo=pytz.UTC)
 
         to_dt = now
-        if _is_intraday(tf):
-            try:
-                base_tf = self._base_interval_for(tf)
-                initial_bars = self._initial_fetch_window_bars(base_tf, cfg)
-                min_from_dt = now - self._timedelta_for(base_tf, initial_bars)
-                if from_dt < min_from_dt:
-                    logger.warning(
-                        "[CACHE-FIRST] %s/%s: clamped stale/ancient FMP range from=%s to=%s window=%d bars",
-                        symbol,
-                        tf,
-                        from_dt.isoformat(),
-                        min_from_dt.isoformat(),
-                        initial_bars,
-                    )
-                    from_dt = min_from_dt
-            except Exception:
-                pass
         new_df = pd.DataFrame()
         if allow_refresh and from_dt < to_dt:
             lock = self._get_fmp_lock(symbol, tf)

@@ -1374,12 +1374,12 @@ def register_monitoreo_routes(app, *, services) -> None:
     # second reuse the last FMP response instead of hitting the API again.
     _lc_cache: dict = {}
     _lc_cache_ttl = {
-        "1min":  int(os.getenv("LIVE_CANDLE_CACHE_TTL_1MIN_SECONDS", "20")),
-        "5min":  int(os.getenv("LIVE_CANDLE_CACHE_TTL_5MIN_SECONDS", "30")),
-        "15min": int(os.getenv("LIVE_CANDLE_CACHE_TTL_15MIN_SECONDS", "45")),
-        "30min": int(os.getenv("LIVE_CANDLE_CACHE_TTL_30MIN_SECONDS", "60")),
-        "1hour": int(os.getenv("LIVE_CANDLE_CACHE_TTL_1HOUR_SECONDS", "120")),
-        "4hour": int(os.getenv("LIVE_CANDLE_CACHE_TTL_4HOUR_SECONDS", "180")),
+        "1min":  5,
+        "5min":  10,
+        "15min": 20,
+        "30min": 30,
+        "1hour": 60,
+        "4hour": 120,
     }
 
     @app.route("/monitoreo/live-candle", methods=["GET"])

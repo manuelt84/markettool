@@ -95,7 +95,6 @@ _MEM_BILLING_KEYS: dict[str, float] = {}
 _MEM_MARKET_POOL: dict[str, dict] = {}
 _MEM_MARKET_POOL_RATE: dict[str, int] = {}
 _MEM_MARKET_POOL_COOLDOWN: dict[str, float] = {}
-_MEM_MARKET_POOL_LOG_LAST: dict[str, float] = {}
 _MARKET_POOL_TASK: asyncio.Task | None = None
 _SUBSCRIBERS: dict[str, list[queue.Queue]] = {}
 _SUBSCRIBERS_LOCK = threading.Lock()
@@ -156,34 +155,6 @@ def _redis_market_pool_cooldown_key(symbol: str, tf: str) -> str:
 
 def _redis_market_pool_rate_key() -> str:
     return f"market_pool:fmp_calls:{int(time.time() // 60)}"
-
-
-def _market_pool_logs_enabled() -> bool:
-    return str(os.getenv("MARKET_POOL_VERBOSE_LOGS", "false")).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _market_pool_log_interval_s() -> int:
-    try:
-        return max(1, int(os.getenv("MARKET_POOL_LOG_INTERVAL_SECONDS", "60")))
-    except Exception:
-        return 60
-
-
-def _market_pool_log(key: str, level: int, message: str, *args) -> None:
-    """Sampled operational logging for the central market pool.
-
-    Keep this opt-in because live-entry beats can be frequent. Repeated events
-    for the same symbol/TF/reason are emitted at most once per configured window.
-    """
-    if not _market_pool_logs_enabled():
-        return
-    now = time.time()
-    interval = _market_pool_log_interval_s()
-    last = float(_MEM_MARKET_POOL_LOG_LAST.get(key, 0) or 0)
-    if now - last < interval:
-        return
-    _MEM_MARKET_POOL_LOG_LAST[key] = now
-    logger.log(level, message, *args)
 
 
 def _event_id(exec_id: str, symbol: str, tf: str, ts_ms: int) -> str:
@@ -715,35 +686,12 @@ def _market_pool_fresh(series_ms: list[dict], tf: str, tf_ms_fn) -> bool:
     return int(time.time() * 1000) - last_ms <= max_age
 
 
-def _market_pool_last_age_s(series_ms: list[dict]) -> float:
-    if not series_ms:
-        return float("inf")
-    last = series_ms[-1]
-    raw_ts = last.get("t") or last.get("timestamp") or 0
-    try:
-        last_ms = int(raw_ts if float(raw_ts) > 1e12 else float(raw_ts) * 1000)
-    except Exception:
-        return float("inf")
-    return max(0.0, (int(time.time() * 1000) - last_ms) / 1000)
-
-
-def _market_pool_serve_stale_during_cooldown() -> bool:
-    return os.getenv("MARKET_POOL_SERVE_STALE_DURING_COOLDOWN", "true").lower() in {"1", "true", "yes", "on"}
-
-
 def _load_market_pool_series(redis_client, symbol: str, tf: str, tf_ms_fn) -> list[dict]:
     key = _redis_market_pool_key(symbol, tf)
     try:
         if redis_client is not None:
             raw = redis_client.get(key)
             if not raw:
-                _market_pool_log(
-                    f"load-miss:{symbol.upper()}:{tf}",
-                    logging.INFO,
-                    "[MarketPool][load] miss symbol=%s tf=%s reason=missing",
-                    symbol.upper(),
-                    tf,
-                )
                 return []
             payload = json.loads(raw)
         else:
@@ -751,45 +699,7 @@ def _load_market_pool_series(redis_client, symbol: str, tf: str, tf_ms_fn) -> li
         series = payload.get("series") if isinstance(payload, dict) else payload
         series = [c for c in (_normalize_candle_for_payload(row) for row in (series or [])) if c is not None]
         if not _market_pool_fresh(series, tf, tf_ms_fn):
-            if _market_pool_serve_stale_during_cooldown() and len(series) >= MIN_CANDLES:
-                max_stale_s = int(
-                    os.getenv(
-                        "MARKET_POOL_MAX_STALE_DURING_COOLDOWN_SECONDS",
-                        str(_market_pool_cooldown_seconds(tf, tf_ms_fn) + 120),
-                    )
-                )
-                age_s = _market_pool_last_age_s(series)
-                if age_s <= max_stale_s and _market_pool_in_cooldown(redis_client, symbol, tf):
-                    _market_pool_log(
-                        f"load-stale-hit:{symbol.upper()}:{tf}",
-                        logging.INFO,
-                        "[MarketPool][load] hit symbol=%s tf=%s rows=%d backend=%s freshness=stale_during_cooldown age_s=%.0f max_stale_s=%d",
-                        symbol.upper(),
-                        tf,
-                        len(series),
-                        "redis" if redis_client is not None else "memory",
-                        age_s,
-                        max_stale_s,
-                    )
-                    return series
-            _market_pool_log(
-                f"load-stale:{symbol.upper()}:{tf}",
-                logging.INFO,
-                "[MarketPool][load] miss symbol=%s tf=%s reason=stale_or_short rows=%d",
-                symbol.upper(),
-                tf,
-                len(series),
-            )
             return []
-        _market_pool_log(
-            f"load-hit:{symbol.upper()}:{tf}",
-            logging.INFO,
-            "[MarketPool][load] hit symbol=%s tf=%s rows=%d backend=%s",
-            symbol.upper(),
-            tf,
-            len(series),
-            "redis" if redis_client is not None else "memory",
-        )
         return series
     except Exception as exc:
         logger.debug("[MarketPool] load failed %s/%s: %s", symbol, tf, exc)
@@ -808,26 +718,11 @@ def _store_market_pool_series(redis_client, symbol: str, tf: str, series_ms: lis
         "updated_at": int(time.time() * 1000),
     }
     key = _redis_market_pool_key(symbol, tf)
-    ttl_s = max(
-        _market_pool_ttl_s(tf),
-        300,
-        _market_pool_cooldown_seconds(tf) + int(os.getenv("MARKET_POOL_TTL_AFTER_COOLDOWN_SECONDS", "120")),
-    )
+    ttl_s = max(_market_pool_ttl_s(tf), 300)
     if redis_client is not None:
         redis_client.setex(key, ttl_s, json.dumps(payload, separators=(",", ":")))
     else:
         _MEM_MARKET_POOL[key] = payload
-    _market_pool_log(
-        f"store:{symbol.upper()}:{tf}",
-        logging.INFO,
-        "[MarketPool][store] symbol=%s tf=%s rows=%d tail=%d ttl=%ds backend=%s",
-        symbol.upper(),
-        tf,
-        len(payload["series"]),
-        tail,
-        ttl_s,
-        "redis" if redis_client is not None else "memory",
-    )
 
 
 def _market_pool_acquire_fmp_slot(redis_client) -> bool:
@@ -870,34 +765,7 @@ def _market_pool_cooldown_seconds(tf: str, tf_ms_fn=None) -> int:
     return max(base, int((tf_ms_val / 1000) * 4))
 
 
-def _market_pool_cache_needs_refill(redis_client, symbol: str, tf: str, tf_ms_fn=None) -> bool:
-    cache_key = _redis_market_pool_key(symbol, tf)
-    try:
-        if redis_client is not None:
-            raw = redis_client.get(cache_key)
-        else:
-            raw = _MEM_MARKET_POOL.get(cache_key)
-        if not raw:
-            return True
-        payload = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
-        series = payload.get("series") if isinstance(payload, dict) else payload
-        series = [c for c in (_normalize_candle_for_payload(row) for row in (series or [])) if c is not None]
-        return not _market_pool_fresh(series, tf, tf_ms_fn)
-    except Exception:
-        return False
-
-
-def _market_pool_in_cooldown(redis_client, symbol: str, tf: str, tf_ms_fn=None) -> bool:
-    if os.getenv("MARKET_POOL_IGNORE_COOLDOWN_ON_MISSING_CACHE", "true").lower() in {"1", "true", "yes", "on"}:
-        cache_key = _redis_market_pool_key(symbol, tf)
-        try:
-            if redis_client is not None and not redis_client.exists(cache_key):
-                return False
-        except Exception:
-            pass
-    if os.getenv("MARKET_POOL_IGNORE_COOLDOWN_ON_STALE_CACHE", "true").lower() in {"1", "true", "yes", "on"}:
-        if _market_pool_cache_needs_refill(redis_client, symbol, tf, tf_ms_fn):
-            return False
+def _market_pool_in_cooldown(redis_client, symbol: str, tf: str) -> bool:
     key = _redis_market_pool_cooldown_key(symbol, tf)
     if redis_client is not None:
         try:
@@ -974,14 +842,6 @@ async def _load_from_market_pool(
     target = norm_tf_fn(target_tf)
     direct = await asyncio.to_thread(_load_market_pool_series, redis_client, symbol, target, tf_ms_fn)
     if direct:
-        _market_pool_log(
-            f"serve-direct:{symbol.upper()}:{target}",
-            logging.INFO,
-            "[MarketPool][serve] direct symbol=%s tf=%s rows=%d",
-            symbol.upper(),
-            target,
-            len(direct),
-        )
         return direct, "market_pool"
 
     configured_base = [
@@ -1004,25 +864,7 @@ async def _load_from_market_pool(
             continue
         derived = _resample_series_ms(lower, target)
         if len(derived) >= MIN_CANDLES and _market_pool_fresh(derived, target, tf_ms_fn):
-            _market_pool_log(
-                f"serve-derived:{symbol.upper()}:{target}:{lower_tf}",
-                logging.INFO,
-                "[MarketPool][serve] derived symbol=%s tf=%s from=%s base_rows=%d rows=%d",
-                symbol.upper(),
-                target,
-                lower_tf,
-                len(lower),
-                len(derived),
-            )
             return derived, f"market_pool_derived_from_{lower_tf}"
-    _market_pool_log(
-        f"serve-miss:{symbol.upper()}:{target}",
-        logging.INFO,
-        "[MarketPool][serve] miss symbol=%s tf=%s candidates=%s",
-        symbol.upper(),
-        target,
-        ",".join(candidates) or "-",
-    )
     return [], None
 
 
@@ -1056,33 +898,11 @@ async def _refresh_market_pool_symbol_tf(
 ) -> bool:
     existing = await asyncio.to_thread(_load_market_pool_series, redis_client, symbol, tf, tf_ms_fn)
     if existing:
-        _market_pool_log(
-            f"refresh-skip-fresh:{symbol.upper()}:{tf}",
-            logging.INFO,
-            "[MarketPool][refresh] skip symbol=%s tf=%s reason=fresh rows=%d",
-            symbol.upper(),
-            tf,
-            len(existing),
-        )
         return False
     if not _market_pool_symbol_market_open(symbol):
         await asyncio.to_thread(_market_pool_set_cooldown, redis_client, symbol, tf, 3600, tf_ms_fn)
-        _market_pool_log(
-            f"refresh-skip-market:{symbol.upper()}:{tf}",
-            logging.INFO,
-            "[MarketPool][refresh] skip symbol=%s tf=%s reason=market_closed cooldown=3600s",
-            symbol.upper(),
-            tf,
-        )
         return False
-    if await asyncio.to_thread(_market_pool_in_cooldown, redis_client, symbol, tf, tf_ms_fn):
-        _market_pool_log(
-            f"refresh-skip-cooldown:{symbol.upper()}:{tf}",
-            logging.INFO,
-            "[MarketPool][refresh] skip symbol=%s tf=%s reason=cooldown",
-            symbol.upper(),
-            tf,
-        )
+    if await asyncio.to_thread(_market_pool_in_cooldown, redis_client, symbol, tf):
         return False
 
     lock_key = _redis_market_pool_lock_key(symbol, tf)
@@ -1092,13 +912,6 @@ async def _refresh_market_pool_symbol_tf(
         try:
             lock_acquired = bool(redis_client.set(lock_key, str(os.getpid()), nx=True, ex=lock_ttl))
             if not lock_acquired:
-                _market_pool_log(
-                    f"refresh-skip-lock:{symbol.upper()}:{tf}",
-                    logging.INFO,
-                    "[MarketPool][refresh] skip symbol=%s tf=%s reason=locked",
-                    symbol.upper(),
-                    tf,
-                )
                 return False
         except Exception:
             lock_acquired = True
@@ -1111,31 +924,15 @@ async def _refresh_market_pool_symbol_tf(
         if closed_end <= 0:
             closed_end = int(time.time() * 1000)
         if not _market_pool_acquire_fmp_slot(redis_client):
-            _market_pool_log(
-                f"refresh-skip-rate:{symbol.upper()}:{tf}",
-                logging.WARNING,
-                "[MarketPool][refresh] skip symbol=%s tf=%s reason=fmp_rate_limit",
-                symbol.upper(),
-                tf,
-            )
             return False
         bars = int(os.getenv("MARKET_POOL_FETCH_BARS", "180"))
         from_ms = closed_end - max(MIN_CANDLES + 10, bars) * tf_ms_val
         await asyncio.to_thread(_market_pool_set_cooldown, redis_client, symbol, tf, None, tf_ms_fn)
         hist = await asyncio.to_thread(fetch_historical_range, symbol, tf, from_ms, closed_end)
         if not hist:
-            _market_pool_log(
-                f"refresh-empty:{symbol.upper()}:{tf}",
-                logging.INFO,
-                "[MarketPool][refresh] empty symbol=%s tf=%s from_ms=%d to_ms=%d",
-                symbol.upper(),
-                tf,
-                int(from_ms),
-                int(closed_end),
-            )
             return False
         await asyncio.to_thread(_store_market_pool_series, redis_client, symbol, tf, hist)
-        logger.info("[MarketPool][refresh] refreshed symbol=%s tf=%s rows=%d from_ms=%d to_ms=%d", symbol.upper(), tf, len(hist), int(from_ms), int(closed_end))
+        logger.info("[MarketPool] refreshed %s/%s rows=%d", symbol, tf, len(hist))
         return True
     except Exception as exc:
         logger.debug("[MarketPool] refresh failed %s/%s: %s", symbol, tf, exc)
@@ -1169,9 +966,9 @@ async def _market_pool_loop(
         try:
             symbols = _market_pool_symbols(norm_tf_fn)
             pairs = [(s, tf) for s in symbols for tf in base_tfs]
-            refreshed = 0
-            checked = 0
             if pairs:
+                refreshed = 0
+                checked = 0
                 while checked < len(pairs) and refreshed < max_per_tick:
                     symbol, tf = pairs[cursor % len(pairs)]
                     cursor += 1
@@ -1186,18 +983,6 @@ async def _market_pool_loop(
                     )
                     if did:
                         refreshed += 1
-            _market_pool_log(
-                "loop-summary",
-                logging.INFO,
-                "[MarketPool][loop] symbols=%d pairs=%d checked=%d refreshed=%d cursor=%d interval=%.1fs max_per_tick=%d",
-                len(symbols),
-                len(pairs),
-                checked,
-                refreshed,
-                cursor,
-                interval_s,
-                max_per_tick,
-            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
