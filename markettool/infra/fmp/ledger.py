@@ -156,7 +156,7 @@ def get_fmp_usage_policy() -> dict[str, Any]:
         "market_pool_refresh": ("FMP_USAGE_UNITS_MARKET_POOL_REFRESH", 0, "Central MarketPool refresh"),
         "historical_backfill": ("FMP_USAGE_UNITS_HISTORICAL_BACKFILL", 0, "Historical cache/backfill"),
         "asset_analysis_basic": ("FMP_USAGE_UNITS_ASSET_ANALYSIS_BASIC", 1, "Basic asset analysis"),
-        "asset_analysis_full": ("FMP_USAGE_UNITS_ASSET_ANALYSIS_FULL", 5, "Complete/advanced asset analysis"),
+        "asset_analysis_full": ("FMP_USAGE_UNITS_ASSET_ANALYSIS_FULL", 5, "Full/premium asset analysis"),
         "bot_context_analysis": ("FMP_USAGE_UNITS_BOT_CONTEXT_ANALYSIS", 2, "Bot contextual analysis"),
         "market_quote": ("FMP_USAGE_UNITS_MARKET_QUOTE", 0, "Single quote lookup"),
         "unknown": ("FMP_USAGE_UNITS_UNKNOWN", 1, "Unclassified FMP call"),
