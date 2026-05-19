@@ -66,7 +66,7 @@ def test_warmup_concurrency():
         def _warmup_single(symbol_tf):
             symbol, tf = symbol_tf
             try:
-                df = obtener_datos_con_hilos(symbol, tf, bars=500)
+                df = obtener_datos_con_hilos(symbol, tf, cfg={"fmpWindows": {tf: 500}})
                 if df is not None and not df.empty:
                     _ = calcular_indicadores(df, tf, symbol=symbol)
                     warmed_count[0] += 1
@@ -134,7 +134,7 @@ def test_cache_hit_ratio():
         
         for symbol, tf in test_assets:
             t0 = time.time()
-            df = obtener_datos_con_hilos(symbol, tf, bars=500)
+            df = obtener_datos_con_hilos(symbol, tf, cfg={"fmpWindows": {tf: 500}})
             latency = (time.time() - t0) * 1000  # ms
             latencies.append(latency)
             

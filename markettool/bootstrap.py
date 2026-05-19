@@ -146,9 +146,24 @@ def _warmup_caches_principales():
             # Commodities
             'XAUUSD'
         ]
+        env_assets = [
+            s.strip().upper()
+            for s in os.getenv("CACHE_WARMUP_SYMBOLS", "").split(",")
+            if s.strip()
+        ]
+        if env_assets:
+            main_assets = env_assets
         
         # Timeframes estratégicos: 1hour (swing) y 1day (tendencia)
         main_timeframes = ['1hour', '1day']
+        env_timeframes = [
+            tf.strip()
+            for tf in os.getenv("CACHE_WARMUP_TIMEFRAMES", "").split(",")
+            if tf.strip()
+        ]
+        if env_timeframes:
+            main_timeframes = env_timeframes
+        warmup_bars = int(os.environ.get("CACHE_WARMUP_BARS", "500"))
         
         # FASE 2: Get concurrency level from env (default 12)
         warmup_concurrency = int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "12"))
@@ -173,8 +188,21 @@ def _warmup_caches_principales():
             """Warmup a single (symbol, timeframe) combination."""
             symbol, tf = symbol_tf_tuple
             try:
-                # Fetch históricos (popula cache de históricos, niveles, ATR)
-                df = obtener_datos_con_hilos(symbol, tf, bars=500)
+                tf_norm = {
+                    "1minute": "1min", "1m": "1min",
+                    "5m": "5min", "15m": "15min", "30m": "30min",
+                    "1h": "1hour", "4h": "4hour",
+                    "1d": "1day", "1w": "1week",
+                }.get(str(tf).strip().lower(), tf)
+                fmp_windows = {tf: warmup_bars, tf_norm: warmup_bars}
+                # Fetch históricos (popula cache de históricos, niveles, ATR).
+                # obtener_datos_con_hilos recibe recortes por cfg/fmpWindows,
+                # no por keyword bars.
+                df = obtener_datos_con_hilos(
+                    symbol,
+                    tf,
+                    cfg={"fmpWindows": fmp_windows},
+                )
                 if df is not None and not df.empty:
                     # Calcular indicadores (popula cache de indicadores)
                     _ = calcular_indicadores(df, tf, symbol=symbol)
