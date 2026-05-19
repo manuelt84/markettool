@@ -90,6 +90,8 @@ _MEM_EXPIRY: dict[str, float] = {}
 _MEM_BEATS: dict[str, dict] = {}
 _MEM_EVENTS: dict[str, list[dict]] = {}         # short replay buffer for SSE when Redis is unavailable
 _MEM_BILLING_KEYS: dict[str, float] = {}
+_MEM_MARKET_POOL: dict[str, dict] = {}
+_MARKET_POOL_TASK: asyncio.Task | None = None
 _SUBSCRIBERS: dict[str, list[queue.Queue]] = {}
 _SUBSCRIBERS_LOCK = threading.Lock()
 
@@ -133,6 +135,14 @@ def _redis_worker_stop_key(worker_key: str) -> str:
 def _redis_billing_key(user_id: str, exec_id: str, symbol: str, tf: str, bucket_ms: int, source: str) -> str:
     safe_source = str(source or "cache").replace(":", "_")
     return f"live_data_billed:{user_id}:{exec_id}:{symbol.upper()}:{tf}:{bucket_ms}:{safe_source}"
+
+
+def _redis_market_pool_key(symbol: str, tf: str) -> str:
+    return f"market_pool:candles:{symbol.upper()}:{tf}"
+
+
+def _redis_market_pool_lock_key(symbol: str, tf: str) -> str:
+    return f"market_pool:lock:{symbol.upper()}:{tf}"
 
 
 def _event_id(exec_id: str, symbol: str, tf: str, ts_ms: int) -> str:
@@ -643,6 +653,246 @@ def _build_candles_payload(series_ms: list[dict], tail: int = 240) -> dict:
         "last_ts": live_candle.get("t") if live_candle else 0,
         "count": len(series_ms or []),
     }
+
+
+def _market_pool_ttl_s(tf: str) -> int:
+    tf_norm = str(tf or "").lower()
+    return max(int(os.getenv("MARKET_POOL_MIN_TTL_SECONDS", "60")), int(_DEFAULT_BEAT_S + ENTRY_TTL_BY_TF_S.get(tf_norm, 300) / 24))
+
+
+def _market_pool_fresh(series_ms: list[dict], tf: str, tf_ms_fn) -> bool:
+    if len(series_ms or []) < MIN_CANDLES:
+        return False
+    last = (series_ms or [])[-1]
+    raw_ts = last.get("t") or last.get("timestamp") or 0
+    try:
+        last_ms = int(raw_ts if float(raw_ts) > 1e12 else float(raw_ts) * 1000)
+    except Exception:
+        return False
+    tf_ms = tf_ms_fn(tf) or 60_000
+    max_age = max(tf_ms * int(os.getenv("MARKET_POOL_MAX_AGE_BUCKETS", "4")), 90_000)
+    return int(time.time() * 1000) - last_ms <= max_age
+
+
+def _load_market_pool_series(redis_client, symbol: str, tf: str, tf_ms_fn) -> list[dict]:
+    key = _redis_market_pool_key(symbol, tf)
+    try:
+        if redis_client is not None:
+            raw = redis_client.get(key)
+            if not raw:
+                return []
+            payload = json.loads(raw)
+        else:
+            payload = _MEM_MARKET_POOL.get(key) or {}
+        series = payload.get("series") if isinstance(payload, dict) else payload
+        series = [c for c in (_normalize_candle_for_payload(row) for row in (series or [])) if c is not None]
+        if not _market_pool_fresh(series, tf, tf_ms_fn):
+            return []
+        return series
+    except Exception as exc:
+        logger.debug("[MarketPool] load failed %s/%s: %s", symbol, tf, exc)
+        return []
+
+
+def _store_market_pool_series(redis_client, symbol: str, tf: str, series_ms: list[dict]) -> None:
+    series = [c for c in (_normalize_candle_for_payload(row) for row in (series_ms or [])) if c is not None]
+    if not series:
+        return
+    tail = int(os.getenv("MARKET_POOL_TAIL", "360"))
+    payload = {
+        "symbol": symbol.upper(),
+        "tf": tf,
+        "series": series[-tail:],
+        "updated_at": int(time.time() * 1000),
+    }
+    key = _redis_market_pool_key(symbol, tf)
+    ttl_s = max(_market_pool_ttl_s(tf), 300)
+    if redis_client is not None:
+        redis_client.setex(key, ttl_s, json.dumps(payload, separators=(",", ":")))
+    else:
+        _MEM_MARKET_POOL[key] = payload
+
+
+async def _load_from_market_pool(
+    *,
+    redis_client,
+    symbol: str,
+    target_tf: str,
+    active_tfs: list[str],
+    norm_tf_fn,
+    tf_ms_fn,
+) -> tuple[list[dict], str | None]:
+    target = norm_tf_fn(target_tf)
+    direct = await asyncio.to_thread(_load_market_pool_series, redis_client, symbol, target, tf_ms_fn)
+    if direct:
+        return direct, "market_pool"
+
+    configured_base = [
+        norm_tf_fn(tf)
+        for tf in os.getenv("MARKET_POOL_BASE_TFS", "1min,5min").split(",")
+        if tf.strip()
+    ]
+    candidates = sorted(
+        {
+            norm_tf_fn(tf)
+            for tf in [*configured_base, *(active_tfs or [])]
+            if _tf_rank(norm_tf_fn(tf)) and _tf_rank(norm_tf_fn(tf)) < _tf_rank(target)
+        },
+        key=_tf_rank,
+        reverse=True,
+    )
+    for lower_tf in candidates:
+        lower = await asyncio.to_thread(_load_market_pool_series, redis_client, symbol, lower_tf, tf_ms_fn)
+        if not lower:
+            continue
+        derived = _resample_series_ms(lower, target)
+        if len(derived) >= MIN_CANDLES and _market_pool_fresh(derived, target, tf_ms_fn):
+            return derived, f"market_pool_derived_from_{lower_tf}"
+    return [], None
+
+
+def _market_pool_symbols(norm_tf_fn) -> list[str]:
+    try:
+        from MarketTool import _ensure_globals_loaded, _universe_symbols
+        _ensure_globals_loaded()
+        symbols = sorted(str(s).upper() for s in (_universe_symbols() or []) if str(s).strip())
+    except Exception as exc:
+        logger.warning("[MarketPool] could not load common symbols: %s", exc)
+        symbols = []
+    max_symbols = int(os.getenv("MARKET_POOL_MAX_SYMBOLS", os.getenv("CACHE_WARMUP_MAX_SYMBOLS", "80")))
+    env_symbols = [
+        str(s).strip().upper()
+        for s in os.getenv("MARKET_POOL_SYMBOLS", "").split(",")
+        if str(s).strip()
+    ]
+    if env_symbols:
+        symbols = env_symbols
+    return symbols[:max(1, max_symbols)]
+
+
+async def _refresh_market_pool_symbol_tf(
+    *,
+    redis_client,
+    symbol: str,
+    tf: str,
+    fetch_historical_range,
+    tf_ms_fn,
+    current_closed_bucket_start,
+) -> bool:
+    existing = await asyncio.to_thread(_load_market_pool_series, redis_client, symbol, tf, tf_ms_fn)
+    if existing:
+        return False
+
+    lock_key = _redis_market_pool_lock_key(symbol, tf)
+    lock_ttl = int(os.getenv("MARKET_POOL_LOCK_TTL_SECONDS", "45"))
+    lock_acquired = False
+    if redis_client is not None:
+        try:
+            lock_acquired = bool(redis_client.set(lock_key, str(os.getpid()), nx=True, ex=lock_ttl))
+            if not lock_acquired:
+                return False
+        except Exception:
+            lock_acquired = True
+    else:
+        lock_acquired = True
+
+    try:
+        tf_ms_val = tf_ms_fn(tf) or 60_000
+        closed_end = current_closed_bucket_start(tf) - tf_ms_val
+        if closed_end <= 0:
+            closed_end = int(time.time() * 1000)
+        bars = int(os.getenv("MARKET_POOL_FETCH_BARS", "320"))
+        from_ms = closed_end - max(MIN_CANDLES + 10, bars) * tf_ms_val
+        hist = await asyncio.to_thread(fetch_historical_range, symbol, tf, from_ms, closed_end)
+        if not hist:
+            return False
+        await asyncio.to_thread(_store_market_pool_series, redis_client, symbol, tf, hist)
+        logger.info("[MarketPool] refreshed %s/%s rows=%d", symbol, tf, len(hist))
+        return True
+    except Exception as exc:
+        logger.debug("[MarketPool] refresh failed %s/%s: %s", symbol, tf, exc)
+        return False
+    finally:
+        if redis_client is not None and lock_acquired:
+            try:
+                redis_client.delete(lock_key)
+            except Exception:
+                pass
+
+
+async def _market_pool_loop(
+    *,
+    redis_client,
+    fetch_historical_range,
+    norm_tf_fn,
+    tf_ms_fn,
+    current_closed_bucket_start,
+):
+    base_tfs = [
+        norm_tf_fn(tf)
+        for tf in os.getenv("MARKET_POOL_BASE_TFS", "1min").split(",")
+        if tf.strip()
+    ]
+    interval_s = max(5.0, float(os.getenv("MARKET_POOL_INTERVAL_SECONDS", "10")))
+    max_per_tick = max(1, int(os.getenv("MARKET_POOL_MAX_REFRESH_PER_TICK", "4")))
+    cursor = 0
+    logger.info("[MarketPool] started base_tfs=%s interval=%.1fs max_per_tick=%d", base_tfs, interval_s, max_per_tick)
+    while True:
+        try:
+            symbols = _market_pool_symbols(norm_tf_fn)
+            pairs = [(s, tf) for s in symbols for tf in base_tfs]
+            if pairs:
+                refreshed = 0
+                checked = 0
+                while checked < len(pairs) and refreshed < max_per_tick:
+                    symbol, tf = pairs[cursor % len(pairs)]
+                    cursor += 1
+                    checked += 1
+                    did = await _refresh_market_pool_symbol_tf(
+                        redis_client=redis_client,
+                        symbol=symbol,
+                        tf=tf,
+                        fetch_historical_range=fetch_historical_range,
+                        tf_ms_fn=tf_ms_fn,
+                        current_closed_bucket_start=current_closed_bucket_start,
+                    )
+                    if did:
+                        refreshed += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[MarketPool] loop error: %s", exc)
+        await asyncio.sleep(interval_s)
+
+
+def _ensure_market_pool_started(
+    *,
+    redis_client,
+    fetch_historical_range,
+    norm_tf_fn,
+    tf_ms_fn,
+    current_closed_bucket_start,
+) -> None:
+    global _MARKET_POOL_TASK
+    enabled = str(os.getenv("MARKET_POOL_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        logger.info("[MarketPool] disabled by MARKET_POOL_ENABLED")
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _MARKET_POOL_TASK is not None and not _MARKET_POOL_TASK.done():
+        return
+    _MARKET_POOL_TASK = loop.create_task(
+        _market_pool_loop(
+            redis_client=redis_client,
+            fetch_historical_range=fetch_historical_range,
+            norm_tf_fn=norm_tf_fn,
+            tf_ms_fn=tf_ms_fn,
+            current_closed_bucket_start=current_closed_bucket_start,
+        )
+    )
 
 
 async def _charge_live_data_once(
@@ -1156,16 +1406,30 @@ async def _live_worker(
         try:
             norm = norm_tf_fn(tf)
 
-            # 1. Candles del mon_cache
-            st: dict = await asyncio.to_thread(load_cache, exec_id, symbol, norm)
-            series_ms: list[dict] = st.get("series") or []
+            # 1. Pool central Redis para activos comunes. Esto evita que cada
+            # ejecución privada vuelva a consultar FMP si ya existe data viva.
+            series_ms, pool_source = await _load_from_market_pool(
+                redis_client=redis_client,
+                symbol=symbol,
+                target_tf=norm,
+                active_tfs=list(tf_tasks_map.keys()),
+                norm_tf_fn=norm_tf_fn,
+                tf_ms_fn=tf_ms_fn,
+            )
+            data_source = pool_source or "cache"
 
-            # 2. Refrescar GCS seed
-            await asyncio.to_thread(maybe_refresh_from_gcs, exec_id, symbol, norm, st)
-            series_ms = st.get("series") or series_ms
-            data_source = "cache"
+            # 2. Candles del mon_cache específico de la ejecución si el pool
+            # no tiene suficiente cobertura fresca.
+            st: dict = {}
+            if len(series_ms) < MIN_CANDLES:
+                st = await asyncio.to_thread(load_cache, exec_id, symbol, norm)
+                series_ms = st.get("series") or []
 
-            # 3. Antes de ir a FMP, inferir TF mayor desde una TF menor ya cacheada.
+                # 3. Refrescar GCS seed
+                await asyncio.to_thread(maybe_refresh_from_gcs, exec_id, symbol, norm, st)
+                series_ms = st.get("series") or series_ms
+
+            # 4. Antes de ir a FMP, inferir TF mayor desde una TF menor ya cacheada.
             derived_from_tf = None
             if len(series_ms) < MIN_CANDLES:
                 derived, derived_from_tf = await _load_resampled_from_lower_tfs(
@@ -1188,7 +1452,7 @@ async def _live_worker(
                         derived_from_tf,
                     )
 
-            # 4. Fallback FMP si faltan candles. La cuota se cobra solo cuando
+            # 5. Fallback FMP si faltan candles. La cuota se cobra solo cuando
             # existe data lista para entregar, así no hay que reponer fallos.
             if len(series_ms) < MIN_CANDLES:
                 tf_ms_val = tf_ms_fn(norm) or 60_000
@@ -1199,6 +1463,10 @@ async def _live_worker(
                     if hist:
                         series_ms = hist
                         data_source = "fmp"
+                        try:
+                            await asyncio.to_thread(_store_market_pool_series, redis_client, symbol, norm, hist)
+                        except Exception:
+                            pass
                 except Exception:
                     raise
 
@@ -1400,6 +1668,14 @@ def register_live_entries_routes(app, *, services) -> None:
     except ImportError:
         calcular_entradas_sync_wrapper = None
         logger.warning("[LiveEntries] calcular_entradas_sync_wrapper no disponible")
+
+    _ensure_market_pool_started(
+        redis_client=redis_client,
+        fetch_historical_range=fetch_historical_range,
+        norm_tf_fn=norm_tf,
+        tf_ms_fn=tf_ms,
+        current_closed_bucket_start=current_closed_bucket_start,
+    )
 
     # ── POST /monitoreo/live-entries/start ──────────────────────────────────
     @app.route("/monitoreo/live-entries/start", methods=["POST"])
