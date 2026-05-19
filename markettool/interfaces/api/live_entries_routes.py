@@ -89,6 +89,7 @@ _MEM_ENTRIES: dict[str, list[dict]] = {}        # fallback when Redis is unavail
 _MEM_EXPIRY: dict[str, float] = {}
 _MEM_BEATS: dict[str, dict] = {}
 _MEM_EVENTS: dict[str, list[dict]] = {}         # short replay buffer for SSE when Redis is unavailable
+_MEM_BILLING_KEYS: dict[str, float] = {}
 _SUBSCRIBERS: dict[str, list[queue.Queue]] = {}
 _SUBSCRIBERS_LOCK = threading.Lock()
 
@@ -127,6 +128,11 @@ def _redis_worker_owner_key(worker_key: str) -> str:
 
 def _redis_worker_stop_key(worker_key: str) -> str:
     return f"live_worker_stop:{worker_key}"
+
+
+def _redis_billing_key(user_id: str, exec_id: str, symbol: str, tf: str, bucket_ms: int, source: str) -> str:
+    safe_source = str(source or "cache").replace(":", "_")
+    return f"live_data_billed:{user_id}:{exec_id}:{symbol.upper()}:{tf}:{bucket_ms}:{safe_source}"
 
 
 def _event_id(exec_id: str, symbol: str, tf: str, ts_ms: int) -> str:
@@ -639,6 +645,68 @@ def _build_candles_payload(series_ms: list[dict], tail: int = 240) -> dict:
     }
 
 
+async def _charge_live_data_once(
+    *,
+    redis_client,
+    user_id: str | None,
+    exec_id: str,
+    symbol: str,
+    tf: str,
+    candles_payload: dict,
+    source: str,
+    charge_monitoreo_per_call,
+) -> tuple[bool, str]:
+    """
+    Cobra una vez por bucket de vela viva entregada/construida.
+
+    Esto separa cuota comercial de costo FMP: aunque el dato venga de cache o sea
+    resampleado desde 1min, sigue siendo data servida por la plataforma.
+    """
+    if not user_id or charge_monitoreo_per_call is None:
+        return True, "no_user"
+    live_candle = candles_payload.get("live_candle") or {}
+    bucket_ms = int(live_candle.get("t") or candles_payload.get("last_ts") or 0)
+    if bucket_ms <= 0:
+        return True, "no_bucket"
+    key = _redis_billing_key(user_id, exec_id, symbol, tf, bucket_ms, source)
+    ttl_s = max(_entry_ttl_s(tf), 3600)
+
+    if redis_client is not None:
+        try:
+            if not redis_client.set(key, "pending", nx=True, ex=ttl_s):
+                return True, "already_billed"
+        except Exception as exc:
+            logger.debug("[LiveBilling] redis billing key failed %s: %s", key, exc)
+    else:
+        now = time.time()
+        expired = [k for k, exp in _MEM_BILLING_KEYS.items() if exp <= now]
+        for k in expired[:1000]:
+            _MEM_BILLING_KEYS.pop(k, None)
+        if key in _MEM_BILLING_KEYS:
+            return True, "already_billed"
+        _MEM_BILLING_KEYS[key] = now + ttl_s
+
+    ok, msg = await charge_monitoreo_per_call(user_id, origen="app")
+    if ok:
+        if redis_client is not None:
+            try:
+                redis_client.setex(key, ttl_s, "charged")
+            except Exception:
+                pass
+        logger.info("[LiveBilling] charged user=%s %s/%s source=%s bucket=%s", user_id, symbol, tf, source, bucket_ms)
+        return True, msg
+
+    if redis_client is not None:
+        try:
+            redis_client.delete(key)
+        except Exception:
+            pass
+    else:
+        _MEM_BILLING_KEYS.pop(key, None)
+    logger.warning("[LiveBilling] blocked user=%s %s/%s source=%s: %s", user_id, symbol, tf, source, msg)
+    return False, msg
+
+
 def _tf_to_resample_rule(tf: str) -> str | None:
     mapping = {
         "5m": "5min",
@@ -1095,6 +1163,7 @@ async def _live_worker(
             # 2. Refrescar GCS seed
             await asyncio.to_thread(maybe_refresh_from_gcs, exec_id, symbol, norm, st)
             series_ms = st.get("series") or series_ms
+            data_source = "cache"
 
             # 3. Antes de ir a FMP, inferir TF mayor desde una TF menor ya cacheada.
             derived_from_tf = None
@@ -1110,6 +1179,7 @@ async def _live_worker(
                 )
                 if derived:
                     series_ms = derived
+                    data_source = f"derived_from_{derived_from_tf}"
                     logger.info(
                         "[LiveWorker] %s/%s derived %d candles from %s cache",
                         symbol,
@@ -1118,16 +1188,9 @@ async def _live_worker(
                         derived_from_tf,
                     )
 
-            # 4. Fallback FMP si faltan candles. Se cobra solo cuando realmente
-            # se intenta salir a FMP; si falla o no entrega datos, se repone.
+            # 4. Fallback FMP si faltan candles. La cuota se cobra solo cuando
+            # existe data lista para entregar, así no hay que reponer fallos.
             if len(series_ms) < MIN_CANDLES:
-                charged_for_fmp = False
-                if user_id and charge_monitoreo_per_call is not None:
-                    ok, msg = await charge_monitoreo_per_call(user_id, origen="app")
-                    if not ok:
-                        logger.warning("[LiveWorker] FMP fallback blocked by quota %s/%s user=%s: %s", symbol, norm, user_id, msg)
-                        return
-                    charged_for_fmp = True
                 tf_ms_val = tf_ms_fn(norm) or 60_000
                 closed_end = current_closed_bucket_start(norm) - tf_ms_val
                 from_ms = closed_end - 300 * tf_ms_val
@@ -1135,15 +1198,34 @@ async def _live_worker(
                     hist = await asyncio.to_thread(fetch_historical_range, symbol, norm, from_ms, closed_end)
                     if hist:
                         series_ms = hist
-                    elif charged_for_fmp and reponer_transaccion is not None:
-                        await reponer_transaccion(user_id, 1, origen="app")
+                        data_source = "fmp"
                 except Exception:
-                    if charged_for_fmp and reponer_transaccion is not None:
-                        await reponer_transaccion(user_id, 1, origen="app")
                     raise
 
             if len(series_ms) < MIN_CANDLES:
                 logger.info("[LiveWorker] %s/%s sin candles suficientes (%d)", symbol, norm, len(series_ms))
+                return
+
+            candles_payload = _build_candles_payload(series_ms)
+            charged_ok, charged_msg = await _charge_live_data_once(
+                redis_client=redis_client,
+                user_id=user_id,
+                exec_id=exec_id,
+                symbol=symbol,
+                tf=norm,
+                candles_payload=candles_payload,
+                source=data_source,
+                charge_monitoreo_per_call=charge_monitoreo_per_call,
+            )
+            if not charged_ok:
+                logger.warning(
+                    "[LiveWorker] %s/%s data blocked by quota user=%s source=%s: %s",
+                    symbol,
+                    norm,
+                    user_id,
+                    data_source,
+                    charged_msg,
+                )
                 return
 
             # 5. Niveles del indicators cache
@@ -1179,7 +1261,6 @@ async def _live_worker(
                     logger.info("[LiveWorker] %s/%s +%d nuevas entradas", symbol, norm, len(new_entries))
                     _publish_live_entries(redis_client, exec_id, symbol, norm, new_entries)
 
-            candles_payload = _build_candles_payload(series_ms)
             _publish_live_candles(redis_client, exec_id, symbol, norm, candles_payload)
 
             # 9. Actualizar beat timestamp + sr_levels + candles en Redis
