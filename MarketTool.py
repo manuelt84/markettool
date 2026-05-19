@@ -20856,6 +20856,12 @@ async def calcular_entradas_async(
                     ),
                     timeout=60.0  # INCREASED: 30s→60s (complex analysis under high concurrency)
                 )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timeout calculando S/R dinámicos para %s-%s; usando fallback estático",
+                    symbol,
+                    tf,
+                )
             except Exception as e:
                 logger.warning(
                     f"Error calculando S/R dinámicos para {symbol}-{tf}: {e}",

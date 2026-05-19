@@ -60,11 +60,14 @@ class RedisHistoricosCache:
         
         if self.redis_url and redis:
             try:
+                connect_timeout = float(os.getenv("REDIS_HIST_CONNECT_TIMEOUT", "3"))
+                socket_timeout = float(os.getenv("REDIS_HIST_SOCKET_TIMEOUT", "10"))
                 self.redis_client = redis.Redis.from_url(
                     self.redis_url, 
                     decode_responses=False,  # We'll handle binary (gzip) data
-                    socket_connect_timeout=2,
-                    socket_timeout=3,
+                    socket_connect_timeout=connect_timeout,
+                    socket_timeout=socket_timeout,
+                    health_check_interval=30,
                 )
                 self.redis_client.ping()
                 self.enabled = True
@@ -162,8 +165,18 @@ class RedisHistoricosCache:
             json_bytes = json.dumps(data).encode('utf-8')
             compressed = gzip.compress(json_bytes, compresslevel=6)
             
-            # Save to Redis with TTL
-            self.redis_client.setex(key, ttl, compressed)
+            # Save to Redis with TTL. Under full-universe runs Redis can briefly
+            # stall on large compressed payloads, so retry once before falling
+            # back to the local/GCS cache path.
+            attempts = int(os.getenv("REDIS_HIST_SET_ATTEMPTS", "2"))
+            for attempt in range(max(1, attempts)):
+                try:
+                    self.redis_client.setex(key, ttl, compressed)
+                    break
+                except Exception:
+                    if attempt >= max(1, attempts) - 1:
+                        raise
+                    time.sleep(0.15 * (attempt + 1))
             
             compression_ratio = len(json_bytes) / len(compressed)
             logger.debug("[RedisHistCache] SET: %s/%s (%d rows, %.1fKB → %.1fKB, ratio=%.1fx, TTL=%ds)",
