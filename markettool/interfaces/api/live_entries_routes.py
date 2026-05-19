@@ -809,7 +809,12 @@ def _market_pool_symbol_market_open(symbol: str) -> bool:
         return True
     now_utc = datetime.now(timezone.utc)
     try:
-        now_ny = now_utc.astimezone(ZoneInfo(os.getenv("FMP_INTRADAY_SOURCE_TZ", "America/New_York")))
+        market_tz = (
+            os.getenv("MARKET_TIMEZONE")
+            or os.getenv("FMP_INTRADAY_SOURCE_TZ")
+            or "America/New_York"
+        )
+        now_ny = now_utc.astimezone(ZoneInfo(market_tz))
     except Exception:
         now_ny = now_utc
     weekday = now_ny.weekday()  # Monday=0, Sunday=6

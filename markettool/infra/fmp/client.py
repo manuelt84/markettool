@@ -32,6 +32,7 @@ class FMPClient:
     timeout: int = 10
     http_session: requests.Session | None = None
     intraday_source_tz: str = "America/New_York"
+    daily_source_tz: str | None = None
     max_concurrency: int = 6
     per_symbol_concurrency: int = 1
 
@@ -44,6 +45,9 @@ class FMPClient:
         self._symbol_sems: dict[str, threading.BoundedSemaphore] = {}
         self._symbol_sems_lock = threading.Lock()
         self._log = logging.getLogger("MarketTool.FMP")
+        if not self.daily_source_tz:
+            import os
+            self.daily_source_tz = os.getenv("FMP_DAILY_SOURCE_TZ") or self.intraday_source_tz
 
     def _get_symbol_sem(self, symbol: str) -> threading.BoundedSemaphore | None:
         if self.per_symbol_concurrency <= 0:
@@ -170,7 +174,7 @@ class FMPClient:
         
         # ✅ FIX: Convert UTC to NY timezone for FMP API consistency
         try:
-            ny_tz = pytz.timezone(self.intraday_source_tz)  # "America/New_York"
+            ny_tz = pytz.timezone(self.daily_source_tz or self.intraday_source_tz)
         except Exception:
             ny_tz = pytz.timezone("America/New_York")
         
@@ -192,7 +196,10 @@ class FMPClient:
         cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
         df = df[cols].copy()
 
-        ny = ZoneInfo("America/New_York")
+        try:
+            ny = ZoneInfo(self.daily_source_tz or self.intraday_source_tz)
+        except Exception:
+            ny = ZoneInfo("America/New_York")
         dt_day = pd.to_datetime(df["date"], errors="coerce")
         df["date"] = (
             dt_day.dt.tz_localize(ny)

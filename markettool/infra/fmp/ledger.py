@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 import json
 import logging
 import os
@@ -105,6 +106,19 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _ledger_now() -> datetime:
+    tz_name = (
+        os.getenv("FMP_LEDGER_DAY_TZ")
+        or os.getenv("MARKET_TIMEZONE")
+        or os.getenv("FMP_DAILY_SOURCE_TZ")
+        or "UTC"
+    )
+    try:
+        return datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
 def current_context() -> dict[str, Any]:
     ctx = getattr(_TLS, "ctx", None)
     return dict(ctx or {})
@@ -140,8 +154,12 @@ def record_fmp_call(
     endpoint = _endpoint_from_url(url)
     status = _safe_int(status_code, 0)
     byte_count = max(0, _safe_int(response_bytes, 0))
+    now_local = _ledger_now()
+    now_utc = datetime.now(timezone.utc)
     rec = {
-        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "ts": now_utc.isoformat().replace("+00:00", "Z"),
+        "ledger_day": now_local.strftime("%Y-%m-%d"),
+        "ledger_tz": getattr(now_local.tzinfo, "key", str(now_local.tzinfo)),
         "environment": os.getenv("MARKETTOOL_ENV") or os.getenv("APP_ENV") or os.getenv("ENV") or "unknown",
         "node_id": os.getenv("MARKET_DATA_NODE_ID") or os.getenv("WORKER_ID") or "",
         "method": method,
@@ -160,7 +178,7 @@ def record_fmp_call(
         "error": str(error or "")[:180],
     }
 
-    day = rec["ts"][:10].replace("-", "")
+    day = str(rec["ledger_day"]).replace("-", "")
     ns = _namespace()
     summary_key = f"{ns}:daily:{day}:summary"
     recent_key = f"{ns}:recent"
@@ -209,7 +227,8 @@ def record_fmp_call(
 
 def get_fmp_ledger_summary(limit_recent: int = 20) -> dict[str, Any]:
     ns = _namespace()
-    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    now_local = _ledger_now()
+    day = now_local.strftime("%Y%m%d")
     client = _redis()
     if client is not None:
         try:
@@ -238,4 +257,3 @@ def get_fmp_ledger_summary(limit_recent: int = 20) -> dict[str, Any]:
             "summary": dict(_LOCAL_SUMMARY),
             "recent": list(_LOCAL_RECENT[:limit_recent]),
         }
-
