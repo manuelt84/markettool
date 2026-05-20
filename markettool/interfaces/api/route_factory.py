@@ -23,6 +23,7 @@ from markettool.interfaces.api.ponderacion_routes import register_ponderacion_ro
 from markettool.interfaces.api.ponderacion_history import PonderacionHistory
 from markettool.interfaces.api.ponderacion_alerts import PonderacionAlert
 from markettool.interfaces.api.payment_routes import register_payment_routes
+from markettool.interfaces.api.whatsapp_routes import register_whatsapp_routes
 from markettool.interfaces.api.live_entries_routes import register_live_entries_routes
 from markettool.interfaces.api.fmp_ledger_routes import register_fmp_ledger_routes
 # backtest_routes removed — backtest is now 100% client-side
@@ -124,6 +125,10 @@ def register_all_routes(
     # Payment routes (PayPal)
     register_payment_routes(app)
     logger.info("✅ Payment routes registered")
+
+    # WhatsApp support routes (UltraMsg external service)
+    register_whatsapp_routes(app)
+    logger.info("✅ WhatsApp routes registered")
 
     # Legacy routes migrated into hexagonal registration
     legacy_services = getattr(container, "legacy_services", None)
