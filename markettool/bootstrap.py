@@ -548,6 +548,7 @@ def main() -> None:
             merge_bars_series=merge_bars_series,
             backfill_internal_gaps=_backfill_internal_gaps,
             bucket_name=BUCKET_NAME,
+            gcs_client=get_gcs_client(),
             indicators_cache=_INDICATORS_CACHE,
             cache_enabled=_INDICATORS_CACHE_ENABLED,
             ttl_hours=_INDICATORS_CACHE_TTL_HOURS,

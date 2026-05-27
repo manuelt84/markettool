@@ -491,12 +491,14 @@ class LegacyAnalisisUseCase:
 
             # Get GCS bucket
             try:
-                from google.cloud import storage as gcs_storage
                 bucket_name = getattr(self._services, "gcs_bucket_name", None) or "markettool_bucket"
-                gcs_client = gcs_storage.Client()
+                gcs_client = getattr(self._services, "gcs_client", None)
+                if gcs_client is None:
+                    from google.cloud import storage as gcs_storage
+                    gcs_client = gcs_storage.Client()
                 bucket = gcs_client.bucket(bucket_name)
             except Exception as exc:
-                self._services.logger.warning("[PostBacktest] GCS not available: %s", exc)
+                self._services.logger.warning("[PostBacktest] JSON storage not available: %s", exc)
                 return
 
             for file_data in enriched_files:

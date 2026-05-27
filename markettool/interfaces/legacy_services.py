@@ -71,3 +71,4 @@ class LegacyServices:
     cache_enabled: bool
     ttl_hours: int
     force_recalc: bool
+    gcs_client: Any = None

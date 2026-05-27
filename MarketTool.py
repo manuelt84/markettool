@@ -22548,12 +22548,11 @@ def _gcs_file_name_for(symbol: str, timeframe: str) -> str:
 
 
 def _download_json_from_gcs(path: str) -> Any:
-    client = storage.Client()
     """
     Lee un JSON de GCS (usando storage_client global si ya existe).
     Retorna dict/list. Lanza excepción si falla.
     """
-    # Requiere google-cloud-storage y que tengas storage_client global (ya suele existir en tu app).
+    client = get_gcs_client()
     bucket = client.bucket(BUCKET_NAME)
     blob = bucket.blob(path)
     data = blob.download_as_bytes()
@@ -22563,7 +22562,7 @@ def _download_json_from_gcs(path: str) -> Any:
 
 def _persist_if_needed(exec_id: str, symbol: str, timeframe: str, force: bool = False) -> Optional[str]:
     try:
-        client = storage.Client()
+        client = get_gcs_client()
         key = (exec_id, symbol.upper(), timeframe)
         with _MON_CACHE_LOCK:
             state = _MON_CACHE.get(key)
@@ -22674,7 +22673,7 @@ def fs_touch_monitoreo(exec_id: str, symbol: str, data: Dict[str, Any]) -> None:
 
 def _maybe_refresh_from_gcs(exec_id: str, symbol: str, timeframe: str, st: dict, max_age_s: int = 30):
     try:
-        client = storage.Client()
+        client = get_gcs_client()
         paths = [f"{_gcs_exec_base(exec_id)}{_gcs_file_name_for(symbol, timeframe)}"]
         stream_path_fn = globals().get("_gcs_stream_path")
         if callable(stream_path_fn):
@@ -23450,7 +23449,7 @@ def gcs_blob_exists(bucket_name: str, path: str) -> bool:
     Verifica si existe un blob en GCS.
     """
     try:
-        client = storage.Client()
+        client = get_gcs_client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(path)
         return blob.exists()
@@ -23465,7 +23464,7 @@ def read_json_from_gcs(bucket_name: str, path: str) -> Any:
     Retorna list/dict o {} si falla.
     """
     try:
-        client = storage.Client()
+        client = get_gcs_client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(path)
         if not blob.exists():
@@ -23485,7 +23484,7 @@ def write_json_to_gcs(bucket_name: str, path: str, obj: Any, content_type: str =
     """
     try:
         payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        client =  storage.Client()
+        client = get_gcs_client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(path)
         blob.upload_from_string(payload, content_type=content_type)

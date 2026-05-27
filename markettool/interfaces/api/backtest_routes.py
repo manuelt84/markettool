@@ -36,11 +36,14 @@ def _get_firestore_db(services: Any):
 
 def _get_gcs_bucket(services: Any):
     try:
-        from google.cloud import storage as gcs_storage
         bucket_name = getattr(services, "gcs_bucket_name", None) or "markettool_bucket"
-        return gcs_storage.Client().bucket(bucket_name)
+        gcs_client = getattr(services, "gcs_client", None)
+        if gcs_client is None:
+            from google.cloud import storage as gcs_storage
+            gcs_client = gcs_storage.Client()
+        return gcs_client.bucket(bucket_name)
     except Exception as exc:
-        logger.warning("Could not get GCS bucket: %s", exc)
+        logger.warning("Could not get JSON storage bucket: %s", exc)
         return None
 
 

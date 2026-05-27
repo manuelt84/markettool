@@ -129,6 +129,8 @@ class _VpsBlob:
         self.name = _clean_rel_path(rel_path)
         self.public_url = store.public_url(self.name)
         self.size: Optional[int] = None
+        self.generation: Optional[str] = None
+        self.updated: Optional[datetime] = None
 
     def upload_from_string(self, data: bytes | str, content_type: str = "application/octet-stream", **_: Any) -> None:
         payload = data.encode("utf-8") if isinstance(data, str) else data
@@ -160,7 +162,15 @@ class _VpsBlob:
 
     def reload(self) -> None:
         path = self._store._path(self.name)
-        self.size = path.stat().st_size if path.exists() else None
+        if not path.exists():
+            self.size = None
+            self.generation = None
+            self.updated = None
+            return
+        stat = path.stat()
+        self.size = stat.st_size
+        self.generation = str(int(stat.st_mtime_ns))
+        self.updated = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
 
 
 class _PgSnapshot:
@@ -192,6 +202,9 @@ class _PgDocumentRef:
 
     def delete(self) -> None:
         self._store.delete_document(self._collection, self.id)
+
+    def collection(self, name: str) -> "_PgCollectionRef":
+        return _PgCollectionRef(self._store, f"{self._collection}/{self.id}/{name}")
 
 
 class _PgQuery:
@@ -250,6 +263,12 @@ class PostgresDocumentStore:
     @classmethod
     def from_env(cls) -> Optional["PostgresDocumentStore"]:
         dsn = os.getenv("MARKETTOOL_POSTGRES_DSN") or os.getenv("DATABASE_URL")
+        dsn_file = os.getenv("MARKETTOOL_POSTGRES_DSN_FILE")
+        if not dsn and dsn_file:
+            try:
+                dsn = Path(dsn_file).read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                logger.warning("[PostgresDocumentStore] Could not read DSN file %s: %s", dsn_file, exc)
         if not dsn:
             return None
         return cls(
@@ -281,6 +300,10 @@ class PostgresDocumentStore:
             cur.execute(
                 f'CREATE INDEX IF NOT EXISTS firestore_docs_collection_updated_idx '
                 f'ON "{self.schema}".firestore_docs (collection_name, updated_at DESC)'
+            )
+            cur.execute(
+                f'CREATE INDEX IF NOT EXISTS firestore_docs_data_gin_idx '
+                f'ON "{self.schema}".firestore_docs USING gin (data)'
             )
             conn.commit()
         self._ready = True
