@@ -31,11 +31,14 @@ _INDICATORS_FORCE_RECALC = os.environ.get("INDICATORS_FORCE_RECALC", "false").lo
 _INDICATORS_MEMORY_CACHE_SIZE = int(os.environ.get("INDICATORS_MEMORY_CACHE_SIZE", "10"))
 _INDICATORS_LOCK_TIMEOUT_SEC = int(os.environ.get("INDICATORS_LOCK_TIMEOUT_SEC", "180"))
 
+_VPS_BACKEND_ENABLED = os.environ.get("MARKETTOOL_CLOUD_BACKEND", "").strip().lower() == "vps"
+_VPS_STORAGE_ROOT = os.environ.get("MARKETTOOL_VPS_STORAGE_ROOT", "/app/storage/markettool-json")
 _GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
+_GCS_ENABLED = os.environ.get("GCS_ENABLED", "true").lower() == "true" and not _VPS_BACKEND_ENABLED
 _GCS_POOL_CONNECTIONS = int(os.environ.get("GCS_POOL_CONNECTIONS", "64"))
 _GCS_POOL_MAXSIZE = int(os.environ.get("GCS_POOL_MAXSIZE", "64"))
 _FIRESTORE_CLIENT = None
-_FIRESTORE_ENABLED = os.environ.get("FIRESTORE_ENABLED", "true").lower() == "true"
+_FIRESTORE_ENABLED = os.environ.get("FIRESTORE_ENABLED", "true").lower() == "true" and not _VPS_BACKEND_ENABLED
 
 UTC = timezone.utc
 
@@ -124,7 +127,10 @@ class IndicatorsCache:
         self._memory_cache_max = _INDICATORS_MEMORY_CACHE_SIZE
         self._memory_cache_ttl_sec = CACHE_CONFIG['memory_ttl_seconds']  # Use unified config
         self._memory_cache_lock = threading.RLock()  # PROPOSAL 3: Thread-safe lock
-        self._local_dir = os.environ.get("INDICATORS_DIR", "indicators")
+        self._local_dir = os.environ.get(
+            "INDICATORS_DIR",
+            os.path.join(_VPS_STORAGE_ROOT, "indicators") if _VPS_BACKEND_ENABLED else "indicators",
+        )
 
         self._enabled = _INDICATORS_CACHE_ENABLED
 
@@ -139,6 +145,8 @@ class IndicatorsCache:
 
     @property
     def bucket(self):
+        if not _GCS_ENABLED:
+            return None
         if self._bucket is None and self._enabled:
             try:
                 self._bucket = _tune_storage_client(storage.Client()).bucket(self.bucket_name)
