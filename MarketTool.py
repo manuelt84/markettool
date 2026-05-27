@@ -127,6 +127,11 @@ from markettool.application.services import (
     get_confluence_service,
     get_zone_validator,
 )
+from markettool.infra.storage.vps_json_store import (
+    PostgresDocumentStore,
+    VpsJsonStore,
+    vps_mode_enabled,
+)
 try:
     import psutil
 except Exception:
@@ -2230,10 +2235,33 @@ if not API_KEY:
 # These are initialized on-demand, not at import time
 _db = None
 _storage_client = None
+_vps_json_store = None
+_postgres_doc_store = None
+
+
+def get_vps_json_store() -> VpsJsonStore:
+    """Lazy-load VPS/local JSON storage."""
+    global _vps_json_store
+    if _vps_json_store is None:
+        _vps_json_store = VpsJsonStore.from_env()
+    return _vps_json_store
+
+
+def get_postgres_doc_store() -> Optional[PostgresDocumentStore]:
+    """Lazy-load PostgreSQL metadata store used in VPS mode."""
+    global _postgres_doc_store
+    if _postgres_doc_store is None:
+        _postgres_doc_store = PostgresDocumentStore.from_env()
+    return _postgres_doc_store
 
 def get_firestore_db():
     """Lazy-load Firestore client on first use."""
     global _db
+    if vps_mode_enabled():
+        store = get_postgres_doc_store()
+        if store is None:
+            raise RuntimeError("MARKETTOOL_CLOUD_BACKEND=vps requiere MARKETTOOL_POSTGRES_DSN o DATABASE_URL")
+        return store
     if _db is None:
         try:
             _db = firestore.Client()
@@ -2327,6 +2355,8 @@ db = _LazyFirestoreProxy()
 def get_gcs_client():
     """Lazy-load GCS client on first use."""
     global _storage_client
+    if vps_mode_enabled():
+        return get_vps_json_store()
     if _storage_client is None:
         try:
             _storage_client = storage.Client()
@@ -5158,6 +5188,14 @@ async def subir_a_bucket_y_obtener_url(fuente, nombre_remoto=None, carpeta='anal
 
     def _upload_sync():
         """Operación sincrónica envuelta para ejecutarse en thread pool"""
+        if vps_mode_enabled():
+            object_path = f"{carpeta}/{nombre_remoto}".replace("//", "/")
+            store = get_vps_json_store()
+            if isinstance(fuente, BytesIO):
+                fuente.seek(0)
+                return store.write_bytes(object_path, fuente.getvalue())
+            return store.upload_file(fuente, object_path)
+
         client = storage.Client()
         bucket = client.bucket(BUCKET_NAME)
         blob = bucket.blob(f"{carpeta}/{nombre_remoto}")
@@ -6248,6 +6286,8 @@ _last_gcs_backup_hash = {}  # {(symbol, tf): data_hash} - detect delta changes
 def _get_gcs_bucket():
     """Inicializa lazy el cliente de GCS."""
     global _GCS_CLIENT
+    if vps_mode_enabled():
+        return get_vps_json_store()
     if not _GCS_ENABLED:
         return None
     
@@ -6277,12 +6317,15 @@ def load_from_gcs(symbol: str, tf: str) -> Optional[pd.DataFrame]:
         safe_tf = normalize_tf(tf)
         gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
         
-        blob = bucket.blob(gcs_path)
-        if not blob.exists():
-            return None
-        
-        # Descargar y parsear
-        json_data = blob.download_as_text(encoding="utf-8")
+        if vps_mode_enabled():
+            if not bucket.exists(gcs_path):
+                return None
+            json_data = bucket.read_bytes(gcs_path).decode("utf-8")
+        else:
+            blob = bucket.blob(gcs_path)
+            if not blob.exists():
+                return None
+            json_data = blob.download_as_text(encoding="utf-8")
         data = json.loads(json_data)
         
         # Soportar formato {"data": [...]} o directamente [...]
@@ -6306,7 +6349,7 @@ def load_from_gcs(symbol: str, tf: str) -> Optional[pd.DataFrame]:
         # Normalizar columnas OHLCV
         df = _ensure_cols(df)
         
-        logger.debug(f"[GCS] Loaded {symbol}/{tf} from gs://{_GCS_BUCKET_NAME}/{gcs_path} ({len(df)} rows)")
+        logger.debug(f"[Storage] Loaded {symbol}/{tf} from {gcs_path} ({len(df)} rows)")
         return df
     
     except Exception as e:
@@ -6353,14 +6396,16 @@ def save_to_gcs(symbol: str, tf: str, df: pd.DataFrame) -> bool:
         # Mantener solo últimas 1000 filas para no exceder límites
         payload = out[["time", "open", "high", "low", "close", "volume"]].tail(1000).to_dict(orient="records")
         
-        # Subir a GCS
-        blob = bucket.blob(gcs_path)
-        blob.upload_from_string(
-            json.dumps(payload, ensure_ascii=False),
-            content_type="application/json"
-        )
-        
-        logger.debug(f"[GCS] Saved {symbol}/{tf} to gs://{_GCS_BUCKET_NAME}/{gcs_path} ({len(payload)} rows)")
+        if vps_mode_enabled():
+            bucket.write_bytes(gcs_path, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        else:
+            blob = bucket.blob(gcs_path)
+            blob.upload_from_string(
+                json.dumps(payload, ensure_ascii=False),
+                content_type="application/json"
+            )
+
+        logger.debug(f"[Storage] Saved {symbol}/{tf} to {gcs_path} ({len(payload)} rows)")
         return True
     
     except Exception as e:
@@ -6376,9 +6421,11 @@ def save_to_gcs(symbol: str, tf: str, df: pd.DataFrame) -> bool:
 _FIRESTORE_CLIENT = None
 _FIRESTORE_ENABLED = os.environ.get("FIRESTORE_ENABLED", "true").lower() == "true"
 
-def _get_firestore_client() -> Optional[firestore.Client]:
+def _get_firestore_client():
     """Initializes Firestore client lazily."""
     global _FIRESTORE_CLIENT
+    if vps_mode_enabled():
+        return get_postgres_doc_store()
     if not _FIRESTORE_ENABLED:
         return None
     
