@@ -28,6 +28,7 @@ from markettool.interfaces.api.payment_routes import register_payment_routes
 from markettool.interfaces.api.whatsapp_routes import register_whatsapp_routes
 from markettool.interfaces.api.live_entries_routes import register_live_entries_routes
 from markettool.interfaces.api.fmp_ledger_routes import register_fmp_ledger_routes
+from markettool.interfaces.api.firestore_vps_routes import register_firestore_vps_routes
 from markettool.infra.storage.vps_json_store import VpsJsonStore, vps_mode_enabled
 # backtest_routes removed — backtest is now 100% client-side
 
@@ -132,6 +133,10 @@ def register_all_routes(
     # WhatsApp support routes (UltraMsg external service)
     register_whatsapp_routes(app)
     logger.info("✅ WhatsApp routes registered")
+
+    # Firestore-compatible REST routes for VPS/PostgreSQL mode.
+    register_firestore_vps_routes(app)
+    logger.info("✅ Firestore VPS compatibility routes registered")
 
     # Legacy routes migrated into hexagonal registration
     legacy_services = getattr(container, "legacy_services", None)
