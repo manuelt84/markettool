@@ -115,6 +115,13 @@ def _warmup_caches_principales():
     ✅ RESILIENT: Fast-fail on FMP errors, graceful degradation
     """
     try:
+        warmup_enabled = str(os.getenv("CACHE_WARMUP_ENABLED", "true")).strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+        if not warmup_enabled:
+            logger.info("[Warmup] Cache warmup disabled by CACHE_WARMUP_ENABLED")
+            return
+
         # Check if FMP_API_KEY is available first
         fmp_api_key = (os.environ.get("FMP_API_KEY") or "").strip()
         if not fmp_api_key:
