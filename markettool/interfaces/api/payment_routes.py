@@ -11,6 +11,8 @@ from typing import Any
 import requests
 from flask import Blueprint, jsonify, request
 
+from markettool.infra.storage.vps_json_store import PostgresDocumentStore, vps_mode_enabled
+
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -92,8 +94,32 @@ def _get_access_token() -> str:
 
 
 def _firestore_client():
+    if vps_mode_enabled():
+        store = PostgresDocumentStore.from_env()
+        if store is None:
+            raise RuntimeError("MARKETTOOL_POSTGRES_DSN or MARKETTOOL_POSTGRES_DSN_FILE is required in VPS mode")
+        return store
     from google.cloud import firestore  # lazy import
     return firestore.Client(project="trading-449607")
+
+
+class Increment:
+    def __init__(self, value: int):
+        self._value = value
+
+
+def _increment(value: int) -> Any:
+    if vps_mode_enabled():
+        return Increment(value)
+    from google.cloud import firestore
+    return firestore.Increment(value)
+
+
+def _server_timestamp() -> Any:
+    if vps_mode_enabled():
+        return datetime.now(timezone.utc).isoformat()
+    from google.cloud import firestore
+    return firestore.SERVER_TIMESTAMP
 
 
 def _parse_item(data: dict[str, Any]) -> tuple[str, str]:
@@ -176,8 +202,6 @@ def _is_admin_user(user_id: str) -> bool:
 
 def _credit_transactions(user_id: str, pack_id: str, order_id: str, *, provider: str = "paypal") -> int:
     """Increment transacciones_restantes and log payment_history. Returns new balance."""
-    from google.cloud import firestore
-
     pack = PACKS[pack_id]
     ops = pack["ops"]
     db = _firestore_client()
@@ -185,8 +209,8 @@ def _credit_transactions(user_id: str, pack_id: str, order_id: str, *, provider:
 
     doc_ref.update(
         {
-            "transacciones_restantes": firestore.Increment(ops),
-            "updated_at": firestore.SERVER_TIMESTAMP,
+            "transacciones_restantes": _increment(ops),
+            "updated_at": _server_timestamp(),
         }
     )
 
@@ -211,8 +235,6 @@ def _credit_transactions(user_id: str, pack_id: str, order_id: str, *, provider:
 
 
 def _activate_plan(user_id: str, plan_id: str, order_id: str, *, provider: str = "paypal") -> dict[str, Any]:
-    from google.cloud import firestore
-
     plan = PLANS[plan_id]
     now = datetime.now(timezone.utc)
     end = now + timedelta(days=int(plan["duration_days"]))
@@ -229,7 +251,7 @@ def _activate_plan(user_id: str, plan_id: str, order_id: str, *, provider: str =
         "fin": end.isoformat(),
         "limite_transacciones": int(plan["transactions"]),
         "transacciones_restantes": int(plan["transactions"]),
-        "updated_at": firestore.SERVER_TIMESTAMP,
+        "updated_at": _server_timestamp(),
     }
     doc_ref.set(payload, merge=True)
     doc_ref.collection("payment_history").document(order_id).set(

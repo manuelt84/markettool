@@ -354,6 +354,25 @@ class PostgresDocumentStore:
             if value.__class__.__name__ == "Increment":
                 delta = int(getattr(value, "_value", 1) or 1)
                 current[str(key)] = int(current.get(str(key), 0) or 0) + delta
+            elif isinstance(value, dict) and value.get("__op") == "increment":
+                delta = int(value.get("value", 1) or 1)
+                current[str(key)] = int(current.get(str(key), 0) or 0) + delta
+            elif isinstance(value, dict) and value.get("__op") == "serverTimestamp":
+                current[str(key)] = datetime.now(timezone.utc).isoformat()
+            elif isinstance(value, dict) and value.get("__op") == "deleteField":
+                current.pop(str(key), None)
+            elif isinstance(value, dict) and value.get("__op") == "arrayUnion":
+                existing = current.get(str(key))
+                values = value.get("values") or []
+                merged = list(existing) if isinstance(existing, list) else []
+                for item in values:
+                    if item not in merged:
+                        merged.append(self._normalize(item))
+                current[str(key)] = merged
+            elif isinstance(value, dict) and value.get("__op") == "arrayRemove":
+                existing = current.get(str(key))
+                values = value.get("values") or []
+                current[str(key)] = [item for item in existing if item not in values] if isinstance(existing, list) else []
             else:
                 current[str(key)] = self._normalize(value)
         self.set_document(collection, doc_id, current, merge=False)

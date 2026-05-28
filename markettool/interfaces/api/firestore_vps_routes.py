@@ -91,7 +91,11 @@ def register_firestore_vps_routes(app) -> None:
         payload = request.get_json(silent=True) or {}
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
         merge = bool(payload.get("merge")) or request.method == "PATCH"
-        _store().set_document(collection, doc_id, data, merge=merge)
+        store = _store()
+        if request.method == "PATCH":
+            store.update_document(collection, doc_id, data)
+        else:
+            store.set_document(collection, doc_id, data, merge=merge)
         return jsonify({"status": "ok", "id": doc_id})
 
     @app.route("/api/v1/firestore/doc/<path:doc_path>", methods=["DELETE"])

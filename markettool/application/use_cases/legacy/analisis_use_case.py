@@ -489,14 +489,19 @@ class LegacyAnalisisUseCase:
                 )
                 return
 
-            # Get GCS bucket
+            # Get JSON storage bucket
             try:
-                bucket_name = getattr(self._services, "gcs_bucket_name", None) or "markettool_bucket"
-                gcs_client = getattr(self._services, "gcs_client", None)
-                if gcs_client is None:
-                    from google.cloud import storage as gcs_storage
-                    gcs_client = gcs_storage.Client()
-                bucket = gcs_client.bucket(bucket_name)
+                from markettool.infra.storage.vps_json_store import VpsJsonStore, vps_mode_enabled
+
+                if vps_mode_enabled():
+                    bucket = VpsJsonStore.from_env()
+                else:
+                    bucket_name = getattr(self._services, "gcs_bucket_name", None) or "markettool_bucket"
+                    gcs_client = getattr(self._services, "gcs_client", None)
+                    if gcs_client is None:
+                        from google.cloud import storage as gcs_storage
+                        gcs_client = gcs_storage.Client()
+                    bucket = gcs_client.bucket(bucket_name)
             except Exception as exc:
                 self._services.logger.warning("[PostBacktest] JSON storage not available: %s", exc)
                 return
@@ -638,15 +643,15 @@ class LegacyAnalisisUseCase:
 
                 try:
                     gcs_path = data.get("gcs_path")
-                    signed_url = (
-                        data.get("signed_url")
-                        or data.get("metadata", {}).get("signed_url")
-                        or (
-                            f"https://storage.googleapis.com/markettool_bucket/{gcs_path}"
-                            if isinstance(gcs_path, str) and gcs_path
-                            else None
+                    signed_url = data.get("signed_url") or data.get("metadata", {}).get("signed_url")
+                    if not signed_url and isinstance(gcs_path, str) and gcs_path:
+                        from markettool.infra.storage.vps_json_store import VpsJsonStore, vps_mode_enabled
+
+                        signed_url = (
+                            VpsJsonStore.from_env().public_url(gcs_path)
+                            if vps_mode_enabled()
+                            else f"https://storage.googleapis.com/markettool_bucket/{gcs_path}"
                         )
-                    )
                     if signed_url:
                         resp = requests.get(signed_url, timeout=10)
                         if resp.status_code == 200:
