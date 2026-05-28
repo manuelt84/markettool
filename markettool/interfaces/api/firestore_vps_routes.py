@@ -44,16 +44,19 @@ def _doc_parts(path: str) -> tuple[str, str]:
 
 
 def _filter_rows(rows: list[tuple[str, dict[str, Any]]], filters: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
-    def matches(data: dict[str, Any]) -> bool:
+    def matches(doc_id: str, data: dict[str, Any]) -> bool:
         for flt in filters:
             field = str(flt.get("field") or "")
             op = str(flt.get("op") or "==")
             expected = flt.get("value")
-            actual = data.get(field)
+            actual = doc_id if field == "__name__" else data.get(field)
             if op == "==" and str(actual) != str(expected):
                 return False
             if op == "!=" and str(actual) == str(expected):
                 return False
+            if op == "in":
+                if not isinstance(expected, list) or actual not in expected:
+                    return False
             if op in {">", ">=", "<", "<="}:
                 try:
                     a = float(actual)
@@ -71,7 +74,17 @@ def _filter_rows(rows: list[tuple[str, dict[str, Any]]], filters: list[dict[str,
                     return False
         return True
 
-    return [(doc_id, data) for doc_id, data in rows if matches(data)]
+    return [(doc_id, data) for doc_id, data in rows if matches(doc_id, data)]
+
+
+def _has_field_ops(value: Any) -> bool:
+    if isinstance(value, dict):
+        if "__op" in value:
+            return True
+        return any(_has_field_ops(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_field_ops(v) for v in value)
+    return False
 
 
 def register_firestore_vps_routes(app) -> None:
@@ -92,7 +105,7 @@ def register_firestore_vps_routes(app) -> None:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
         merge = bool(payload.get("merge")) or request.method == "PATCH"
         store = _store()
-        if request.method == "PATCH":
+        if request.method == "PATCH" or (merge and _has_field_ops(data)):
             store.update_document(collection, doc_id, data)
         else:
             store.set_document(collection, doc_id, data, merge=merge)

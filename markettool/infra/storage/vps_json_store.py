@@ -350,31 +350,67 @@ class PostgresDocumentStore:
 
     def update_document(self, collection: str, doc_id: str, data: dict[str, Any]) -> None:
         current = self.get_document(collection, doc_id) or {}
+
+        def parts(field: str) -> list[str]:
+            return [part for part in str(field).split(".") if part]
+
+        def get_value(field: str) -> Any:
+            target: Any = current
+            for part in parts(field):
+                if not isinstance(target, dict) or part not in target:
+                    return None
+                target = target[part]
+            return target
+
+        def set_value(field: str, value: Any) -> None:
+            target = current
+            path = parts(field)
+            if not path:
+                return
+            for part in path[:-1]:
+                child = target.get(part)
+                if not isinstance(child, dict):
+                    child = {}
+                    target[part] = child
+                target = child
+            target[path[-1]] = value
+
+        def delete_value(field: str) -> None:
+            target = current
+            path = parts(field)
+            for part in path[:-1]:
+                child = target.get(part)
+                if not isinstance(child, dict):
+                    return
+                target = child
+            if path:
+                target.pop(path[-1], None)
+
         for key, value in data.items():
             if value.__class__.__name__ == "Increment":
                 delta = int(getattr(value, "_value", 1) or 1)
-                current[str(key)] = int(current.get(str(key), 0) or 0) + delta
+                set_value(str(key), int(get_value(str(key)) or 0) + delta)
             elif isinstance(value, dict) and value.get("__op") == "increment":
                 delta = int(value.get("value", 1) or 1)
-                current[str(key)] = int(current.get(str(key), 0) or 0) + delta
+                set_value(str(key), int(get_value(str(key)) or 0) + delta)
             elif isinstance(value, dict) and value.get("__op") == "serverTimestamp":
-                current[str(key)] = datetime.now(timezone.utc).isoformat()
+                set_value(str(key), datetime.now(timezone.utc).isoformat())
             elif isinstance(value, dict) and value.get("__op") == "deleteField":
-                current.pop(str(key), None)
+                delete_value(str(key))
             elif isinstance(value, dict) and value.get("__op") == "arrayUnion":
-                existing = current.get(str(key))
+                existing = get_value(str(key))
                 values = value.get("values") or []
                 merged = list(existing) if isinstance(existing, list) else []
                 for item in values:
                     if item not in merged:
                         merged.append(self._normalize(item))
-                current[str(key)] = merged
+                set_value(str(key), merged)
             elif isinstance(value, dict) and value.get("__op") == "arrayRemove":
-                existing = current.get(str(key))
+                existing = get_value(str(key))
                 values = value.get("values") or []
-                current[str(key)] = [item for item in existing if item not in values] if isinstance(existing, list) else []
+                set_value(str(key), [item for item in existing if item not in values] if isinstance(existing, list) else [])
             else:
-                current[str(key)] = self._normalize(value)
+                set_value(str(key), self._normalize(value))
         self.set_document(collection, doc_id, current, merge=False)
 
     def delete_document(self, collection: str, doc_id: str) -> None:
@@ -397,8 +433,12 @@ class PostgresDocumentStore:
         for field, op, value in filters:
             if op != "==":
                 continue
-            sql.append("AND data ->> %s = %s")
-            params.extend([field, str(value)])
+            if field == "__name__":
+                sql.append("AND doc_id = %s")
+                params.append(str(value))
+            else:
+                sql.append("AND data ->> %s = %s")
+                params.extend([field, str(value)])
         if order_by:
             sql.append("ORDER BY data ->> %s DESC NULLS LAST, updated_at DESC")
             params.append(order_by)
@@ -421,6 +461,15 @@ class PostgresDocumentStore:
 
     def _normalize(self, value: Any) -> Any:
         if isinstance(value, dict):
+            op = value.get("__op")
+            if op == "serverTimestamp":
+                return datetime.now(timezone.utc).isoformat()
+            if op == "deleteField":
+                return None
+            if op == "increment":
+                return int(value.get("value", 1) or 1)
+            if op in {"arrayUnion", "arrayRemove"}:
+                return [self._normalize(v) for v in value.get("values", [])]
             return {str(k): self._normalize(v) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return [self._normalize(v) for v in value]
