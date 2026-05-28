@@ -21,6 +21,11 @@ from requests.adapters import HTTPAdapter
 from markettool.core.config import load_config
 from markettool.infra.fmp import normalize_tf
 from markettool.core.cache_config import validate_data_freshness, get_freshness_requirement_for_timeframe, CACHE_CONFIG
+from markettool.infra.storage.vps_json_store import (
+    PostgresDocumentStore,
+    VpsJsonStore,
+    vps_mode_enabled,
+)
 
 # Optional Redis support
 try:
@@ -1101,6 +1106,8 @@ def _tune_gcs_client(client: storage.Client) -> storage.Client:
 
 def _get_gcs_bucket():
     global _GCS_CLIENT
+    if vps_mode_enabled():
+        return VpsJsonStore.from_env()
     if not _GCS_ENABLED:
         return None
     try:
@@ -1210,6 +1217,8 @@ _FIRESTORE_ENABLED = os.environ.get("FIRESTORE_ENABLED", "true").lower() == "tru
 
 def _get_firestore_client() -> Optional[firestore.Client]:
     global _FIRESTORE_CLIENT
+    if vps_mode_enabled():
+        return PostgresDocumentStore.from_env()
     if not _FIRESTORE_ENABLED:
         return None
 
