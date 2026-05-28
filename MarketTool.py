@@ -130,6 +130,7 @@ from markettool.application.services import (
 from markettool.infra.storage.vps_json_store import (
     PostgresDocumentStore,
     VpsJsonStore,
+    hybrid_mode_enabled,
     vps_mode_enabled,
 )
 try:
@@ -2245,6 +2246,25 @@ def get_vps_json_store() -> VpsJsonStore:
     if _vps_json_store is None:
         _vps_json_store = VpsJsonStore.from_env()
     return _vps_json_store
+
+
+def _mirror_bytes_to_vps(path: str, payload: bytes) -> None:
+    """Best-effort backup for hybrid mode: GCP is primary, VPS is fallback."""
+    if not hybrid_mode_enabled():
+        return
+    try:
+        get_vps_json_store().write_bytes(path, payload)
+    except Exception as exc:
+        logger.warning("[HybridStorage] VPS mirror failed for %s: %s", path, exc)
+
+
+def _mirror_file_to_vps(path: str, source_path: str) -> None:
+    if not hybrid_mode_enabled():
+        return
+    try:
+        get_vps_json_store().upload_file(source_path, path)
+    except Exception as exc:
+        logger.warning("[HybridStorage] VPS mirror failed for %s: %s", path, exc)
 
 
 def get_postgres_doc_store() -> Optional[PostgresDocumentStore]:
@@ -5188,8 +5208,8 @@ async def subir_a_bucket_y_obtener_url(fuente, nombre_remoto=None, carpeta='anal
 
     def _upload_sync():
         """Operación sincrónica envuelta para ejecutarse en thread pool"""
+        object_path = f"{carpeta}/{nombre_remoto}".replace("//", "/")
         if vps_mode_enabled():
-            object_path = f"{carpeta}/{nombre_remoto}".replace("//", "/")
             store = get_vps_json_store()
             if isinstance(fuente, BytesIO):
                 fuente.seek(0)
@@ -5204,11 +5224,14 @@ async def subir_a_bucket_y_obtener_url(fuente, nombre_remoto=None, carpeta='anal
         if isinstance(fuente, BytesIO):
             # Upload desde buffer en memoria (sin I/O a disco)
             fuente.seek(0)  # Reset position to start
-            blob.upload_from_string(fuente.getvalue(), content_type=content_type)
-            logger.info(f"[BytesIO Upload] {nombre_remoto} ({len(fuente.getvalue())} bytes)")
+            payload = fuente.getvalue()
+            blob.upload_from_string(payload, content_type=content_type)
+            _mirror_bytes_to_vps(object_path, payload)
+            logger.info(f"[BytesIO Upload] {nombre_remoto} ({len(payload)} bytes)")
         else:
             # Upload desde archivo en disco (compatibilidad)
             blob.upload_from_filename(fuente)
+            _mirror_file_to_vps(object_path, fuente)
             logger.info(f"[File Upload] {nombre_remoto}")
         
         blob.make_public()  # O usar signed_url si prefieres enlaces temporales
@@ -6429,11 +6452,13 @@ def save_to_gcs(symbol: str, tf: str, df: pd.DataFrame) -> bool:
         if vps_mode_enabled():
             bucket.write_bytes(gcs_path, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
         else:
+            raw_payload = json.dumps(payload, ensure_ascii=False)
             blob = bucket.blob(gcs_path)
             blob.upload_from_string(
-                json.dumps(payload, ensure_ascii=False),
+                raw_payload,
                 content_type="application/json"
             )
+            _mirror_bytes_to_vps(gcs_path, raw_payload.encode("utf-8"))
 
         logger.debug(f"[Storage] Saved {symbol}/{tf} to {gcs_path} ({len(payload)} rows)")
         return True
@@ -22665,11 +22690,17 @@ def _download_json_from_gcs(path: str) -> Any:
     Lee un JSON de GCS (usando storage_client global si ya existe).
     Retorna dict/list. Lanza excepción si falla.
     """
-    client = get_gcs_client()
-    bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(path)
-    data = blob.download_as_bytes()
-    return json.loads(data.decode("utf-8"))
+    try:
+        client = get_gcs_client()
+        bucket = client.bucket(BUCKET_NAME)
+        blob = bucket.blob(path)
+        data = blob.download_as_bytes()
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        if not hybrid_mode_enabled():
+            raise
+        data = get_vps_json_store().read_bytes(path)
+        return json.loads(data.decode("utf-8"))
 
 
 
@@ -22695,6 +22726,7 @@ def _persist_if_needed(exec_id: str, symbol: str, timeframe: str, force: bool = 
             blob = bucket.blob(path)
             
             blob.upload_from_string(payload, content_type="application/json")
+            _mirror_bytes_to_vps(path, payload)
             blob.reload()
             
             state["dirty"] = False
@@ -23581,11 +23613,18 @@ def read_json_from_gcs(bucket_name: str, path: str) -> Any:
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(path)
         if not blob.exists():
+            if hybrid_mode_enabled() and get_vps_json_store().exists(path):
+                return json.loads(get_vps_json_store().read_bytes(path).decode("utf-8"))
             return {}
         data = blob.download_as_bytes()
         # Si algún día subes gz, aquí podrías detectar y descomprimir
         return json.loads(data.decode("utf-8"))
     except Exception:
+        if hybrid_mode_enabled():
+            try:
+                return json.loads(get_vps_json_store().read_bytes(path).decode("utf-8"))
+            except Exception:
+                pass
         return {}
 
 
@@ -23601,6 +23640,7 @@ def write_json_to_gcs(bucket_name: str, path: str, obj: Any, content_type: str =
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(path)
         blob.upload_from_string(payload, content_type=content_type)
+        _mirror_bytes_to_vps(path, payload)
         # Devuelve la generación para control de cambios
         blob.reload()  # actualiza metadata local
         return str(blob.generation) if getattr(blob, "generation", None) else None

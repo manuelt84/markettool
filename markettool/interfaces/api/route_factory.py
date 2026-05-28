@@ -29,7 +29,7 @@ from markettool.interfaces.api.whatsapp_routes import register_whatsapp_routes
 from markettool.interfaces.api.live_entries_routes import register_live_entries_routes
 from markettool.interfaces.api.fmp_ledger_routes import register_fmp_ledger_routes
 from markettool.interfaces.api.firestore_vps_routes import register_firestore_vps_routes
-from markettool.infra.storage.vps_json_store import VpsJsonStore, vps_mode_enabled
+from markettool.infra.storage.vps_json_store import VpsJsonStore, vps_fallback_enabled
 # backtest_routes removed — backtest is now 100% client-side
 
 if TYPE_CHECKING:
@@ -160,7 +160,7 @@ def register_all_routes(
 
     @app.route("/storage/files/<path:rel_path>", methods=["GET"])
     def storage_file(rel_path: str):
-        if not vps_mode_enabled():
+        if not vps_fallback_enabled():
             abort(404)
         store = VpsJsonStore.from_env()
         full_path = (store.root / rel_path).resolve()

@@ -36,6 +36,18 @@ def vps_mode_enabled() -> bool:
     return cloud_backend() in {"vps", "postgres", "local", "filesystem", "fs"}
 
 
+def hybrid_mode_enabled() -> bool:
+    return cloud_backend() in {"hybrid", "gcp_vps", "gcp-vps", "gcp_fallback_vps", "gcp-fallback-vps"}
+
+
+def vps_fallback_enabled() -> bool:
+    return (
+        vps_mode_enabled()
+        or hybrid_mode_enabled()
+        or _env_bool("MARKETTOOL_VPS_FALLBACK_ENABLED")
+    )
+
+
 def _clean_rel_path(value: str) -> str:
     clean = str(value or "").strip().replace("\\", "/")
     clean = clean.split("?", 1)[0]

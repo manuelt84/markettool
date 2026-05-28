@@ -13,7 +13,7 @@ from typing import Any
 
 from flask import abort, jsonify, request
 
-from markettool.infra.storage.vps_json_store import PostgresDocumentStore, vps_mode_enabled
+from markettool.infra.storage.vps_json_store import PostgresDocumentStore, vps_fallback_enabled
 
 
 def _store() -> PostgresDocumentStore:
@@ -24,7 +24,7 @@ def _store() -> PostgresDocumentStore:
 
 
 def _enabled() -> bool:
-    return vps_mode_enabled() or os.getenv("MARKETTOOL_FIRESTORE_REST_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+    return vps_fallback_enabled() or os.getenv("MARKETTOOL_FIRESTORE_REST_ENABLED", "").lower() in {"1", "true", "yes", "on"}
 
 
 def _clean_path(path: str) -> str:
