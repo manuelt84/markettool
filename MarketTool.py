@@ -743,13 +743,17 @@ def _mark_tf_stopped_by_subscription(exec_id: str, symbol: str, tf_canonical: st
         )
         tf_states[tf_canonical] = tf_state
 
-        ref.set(
-            {
-                "tf_states": tf_states,
-                "updated_at": now_ms,
-            },
-            merge=True,
-        )
+        payload = {
+            "tf_states": tf_states,
+            "updated_at": now_ms,
+        }
+        try:
+            ref.set(payload, merge=True)
+        except Exception as exc:
+            if not hybrid_mode_enabled():
+                raise
+            logger.warning("[HybridFirestore] Firestore set failed for monitoreos/%s: %s", doc_id, exc)
+        _mirror_firestore_set("monitoreos", doc_id, payload, merge=True)
     except Exception:
         pass
 
@@ -2274,6 +2278,30 @@ def get_postgres_doc_store() -> Optional[PostgresDocumentStore]:
         _postgres_doc_store = PostgresDocumentStore.from_env()
     return _postgres_doc_store
 
+
+def _mirror_firestore_set(collection: str, doc_id: str, data: dict[str, Any], *, merge: bool = False) -> None:
+    """Best-effort Firestore metadata backup for hybrid mode."""
+    if not hybrid_mode_enabled():
+        return
+    try:
+        store = get_postgres_doc_store()
+        if store is not None:
+            store.set_document(str(collection), str(doc_id), data or {}, merge=merge)
+    except Exception as exc:
+        logger.warning("[HybridFirestore] VPS mirror set failed for %s/%s: %s", collection, doc_id, exc)
+
+
+def _mirror_firestore_update(collection: str, doc_id: str, data: dict[str, Any]) -> None:
+    """Best-effort Firestore metadata update backup for hybrid mode."""
+    if not hybrid_mode_enabled():
+        return
+    try:
+        store = get_postgres_doc_store()
+        if store is not None:
+            store.update_document(str(collection), str(doc_id), data or {})
+    except Exception as exc:
+        logger.warning("[HybridFirestore] VPS mirror update failed for %s/%s: %s", collection, doc_id, exc)
+
 def get_firestore_db():
     """Lazy-load Firestore client on first use."""
     global _db
@@ -2765,7 +2793,13 @@ def fs_marcar_worker(
         payload["updated_at_server"] = SERVER_TS
 
     # merge=True para no pisar otros campos (resumen, urls, etc.)
-    db.collection("ejecuciones").document(exec_id).set(payload, merge=True)
+    try:
+        db.collection("ejecuciones").document(exec_id).set(payload, merge=True)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore set failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_set("ejecuciones", exec_id, payload, merge=True)
 
 
 def fs_heartbeat(exec_id: str, progress: dict | None = None):
@@ -2794,7 +2828,13 @@ def fs_heartbeat(exec_id: str, progress: dict | None = None):
             "timestamp": ts
         }
     
-    db.collection("ejecuciones").document(exec_id).set(update_data, merge=True)
+    try:
+        db.collection("ejecuciones").document(exec_id).set(update_data, merge=True)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore heartbeat failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_set("ejecuciones", exec_id, update_data, merge=True)
     
     # ⬇️ Mantén vivo el user_state (sirve para que el watchdog no lo resetee por error)
     try:
@@ -2803,9 +2843,15 @@ def fs_heartbeat(exec_id: str, progress: dict | None = None):
         # la ejecución guarda ambos; usa el que haya
         key = d.get("user_id") or (f"tg_{d.get('chat_id')}" if d.get("chat_id") else None)
         if key:
-            db.collection("user_states").document(key).set(
-                {"updated_at_unix": ts}, merge=True
-            )
+            user_state_payload = {"updated_at_unix": ts}
+            try:
+                db.collection("user_states").document(key).set(
+                    user_state_payload, merge=True
+                )
+            except Exception:
+                if not hybrid_mode_enabled():
+                    raise
+            _mirror_firestore_set("user_states", key, user_state_payload, merge=True)
     except Exception:
         pass
 
@@ -3800,7 +3846,13 @@ def fs_crear_ejecucion(
         "created_at": firestore.SERVER_TIMESTAMP,
         "updated_at": firestore.SERVER_TIMESTAMP,
     })
-    db.collection("ejecuciones").document(exec_id).set(payload)
+    try:
+        db.collection("ejecuciones").document(exec_id).set(payload)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore create failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_set("ejecuciones", exec_id, payload, merge=False)
     return exec_id
 
 #@profile
@@ -3809,15 +3861,28 @@ def fs_actualizar_ejecucion(exec_id: str, **campos):
     if not isinstance(campos, dict):
         campos = {}
     campos["updated_at"] = firestore.SERVER_TIMESTAMP
-    db.collection("ejecuciones").document(exec_id).update(campos)
+    try:
+        db.collection("ejecuciones").document(exec_id).update(campos)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore update failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_update("ejecuciones", exec_id, campos)
 
 #@profile
 def fs_finalizar_ejecucion(exec_id: str, estado: str = "completado", resumen: dict | None = None):
-    db.collection("ejecuciones").document(exec_id).update({
+    payload = {
         "estado": str(estado),
         "resumen": _sanitize_for_firestore(resumen or {}),
         "updated_at": firestore.SERVER_TIMESTAMP
-    })
+    }
+    try:
+        db.collection("ejecuciones").document(exec_id).update(payload)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore finalize failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_update("ejecuciones", exec_id, payload)
 
 #@profile
 def fs_registrar_archivo_generado(
@@ -3839,11 +3904,26 @@ def fs_registrar_archivo_generado(
         "metadata": metadata or {},
         "created_at": firestore.SERVER_TIMESTAMP,
     })
-    db.collection("archivos_generados").add(payload)
-    db.collection("ejecuciones").document(exec_id).update({
+    archivo_doc_id = uuid.uuid4().hex
+    try:
+        db.collection("archivos_generados").document(archivo_doc_id).set(payload)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore create failed for archivos_generados/%s: %s", archivo_doc_id, exc)
+    _mirror_firestore_set("archivos_generados", archivo_doc_id, payload, merge=False)
+
+    exec_update = {
         "archivos": firestore.Increment(1),
         "updated_at": firestore.SERVER_TIMESTAMP
-    })
+    }
+    try:
+        db.collection("ejecuciones").document(exec_id).update(exec_update)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore archivo counter failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_update("ejecuciones", exec_id, exec_update)
 
 #@profile
 async def guardar_json_en_storage_y_registrar(
@@ -22811,7 +22891,13 @@ def fs_touch_monitoreo(exec_id: str, symbol: str, data: Dict[str, Any]) -> None:
 
         cur.update(data)
         cur["updated_at"] = int(time.time() * 1000)
-        ref.set(cur, merge=True)
+        try:
+            ref.set(cur, merge=True)
+        except Exception as exc:
+            if not hybrid_mode_enabled():
+                raise
+            logger.warning("[HybridFirestore] Firestore set failed for monitoreos/%s: %s", doc_id, exc)
+        _mirror_firestore_set("monitoreos", doc_id, cur, merge=True)
     except Exception:
         pass
 
