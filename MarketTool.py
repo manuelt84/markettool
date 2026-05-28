@@ -2242,6 +2242,37 @@ _db = None
 _storage_client = None
 _vps_json_store = None
 _postgres_doc_store = None
+_HYBRID_MIRROR_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, int(os.environ.get("MARKETTOOL_HYBRID_MIRROR_WORKERS", "2")))
+)
+_HYBRID_MIRROR_PENDING = 0
+_HYBRID_MIRROR_LOCK = threading.Lock()
+_HYBRID_MIRROR_MAX_PENDING = max(10, int(os.environ.get("MARKETTOOL_HYBRID_MIRROR_MAX_PENDING", "200")))
+
+
+def _submit_hybrid_mirror(label: str, fn, *args, **kwargs) -> None:
+    """Queue VPS backup work without blocking analysis requests."""
+    if not hybrid_mode_enabled():
+        return
+
+    global _HYBRID_MIRROR_PENDING
+    with _HYBRID_MIRROR_LOCK:
+        if _HYBRID_MIRROR_PENDING >= _HYBRID_MIRROR_MAX_PENDING:
+            logger.warning("[HybridMirror] queue full, skipping %s", label)
+            return
+        _HYBRID_MIRROR_PENDING += 1
+
+    def _run():
+        global _HYBRID_MIRROR_PENDING
+        try:
+            fn(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("[HybridMirror] %s failed: %s", label, exc)
+        finally:
+            with _HYBRID_MIRROR_LOCK:
+                _HYBRID_MIRROR_PENDING = max(0, _HYBRID_MIRROR_PENDING - 1)
+
+    _HYBRID_MIRROR_EXECUTOR.submit(_run)
 
 
 def get_vps_json_store() -> VpsJsonStore:
@@ -2256,19 +2287,13 @@ def _mirror_bytes_to_vps(path: str, payload: bytes) -> None:
     """Best-effort backup for hybrid mode: GCP is primary, VPS is fallback."""
     if not hybrid_mode_enabled():
         return
-    try:
-        get_vps_json_store().write_bytes(path, payload)
-    except Exception as exc:
-        logger.warning("[HybridStorage] VPS mirror failed for %s: %s", path, exc)
+    _submit_hybrid_mirror("storage bytes", get_vps_json_store().write_bytes, path, payload)
 
 
 def _mirror_file_to_vps(path: str, source_path: str) -> None:
     if not hybrid_mode_enabled():
         return
-    try:
-        get_vps_json_store().upload_file(source_path, path)
-    except Exception as exc:
-        logger.warning("[HybridStorage] VPS mirror failed for %s: %s", path, exc)
+    _submit_hybrid_mirror("storage file", get_vps_json_store().upload_file, source_path, path)
 
 
 def get_postgres_doc_store() -> Optional[PostgresDocumentStore]:
@@ -2283,24 +2308,26 @@ def _mirror_firestore_set(collection: str, doc_id: str, data: dict[str, Any], *,
     """Best-effort Firestore metadata backup for hybrid mode."""
     if not hybrid_mode_enabled():
         return
-    try:
+
+    def _write():
         store = get_postgres_doc_store()
         if store is not None:
             store.set_document(str(collection), str(doc_id), data or {}, merge=merge)
-    except Exception as exc:
-        logger.warning("[HybridFirestore] VPS mirror set failed for %s/%s: %s", collection, doc_id, exc)
+
+    _submit_hybrid_mirror(f"firestore set {collection}/{doc_id}", _write)
 
 
 def _mirror_firestore_update(collection: str, doc_id: str, data: dict[str, Any]) -> None:
     """Best-effort Firestore metadata update backup for hybrid mode."""
     if not hybrid_mode_enabled():
         return
-    try:
+
+    def _write():
         store = get_postgres_doc_store()
         if store is not None:
             store.update_document(str(collection), str(doc_id), data or {})
-    except Exception as exc:
-        logger.warning("[HybridFirestore] VPS mirror update failed for %s/%s: %s", collection, doc_id, exc)
+
+    _submit_hybrid_mirror(f"firestore update {collection}/{doc_id}", _write)
 
 def get_firestore_db():
     """Lazy-load Firestore client on first use."""
