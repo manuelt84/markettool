@@ -158,7 +158,7 @@ def register_all_routes(
             "version": "2.0.0",
         }, 200
 
-    @app.route("/storage/files/<path:rel_path>", methods=["GET"])
+    @app.route("/storage/files/<path:rel_path>", methods=["GET", "HEAD"])
     def storage_file(rel_path: str):
         if not vps_fallback_enabled():
             abort(404)
@@ -169,6 +169,10 @@ def register_all_routes(
             abort(400)
         if not full_path.exists() or not full_path.is_file():
             abort(404)
-        return send_file(full_path)
+        response = send_file(full_path, conditional=False, max_age=0)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
     
     logger.info("✅ All API routes registered")
