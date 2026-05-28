@@ -191,16 +191,16 @@ class _PgDocumentRef:
         self._collection = collection
         self.id = doc_id
 
-    def get(self) -> _PgSnapshot:
+    def get(self, *_: Any, **__: Any) -> _PgSnapshot:
         return _PgSnapshot(self.id, self._store.get_document(self._collection, self.id))
 
-    def set(self, data: dict[str, Any], merge: bool = False) -> None:
+    def set(self, data: dict[str, Any], merge: bool = False, *_: Any, **__: Any) -> None:
         self._store.set_document(self._collection, self.id, data, merge=merge)
 
-    def update(self, data: dict[str, Any]) -> None:
+    def update(self, data: dict[str, Any], *_: Any, **__: Any) -> None:
         self._store.update_document(self._collection, self.id, data)
 
-    def delete(self) -> None:
+    def delete(self, *_: Any, **__: Any) -> None:
         self._store.delete_document(self._collection, self.id)
 
     def collection(self, name: str) -> "_PgCollectionRef":
@@ -233,6 +233,9 @@ class _PgQuery:
     def stream(self) -> Iterable[_PgSnapshot]:
         rows = self._store.query_documents(self._collection, self._filters, self._order_by, self._limit)
         return [_PgSnapshot(doc_id, data) for doc_id, data in rows]
+
+    def get(self) -> Iterable[_PgSnapshot]:
+        return self.stream()
 
     def _clone(self) -> "_PgQuery":
         clone = _PgQuery(self._store, self._collection)
@@ -313,6 +316,22 @@ class PostgresDocumentStore:
 
     def batch(self):
         return _PgBatch(self)
+
+    def get_all(self, references: Iterable[_PgDocumentRef], **_: Any) -> Iterable[_PgSnapshot]:
+        refs = list(references or [])
+        if not refs:
+            return []
+
+        snapshots: list[_PgSnapshot] = []
+        for ref in refs:
+            if not isinstance(ref, _PgDocumentRef):
+                get_fn = getattr(ref, "get", None)
+                if callable(get_fn):
+                    snapshots.append(get_fn())
+                    continue
+                raise TypeError(f"Unsupported reference for get_all: {type(ref)!r}")
+            snapshots.append(_PgSnapshot(ref.id, self.get_document(ref._collection, ref.id)))
+        return snapshots
 
     def get_document(self, collection: str, doc_id: str) -> Optional[dict[str, Any]]:
         with self._connect() as conn, conn.cursor() as cur:
@@ -427,6 +446,7 @@ class PostgresDocumentStore:
         filters: list[tuple[str, str, Any]],
         order_by: Optional[str],
         limit: Optional[int],
+        order_direction: str = "desc",
     ) -> list[tuple[str, dict[str, Any]]]:
         sql = [f'SELECT doc_id, data FROM "{self.schema}".firestore_docs WHERE collection_name=%s']
         params: list[Any] = [collection]
@@ -442,8 +462,9 @@ class PostgresDocumentStore:
             else:
                 sql.append("AND data ->> %s = %s")
                 params.extend([field, str(value)])
+        direction = "ASC" if str(order_direction).lower() == "asc" else "DESC"
         if order_by:
-            sql.append("ORDER BY data ->> %s DESC NULLS LAST, updated_at DESC")
+            sql.append(f"ORDER BY data ->> %s {direction} NULLS LAST, updated_at DESC")
             params.append(order_by)
         else:
             sql.append("ORDER BY updated_at DESC")

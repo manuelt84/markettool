@@ -96,6 +96,45 @@ def _filter_rows(rows: list[tuple[str, dict[str, Any]]], filters: list[dict[str,
     return [(doc_id, data) for doc_id, data in rows if matches(doc_id, data)]
 
 
+def _field_value(data: dict[str, Any], field: str) -> Any:
+    target: Any = data
+    for part in field.split("."):
+        if not isinstance(target, dict) or part not in target:
+            return None
+        target = target[part]
+    return target
+
+
+def _apply_cursors(
+    rows: list[tuple[str, dict[str, Any]]],
+    order_by: str | None,
+    start_at: Any,
+    end_at: Any,
+) -> list[tuple[str, dict[str, Any]]]:
+    if not order_by or (start_at is None and end_at is None):
+        return rows
+
+    def comparable(value: Any) -> str:
+        return "" if value is None else str(value)
+
+    result = rows
+    if start_at is not None:
+        start = comparable(start_at)
+        result = [
+            (doc_id, data)
+            for doc_id, data in result
+            if comparable(_field_value(data, order_by)) >= start
+        ]
+    if end_at is not None:
+        end = comparable(end_at)
+        result = [
+            (doc_id, data)
+            for doc_id, data in result
+            if comparable(_field_value(data, order_by)) <= end
+        ]
+    return result
+
+
 def _has_field_ops(value: Any) -> bool:
     if isinstance(value, dict):
         if "__op" in value:
@@ -148,25 +187,30 @@ def register_firestore_vps_routes(app) -> None:
             if flt is not None
         ]
         order_by = payload.get("orderBy")
+        order_direction = str(payload.get("orderDirection") or "asc").lower()
         limit = payload.get("limit")
+        start_at = payload.get("startAt")
+        end_at = payload.get("endAt")
         sql_filters = [f for f in filters if f.get("op", "==") == "=="]
         remaining_filters = [f for f in filters if f.get("op", "==") != "=="]
-        sql_limit = None if remaining_filters else limit
+        sql_limit = None if remaining_filters or start_at is not None or end_at is not None else limit
         rows = _store().query_documents(
             _clean_path(collection_path),
             [(str(f.get("field")), str(f.get("op") or "=="), f.get("value")) for f in sql_filters],
             str(order_by) if order_by else None,
             int(sql_limit) if sql_limit else None,
+            "asc" if order_direction == "asc" else "desc",
         )
         if remaining_filters:
             rows = _filter_rows(rows, remaining_filters)
             if any(f.get("field") == "__name__" for f in remaining_filters) and not order_by:
                 rows = sorted(rows, key=lambda row: row[0])
-            if limit:
-                rows = rows[:int(limit)]
+        rows = _apply_cursors(rows, str(order_by) if order_by else None, start_at, end_at)
+        if limit and (remaining_filters or start_at is not None or end_at is not None):
+            rows = rows[:int(limit)]
         return jsonify({
             "documents": [
-                {"id": doc_id, "exists": True, "data": data}
+                {"id": doc_id, "exists": True, "path": f"{_clean_path(collection_path)}/{doc_id}", "data": data}
                 for doc_id, data in rows
             ]
         })

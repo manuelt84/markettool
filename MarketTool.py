@@ -5517,6 +5517,36 @@ def acquire_user_lock(
     lease_until = now_unix + ttl
 
     doc_ref = _user_state_doc_by_uuid(uuid)
+
+    if vps_mode_enabled():
+        try:
+            snap = doc_ref.get()
+            data = snap.to_dict() or {}
+
+            current_owner = str(data.get("lock_owner") or "")
+            current_lease = int(data.get("lease_until_unix") or 0)
+            current_state = str(data.get("estado") or "").lower()
+
+            if current_lease > now_unix and current_state in USER_STATE_BUSY_VALUES:
+                if current_owner and current_owner != MY_ID:
+                    return False
+
+            doc_ref.set(
+                {
+                    "estado": "ocupado",
+                    "lock_owner": MY_ID,
+                    "lock_id": lock_id,
+                    "lease_until_unix": lease_until,
+                    "updated_at_unix": now_unix,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                merge=True,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[user_lock] acquire failed: {e}")
+            return False
+
     transaction = db.transaction()
 
     @firestore.transactional
@@ -20119,6 +20149,58 @@ async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen
     if not canon_ref:
         return False, f"❌ No se encontró suscripción para {user_key}."
 
+    if vps_mode_enabled():
+        try:
+            canon_snap = canon_ref.get()
+            if not canon_snap.exists:
+                raise ValueError("No existe el documento canónico.")
+
+            sus = canon_snap.to_dict() or {}
+            curr = int(sus.get("transacciones_restantes") or 0)
+
+            if curr < dec:
+                if curr <= 0:
+                    inactive_payload = {
+                        "transacciones_restantes": 0,
+                        "estado": "inactiva",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    canon_ref.set(inactive_payload, merge=True)
+                    if alias_ref is not None:
+                        alias_ref.set(
+                            {
+                                "user_id": sus.get("user_id") or canon_ref.id,
+                                "doc_alias_of": sus.get("user_id") or canon_ref.id,
+                                **inactive_payload,
+                            },
+                            merge=True,
+                        )
+                return False, "No cuenta con la cuota de transacciones requerida. Por favor, adquiere un paquete."
+
+            nuevo = max(curr - dec, 0)
+            estado = "activa" if nuevo > 0 else "inactiva"
+            payload = {
+                "transacciones_restantes": nuevo,
+                "estado": estado,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            canon_ref.set(payload, merge=True)
+            if alias_ref is not None:
+                alias_ref.set(
+                    {
+                        "user_id": sus.get("user_id") or canon_ref.id,
+                        "doc_alias_of": sus.get("user_id") or canon_ref.id,
+                        **payload,
+                    },
+                    merge=True,
+                )
+
+            if nuevo <= 0:
+                return True, "✅ Transacción aplicada. Te quedan 0; tu suscripción quedó inactiva."
+            return True, f"✅ Transacción aplicada. Te quedan {nuevo}."
+        except Exception as e:
+            return False, f"❌ Error inesperado al descontar transacción: {e}"
+
     @firestore.transactional
     def _tx(transaction: firestore.Transaction):
         canon_snap = canon_ref.get(transaction=transaction)
@@ -20219,6 +20301,37 @@ async def reponer_transaccion(user_key: str, numero_transacciones_in=1, origen="
     canon_ref, alias_ref, _ = _resolve_refs_from_key(user_key)
     if not canon_ref:
         return False, f"❌ No se encontró suscripción para {user_key}."
+
+    if vps_mode_enabled():
+        try:
+            canon_snap = canon_ref.get()
+            if not canon_snap.exists:
+                raise ValueError("No existe el documento canónico.")
+
+            sus = canon_snap.to_dict() or {}
+            curr = int(sus.get("transacciones_restantes") or 0)
+            nuevo = curr + inc
+
+            fin = parse_iso_aware(sus.get("fin") or "")
+            estado = "activa" if fin and fin >= _now_utc() and nuevo > 0 else sus.get("estado", "activa")
+            payload = {
+                "transacciones_restantes": nuevo,
+                "estado": estado,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            canon_ref.set(payload, merge=True)
+            if alias_ref is not None:
+                alias_ref.set(
+                    {
+                        "user_id": sus.get("user_id") or canon_ref.id,
+                        "doc_alias_of": sus.get("user_id") or canon_ref.id,
+                        **payload,
+                    },
+                    merge=True,
+                )
+            return True, f"✅ Transacción repuesta. Te quedan {nuevo}."
+        except Exception as e:
+            return False, f"❌ Error inesperado al reponer transacción: {e}"
 
     @firestore.transactional
     def _tx(transaction: firestore.Transaction):
