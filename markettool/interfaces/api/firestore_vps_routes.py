@@ -43,19 +43,38 @@ def _doc_parts(path: str) -> tuple[str, str]:
     return "/".join(parts[:-1]), parts[-1]
 
 
+def _normalize_filter(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, dict):
+        field = raw.get("field")
+        if not field:
+            return None
+        return {"field": str(field), "op": str(raw.get("op") or "=="), "value": raw.get("value")}
+    if isinstance(raw, (list, tuple)) and len(raw) >= 3:
+        return {"field": str(raw[0]), "op": str(raw[1] or "=="), "value": raw[2]}
+    return None
+
+
 def _filter_rows(rows: list[tuple[str, dict[str, Any]]], filters: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    def field_value(data: dict[str, Any], field: str) -> Any:
+        target: Any = data
+        for part in field.split("."):
+            if not isinstance(target, dict) or part not in target:
+                return None
+            target = target[part]
+        return target
+
     def matches(doc_id: str, data: dict[str, Any]) -> bool:
         for flt in filters:
             field = str(flt.get("field") or "")
             op = str(flt.get("op") or "==")
             expected = flt.get("value")
-            actual = doc_id if field == "__name__" else data.get(field)
+            actual = doc_id if field == "__name__" else field_value(data, field)
             if op == "==" and str(actual) != str(expected):
                 return False
             if op == "!=" and str(actual) == str(expected):
                 return False
             if op == "in":
-                if not isinstance(expected, list) or actual not in expected:
+                if not isinstance(expected, list) or str(actual) not in {str(item) for item in expected}:
                     return False
             if op in {">", ">=", "<", "<="}:
                 try:
@@ -124,18 +143,27 @@ def register_firestore_vps_routes(app) -> None:
         if not _enabled():
             abort(404)
         payload = request.get_json(silent=True) or {}
-        filters = payload.get("filters") or []
+        filters = [
+            flt for flt in (_normalize_filter(item) for item in (payload.get("filters") or []))
+            if flt is not None
+        ]
         order_by = payload.get("orderBy")
         limit = payload.get("limit")
+        sql_filters = [f for f in filters if f.get("op", "==") == "=="]
+        remaining_filters = [f for f in filters if f.get("op", "==") != "=="]
+        sql_limit = None if remaining_filters else limit
         rows = _store().query_documents(
             _clean_path(collection_path),
-            [(str(f.get("field")), str(f.get("op") or "=="), f.get("value")) for f in filters if isinstance(f, dict) and f.get("op", "==") == "=="],
+            [(str(f.get("field")), str(f.get("op") or "=="), f.get("value")) for f in sql_filters],
             str(order_by) if order_by else None,
-            int(limit) if limit else None,
+            int(sql_limit) if sql_limit else None,
         )
-        remaining_filters = [f for f in filters if isinstance(f, dict) and f.get("op", "==") != "=="]
         if remaining_filters:
             rows = _filter_rows(rows, remaining_filters)
+            if any(f.get("field") == "__name__" for f in remaining_filters) and not order_by:
+                rows = sorted(rows, key=lambda row: row[0])
+            if limit:
+                rows = rows[:int(limit)]
         return jsonify({
             "documents": [
                 {"id": doc_id, "exists": True, "data": data}

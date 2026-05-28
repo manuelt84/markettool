@@ -436,6 +436,9 @@ class PostgresDocumentStore:
             if field == "__name__":
                 sql.append("AND doc_id = %s")
                 params.append(str(value))
+            elif "." in field:
+                sql.append("AND data #>> string_to_array(%s, '.') = %s")
+                params.extend([field, str(value)])
             else:
                 sql.append("AND data ->> %s = %s")
                 params.extend([field, str(value)])
