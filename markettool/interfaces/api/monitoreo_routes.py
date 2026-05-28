@@ -1322,6 +1322,12 @@ def register_monitoreo_routes(app, *, services) -> None:
                         "estado": data.get("estado"),
                         "updated_at": data.get("updated_at"),
                         "allowed_timeframes": data.get("allowed_timeframes", []),
+                        "timeframes_permitidas": data.get("timeframes_permitidas", []),
+                        "selected_tfs": data.get("selected_tfs", []),
+                        "monitor_selected_tfs": data.get("monitor_selected_tfs", []),
+                        "selectedTFs": data.get("selectedTFs", []),
+                        "tfs": data.get("tfs", []),
+                        "running": data.get("running", []),
                     })
                 
                 logger.info(f"[MonitoreosAPI] Strategy=RECENT user={user_id} count={len(monitoreos)}")
@@ -1357,6 +1363,12 @@ def register_monitoreo_routes(app, *, services) -> None:
                                 "estado": data.get("estado"),
                                 "updated_at": data.get("updated_at"),
                                 "allowed_timeframes": data.get("allowed_timeframes", []),
+                                "timeframes_permitidas": data.get("timeframes_permitidas", []),
+                                "selected_tfs": data.get("selected_tfs", []),
+                                "monitor_selected_tfs": data.get("monitor_selected_tfs", []),
+                                "selectedTFs": data.get("selectedTFs", []),
+                                "tfs": data.get("tfs", []),
+                                "running": data.get("running", []),
                             })
                     
                     logger.info(f"[MonitoreosAPI] Strategy=FALLBACK user={user_id} count={len(monitoreos)}")
