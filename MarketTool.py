@@ -13504,6 +13504,20 @@ def detectar_rango_zigzag(
 # OPT2: Manual cache for level calculations (symbol, temporalidad -> niveles)
 _NIVELES_CACHE = {}
 
+
+def _df_ohlc_tail_hash(df, rows=120):
+    try:
+        if df is None or df.empty:
+            return "empty"
+        cols = [c for c in ("open", "high", "low", "close") if c in df.columns]
+        if not cols:
+            return f"len:{len(df)}"
+        tail = df[cols].tail(rows).round(8)
+        payload = tail.to_json(date_format="iso", orient="split")
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return f"len:{len(df) if df is not None else 0}"
+
 #@profile
 def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol, temporalidad_actual, umbral_atr=2.0, max_niveles=5):
     """
@@ -13528,7 +13542,7 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
         last_marker = (
             len(df),
             str(df.index[-1]) if len(df.index) else "",
-            round(float(df['close'].iloc[-1]), 8) if 'close' in df.columns and len(df) else None,
+            _df_ohlc_tail_hash(df),
         )
     except Exception:
         last_marker = (len(df), "", None)

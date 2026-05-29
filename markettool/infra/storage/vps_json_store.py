@@ -85,6 +85,16 @@ def vps_fallback_enabled() -> bool:
     return (
         vps_mode_enabled()
         or hybrid_mode_enabled()
+        or _env_bool("MARKETTOOL_METADATA_VPS_FALLBACK_ENABLED")
+    )
+
+
+def vps_storage_routes_enabled() -> bool:
+    public_storage = (os.getenv("MARKETTOOL_PUBLIC_STORAGE") or "").strip().lower()
+    return (
+        vps_fallback_enabled()
+        or public_storage in {"vps", "local", "filesystem", "fs"}
+        or _env_bool("MARKETTOOL_VPS_STORAGE_ROUTES_ENABLED")
         or _env_bool("MARKETTOOL_VPS_FALLBACK_ENABLED")
     )
 
