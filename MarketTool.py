@@ -18057,6 +18057,12 @@ async def procesar_resultado(
         logger.info("[preview] final archivos count reconciled: %s", final_archivos)
 
     urls_generadas = _solo_strings_urls(urls_generadas)
+    logger.info(
+        "[AnalisisTiming] phase=procesar_resultado_total exec_id=%s elapsed=%.2fs urls=%d",
+        exec_id,
+        time.time() - t_proc_start,
+        len(urls_generadas),
+    )
     logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
     return urls_generadas
 
@@ -19395,11 +19401,16 @@ async def ejecutar_recurrente(
             return  # ya se manejó y se liberará estado en finally
 
         start_time = datetime.now()
+        perf_start = time.perf_counter()
+        perf_events_sec = 0.0
+        perf_analysis_sec = 0.0
+        perf_publish_sec = 0.0
 
         # Eventos económicos (tolerante a error) ✅ Con caché multi-pod
         # ✅ OPTIMIZACION: Si es un solo activo/temporalidad, posponer eventos económicos
         # para evitar latencia innecesaria. Se cargarán lazy al procesar.
         single_asset_analysis = len(activos_filtrados) == 1 and len(temps) <= 2
+        t_events_start = time.perf_counter()
         if single_asset_analysis:
             logger.info(f"[OptiAnalisis] Análisis de activo único detectado, aplicando modo fast-track")
             df_eventos = None  # Se cargarán lazy en procesar_simbolo_temporalidad si se necesitan
@@ -19410,7 +19421,14 @@ async def ejecutar_recurrente(
             except Exception as e:
                 logger.warning(f"Error al obtener eventos económicos: {e}")
                 df_eventos = None
+        perf_events_sec = time.perf_counter() - t_events_start
+        logger.info(
+            "[AnalisisTiming] phase=eventos exec_id=%s elapsed=%.2fs",
+            exec_id,
+            perf_events_sec,
+        )
 
+        t_analysis_start = time.perf_counter()
         resultados = await ejecutar_analisis_con_hilos(
             df_eventos,
             activos_filtrados,
@@ -19424,6 +19442,13 @@ async def ejecutar_recurrente(
             },
             cfg=cfg,
             exec_id=exec_id,  # 🆕 Pass exec_id for progress tracking
+        )
+        perf_analysis_sec = time.perf_counter() - t_analysis_start
+        logger.info(
+            "[AnalisisTiming] phase=calculo exec_id=%s elapsed=%.2fs resultados=%d",
+            exec_id,
+            perf_analysis_sec,
+            len(resultados) if resultados else 0,
         )
         logger.info(f"[Analisis completado] Retornando {len(resultados) if resultados else 0} resultados")
 
@@ -19440,10 +19465,18 @@ async def ejecutar_recurrente(
 
         try:
             logger.info(f"[procesar_resultado] Iniciando procesamiento de {len(resultados)} resultados")
+            t_publish_start = time.perf_counter()
             url_generadas = await procesar_resultado(
                 resultados, df_eventos, context, update,
                 moneda_filtro, user_id, user_chat_id, opciones_usuario, origen,
                 exec_id=exec_id, cfg=cfg
+            )
+            perf_publish_sec = time.perf_counter() - t_publish_start
+            logger.info(
+                "[AnalisisTiming] phase=publicacion exec_id=%s elapsed=%.2fs urls=%d",
+                exec_id,
+                perf_publish_sec,
+                len(url_generadas) if url_generadas else 0,
             )
             logger.info(f"[procesar_resultado] Completado, {len(url_generadas) if url_generadas else 0} URLs generadas")
         except Exception as e:
@@ -19461,9 +19494,19 @@ async def ejecutar_recurrente(
             raise  # Re-raise para que sea capturado por el bloque except principal
 
         elapsed_time = (datetime.now() - start_time).total_seconds()
+        perf_total_sec = time.perf_counter() - perf_start
         logger.info(
             f"[{datetime.now()}] Análisis finalizado (chat={user_chat_id}, uuid={user_id}). "
             f"Tiempo: {elapsed_time:.2f}s."
+        )
+        logger.info(
+            "[AnalisisTiming] phase=total exec_id=%s eventos=%.2fs calculo=%.2fs publicacion=%.2fs total=%.2fs overhead=%.2fs",
+            exec_id,
+            perf_events_sec,
+            perf_analysis_sec,
+            perf_publish_sec,
+            perf_total_sec,
+            max(0.0, perf_total_sec - perf_events_sec - perf_analysis_sec - perf_publish_sec),
         )
         return url_generadas
 
