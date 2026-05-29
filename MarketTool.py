@@ -7132,10 +7132,21 @@ def merge_indicators_incremental(cached: dict, new: dict, split_index: int, wind
     merged = {}
     
     # Indicadores que son listas de valores (por fila)
-    for key in new.keys():
+    expected_old_rows = max(0, int(split_index or 0))
+    for key in set(cached.keys()) | set(new.keys()):
+        if key not in new:
+            merged[key] = cached[key]
+            continue
+
         if key not in cached:
-            # Indicador nuevo que no existía en cache
-            merged[key] = new[key]
+            # Indicador nuevo que no existía en cache. En un cálculo parcial
+            # hay que rellenar las filas anteriores para conservar el largo.
+            new_val = new[key]
+            if isinstance(new_val, list):
+                new_part = new_val[window_context:] if len(new_val) > window_context else new_val
+                merged[key] = ([None] * expected_old_rows) + new_part
+            else:
+                merged[key] = new_val
             continue
         
         cached_val = cached[key]
@@ -16105,20 +16116,24 @@ async def ejecutar_analisis_con_hilos(
     if prefetch_enabled and total_tasks > 10 and not is_small_analysis:  # Solo para análisis medianos/grandes
         t_prefetch_start = time.time()
         
-        # Sample 5 random (symbol, tf) combos to check cache hit rate
+        # Sample enough (symbol, tf) combos to catch partial cold caches. A
+        # 5-item sample was too optimistic in large runs and skipped prefetch
+        # even while many assets missed historical cache during analysis.
         import random
+        sample_size = min(50, max(10, total_tasks // 10), total_tasks)
         sample_combos = random.sample(
             [(s, tf) for s in activos_filtrados for tf in temps],
-            min(5, total_tasks)
+            sample_size
         )
-        sample_hits = sum(
-            1 for s, tf in sample_combos 
-            if not (load_cached_history(s, tf) is None or load_cached_history(s, tf).empty)
-        )
+        sample_hits = 0
+        for s, tf in sample_combos:
+            cached_sample = load_cached_history(s, tf)
+            if cached_sample is not None and not cached_sample.empty:
+                sample_hits += 1
         cache_hit_rate = sample_hits / len(sample_combos) if sample_combos else 1.0
         
-        # Si cache hit rate < 50% → hacer pre-fetch agresivo
-        if cache_hit_rate < 0.5:
+        # Si el cache no está casi completo, hacer pre-fetch agresivo.
+        if cache_hit_rate < 0.9:
             logger.info(
                 f"[Prefetch] Cache hit rate bajo ({cache_hit_rate:.1%}), "
                 f"pre-fetching {total_tasks} históricos en paralelo..."

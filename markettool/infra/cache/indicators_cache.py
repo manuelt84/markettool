@@ -95,9 +95,19 @@ def _tune_storage_client(client: storage.Client) -> storage.Client:
 def merge_indicators_incremental(cached: dict, new: dict, split_index: int, window_context: int) -> dict:
     """Combina indicadores cacheados + nuevos calculados incrementalmente."""
     merged = {}
-    for key in new.keys():
+    expected_old_rows = max(0, int(split_index or 0))
+    for key in set(cached.keys()) | set(new.keys()):
+        if key not in new:
+            merged[key] = cached[key]
+            continue
+
         if key not in cached:
-            merged[key] = new[key]
+            new_val = new[key]
+            if isinstance(new_val, list):
+                new_part = new_val[window_context:] if len(new_val) > window_context else new_val
+                merged[key] = ([None] * expected_old_rows) + new_part
+            else:
+                merged[key] = new_val
             continue
 
         cached_val = cached[key]
