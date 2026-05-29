@@ -8195,7 +8195,7 @@ class UserStateCache:
         indicators = {}
         
         # Columnas de indicadores (excluir OHLCV originales)
-        base_cols = {'open', 'high', 'low', 'close', 'volume', 'time'}
+        base_cols = {'open', 'high', 'low', 'close', 'volume', 'time', 'index', '_index'}
         indicator_cols = [col for col in df.columns if col not in base_cols]
         
         for col in indicator_cols:
@@ -8213,6 +8213,8 @@ class UserStateCache:
         """Aplica indicadores desde dict a DataFrame."""
         mismatch = False
         for col, values in indicators.items():
+            if col in {'index', '_index'}:
+                continue
             try:
                 if len(values) == len(df):
                     df[col] = values

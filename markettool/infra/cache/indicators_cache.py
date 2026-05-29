@@ -955,7 +955,7 @@ class IndicatorsCache:
 
     def _extract_indicators_from_df(self, df: pd.DataFrame) -> dict:
         indicators = {}
-        base_cols = {"open", "high", "low", "close", "volume", "time"}
+        base_cols = {"open", "high", "low", "close", "volume", "time", "index", "_index"}
         indicator_cols = [col for col in df.columns if col not in base_cols]
 
         for col in indicator_cols:
@@ -971,6 +971,8 @@ class IndicatorsCache:
     def _apply_indicators_to_df(self, df: pd.DataFrame, indicators: dict) -> pd.DataFrame:
         mismatch = False
         for col, values in indicators.items():
+            if col in {"index", "_index"}:
+                continue
             try:
                 if len(values) == len(df):
                     df[col] = values
