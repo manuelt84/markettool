@@ -57,7 +57,11 @@ class RedisHistoricosCache:
     """
     
     def __init__(self):
-        self.redis_url = os.getenv("REDIS_URL", None)
+        self.redis_url = (
+            os.getenv("REDIS_HISTORICOS_URL")
+            or os.getenv("MARKET_DATA_REDIS_URL")
+            or os.getenv("REDIS_URL")
+        )
         self.redis_client = None
         self.enabled = False
         self.hits = 0

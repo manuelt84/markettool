@@ -1505,15 +1505,15 @@ def _parse_history_refresh_ttl_minutes() -> dict[str, int]:
     """
     Cache-first TTL (minutes) per timeframe.
     Env override:
-      HISTORY_REFRESH_TTL_MINUTES="1min:1,5min:5,15min:15,30min:30,1hour:60,4hour:240,1day:1440,1week:10080"
+      HISTORY_REFRESH_TTL_MINUTES="1min:5,5min:15,15min:45,30min:90,1hour:180,4hour:480,1day:1440,1week:10080"
     """
     policy = {
-        "1min": 1,
-        "5min": 5,
-        "15min": 15,
-        "30min": 30,
-        "1hour": 60,
-        "4hour": 240,
+        "1min": 5,
+        "5min": 15,
+        "15min": 45,
+        "30min": 90,
+        "1hour": 180,
+        "4hour": 480,
         "1day": 1440,
         "1week": 10080,
     }
