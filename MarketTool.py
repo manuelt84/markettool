@@ -808,23 +808,15 @@ def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
         or {}
     )
 
-    # 3) estado particular del TF
-    estado_tf = str(st.get("estado") or "").lower()
-    if any(w in estado_tf for w in _STOP_WORDS):
-        return False
-
-    enabled = st.get("enabled")
-    if enabled is False:
-        return False
-    if enabled is True:
-        # Si explícitamente está en True, ya consideramos habilitado
-        # (sin mirar allowed_timeframes ni TTL, como en tu lógica original)
-        return True
     # 4) Fallback: allowlist de timeframes.
     # Si no definiste allowlist, NO bloqueamos por defecto (evita que el backend
     # pise "running" → "stopped" solo por no tener allowed_timeframes configurado).
     allowed_list = (
         doc.get("allowed_timeframes")
+        or doc.get("timeframes_permitidas")
+        or doc.get("selected_tfs")
+        or doc.get("monitor_selected_tfs")
+        or doc.get("selectedTFs")
         or doc.get("timeframes")
         or doc.get("tf_list")
         or doc.get("tfs")
@@ -834,6 +826,19 @@ def _tf_is_enabled(exec_id: str, symbol: str, tf: str) -> bool:
         allowed_norm = {_norm_tf_allowed(x) for x in allowed_list}
         if tf_allowed not in allowed_norm:
             return False
+
+    # 3) estado particular del TF. Se evalúa después de la allowlist: si existe
+    # allowed_timeframes, esa lista manda y evita reactivar TFs viejos que hayan
+    # quedado con enabled=True en tf_states.
+    estado_tf = str(st.get("estado") or "").lower()
+    if any(w in estado_tf for w in _STOP_WORDS):
+        return False
+
+    enabled = st.get("enabled")
+    if enabled is False:
+        return False
+    if enabled is True:
+        return True
     # 5) Opcional: TTL (en ms)
     last = (
         st.get("last_heartbeat_ms")
