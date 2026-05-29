@@ -55,7 +55,7 @@ class CacheConfig:
     
     # GCS
     _GCS_ENV_ENABLED = str(os.getenv("GCS_ENABLED", "true")).lower() == "true"
-    _VPS_BACKEND_ENABLED = str(os.getenv("MARKETTOOL_CLOUD_BACKEND", "")).strip().lower() == "vps"
+    _VPS_BACKEND_ENABLED = str(os.getenv("MARKETTOOL_CLOUD_BACKEND", "")).strip().lower() in {"vps", "postgres", "local", "filesystem", "fs", "vps_gcp", "vps-gcp", "vps_fallback_gcp", "vps-fallback-gcp"}
     GCS_ENABLED = (
         CACHE_ENABLED
         and _GCS_ENV_ENABLED

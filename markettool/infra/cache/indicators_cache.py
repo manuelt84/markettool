@@ -31,7 +31,8 @@ _INDICATORS_FORCE_RECALC = os.environ.get("INDICATORS_FORCE_RECALC", "false").lo
 _INDICATORS_MEMORY_CACHE_SIZE = int(os.environ.get("INDICATORS_MEMORY_CACHE_SIZE", "10"))
 _INDICATORS_LOCK_TIMEOUT_SEC = int(os.environ.get("INDICATORS_LOCK_TIMEOUT_SEC", "180"))
 
-_VPS_BACKEND_ENABLED = os.environ.get("MARKETTOOL_CLOUD_BACKEND", "").strip().lower() == "vps"
+_CLOUD_BACKEND = os.environ.get("MARKETTOOL_CLOUD_BACKEND", "").strip().lower()
+_VPS_BACKEND_ENABLED = _CLOUD_BACKEND in {"vps", "postgres", "local", "filesystem", "fs", "vps_gcp", "vps-gcp", "vps_fallback_gcp", "vps-fallback-gcp"}
 _VPS_STORAGE_ROOT = os.environ.get("MARKETTOOL_VPS_STORAGE_ROOT", "/app/storage/markettool-json")
 _GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
 _GCS_ENABLED = os.environ.get("GCS_ENABLED", "true").lower() == "true" and not _VPS_BACKEND_ENABLED

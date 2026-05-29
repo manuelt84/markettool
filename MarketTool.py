@@ -130,7 +130,9 @@ from markettool.application.services import (
 from markettool.infra.storage.vps_json_store import (
     PostgresDocumentStore,
     VpsJsonStore,
+    gcp_to_vps_enabled,
     hybrid_mode_enabled,
+    vps_to_gcp_enabled,
     vps_mode_enabled,
 )
 try:
@@ -754,6 +756,7 @@ def _mark_tf_stopped_by_subscription(exec_id: str, symbol: str, tf_canonical: st
                 raise
             logger.warning("[HybridFirestore] Firestore set failed for monitoreos/%s: %s", doc_id, exc)
         _mirror_firestore_set("monitoreos", doc_id, payload, merge=True)
+        _mirror_firestore_set_to_gcp("monitoreos", doc_id, payload, merge=True)
     except Exception:
         pass
 
@@ -2247,33 +2250,24 @@ _HYBRID_MIRROR_EXECUTOR = ThreadPoolExecutor(
 )
 _HYBRID_MIRROR_PENDING = 0
 _HYBRID_MIRROR_LOCK = threading.Lock()
-_HYBRID_MIRROR_MAX_PENDING = max(100, int(os.environ.get("MARKETTOOL_HYBRID_MIRROR_MAX_PENDING", "5000")))
+_HYBRID_MIRROR_WARN_PENDING = max(100, int(os.environ.get("MARKETTOOL_HYBRID_MIRROR_WARN_PENDING", "5000")))
 
 
 def _submit_hybrid_mirror(label: str, fn, *args, **kwargs) -> None:
-    """Queue VPS backup work without blocking analysis requests."""
+    """Queue fallback backup work without blocking analysis requests."""
     if not hybrid_mode_enabled():
         return
 
     global _HYBRID_MIRROR_PENDING
     with _HYBRID_MIRROR_LOCK:
-        if _HYBRID_MIRROR_PENDING >= _HYBRID_MIRROR_MAX_PENDING:
+        _HYBRID_MIRROR_PENDING += 1
+        pending = _HYBRID_MIRROR_PENDING
+        if pending >= _HYBRID_MIRROR_WARN_PENDING:
             logger.warning(
-                "[HybridMirror] queue saturated (%s pending), running %s synchronously",
-                _HYBRID_MIRROR_PENDING,
+                "[HybridMirror] queue high (%s pending), still running %s asynchronously",
+                pending,
                 label,
             )
-            run_sync = True
-        else:
-            _HYBRID_MIRROR_PENDING += 1
-            run_sync = False
-
-    if run_sync:
-        try:
-            fn(*args, **kwargs)
-        except Exception as exc:
-            logger.warning("[HybridMirror] %s failed: %s", label, exc)
-        return
 
     def _run():
         global _HYBRID_MIRROR_PENDING
@@ -2298,13 +2292,13 @@ def get_vps_json_store() -> VpsJsonStore:
 
 def _mirror_bytes_to_vps(path: str, payload: bytes) -> None:
     """Best-effort backup for hybrid mode: GCP is primary, VPS is fallback."""
-    if not hybrid_mode_enabled():
+    if not gcp_to_vps_enabled():
         return
     _submit_hybrid_mirror("storage bytes", get_vps_json_store().write_bytes, path, payload)
 
 
 def _mirror_file_to_vps(path: str, source_path: str) -> None:
-    if not hybrid_mode_enabled():
+    if not gcp_to_vps_enabled():
         return
     try:
         payload = Path(source_path).read_bytes()
@@ -2312,6 +2306,35 @@ def _mirror_file_to_vps(path: str, source_path: str) -> None:
         logger.warning("[HybridMirror] could not snapshot storage file %s: %s", source_path, exc)
         return
     _submit_hybrid_mirror("storage file", get_vps_json_store().write_bytes, path, payload)
+
+
+def _mirror_bytes_to_gcp(path: str, payload: bytes, content_type: str = "application/octet-stream") -> None:
+    """Best-effort backup for hybrid mode: VPS is primary, GCP is fallback."""
+    if not vps_to_gcp_enabled():
+        return
+
+    def _write():
+        client = storage.Client()
+        bucket = client.bucket(BUCKET_NAME)
+        blob = bucket.blob(path)
+        blob.upload_from_string(payload, content_type=content_type)
+        try:
+            blob.make_public()
+        except Exception:
+            pass
+
+    _submit_hybrid_mirror("storage bytes to gcp", _write)
+
+
+def _mirror_file_to_gcp(path: str, source_path: str, content_type: str = "application/octet-stream") -> None:
+    if not vps_to_gcp_enabled():
+        return
+    try:
+        payload = Path(source_path).read_bytes()
+    except Exception as exc:
+        logger.warning("[HybridMirror] could not snapshot storage file %s for GCP: %s", source_path, exc)
+        return
+    _mirror_bytes_to_gcp(path, payload, content_type=content_type)
 
 
 def get_postgres_doc_store() -> Optional[PostgresDocumentStore]:
@@ -2324,7 +2347,7 @@ def get_postgres_doc_store() -> Optional[PostgresDocumentStore]:
 
 def _mirror_firestore_set(collection: str, doc_id: str, data: dict[str, Any], *, merge: bool = False) -> None:
     """Best-effort Firestore metadata backup for hybrid mode."""
-    if not hybrid_mode_enabled():
+    if not gcp_to_vps_enabled():
         return
 
     def _write():
@@ -2337,7 +2360,7 @@ def _mirror_firestore_set(collection: str, doc_id: str, data: dict[str, Any], *,
 
 def _mirror_firestore_update(collection: str, doc_id: str, data: dict[str, Any]) -> None:
     """Best-effort Firestore metadata update backup for hybrid mode."""
-    if not hybrid_mode_enabled():
+    if not gcp_to_vps_enabled():
         return
 
     def _write():
@@ -2346,6 +2369,28 @@ def _mirror_firestore_update(collection: str, doc_id: str, data: dict[str, Any])
             store.update_document(str(collection), str(doc_id), data or {})
 
     _submit_hybrid_mirror(f"firestore update {collection}/{doc_id}", _write)
+
+
+def _mirror_firestore_set_to_gcp(collection: str, doc_id: str, data: dict[str, Any], *, merge: bool = False) -> None:
+    """Best-effort Firestore metadata backup when VPS is primary and GCP is fallback."""
+    if not vps_to_gcp_enabled():
+        return
+
+    def _write():
+        firestore.Client().collection(str(collection)).document(str(doc_id)).set(data or {}, merge=merge)
+
+    _submit_hybrid_mirror(f"firestore set to gcp {collection}/{doc_id}", _write)
+
+
+def _mirror_firestore_update_to_gcp(collection: str, doc_id: str, data: dict[str, Any]) -> None:
+    """Best-effort Firestore metadata update when VPS is primary and GCP is fallback."""
+    if not vps_to_gcp_enabled():
+        return
+
+    def _write():
+        firestore.Client().collection(str(collection)).document(str(doc_id)).update(data or {})
+
+    _submit_hybrid_mirror(f"firestore update to gcp {collection}/{doc_id}", _write)
 
 def get_firestore_db():
     """Lazy-load Firestore client on first use."""
@@ -2845,6 +2890,7 @@ def fs_marcar_worker(
             raise
         logger.warning("[HybridFirestore] Firestore set failed for ejecuciones/%s: %s", exec_id, exc)
     _mirror_firestore_set("ejecuciones", exec_id, payload, merge=True)
+    _mirror_firestore_set_to_gcp("ejecuciones", exec_id, payload, merge=True)
 
 
 def fs_heartbeat(exec_id: str, progress: dict | None = None):
@@ -2880,6 +2926,7 @@ def fs_heartbeat(exec_id: str, progress: dict | None = None):
             raise
         logger.warning("[HybridFirestore] Firestore heartbeat failed for ejecuciones/%s: %s", exec_id, exc)
     _mirror_firestore_set("ejecuciones", exec_id, update_data, merge=True)
+    _mirror_firestore_set_to_gcp("ejecuciones", exec_id, update_data, merge=True)
     
     # ⬇️ Mantén vivo el user_state (sirve para que el watchdog no lo resetee por error)
     try:
@@ -2897,6 +2944,7 @@ def fs_heartbeat(exec_id: str, progress: dict | None = None):
                 if not hybrid_mode_enabled():
                     raise
             _mirror_firestore_set("user_states", key, user_state_payload, merge=True)
+            _mirror_firestore_set_to_gcp("user_states", key, user_state_payload, merge=True)
     except Exception:
         pass
 
@@ -3898,6 +3946,7 @@ def fs_crear_ejecucion(
             raise
         logger.warning("[HybridFirestore] Firestore create failed for ejecuciones/%s: %s", exec_id, exc)
     _mirror_firestore_set("ejecuciones", exec_id, payload, merge=False)
+    _mirror_firestore_set_to_gcp("ejecuciones", exec_id, payload, merge=False)
     return exec_id
 
 #@profile
@@ -3913,6 +3962,7 @@ def fs_actualizar_ejecucion(exec_id: str, **campos):
             raise
         logger.warning("[HybridFirestore] Firestore update failed for ejecuciones/%s: %s", exec_id, exc)
     _mirror_firestore_update("ejecuciones", exec_id, campos)
+    _mirror_firestore_update_to_gcp("ejecuciones", exec_id, campos)
 
 #@profile
 def fs_finalizar_ejecucion(exec_id: str, estado: str = "completado", resumen: dict | None = None):
@@ -3928,6 +3978,7 @@ def fs_finalizar_ejecucion(exec_id: str, estado: str = "completado", resumen: di
             raise
         logger.warning("[HybridFirestore] Firestore finalize failed for ejecuciones/%s: %s", exec_id, exc)
     _mirror_firestore_update("ejecuciones", exec_id, payload)
+    _mirror_firestore_update_to_gcp("ejecuciones", exec_id, payload)
 
 #@profile
 def fs_registrar_archivo_generado(
@@ -3957,6 +4008,7 @@ def fs_registrar_archivo_generado(
             raise
         logger.warning("[HybridFirestore] Firestore create failed for archivos_generados/%s: %s", archivo_doc_id, exc)
     _mirror_firestore_set("archivos_generados", archivo_doc_id, payload, merge=False)
+    _mirror_firestore_set_to_gcp("archivos_generados", archivo_doc_id, payload, merge=False)
 
     exec_update = {
         "archivos": firestore.Increment(1),
@@ -3969,6 +4021,7 @@ def fs_registrar_archivo_generado(
             raise
         logger.warning("[HybridFirestore] Firestore archivo counter failed for ejecuciones/%s: %s", exec_id, exc)
     _mirror_firestore_update("ejecuciones", exec_id, exec_update)
+    _mirror_firestore_update_to_gcp("ejecuciones", exec_id, exec_update)
 
 #@profile
 async def guardar_json_en_storage_y_registrar(
@@ -5338,8 +5391,13 @@ async def subir_a_bucket_y_obtener_url(fuente, nombre_remoto=None, carpeta='anal
             store = get_vps_json_store()
             if isinstance(fuente, BytesIO):
                 fuente.seek(0)
-                return store.write_bytes(object_path, fuente.getvalue())
-            return store.upload_file(fuente, object_path)
+                payload = fuente.getvalue()
+                url = store.write_bytes(object_path, payload)
+                _mirror_bytes_to_gcp(object_path, payload, content_type=content_type)
+                return url
+            url = store.upload_file(fuente, object_path)
+            _mirror_file_to_gcp(object_path, fuente, content_type=content_type)
+            return url
 
         client = storage.Client()
         bucket = client.bucket(BUCKET_NAME)
@@ -6575,7 +6633,10 @@ def save_to_gcs(symbol: str, tf: str, df: pd.DataFrame) -> bool:
         payload = out[["time", "open", "high", "low", "close", "volume"]].tail(1000).to_dict(orient="records")
         
         if vps_mode_enabled():
-            bucket.write_bytes(gcs_path, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            raw_payload = json.dumps(payload, ensure_ascii=False)
+            encoded_payload = raw_payload.encode("utf-8")
+            bucket.write_bytes(gcs_path, encoded_payload)
+            _mirror_bytes_to_gcp(gcs_path, encoded_payload, content_type="application/json")
         else:
             raw_payload = json.dumps(payload, ensure_ascii=False)
             blob = bucket.blob(gcs_path)
@@ -22818,6 +22879,13 @@ def _download_json_from_gcs(path: str) -> Any:
     Lee un JSON de GCS (usando storage_client global si ya existe).
     Retorna dict/list. Lanza excepción si falla.
     """
+    if vps_mode_enabled():
+        try:
+            data = get_vps_json_store().read_bytes(path)
+            return json.loads(data.decode("utf-8"))
+        except Exception:
+            if not vps_to_gcp_enabled():
+                raise
     try:
         client = get_gcs_client()
         bucket = client.bucket(BUCKET_NAME)
@@ -22825,7 +22893,7 @@ def _download_json_from_gcs(path: str) -> Any:
         data = blob.download_as_bytes()
         return json.loads(data.decode("utf-8"))
     except Exception:
-        if not hybrid_mode_enabled():
+        if not gcp_to_vps_enabled():
             raise
         data = get_vps_json_store().read_bytes(path)
         return json.loads(data.decode("utf-8"))
@@ -22834,7 +22902,6 @@ def _download_json_from_gcs(path: str) -> Any:
 
 def _persist_if_needed(exec_id: str, symbol: str, timeframe: str, force: bool = False) -> Optional[str]:
     try:
-        client = get_gcs_client()
         key = (exec_id, symbol.upper(), timeframe)
         with _MON_CACHE_LOCK:
             state = _MON_CACHE.get(key)
@@ -22850,20 +22917,29 @@ def _persist_if_needed(exec_id: str, symbol: str, timeframe: str, force: bool = 
             logging.info(f"PERSIST START: {key} -> {path} ({series_count} candles, force={force})")
             
             payload = json.dumps(state["series"], ensure_ascii=False).encode("utf-8")
-            bucket = client.bucket(BUCKET_NAME)
-            blob = bucket.blob(path)
-            
-            blob.upload_from_string(payload, content_type="application/json")
-            _mirror_bytes_to_vps(path, payload)
-            blob.reload()
+            if vps_mode_enabled():
+                get_vps_json_store().write_bytes(path, payload)
+                _mirror_bytes_to_gcp(path, payload, content_type="application/json")
+                blob = None
+            else:
+                client = get_gcs_client()
+                bucket = client.bucket(BUCKET_NAME)
+                blob = bucket.blob(path)
+                blob.upload_from_string(payload, content_type="application/json")
+                _mirror_bytes_to_vps(path, payload)
+                blob.reload()
             
             state["dirty"] = False
             # >>> reflejar metadata para que _maybe_refresh_from_gcs no re-baje de inmediato
             state["gcs_path"] = path
-            try:
-                state["gcs_generation"] = blob.generation
-                state["gcs_updated"] = blob.updated.timestamp() if blob.updated else time.time()
-            except Exception:
+            if blob is not None:
+                try:
+                    state["gcs_generation"] = blob.generation
+                    state["gcs_updated"] = blob.updated.timestamp() if blob.updated else time.time()
+                except Exception:
+                    state["gcs_updated"] = time.time()
+            else:
+                state["gcs_generation"] = None
                 state["gcs_updated"] = time.time()
             state["ts_loaded"] = time.time()
             
@@ -22946,6 +23022,7 @@ def fs_touch_monitoreo(exec_id: str, symbol: str, data: Dict[str, Any]) -> None:
                 raise
             logger.warning("[HybridFirestore] Firestore set failed for monitoreos/%s: %s", doc_id, exc)
         _mirror_firestore_set("monitoreos", doc_id, cur, merge=True)
+        _mirror_firestore_set_to_gcp("monitoreos", doc_id, cur, merge=True)
     except Exception:
         pass
 
@@ -23742,19 +23819,25 @@ def read_json_from_gcs(bucket_name: str, path: str) -> Any:
     Lee un JSON (UTF-8) desde GCS y lo parsea.
     Retorna list/dict o {} si falla.
     """
+    if vps_mode_enabled():
+        try:
+            return json.loads(get_vps_json_store().read_bytes(path).decode("utf-8"))
+        except Exception:
+            if not vps_to_gcp_enabled():
+                return {}
     try:
         client = get_gcs_client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(path)
         if not blob.exists():
-            if hybrid_mode_enabled() and get_vps_json_store().exists(path):
+            if gcp_to_vps_enabled() and get_vps_json_store().exists(path):
                 return json.loads(get_vps_json_store().read_bytes(path).decode("utf-8"))
             return {}
         data = blob.download_as_bytes()
         # Si algún día subes gz, aquí podrías detectar y descomprimir
         return json.loads(data.decode("utf-8"))
     except Exception:
-        if hybrid_mode_enabled():
+        if gcp_to_vps_enabled():
             try:
                 return json.loads(get_vps_json_store().read_bytes(path).decode("utf-8"))
             except Exception:
@@ -23770,6 +23853,10 @@ def write_json_to_gcs(bucket_name: str, path: str, obj: Any, content_type: str =
     """
     try:
         payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        if vps_mode_enabled():
+            get_vps_json_store().write_bytes(path, payload)
+            _mirror_bytes_to_gcp(path, payload, content_type=content_type)
+            return None
         client = get_gcs_client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(path)

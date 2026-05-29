@@ -17,7 +17,7 @@ def _default_hist_dir() -> str:
     configured = os.environ.get("HIST_DIR")
     if configured:
         return configured
-    if os.environ.get("MARKETTOOL_CLOUD_BACKEND", "").strip().lower() == "vps":
+    if os.environ.get("MARKETTOOL_CLOUD_BACKEND", "").strip().lower() in {"vps", "postgres", "local", "filesystem", "fs", "vps_gcp", "vps-gcp", "vps_fallback_gcp", "vps-fallback-gcp"}:
         root = os.environ.get("MARKETTOOL_VPS_STORAGE_ROOT", "/app/storage/markettool-json")
         return os.path.join(root, "historicos")
     return "historicos"

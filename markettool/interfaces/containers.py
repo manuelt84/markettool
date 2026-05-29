@@ -254,7 +254,7 @@ class DIContainer:
         # Optionally create GCS cache if explicitly enabled and not running in VPS mode.
         gcs_cache = None
         gcs_enabled = os.environ.get("GCS_ENABLED", "true").lower() == "true"
-        vps_backend_enabled = os.environ.get("MARKETTOOL_CLOUD_BACKEND", "").strip().lower() == "vps"
+        vps_backend_enabled = os.environ.get("MARKETTOOL_CLOUD_BACKEND", "").strip().lower() in {"vps", "postgres", "local", "filesystem", "fs", "vps_gcp", "vps-gcp", "vps_fallback_gcp", "vps-fallback-gcp"}
         if gcs_client and gcs_enabled and not vps_backend_enabled:
             bucket_name = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
             gcs_cache = GCSCache(bucket_name=bucket_name, logger=_logger)
