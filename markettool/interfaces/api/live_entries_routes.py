@@ -1354,6 +1354,12 @@ def _extract_sr_seed(niveles: dict | None) -> dict | None:
     return None
 
 
+def _is_sr_entry(source: str, raw_entry: dict) -> bool:
+    source_key = str(source or raw_entry.get("source") or raw_entry.get("fuente") or "").lower()
+    based_on = str(raw_entry.get("basado_en") or raw_entry.get("reason") or raw_entry.get("rawText") or raw_entry.get("text") or "").lower()
+    return source_key == "sr" or "s/r" in based_on or "support" in based_on or "resistance" in based_on or "soporte" in based_on or "resistencia" in based_on
+
+
 def _build_entry_id(symbol: str, tf: str, side: str, ts: int, entry: float, sl: float, tp: float, source: str) -> str:
     payload = "|".join(
         [
@@ -1472,6 +1478,11 @@ def _generate_live_entries_sync(
             rrr = round(abs(tp - entry_price) / abs(entry_price - sl), 2)
 
         source = _normalize_source(e.get("source") or e.get("fuente") or e.get("basado_en"))
+        confirmed_level = bool(e.get("nivel_confirmado") or e.get("confirmado"))
+        if _is_sr_entry(source, e):
+            confirmed_level = confirmed_level or bool(sr_levels)
+            if not confirmed_level:
+                continue
         entry_ts = int(e.get("timestamp") or (series_ms[-1].get("t") if series_ms else now_ts) or now_ts)
         entry_id = _build_entry_id(symbol, tf, side, entry_ts, float(entry_price or 0), float(sl or 0), float(tp or 0), str(source))
 
@@ -1501,7 +1512,7 @@ def _generate_live_entries_sync(
             "timestamp": entry_ts,
             "rawText": e.get("rawText") or e.get("text") or "Backend live",
             "text": e.get("text") or e.get("rawText") or "Backend live",
-            "nivel_confirmado": bool(e.get("nivel_confirmado") or e.get("confirmado")),
+            "nivel_confirmado": confirmed_level,
             "dentro_rango": bool(e.get("dentro_rango") or e.get("en_rango")),
             "early_detection": False,
             "sr_levels": sr_levels,

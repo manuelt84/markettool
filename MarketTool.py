@@ -13318,9 +13318,17 @@ def filtrar_por_distancia(niveles, atr, precio_actual, max_distancia=1.5):
 
     return niveles_filtrados
 
+MIN_SR_TOUCHES_OPERATIVO = 2
+
 #@profile
 def contar_toques(nivel, precios, umbral=0.01):
-    return sum(abs(precios - nivel) / nivel <= umbral)
+    try:
+        nivel_float = float(nivel)
+        if not np.isfinite(nivel_float) or nivel_float <= 0:
+            return 0
+        return int(sum(abs(precios - nivel_float) / nivel_float <= umbral))
+    except Exception:
+        return 0
 
 #@profile
 def unificar_niveles(symbol):
@@ -13516,7 +13524,15 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
         dict: Niveles clave confirmados con toques
     """
     # OPT2: Check cache first (using hashable parameters only)
-    cache_key = (symbol, temporalidad_actual)
+    try:
+        last_marker = (
+            len(df),
+            str(df.index[-1]) if len(df.index) else "",
+            round(float(df['close'].iloc[-1]), 8) if 'close' in df.columns and len(df) else None,
+        )
+    except Exception:
+        last_marker = (len(df), "", None)
+    cache_key = (symbol, temporalidad_actual, last_marker)
     if cache_key in _NIVELES_CACHE:
         result = _NIVELES_CACHE[cache_key]
         result["DataFrame Actualizado"] = df  # Add current df
@@ -13588,23 +13604,14 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
     precio_actual = df['close'].iloc[-1]
     umbral = atr * umbral_atr
 
-    # Filtrar soportes y resistencias cercanos al precio actual
-    soportes_cercanos = [s for s in soportes if abs(precio_actual - s) <= umbral and s < precio_actual]
-    resistencias_cercanas = [r for r in resistencias if abs(precio_actual - r) <= umbral and r > precio_actual]
-
-    # Si no hay suficientes datos cercanos, expandir búsqueda
-    if len(soportes_cercanos) < max_niveles:
-        soportes_cercanos.extend([s for s in soportes if s not in soportes_cercanos])
-
-    if len(resistencias_cercanas) < max_niveles:
-        resistencias_cercanas.extend([r for r in resistencias if r not in resistencias_cercanas])
-
-    soportes_cercanos = sorted(list(aplanar_niveles(soportes_cercanos)), reverse=True)  # Ordenar de mayor a menor
-    resistencias_cercanas = sorted(list(aplanar_niveles(resistencias_cercanas)))       # Ordenar de menor a mayor
-
-    # Confirmar soportes y resistencias con más toques
-    soportes_confirmados = [(s, contar_toques(s, df['low'])) for s in soportes_cache]
-    resistencias_confirmadas = [(r, contar_toques(r, df['high'])) for r in resistencias_cache]
+    # Confirmar soportes y resistencias con toques reales. Los niveles operativos
+    # para entradas no pueden ser simples candidatos/pivots sin reaccion previa.
+    soportes_candidatos = sorted(set(soportes + soportes_cache), reverse=True)
+    resistencias_candidatas = sorted(set(resistencias + resistencias_cache))
+    soportes_con_toques = [(s, contar_toques(s, df['low'])) for s in soportes_candidatos]
+    resistencias_con_toques = [(r, contar_toques(r, df['high'])) for r in resistencias_candidatas]
+    soportes_confirmados = [(s, t) for s, t in soportes_con_toques if t >= MIN_SR_TOUCHES_OPERATIVO]
+    resistencias_confirmadas = [(r, t) for r, t in resistencias_con_toques if t >= MIN_SR_TOUCHES_OPERATIVO]
 
     # Mezclar soportes y resistencias en una sola lista
     niveles_combinados = soportes_confirmados + resistencias_confirmadas
@@ -13638,6 +13645,22 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
 
     soportes_confirmados_orden = sorted(list(soportes_rebote), reverse=True)
     resistencias_confirmadas_orden = sorted(list(resistencias_rebote))
+
+    # Filtrar soportes y resistencias cercanos al precio actual usando solo niveles confirmados.
+    soportes_operativos = [s for s, _ in soportes_confirmados]
+    resistencias_operativas = [r for r, _ in resistencias_confirmadas]
+    soportes_cercanos = [s for s in soportes_operativos if abs(precio_actual - s) <= umbral and s < precio_actual]
+    resistencias_cercanas = [r for r in resistencias_operativas if abs(precio_actual - r) <= umbral and r > precio_actual]
+
+    # Si no hay suficientes datos cercanos, expandir búsqueda, pero siempre dentro de confirmados.
+    if len(soportes_cercanos) < max_niveles:
+        soportes_cercanos.extend([s for s in soportes_operativos if s not in soportes_cercanos])
+
+    if len(resistencias_cercanas) < max_niveles:
+        resistencias_cercanas.extend([r for r in resistencias_operativas if r not in resistencias_cercanas])
+
+    soportes_cercanos = sorted(list(aplanar_niveles(soportes_cercanos)), reverse=True)
+    resistencias_cercanas = sorted(list(aplanar_niveles(resistencias_cercanas)))
 
     # Inicializar valores predeterminados como None
     soporte_nivel_2, soporte_nivel_1 = None, None
@@ -13801,8 +13824,8 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
     }
 
     # Usar filtrar_por_distancia para identificar niveles importantes
-    niveles_importantes_soportes = filtrar_por_distancia(soportes, atr, precio_actual)
-    niveles_importantes_resistencias = filtrar_por_distancia(resistencias, atr, precio_actual)
+    niveles_importantes_soportes = filtrar_por_distancia(soportes_operativos, atr, precio_actual)
+    niveles_importantes_resistencias = filtrar_por_distancia(resistencias_operativas, atr, precio_actual)
 
     # OPT2: Build result and cache it before returning
     result = {
@@ -13822,7 +13845,7 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
     }
     
     # Cache the result (excluding DataFrame for memory efficiency)
-    cache_key = (symbol, temporalidad_actual)
+    cache_key = (symbol, temporalidad_actual, last_marker)
     cache_result = {k: v for k, v in result.items() if k != "DataFrame Actualizado"}
     _NIVELES_CACHE[cache_key] = cache_result
     
