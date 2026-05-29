@@ -17062,6 +17062,10 @@ async def procesar_resultado(
             },
             "top_timeframe": top_timeframe_temp,
             "top_timeframe_by_asset": top_timeframe_by_asset_temp,
+            "selected_symbol": None,
+            "selected_timeframe": None,
+            "selection": {},
+            "selection_pending": True,
         }
 
         try:
@@ -17316,6 +17320,7 @@ async def procesar_resultado(
             "selected_symbol": monitoring_selection.get("symbol"),
             "selected_timeframe": monitoring_selection.get("timeframe"),
             "selection": monitoring_selection,
+            "selection_pending": False,
             "priority_assets": priority_assets,  # ✅ Activos prioritarios para monitoreo
             "ready_for_monitoring": [],  # Se actualizará a medida que se suban
             "ready_for_monitoring_pairs": [],
@@ -17366,15 +17371,12 @@ async def procesar_resultado(
     resultados_priority_sorted = []
     resultados_rest_sorted = []
 
-    # Resolver activo seleccionado (debe coincidir con el elegido por el usuario)
+    # Resolver activo seleccionado desde la selección final calculada por backend.
+    # No usar user_states.par_seleccionado aquí: puede quedar con un activo de una
+    # ejecución anterior y adelantar uploads/ready de un par distinto al final.
     selected_asset = None
     try:
-        if user_chat_id is not None:
-            selected_asset = user_states.get(str(user_chat_id), {}).get("par_seleccionado")
-        if not selected_asset and user_id is not None:
-            selected_asset = user_states.get(str(user_id), {}).get("par_seleccionado")
-        if selected_asset:
-            selected_asset = str(selected_asset).strip().upper()
+        selected_asset = str((monitoring_selection or {}).get("symbol") or "").strip().upper() or None
     except Exception:
         selected_asset = None
     if not selected_asset and top_asset:
