@@ -2606,6 +2606,30 @@ _TF_MINUTES = {
     '1week': 10080,
 }
 
+SR_MAX_CANDLES_BY_TF = {
+    '1min': 900,
+    '5min': 900,
+    '15min': 900,
+    '30min': 900,
+    '1hour': 900,
+    '4hour': 700,
+    '1day': 420,
+    '1week': 260,
+}
+
+SR_DYNAMIC_MAX_FACTOR_BY_TF = {
+    '1min': 5,
+    '5min': 5,
+    '15min': 5,
+    '30min': 4,
+    '1hour': 4,
+    '4hour': 3,
+    '1day': 2,
+    '1week': 2,
+}
+
+SR_LEVEL_CANDIDATE_LIMIT = int(os.getenv("SR_LEVEL_CANDIDATE_LIMIT", "64"))
+
 TF_MAP = {
     '1m':'1min','5m':'5min','15m':'15min','30m':'30min',
     '1h':'1hour','4h':'4hour','1d':'1day','1w':'1week',
@@ -12879,6 +12903,51 @@ def filtrar_niveles_numba(niveles, tolerancia):
             niveles_filtrados.append(nivel)
     return niveles_filtrados
 
+
+def _sr_max_candles(tf: str) -> int:
+    raw = os.getenv(f"SR_MAX_CANDLES_{str(tf or '').upper()}")
+    if raw:
+        try:
+            return max(50, int(raw))
+        except Exception:
+            pass
+    return SR_MAX_CANDLES_BY_TF.get(_tf_backend(tf), 900)
+
+
+def _sr_dynamic_max_factor(tf: str) -> int:
+    raw = os.getenv(f"SR_DYNAMIC_MAX_FACTOR_{str(tf or '').upper()}")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except Exception:
+            pass
+    return SR_DYNAMIC_MAX_FACTOR_BY_TF.get(_tf_backend(tf), 4)
+
+
+def _slice_sr_df(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    max_candles = _sr_max_candles(tf)
+    if df is None or len(df) <= max_candles:
+        return df
+    return df.iloc[-max_candles:].copy()
+
+
+def _df_cache_marker(df: pd.DataFrame) -> str:
+    try:
+        last_index = str(df.index[-1])
+    except Exception:
+        last_index = "noindex"
+    return f"{len(df)}:{last_index}"
+
+
+def _limit_sr_candidates(levels, precio_actual: float, side: str, limit: int):
+    if not levels or limit <= 0:
+        return levels
+    if side == "support":
+        filtered = [float(v) for v in levels if v < precio_actual]
+        return sorted(filtered, reverse=True)[:limit]
+    filtered = [float(v) for v in levels if v > precio_actual]
+    return sorted(filtered)[:limit]
+
 #@profile
 def calcular_soportes_resistencias(df, window, atr_multiplier, precio_actual, min_levels=5, symbol='', temporalidad=''):
 
@@ -12891,8 +12960,9 @@ def calcular_soportes_resistencias(df, window, atr_multiplier, precio_actual, mi
     min_indices = argrelextrema(df['low'].values, np.less, order=order)[0]
     max_indices = argrelextrema(df['high'].values, np.greater, order=order)[0]
 
-    soportes = df['low'].iloc[min_indices].tolist()
-    resistencias = df['high'].iloc[max_indices].tolist()
+    candidate_limit = max(SR_LEVEL_CANDIDATE_LIMIT, min_levels * 4)
+    soportes = _limit_sr_candidates(df['low'].iloc[min_indices].tolist(), precio_actual, "support", candidate_limit)
+    resistencias = _limit_sr_candidates(df['high'].iloc[max_indices].tolist(), precio_actual, "resistance", candidate_limit)
 
     if 'atr' in df.columns:
         atr_mean = df['atr'].mean()
@@ -12987,15 +13057,20 @@ _atr_cache_hits = 0
 _atr_cache_misses = 0
 _ATR_CACHE_LOCK = threading.Lock()
 
-def _get_niveles_cache_key(symbol: str, tf: str, df_len: int, precio_actual: float | None = None) -> str:
-    """Genera clave de cache para niveles basada en símbolo, TF y tamaño del DF.
-    Opcionalmente incluye precio discretizado si NIVELES_CACHE_INCLUDE_PRICE=true.
+def _get_niveles_cache_key(symbol: str, tf: str, df_marker: str | int, precio_actual: float | None = None) -> str:
+    """Genera clave de cache para niveles S/R.
+
+    Los niveles se filtran por lado del precio, así que la clave incluye un
+    bucket de precio y la última vela; sólo usar len(df) podía reutilizar
+    niveles viejos cuando entraba una vela nueva con la misma cantidad de filas.
     """
-    include_price = os.environ.get("NIVELES_CACHE_INCLUDE_PRICE", "false").lower() == "true"
-    if include_price and precio_actual is not None:
-        precio_hash = int(precio_actual * 100)
-        return f"{symbol}|{tf}|{precio_hash}|{df_len}"
-    return f"{symbol}|{tf}|{df_len}"
+    precio_hash = "noprice"
+    if precio_actual is not None:
+        try:
+            precio_hash = str(int(float(precio_actual) * 10000))
+        except Exception:
+            precio_hash = "badprice"
+    return f"{symbol}|{tf}|{precio_hash}|{df_marker}"
 
 def _get_atr_cache_key(symbol: str, tf: str, df_len: int) -> str:
     """Genera clave de cache para ATR basada en símbolo, TF y tamaño del DF."""
@@ -21938,7 +22013,8 @@ async def calcular_entradas_async(
             probabilidad_alza, probabilidad_baja = 50, 50
         
         # ===== DYNAMIC SUPPORT/RESISTANCE (WITH CACHE) =====
-        cache_key = _get_niveles_cache_key(symbol, tf, len(df), precio_actual)
+        df_sr_calc = _slice_sr_df(df, tf)
+        cache_key = _get_niveles_cache_key(symbol, tf, _df_cache_marker(df_sr_calc), precio_actual)
         soportes_cached, resistencias_cached = _get_cached_niveles(cache_key)
         
         if soportes_cached is not None and resistencias_cached is not None:
@@ -21946,22 +22022,22 @@ async def calcular_entradas_async(
             resistencias_dinamicas = resistencias_cached
         else:
             try:
-                df, soportes_dinamicos, resistencias_dinamicas = await asyncio.wait_for(
+                _df_sr, soportes_dinamicos, resistencias_dinamicas = await asyncio.wait_for(
                     loop.run_in_executor(
                         None,
                         lambda: ajustar_window_dinamico_optimizado(
-                            df,
+                            df_sr_calc,
                             symbol,
                             tf,
                             precio_actual,
                             calc_windows=calc_windows,
                             max_incremento=5,
                             min_factor=2,
-                            max_factor=8,
+                            max_factor=_sr_dynamic_max_factor(tf),
                             min_levels=2,
                         ),
                     ),
-                    timeout=60.0  # INCREASED: 30s→60s (complex analysis under high concurrency)
+                    timeout=30.0
                 )
             except asyncio.TimeoutError:
                 logger.warning(
@@ -21979,10 +22055,10 @@ async def calcular_entradas_async(
                         loop.run_in_executor(
                             None,
                             lambda: calcular_soportes_resistencias_para_window(
-                                window, df, precio_actual, 2, symbol, tf
+                                min(window, len(df_sr_calc)), df_sr_calc, precio_actual, 2, symbol, tf
                             ),
                         ),
-                        timeout=20.0,  # INCREASED: 10s→20s for fallback S/R calculation
+                        timeout=10.0,
                     )
                     logger.info(f"[Fallback S/R] {symbol}-{tf}: usando niveles estáticos (window={window})")
                 except Exception as e_fallback:
