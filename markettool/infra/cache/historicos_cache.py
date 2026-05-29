@@ -1051,7 +1051,8 @@ class LazyHistoricosLoader:
             return pd.DataFrame()
 
     def put(self, symbol: str, temporalidad: str, df: pd.DataFrame) -> None:
-        cache_key = f"{symbol.upper()}"
+        safe_tf = normalize_tf(temporalidad)
+        cache_key = f"{symbol.upper()}__{safe_tf}"
         with self._lock:
             if len(self._cache) >= self.maxsize:
                 oldest_key = min(self._cache_times, key=self._cache_times.get)
@@ -1061,7 +1062,7 @@ class LazyHistoricosLoader:
 
             self._cache[cache_key] = df.copy()
             self._cache_times[cache_key] = time.time()
-            logger.debug("[LazyLoader] Cached %s (%d rows)", symbol, len(df))
+            logger.debug("[LazyLoader] Cached %s/%s (%d rows)", symbol, safe_tf, len(df))
 
     def clear_cache(self) -> None:
         with self._lock:
@@ -1071,7 +1072,7 @@ class LazyHistoricosLoader:
 
 
 _LAZY_HIST_LOADER = LazyHistoricosLoader(
-    hist_dir=os.environ.get("HIST_DIR", "historicos"),
+    hist_dir=APP_CONFIG.hist_dir,
     maxsize=APP_CONFIG.cache_max_size_historicos,
     ttl_seconds=APP_CONFIG.cache_ttl_historicos,
 )

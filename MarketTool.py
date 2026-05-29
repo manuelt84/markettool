@@ -6508,7 +6508,8 @@ class LazyHistoricosLoader:
         Guarda un DataFrame en el caché (manualmente).
         Útil para actualizar caché después de cargar de GCS o FMP.
         """
-        cache_key = f"{symbol.upper()}"
+        safe_tf = normalize_tf(temporalidad)
+        cache_key = f"{symbol.upper()}__{safe_tf}"
         with self._lock:
             # Eviction si es necesario
             if len(self._cache) >= self.maxsize:
@@ -6519,7 +6520,7 @@ class LazyHistoricosLoader:
             
             self._cache[cache_key] = df.copy()
             self._cache_times[cache_key] = time.time()
-            logger.debug(f"[LazyLoader] Cached {symbol} ({len(df)} rows)")
+            logger.debug(f"[LazyLoader] Cached {symbol}/{safe_tf} ({len(df)} rows)")
     
     def clear_cache(self):
         """Limpia el caché completo."""
@@ -6531,7 +6532,7 @@ class LazyHistoricosLoader:
 
 # Instancia global del lazy loader
 _LAZY_HIST_LOADER = LazyHistoricosLoader(
-    hist_dir=os.environ.get("HIST_DIR", "historicos"),
+    hist_dir=APP_CONFIG.hist_dir,
     maxsize=APP_CONFIG.cache_max_size_historicos,
     ttl_seconds=APP_CONFIG.cache_ttl_historicos
 )
