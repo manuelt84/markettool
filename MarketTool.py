@@ -5734,7 +5734,10 @@ def acquire_user_lock(
             current_state = str(data.get("estado") or "").lower()
 
             if current_lease > now_unix and current_state in USER_STATE_BUSY_VALUES:
-                if current_owner and current_owner != MY_ID:
+                current_lock_id = str(data.get("lock_id") or "")
+                if current_lock_id and current_lock_id != lock_id:
+                    return False
+                if not current_lock_id:
                     return False
 
             doc_ref.set(
@@ -5766,8 +5769,10 @@ def acquire_user_lock(
 
         # Lock válido si lease no expiró
         if current_lease > now_unix and current_state in USER_STATE_BUSY_VALUES:
-            # Si otro pod tiene lock, no adquirimos
-            if current_owner and current_owner != MY_ID:
+            current_lock_id = str(data.get("lock_id") or "")
+            if current_lock_id and current_lock_id != lock_id:
+                return False
+            if not current_lock_id:
                 return False
 
         payload = {

@@ -32,10 +32,29 @@ def cloud_backend() -> str:
     return (os.getenv("MARKETTOOL_CLOUD_BACKEND") or os.getenv("CLOUD_BACKEND") or "gcp").strip().lower()
 
 
-GCP_ONLY_MODES = {"gcp", "google", "firebase", "firestore"}
-VPS_ONLY_MODES = {"vps", "postgres", "local", "filesystem", "fs"}
-GCP_TO_VPS_MODES = {"hybrid", "gcp_vps", "gcp-vps", "gcp_fallback_vps", "gcp-fallback-vps"}
-VPS_TO_GCP_MODES = {"vps_gcp", "vps-gcp", "vps_fallback_gcp", "vps-fallback-gcp"}
+GCP_ONLY_MODES = {"gcp", "google", "firebase", "firestore", "gcp_only", "gcp-only", "only_gcp", "solo_gcp"}
+VPS_ONLY_MODES = {"vps", "postgres", "local", "filesystem", "fs", "vps_only", "vps-only", "only_vps", "solo_vps"}
+GCP_TO_VPS_MODES = {
+    "hybrid",
+    "gcp_vps",
+    "gcp-vps",
+    "gcp_fallback_vps",
+    "gcp-fallback-vps",
+    "gcp_with_fallback_to_vps",
+    "gcp-with-fallback-to-vps",
+    "gcp_fallback_to_vps",
+    "gcp-fallback-to-vps",
+}
+VPS_TO_GCP_MODES = {
+    "vps_gcp",
+    "vps-gcp",
+    "vps_fallback_gcp",
+    "vps-fallback-gcp",
+    "vps_with_fallback_to_gcp",
+    "vps-with-fallback-to-gcp",
+    "vps_fallback_to_gcp",
+    "vps-fallback-to-gcp",
+}
 
 
 def gcp_primary_enabled() -> bool:
