@@ -2247,7 +2247,7 @@ _HYBRID_MIRROR_EXECUTOR = ThreadPoolExecutor(
 )
 _HYBRID_MIRROR_PENDING = 0
 _HYBRID_MIRROR_LOCK = threading.Lock()
-_HYBRID_MIRROR_MAX_PENDING = max(10, int(os.environ.get("MARKETTOOL_HYBRID_MIRROR_MAX_PENDING", "200")))
+_HYBRID_MIRROR_MAX_PENDING = max(100, int(os.environ.get("MARKETTOOL_HYBRID_MIRROR_MAX_PENDING", "5000")))
 
 
 def _submit_hybrid_mirror(label: str, fn, *args, **kwargs) -> None:
@@ -2258,9 +2258,22 @@ def _submit_hybrid_mirror(label: str, fn, *args, **kwargs) -> None:
     global _HYBRID_MIRROR_PENDING
     with _HYBRID_MIRROR_LOCK:
         if _HYBRID_MIRROR_PENDING >= _HYBRID_MIRROR_MAX_PENDING:
-            logger.warning("[HybridMirror] queue full, skipping %s", label)
-            return
-        _HYBRID_MIRROR_PENDING += 1
+            logger.warning(
+                "[HybridMirror] queue saturated (%s pending), running %s synchronously",
+                _HYBRID_MIRROR_PENDING,
+                label,
+            )
+            run_sync = True
+        else:
+            _HYBRID_MIRROR_PENDING += 1
+            run_sync = False
+
+    if run_sync:
+        try:
+            fn(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("[HybridMirror] %s failed: %s", label, exc)
+        return
 
     def _run():
         global _HYBRID_MIRROR_PENDING
@@ -2293,7 +2306,12 @@ def _mirror_bytes_to_vps(path: str, payload: bytes) -> None:
 def _mirror_file_to_vps(path: str, source_path: str) -> None:
     if not hybrid_mode_enabled():
         return
-    _submit_hybrid_mirror("storage file", get_vps_json_store().upload_file, source_path, path)
+    try:
+        payload = Path(source_path).read_bytes()
+    except Exception as exc:
+        logger.warning("[HybridMirror] could not snapshot storage file %s: %s", source_path, exc)
+        return
+    _submit_hybrid_mirror("storage file", get_vps_json_store().write_bytes, path, payload)
 
 
 def get_postgres_doc_store() -> Optional[PostgresDocumentStore]:
@@ -17772,14 +17790,17 @@ async def procesar_resultado(
             # Aquí NO descontamos nada para evitar doble cargo.
 
     if can_archive:
+        final_archivos = len(_solo_strings_urls(urls_generadas))
         fs_actualizar_ejecucion(
             exec_id,
+            archivos=final_archivos,
             upload_state={
                 "status": "completed",
                 "phase": "done",
                 "updated_at": datetime.now(UTC).isoformat() + "Z",
             },
         )
+        logger.info("[preview] final archivos count reconciled: %s", final_archivos)
 
     urls_generadas = _solo_strings_urls(urls_generadas)
     logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
