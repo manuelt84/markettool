@@ -748,6 +748,30 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
     return out[["open", "high", "low", "close", "volume"]]
 
 
+def _normalize_history_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return OHLCV with a UTC DatetimeIndex, or an empty frame if unusable."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    out = df.copy()
+    if "time" in out.columns or "date" in out.columns:
+        time_col = "time" if "time" in out.columns else "date"
+        out[time_col] = pd.to_datetime(out[time_col], errors="coerce", utc=True)
+        out = out.dropna(subset=[time_col]).set_index(time_col)
+    else:
+        idx = pd.to_datetime(out.index, errors="coerce", utc=True)
+        if idx.isna().all():
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        out = out.loc[~idx.isna()].copy()
+        out.index = idx[~idx.isna()]
+
+    out = _ensure_cols(out).sort_index()
+    out = out[~out.index.duplicated(keep="last")]
+    if out.index.tz is None:
+        out.index = out.index.tz_localize(pytz.UTC)
+    return out
+
+
 @safe_op(default=pd.DataFrame(columns=["open", "high", "low", "close", "volume"]))
 def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     """
@@ -764,6 +788,8 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     try:
         df = _LAZY_HIST_LOADER.get(symbol, tf)
         if not df.empty:
+            df = _normalize_history_df(df)
+        if not df.empty:
             logger.debug("[load_cached] Hit LazyLoader: %s/%s", symbol, tf)
             return df
     except Exception as exc:
@@ -772,6 +798,8 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     # ✅ NEW Opcion 2: Redis (L2 - shared distributed cache)
     try:
         df = _REDIS_HIST_CACHE.get(symbol, tf)
+        if df is not None and not df.empty:
+            df = _normalize_history_df(df)
         if df is not None and not df.empty:
             logger.debug("[load_cached] Hit Redis: %s/%s (%d rows)", symbol, tf, len(df))
             # Populate LazyLoader for future in-memory hits
@@ -791,6 +819,8 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     # Opcion 3: Local files (L2 fallback)
     try:
         df = _load_local(symbol, tf)
+        if df is not None and not df.empty:
+            df = _normalize_history_df(df)
         if df is not None and not df.empty:
             logger.debug("[load_cached] Hit Local: %s/%s", symbol, tf)
             try:
@@ -814,6 +844,8 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
             try:
                 df = load_from_gcs(symbol, tf)
                 if df is not None and not df.empty:
+                    df = _normalize_history_df(df)
+                if df is not None and not df.empty:
                     logger.debug("[load_cached] Hit GCS (via Firestore TTL): %s/%s", symbol, tf)
                     _save_local_history_df(symbol, tf, df)
                     try:
@@ -830,6 +862,8 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     try:
         df = load_from_gcs(symbol, tf)
         if df is not None and not df.empty:
+            df = _normalize_history_df(df)
+        if df is not None and not df.empty:
             logger.debug("[load_cached] Hit GCS: %s/%s", symbol, tf)
             _save_local_history_df(symbol, tf, df)
             try:
@@ -845,15 +879,9 @@ def load_cached_history(symbol: str, tf: str) -> pd.DataFrame:
     alt = _hist_path_json(symbol, tf) if primary.endswith(".csv") else _hist_path_csv(symbol, tf)
 
     def _from_df(df: pd.DataFrame) -> pd.DataFrame:
-        if "time" not in df.columns and "date" not in df.columns:
+        df = _normalize_history_df(df)
+        if df.empty:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-
-        time_col = "time" if "time" in df.columns else "date"
-        df[time_col] = pd.to_datetime(df[time_col], errors="coerce", utc=True)
-        df = df.dropna(subset=[time_col]).set_index(time_col).sort_index()
-        df = _ensure_cols(df)
-        if df.index.tz is None:
-            df.index = df.index.tz_localize(pytz.UTC)
         return df
 
     if os.path.exists(primary):
@@ -1036,12 +1064,12 @@ class LazyHistoricosLoader:
                     data = [data]
                 if not isinstance(data, list):
                     data = [data]
-                return pd.DataFrame(data)
+                return _normalize_history_df(pd.DataFrame(data))
             except json.JSONDecodeError:
                 try:
                     lines = content.split("\n")
                     data = [json.loads(line) for line in lines if line.strip()]
-                    return pd.DataFrame(data)
+                    return _normalize_history_df(pd.DataFrame(data))
                 except json.JSONDecodeError:
                     logger.error("[LazyLoader] Invalid JSON in %s", filepath)
                     return pd.DataFrame()
