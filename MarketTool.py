@@ -15491,6 +15491,15 @@ def procesar_simbolo_temporalidad(
     calc_windows: dict[str,int] | None = None,
     cfg: dict | None = None
 ):
+    perf_enabled = str(os.environ.get("ANALYSIS_TIMING_VERBOSE", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    perf_threshold_s = float(os.environ.get("ANALYSIS_TIMING_THRESHOLD_SEC", "2.0"))
+    t_task_start = time.time()
+    perf_marks: list[tuple[str, float]] = []
+
+    def _mark_perf(label: str, started_at: float):
+        if perf_enabled:
+            perf_marks.append((label, time.time() - started_at))
+
     # Asegurar notación backend de TF (1min, 4hour, 1day, 1week…)
     tf = _tf_backend(temporalidad)  # <- este es el valor correcto a usar en todo el flujo
 
@@ -15531,9 +15540,11 @@ def procesar_simbolo_temporalidad(
         # Solo pasa fmpWindows si viene; si no, deja cfg vacío => bars=None
         cfg_local = {"fmpWindows": fmp_windows} if isinstance(fmp_windows, dict) and fmp_windows else {}
 
+        t_phase = time.time()
         df_combinado = obtener_datos_con_hilos(
             symbol, tf, user_chat_id=user_chat_id, cfg=cfg_local
         )
+        _mark_perf("historicos", t_phase)
         if df_combinado is None or df_combinado.empty:
             logger.info(f"No hay datos combinados para {symbol} en {tf}.")
             return None
@@ -15562,7 +15573,9 @@ def procesar_simbolo_temporalidad(
         logger.warning(f"[VALIDACIÓN] Error validando OHLCV para {symbol}-{tf}: {e}")
     
     try:
+        t_phase = time.time()
         df_indicadores = calcular_indicadores(df_combinado, tf, symbol=symbol)
+        _mark_perf("indicadores", t_phase)
         if df_indicadores is None or df_indicadores.empty:
             logger.info(f"No hay indicadores para {symbol} en {tf}.")
             return None
@@ -15577,10 +15590,12 @@ def procesar_simbolo_temporalidad(
     # ------------------- Entradas / señales -------------------
     # ✅ PHASE 7: Use async-refactored entry calculation
     try:
+        t_phase = time.time()
         entradas = calcular_entradas_sync_wrapper(
             df_indicadores, df_eventos, symbol, tf, user_chat_id,
             calc_windows=calc_windows
         )
+        _mark_perf("entradas_async", t_phase)
         if not entradas:
             logger.info(f"No se pudieron calcular entradas para {symbol} en {tf}.")
             return None
@@ -15606,6 +15621,7 @@ def procesar_simbolo_temporalidad(
 
     # ✅ FASE 3: WHITELISTING - Evaluar si autorizado operar
     try:
+        t_phase = time.time()
         whitelist_result = evaluar_si_autorizado_operar(
             symbol=symbol,
             tf=tf,
@@ -15618,6 +15634,7 @@ def procesar_simbolo_temporalidad(
             tecnica_meta=entradas.get('tecnica_meta'),
             whitelist_cfg=(cfg or {}).get("whitelist")
         )
+        _mark_perf("whitelist", t_phase)
         es_autorizado_operar = whitelist_result.get('autorizado', False)
         score_whitelist = whitelist_result.get('score_final', 0)
         expectativa_val = whitelist_result.get('expectativa', 0.0)
@@ -15725,6 +15742,11 @@ def procesar_simbolo_temporalidad(
         }
     }
 
+
+    total_elapsed = time.time() - t_task_start
+    if perf_enabled and (total_elapsed >= perf_threshold_s or any(v >= perf_threshold_s for _, v in perf_marks)):
+        timing = ", ".join(f"{name}={elapsed:.2f}s" for name, elapsed in perf_marks)
+        logger.info("[Timing][Task] %s/%s total=%.2fs %s", symbol, tf, total_elapsed, timing)
 
     return resultado
 
@@ -16000,6 +16022,8 @@ async def ejecutar_analisis_con_hilos(
         else None
     )
     slow_task_sec = int(os.environ.get("ANALYSIS_SLOW_TASK_SEC", "30"))
+    progress_update_every_n = max(1, int(os.environ.get("ANALYSIS_PROGRESS_EVERY_N", "5")))
+    progress_update_min_interval = max(0.5, float(os.environ.get("ANALYSIS_PROGRESS_MIN_INTERVAL_SEC", "2.0")))
     
     # Calculate effective concurrency limit
     # Note: _ANALYSIS_SEM is the global limit; per_symbol_concurrency adds per-symbol restrictions
@@ -16186,11 +16210,20 @@ async def ejecutar_analisis_con_hilos(
             except Exception as e:
                 logger.error(f"[Progress] CRITICAL: Error updating INITIAL progress - exec_id={exec_id}, error={type(e).__name__}: {e}", exc_info=True)
             
+            last_progress_update_ts = 0.0
             for finished in asyncio.as_completed(analisis_tasks):
                 symbol_done, tf_done, result = await finished
                 completed_with_meta.append((symbol_done, tf_done, result))
                 completed_count = len(completed_with_meta)
                 if completed_count < total_tasks:  # Don't update at 100% yet
+                    now_progress = time.time()
+                    should_update_progress = (
+                        completed_count == 1 or
+                        completed_count % progress_update_every_n == 0 or
+                        (now_progress - last_progress_update_ts) >= progress_update_min_interval
+                    )
+                    if not should_update_progress:
+                        continue
                     try:
                         await asyncio.to_thread(
                             fs_heartbeat,
@@ -16203,6 +16236,7 @@ async def ejecutar_analisis_con_hilos(
                                 "current_tf": tf_done
                             }
                         )
+                        last_progress_update_ts = now_progress
                     except Exception as e:
                         logger.debug(f"[Progress] Skipped progress update ({completed_count}/{total_tasks}): {type(e).__name__}")
             
@@ -21846,6 +21880,14 @@ async def calcular_entradas_async(
         Dict with entry signal analysis (complete legacy format)
     """
     salida = {}
+    perf_enabled = str(os.environ.get("ANALYSIS_TIMING_VERBOSE", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    perf_threshold_s = float(os.environ.get("ANALYSIS_TIMING_THRESHOLD_SEC", "2.0"))
+    t_entry_total = time.time()
+    perf_marks: list[tuple[str, float]] = []
+
+    def _mark_perf(label: str, started_at: float):
+        if perf_enabled:
+            perf_marks.append((label, time.time() - started_at))
     
     # ✅ NIVEL 0: Redis Cache (ultra-fast para cálculos determinísticos)
     tf = _tf_backend(temporalidad)
@@ -21940,6 +21982,7 @@ async def calcular_entradas_async(
                 return (50.0, None)
         
         # Gather all parallel tasks
+        t_phase = time.time()
         patrones_result, rango_result, tecnica_meta, fundamental_result = await asyncio.gather(
             _detect_patterns(),
             _detect_range(),
@@ -21947,6 +21990,7 @@ async def calcular_entradas_async(
             _analyze_fundamental(),
             return_exceptions=False
         )
+        _mark_perf("base_parallel", t_phase)
         
         # Process pattern results
         patrones_detectados = {}
@@ -21994,12 +22038,14 @@ async def calcular_entradas_async(
                 return (50, 50)
         
         try:
+            t_phase = time.time()
             predicciones_arima, predicciones_media_movil, mc_result = await asyncio.gather(
                 _predict_arima(),
                 _predict_mm(),
                 _predict_mc(),
                 return_exceptions=False
             )
+            _mark_perf("predictions", t_phase)
             
             if mc_result and isinstance(mc_result, tuple):
                 probabilidad_alza, probabilidad_baja = mc_result
@@ -22022,8 +22068,10 @@ async def calcular_entradas_async(
         if soportes_cached is not None and resistencias_cached is not None:
             soportes_dinamicos = soportes_cached
             resistencias_dinamicas = resistencias_cached
+            _mark_perf("support_resistance_cache", time.time())
         else:
             try:
+                t_phase = time.time()
                 _df_sr, soportes_dinamicos, resistencias_dinamicas = await asyncio.wait_for(
                     loop.run_in_executor(
                         None,
@@ -22041,6 +22089,7 @@ async def calcular_entradas_async(
                     ),
                     timeout=30.0
                 )
+                _mark_perf("support_resistance_calc", t_phase)
             except asyncio.TimeoutError:
                 logger.warning(
                     "Timeout calculando S/R dinámicos para %s-%s; usando fallback estático",
@@ -22105,6 +22154,7 @@ async def calcular_entradas_async(
             logger.info(f"[ATR] Fallback usado para {symbol}/{tf}: ATR={ATR}")
         
         # ===== PROBABILITY CALCULATIONS =====
+        t_phase = time.time()
         probabilidad_tecnica = round(ajustar_probabilidad_tecnica(
             df, tf, window, cfg, niveles=niveles_clave, symbol=symbol
         ), 2)
@@ -22113,6 +22163,7 @@ async def calcular_entradas_async(
             probabilidad_tecnica, probabilidad_fundamental, cfg
         )
         probabilidad_general = round(probabilidad_general if probabilidad_general is not None else 50, 2)
+        _mark_perf("probabilities", t_phase)
         
         # ===== ZONE VERIFICATION =====
         verificar_znt = True
@@ -22188,6 +22239,7 @@ async def calcular_entradas_async(
         enable_retest = os.environ.get("ENTRADA_ENABLE_RETEST", "false").lower() == "true"
         enable_range_revert = os.environ.get("ENTRADA_ENABLE_RANGE_REVERT", "true").lower() == "true"
         
+        t_phase = time.time()
         entradas_mult = generar_entradas_multiples(
             precio_actual=precio_actual,
             ATR=ATR,
@@ -22205,6 +22257,7 @@ async def calcular_entradas_async(
             enable_breakout_retest=enable_retest,
             enable_range_mean_revert=enable_range_revert,
         )
+        _mark_perf("entries", t_phase)
         
         # Attach metadata to entries
         try:
@@ -22406,6 +22459,11 @@ async def calcular_entradas_async(
                     "ultimo_valor": precio_actual,
                     "meta": {},
                 }]
+
+        total_entry_elapsed = time.time() - t_entry_total
+        if perf_enabled and (total_entry_elapsed >= perf_threshold_s or any(v >= perf_threshold_s for _, v in perf_marks)):
+            timing = ", ".join(f"{name}={elapsed:.2f}s" for name, elapsed in perf_marks)
+            logger.info("[Timing][Entradas] %s/%s total=%.2fs %s", symbol, tf, total_entry_elapsed, timing)
 
         # ✅ NIVEL 0.5: Guardar resultado en Redis para próxima vez (non-blocking)
         try:
