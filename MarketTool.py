@@ -1009,6 +1009,20 @@ ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_RUN = int(
 ANALYSIS_GAPFILL_TIME_BUDGET_SECONDS = float(
     os.environ.get("ANALYSIS_GAPFILL_TIME_BUDGET_SECONDS", "5")
 )
+ANALYSIS_DEEP_GAPFILL_FULL_HISTORY = (
+    os.environ.get("ANALYSIS_DEEP_GAPFILL_FULL_HISTORY", "false").strip().lower()
+    in {"1", "true", "yes", "y", "on"}
+)
+ANALYSIS_DEEP_GAPFILL_LOOKBACK_BARS = {
+    "1min": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_1MIN", "360")),
+    "5min": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_5MIN", "288")),
+    "15min": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_15MIN", "192")),
+    "30min": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_30MIN", "144")),
+    "1hour": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_1HOUR", "96")),
+    "4hour": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_4HOUR", "72")),
+    "1day": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_1DAY", "45")),
+    "1week": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_1WEEK", "16")),
+}
 _DEEP_GAPFILL_RATE_LOCK = threading.Lock()
 _DEEP_GAPFILL_RATE_MINUTE = -1
 _DEEP_GAPFILL_RATE_COUNT = 0
@@ -6545,7 +6559,7 @@ _LAZY_HIST_LOADER = LazyHistoricosLoader(
 _GCS_CLIENT = None
 _GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
 _GCS_ENABLED = os.environ.get("GCS_ENABLED", "true").lower() == "true"
-_GCS_BACKUP_THROTTLE_SECONDS = 600  # ✅ Increased from 300s (5min) to 600s (10min) - lazy-load optimization
+_GCS_BACKUP_THROTTLE_SECONDS = int(os.environ.get("GCS_BACKUP_THROTTLE_SECONDS", "1800"))
 _last_gcs_backup_time = {}  # {(symbol, tf): timestamp}
 _last_gcs_backup_hash = {}  # {(symbol, tf): data_hash} - detect delta changes
 
@@ -10624,12 +10638,20 @@ def obtener_datos_con_hilos(
         # ✅ PERSIST TO GCS AFTER SUCCESSFUL FETCH (with throttling)
         # Backup strategy:
         # - ALWAYS backup on cold_start (initial fetch)
-        # - For subsequent fetches: only backup if >5min since last backup (avoid excessive writes)
+        # - For subsequent fetches: only backup after the throttle window.
+        # - After a container restart, prime the in-memory throttle instead
+        #   of treating every symbol/TF as overdue for periodic GCS backup.
         backup_key = (symbol, tf)
         last_backup = _last_gcs_backup_time.get(backup_key, 0)
         now_ts = datetime.now(UTC).timestamp()
         time_since_last_backup = now_ts - last_backup
-        should_backup = cold_start or gapfill_added > 0 or (time_since_last_backup > _GCS_BACKUP_THROTTLE_SECONDS)
+        first_seen_after_boot = last_backup <= 0 and not cold_start
+        if first_seen_after_boot:
+            _last_gcs_backup_time[backup_key] = now_ts
+            time_since_last_backup = 0
+
+        periodic_due = (not first_seen_after_boot) and time_since_last_backup > _GCS_BACKUP_THROTTLE_SECONDS
+        should_backup = cold_start or ((gapfill_added > 0 or periodic_due) and not first_seen_after_boot)
         
         if should_backup:
             try:
@@ -24306,8 +24328,16 @@ def _backfill_internal_gaps(
     tfms = _tf_ms(tf)
     closed_end = _current_closed_bucket_start(tf) - tfms
     min_backfill_ms = None
-    if not ANALYSIS_DEEP_GAPFILL_ENABLED:
-        lookback_bars = ANALYSIS_GAP_LOOKBACK_BARS.get(normalize_tf(tf), 120)
+    norm_tf = normalize_tf(tf)
+    if ANALYSIS_DEEP_GAPFILL_ENABLED:
+        if not ANALYSIS_DEEP_GAPFILL_FULL_HISTORY:
+            lookback_bars = ANALYSIS_DEEP_GAPFILL_LOOKBACK_BARS.get(
+                norm_tf,
+                ANALYSIS_GAP_LOOKBACK_BARS.get(norm_tf, 120),
+            )
+            min_backfill_ms = closed_end - (max(1, lookback_bars) * tfms)
+    else:
+        lookback_bars = ANALYSIS_GAP_LOOKBACK_BARS.get(norm_tf, 120)
         min_backfill_ms = closed_end - (lookback_bars * tfms)
     total_added = 0
 
