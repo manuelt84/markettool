@@ -29,7 +29,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def cloud_backend() -> str:
-    return (os.getenv("MARKETTOOL_CLOUD_BACKEND") or os.getenv("CLOUD_BACKEND") or "gcp").strip().lower()
+    return (os.getenv("MARKETTOOL_CLOUD_BACKEND") or os.getenv("CLOUD_BACKEND") or "vps").strip().lower()
 
 
 GCP_ONLY_MODES = {"gcp", "google", "firebase", "firestore", "gcp_only", "gcp-only", "only_gcp", "solo_gcp"}
