@@ -9996,6 +9996,23 @@ def _to_utc_datetime(dt_like) -> datetime | None:
     except Exception:
         return None
 
+def _json_safe_event_value(value):
+    """Return a Firestore/Postgres JSON-safe event value, replacing NaN/Inf with None."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {str(k): _json_safe_event_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_event_value(v) for v in value]
+    return value
+
 def _firestore_save_events(events: list[dict]) -> None:
     """
     Persiste eventos en 'eventos_completos' usando batch en trozos de 400.
@@ -10013,7 +10030,7 @@ def _firestore_save_events(events: list[dict]) -> None:
     for i in range(0, len(events), chunk):
         batch = db.batch()
         for row in events[i:i + chunk]:
-            data = dict(row)  # copia defensiva
+            data = _json_safe_event_value(dict(row))  # copia defensiva + JSON-safe
 
             # 2.1) Asegurar date_utc (preferida para queries)
             date_val = data.get("date_utc") or data.get("date")
@@ -10028,7 +10045,8 @@ def _firestore_save_events(events: list[dict]) -> None:
             for key in ("actual", "estimate", "previous"):
                 if key in data:
                     try:
-                        data[key] = float(data[key]) if data[key] is not None else None
+                        numeric_val = float(data[key]) if data[key] is not None else None
+                        data[key] = numeric_val if numeric_val is not None and math.isfinite(numeric_val) else None
                     except Exception:
                         data[key] = None
 

@@ -50,8 +50,8 @@ class DIContainer:
         quote_provider: QuoteProvider,
         cache_provider: CacheProvider,
         notifier: Notifier,
-        historical_data_provider: HistoricalDataProvider,
-        signal_repository: SignalRepository,
+        historical_data_provider: Optional[HistoricalDataProvider] = None,
+        signal_repository: Optional[SignalRepository] = None,
         telegram_app: Optional[Any] = None,
         firestore_db: Optional[Any] = None,
         legacy_services: Optional[LegacyServices] = None,
@@ -69,6 +69,7 @@ class DIContainer:
             cache_provider: Cache implementation
             notifier: Notification service
             historical_data_provider: Historical data provider (for HistoryManager)
+            signal_repository: Signal repository
             telegram_app: Telegram application instance (for health checks)
             firestore_db: Firestore database client (for health checks)
             legacy_services: Legacy MarketTool services

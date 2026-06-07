@@ -89,6 +89,16 @@ def register_monitoreo_routes(app, *, services) -> None:
             if not isinstance(state, dict):
                 return False
             estado = str(state.get("estado") or state.get("status") or "").strip().lower()
+            reason = str(state.get("reason") or data.get("last_reason") or "").strip().lower()
+            stop_reason = str(state.get("stop_reason") or "").strip().lower()
+            if (
+                estado in {"access_denied", "denied"}
+                or "cuota" in reason
+                or "transacciones" in reason
+                or "quota" in reason
+                or stop_reason == "subscription_inactive_or_expired"
+            ):
+                return False
             if estado in {"stopped", "detenido", "inactivo", "access_denied", "denied"}:
                 return True
             return state.get("enabled") is False
@@ -101,6 +111,50 @@ def register_monitoreo_routes(app, *, services) -> None:
                 exc,
             )
             return False
+
+    def _tf_access_denied_reason(exec_id: str, symbol: str, timeframe: str) -> str | None:
+        try:
+            doc_id = f"{exec_id}__{(symbol or '').upper()}"
+            snap = db.collection("monitoreos").document(doc_id).get()
+            if not snap.exists:
+                return None
+            data = snap.to_dict() or {}
+            tf_states = data.get("tf_states") or {}
+            tf_canonical = norm_tf(timeframe)
+            state = (
+                tf_states.get(tf_canonical)
+                or tf_states.get(timeframe)
+                or data.get(tf_canonical)
+                or data.get(timeframe)
+                or {}
+            )
+            if not isinstance(state, dict):
+                return None
+
+            estado = str(state.get("estado") or state.get("status") or "").strip().lower()
+            stop_reason = str(state.get("stop_reason") or "").strip().lower()
+            reason = str(state.get("reason") or data.get("last_reason") or "").strip()
+            reason_l = reason.lower()
+
+            is_access_denied = estado in {"access_denied", "denied"}
+            is_quota_reason = (
+                "cuota" in reason_l
+                or "transacciones" in reason_l
+                or "quota" in reason_l
+                or stop_reason == "subscription_inactive_or_expired"
+            )
+            if is_access_denied or is_quota_reason:
+                return reason or "No cuenta con la cuota de transacciones requerida. Por favor, adquiere un paquete."
+            return None
+        except Exception as exc:
+            logger.debug(
+                "TF access_denied lookup failed exec=%s symbol=%s tf=%s: %s",
+                exec_id,
+                symbol,
+                timeframe,
+                exc,
+            )
+            return None
 
     async def _mark_tf_stopped_access_denied(
         exec_id: str,
@@ -431,6 +485,8 @@ def register_monitoreo_routes(app, *, services) -> None:
                             tf_api: {
                                 "enabled": True,
                                 "estado": "running",
+                                "reason": None,
+                                "stop_reason": None,
                                 "last_heartbeat_ms": now_ms,
                                 "last_ts": now_ms,
                             }
@@ -442,6 +498,9 @@ def register_monitoreo_routes(app, *, services) -> None:
                     logging.warning("INC AUTO-RENEW fallido para %s %s: %s", symbol, tf_api, e)
 
             if not enabled:
+                denied_reason = _tf_access_denied_reason(exec_id, symbol, tf_api)
+                if denied_reason:
+                    return _quota_error_response(denied_reason)
                 return (
                     jsonify(
                         {
@@ -1003,6 +1062,8 @@ def register_monitoreo_routes(app, *, services) -> None:
                             tf_api: {
                                 "enabled": True,
                                 "estado": "running",
+                                "reason": None,
+                                "stop_reason": None,
                                 "last_heartbeat_ms": now_ms,
                                 "last_ts": now_ms,
                             }
@@ -1020,6 +1081,9 @@ def register_monitoreo_routes(app, *, services) -> None:
                     logging.warning("HIST AUTO-RENEW fallido para %s %s: %s", symbol, tf_api, e)
 
             if not enabled:
+                denied_reason = _tf_access_denied_reason(exec_id, symbol, tf_api)
+                if denied_reason:
+                    return _quota_error_response(denied_reason)
                 return (
                     jsonify(
                         {
