@@ -12,6 +12,7 @@ from markettool.application.services.bot_orchestrator_service import (
     BotOrder,
     get_bot_orchestrator_service,
 )
+from markettool.application.services.broker_session_store import get_broker_session_store
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,28 @@ def register_bot_orchestrator_routes(app) -> None:
             )
         }), 200
 
+    @app.route("/api/v1/bot-orchestrator/sessions/libertex", methods=["POST"])
+    def save_libertex_session():
+        payload = request.get_json(silent=True) or {}
+        user_id = str(payload.get("user_id") or "anonymous")
+        session_payload = payload.get("libertex_session") or payload.get("session") or {}
+        if not isinstance(session_payload, dict) or not session_payload:
+            return jsonify({"status": "failed", "error": "libertex_session is required"}), 400
+        saved = get_broker_session_store().save_session(
+            user_id=user_id,
+            broker="libertex",
+            session_payload=session_payload,
+            account_hint=str(payload.get("account_hint") or "default"),
+            expires_at=payload.get("expires_at"),
+        )
+        return jsonify({"status": "ok", "session": saved}), 200
+
+    @app.route("/api/v1/bot-orchestrator/sessions", methods=["GET"])
+    def list_broker_sessions():
+        return jsonify({
+            "sessions": get_broker_session_store().list_sessions(user_id=request.args.get("user_id"))
+        }), 200
+
     @app.route("/api/v1/bot-orchestrator/reconcile", methods=["POST"])
     def reconcile_bot_positions():
         payload = request.get_json(silent=True) or {}
@@ -71,7 +94,7 @@ def register_bot_orchestrator_routes(app) -> None:
                 return jsonify({"status": "failed", "broker": "mt5", "error": str(exc)}), 500
 
         if broker == "libertex":
-            session_data = payload.get("libertex_session") or {}
+            session_data = _resolve_libertex_session(payload, str(payload.get("user_id") or "anonymous"))
             if not session_data:
                 return jsonify({
                     "status": "session_required",
@@ -211,7 +234,7 @@ def _execute_mt5_close(order: BotOrder, payload: dict[str, Any]) -> BotOrder:
 
 
 def _execute_libertex_open(order: BotOrder, payload: dict[str, Any]) -> BotOrder:
-    session_data = payload.get("libertex_session") or {}
+    session_data = _resolve_libertex_session(payload, order.user_id)
     if not session_data:
         return get_bot_orchestrator_service().update_order(
             order.id,
@@ -274,7 +297,7 @@ def _execute_libertex_open(order: BotOrder, payload: dict[str, Any]) -> BotOrder
 
 
 def _execute_libertex_close(order: BotOrder, payload: dict[str, Any]) -> BotOrder:
-    session_data = payload.get("libertex_session") or {}
+    session_data = _resolve_libertex_session(payload, order.user_id)
     invest_id = payload.get("invest_id") or payload.get("investId") or payload.get("broker_position_id")
     if not session_data or not invest_id:
         return get_bot_orchestrator_service().update_order(
@@ -332,6 +355,20 @@ def _libertex_get_open_positions(session_data: dict[str, Any]) -> tuple[dict[str
     if resp.ok:
         return {"status": "ok", "broker": "libertex", "positions": result}, 200
     return {"status": "failed", "broker": "libertex", "raw": result}, 502
+
+
+def _resolve_libertex_session(payload: dict[str, Any], user_id: str) -> dict[str, Any]:
+    inline = payload.get("libertex_session") or {}
+    if isinstance(inline, dict) and inline:
+        return inline
+    session_id = str(payload.get("broker_session_id") or payload.get("libertex_session_id") or "")
+    store = get_broker_session_store()
+    if session_id:
+        return store.get_session(session_id) or {}
+    latest = store.get_latest_session(user_id, "libertex")
+    if latest:
+        return latest[1]
+    return {}
 
 
 def _optional_float(value: Any) -> float | None:
