@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import threading
 import time
@@ -36,6 +37,48 @@ def _redis_client_for_daemon():
         return client
     except Exception:
         return None
+
+
+def _redis_daemon_key(daemon_id: str) -> str:
+    return f"bot_daemon:{daemon_id}"
+
+
+def _redis_daemon_stop_key(daemon_id: str) -> str:
+    return f"bot_daemon_stop:{daemon_id}"
+
+
+def _write_daemon_status(redis_client, state: dict[str, Any]) -> None:
+    if redis_client is None:
+        return
+    try:
+        redis_client.setex(_redis_daemon_key(str(state.get("id"))), 180, json.dumps(_public_daemon(state)))
+    except Exception as exc:
+        logger.debug("Bot daemon redis status write failed: %s", exc)
+
+
+def _read_daemon_status(redis_client, daemon_id: str) -> dict[str, Any] | None:
+    if redis_client is None:
+        return None
+    try:
+        raw = redis_client.get(_redis_daemon_key(daemon_id))
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _list_redis_daemon_status(redis_client) -> list[dict[str, Any]]:
+    if redis_client is None:
+        return []
+    try:
+        result: list[dict[str, Any]] = []
+        for key in redis_client.scan_iter("bot_daemon:*"):
+            raw = redis_client.get(key)
+            if raw:
+                result.append(json.loads(raw))
+        return result
+    except Exception as exc:
+        logger.debug("Bot daemon redis status list failed: %s", exc)
+        return []
 
 
 def register_bot_orchestrator_routes(app) -> None:
@@ -116,11 +159,17 @@ def register_bot_orchestrator_routes(app) -> None:
             return jsonify({"status": "failed", "error": "exec_id, symbol and tfs are required"}), 400
 
         daemon_id = _daemon_id(user_id, bot_type, exec_id, symbol)
+        redis_client = _redis_client_for_daemon()
         with _DAEMONS_LOCK:
             current = _DAEMONS.get(daemon_id)
             if current and current.get("running"):
                 current["last_start_payload"] = _public_daemon_payload(payload)
+                current["payload"] = {**payload, "user_id": user_id, "bot_type": bot_type, "exec_id": exec_id, "symbol": symbol, "tfs": tfs, "broker": broker}
+                _write_daemon_status(redis_client, current)
                 return jsonify({"status": "already_running", "daemon_id": daemon_id, "daemon": _public_daemon(current)}), 200
+            remote = _read_daemon_status(redis_client, daemon_id)
+            if remote and remote.get("running") and int(time.time() * 1000) - int(remote.get("last_tick_at") or remote.get("started_at") or 0) < 180_000:
+                return jsonify({"status": "already_running", "daemon_id": daemon_id, "daemon": remote}), 200
 
             stop_event = threading.Event()
             state: dict[str, Any] = {
@@ -133,14 +182,16 @@ def register_bot_orchestrator_routes(app) -> None:
                 "orders_submitted": 0,
                 "last_start_payload": _public_daemon_payload(payload),
             }
+            state["payload"] = {**payload, "user_id": user_id, "bot_type": bot_type, "exec_id": exec_id, "symbol": symbol, "tfs": tfs, "broker": broker}
             thread = threading.Thread(
                 target=_run_bot_daemon,
-                args=(state, {**payload, "user_id": user_id, "bot_type": bot_type, "exec_id": exec_id, "symbol": symbol, "tfs": tfs, "broker": broker}),
+                args=(state, state["payload"]),
                 daemon=True,
                 name=f"bot-daemon-{bot_type}-{symbol}",
             )
             state["thread"] = thread
             _DAEMONS[daemon_id] = state
+            _write_daemon_status(redis_client, state)
             thread.start()
 
         return jsonify({"status": "started", "daemon_id": daemon_id, "daemon": _public_daemon(state)}), 200
@@ -158,19 +209,45 @@ def register_bot_orchestrator_routes(app) -> None:
             )
         with _DAEMONS_LOCK:
             state = _DAEMONS.get(daemon_id)
+            redis_client = _redis_client_for_daemon()
+            if redis_client is not None:
+                try:
+                    redis_client.setex(_redis_daemon_stop_key(daemon_id), 180, "1")
+                except Exception:
+                    pass
             if not state:
-                return jsonify({"status": "not_found", "daemon_id": daemon_id}), 404
+                return jsonify({"status": "stopping", "daemon_id": daemon_id, "local": False}), 200
             state["running"] = False
             stop_event = state.get("stop_event")
             if stop_event:
                 stop_event.set()
+            _write_daemon_status(redis_client, state)
         return jsonify({"status": "stopping", "daemon_id": daemon_id}), 200
 
     @app.route("/api/v1/bot-orchestrator/daemon/status", methods=["GET"])
     def bot_daemon_status():
+        user_id = request.args.get("user_id")
+        exec_id = request.args.get("exec_id")
+        symbol = request.args.get("symbol")
+        bot_type = request.args.get("bot_type")
         with _DAEMONS_LOCK:
-            daemons = [_public_daemon(item) for item in _DAEMONS.values()]
-        return jsonify({"daemons": daemons}), 200
+            raw_daemons = list(_DAEMONS.values())
+        redis_daemons = _list_redis_daemon_status(_redis_client_for_daemon())
+        by_id = {item.get("id"): item for item in redis_daemons if item.get("id")}
+        by_id.update({item.get("id"): item for item in [_public_daemon(item) for item in raw_daemons] if item.get("id")})
+        daemons = list(by_id.values())
+        if user_id:
+            daemons = [item for item in daemons if item.get("user_id") == user_id]
+        if exec_id:
+            daemons = [item for item in daemons if item.get("exec_id") == exec_id]
+        if symbol:
+            norm_symbol = str(symbol).replace("/", "").upper()
+            daemons = [item for item in daemons if str(item.get("symbol") or "").replace("/", "").upper() == norm_symbol]
+        if bot_type:
+            daemons = [item for item in daemons if item.get("bot_type") == bot_type]
+        orders = _filter_status_items(service.list_orders(user_id=user_id) if user_id else [], exec_id=exec_id, symbol=symbol, bot_type=bot_type)[:100]
+        positions = _filter_status_items(service.list_positions(user_id=user_id) if user_id else [], exec_id=exec_id, symbol=symbol, bot_type=bot_type)[:100]
+        return jsonify({"daemons": daemons, "orders": orders, "positions": positions}), 200
 
     @app.route("/api/v1/bot-orchestrator/reconcile", methods=["POST"])
     def reconcile_bot_positions():
@@ -479,6 +556,7 @@ def _public_daemon_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _public_daemon(state: dict[str, Any]) -> dict[str, Any]:
+    payload = state.get("payload") if isinstance(state.get("payload"), dict) else state.get("last_start_payload", {})
     return {
         "id": state.get("id"),
         "running": bool(state.get("running")),
@@ -487,26 +565,41 @@ def _public_daemon(state: dict[str, Any]) -> dict[str, Any]:
         "last_error": state.get("last_error"),
         "orders_submitted": state.get("orders_submitted", 0),
         "last_start_payload": state.get("last_start_payload"),
+        "user_id": payload.get("user_id"),
+        "bot_type": payload.get("bot_type"),
+        "exec_id": payload.get("exec_id"),
+        "symbol": payload.get("symbol"),
+        "tfs": payload.get("tfs"),
+        "broker": payload.get("broker"),
     }
 
 
 def _run_bot_daemon(state: dict[str, Any], payload: dict[str, Any]) -> None:
-    from markettool.interfaces.api.live_entries_routes import _get_entries_from_redis
+    from markettool.interfaces.api.live_entries_routes import _get_entries_from_redis, _touch_worker, _worker_id
 
     redis_client = _redis_client_for_daemon()
     service = get_bot_orchestrator_service()
-    interval_s = max(1.0, min(float(payload.get("interval_ms") or 5000) / 1000.0, 60.0))
-    user_id = str(payload.get("user_id") or "anonymous")
-    bot_type = str(payload.get("bot_type") or "trading").lower()
-    exec_id = str(payload.get("exec_id") or "")
-    symbol = str(payload.get("symbol") or "").replace("/", "").upper()
-    tfs = [str(tf).lower() for tf in (payload.get("tfs") or [])]
-    broker = str(payload.get("broker") or "mt5").lower()
     since_ts = 0
 
     while not state.get("stop_event").is_set():
         try:
+            if redis_client is not None:
+                try:
+                    if redis_client.get(_redis_daemon_stop_key(str(state.get("id")))):
+                        break
+                except Exception:
+                    pass
+            runtime_payload = state.get("payload") if isinstance(state.get("payload"), dict) else payload
+            interval_s = max(2.0, min(float(runtime_payload.get("interval_ms") or 5000) / 1000.0, 60.0))
+            user_id = str(runtime_payload.get("user_id") or "anonymous")
+            bot_type = str(runtime_payload.get("bot_type") or "trading").lower()
+            exec_id = str(runtime_payload.get("exec_id") or "")
+            symbol = str(runtime_payload.get("symbol") or "").replace("/", "").upper()
+            tfs = [str(tf).lower() for tf in (runtime_payload.get("tfs") or [])]
+            broker = str(runtime_payload.get("broker") or "mt5").lower()
             state["last_tick_at"] = int(time.time() * 1000)
+            _touch_worker(redis_client, _worker_id(exec_id, symbol))
+            _write_daemon_status(redis_client, state)
             entries = _get_entries_from_redis(redis_client, exec_id, symbol, tfs, since_ts)
             for entry in entries:
                 entry_created = _entry_created_ms_safe(entry)
@@ -514,6 +607,8 @@ def _run_bot_daemon(state: dict[str, Any], payload: dict[str, Any]) -> None:
                 order_payload = {
                     "user_id": user_id,
                     "bot_type": bot_type,
+                    "exec_id": exec_id,
+                    "monitored_tfs": tfs,
                     "action": "open",
                     "broker": broker,
                     "entry": entry,
@@ -531,8 +626,12 @@ def _run_bot_daemon(state: dict[str, Any], payload: dict[str, Any]) -> None:
         except Exception as exc:
             logger.warning("Bot daemon tick failed: %s", exc, exc_info=True)
             state["last_error"] = str(exc)
+            _write_daemon_status(redis_client, state)
+        runtime_payload = state.get("payload") if isinstance(state.get("payload"), dict) else payload
+        interval_s = max(2.0, min(float(runtime_payload.get("interval_ms") or 5000) / 1000.0, 60.0))
         state.get("stop_event").wait(interval_s)
     state["running"] = False
+    _write_daemon_status(redis_client, state)
 
 
 def _daemon_order_key(user_id: str, bot_type: str, broker: str, entry: dict[str, Any]) -> str:
@@ -558,6 +657,24 @@ def _entry_created_ms_safe(entry: dict[str, Any]) -> int:
             except Exception:
                 pass
     return int(time.time() * 1000)
+
+
+def _filter_status_items(
+    items: list[dict[str, Any]],
+    *,
+    exec_id: str | None,
+    symbol: str | None,
+    bot_type: str | None,
+) -> list[dict[str, Any]]:
+    result = list(items)
+    if exec_id:
+        result = [item for item in result if not isinstance(item.get("request"), dict) or item.get("request", {}).get("exec_id") == exec_id]
+    if symbol:
+        norm_symbol = str(symbol).replace("/", "").upper()
+        result = [item for item in result if str(item.get("symbol") or item.get("request", {}).get("symbol") or "").replace("/", "").upper() == norm_symbol]
+    if bot_type:
+        result = [item for item in result if item.get("bot_type") == bot_type or item.get("request", {}).get("bot_type") == bot_type]
+    return result
 
 
 def _optional_float(value: Any) -> float | None:
