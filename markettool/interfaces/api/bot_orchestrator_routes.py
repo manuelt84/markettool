@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
+import time
 from typing import Any
 
 import requests
@@ -15,6 +18,24 @@ from markettool.application.services.bot_orchestrator_service import (
 from markettool.application.services.broker_session_store import get_broker_session_store
 
 logger = logging.getLogger(__name__)
+_DAEMONS: dict[str, dict[str, Any]] = {}
+_DAEMONS_LOCK = threading.RLock()
+
+
+def _daemon_id(user_id: str, bot_type: str, exec_id: str, symbol: str) -> str:
+    return f"{user_id}:{bot_type}:{exec_id}:{symbol.upper()}"
+
+
+def _redis_client_for_daemon():
+    try:
+        import redis as _redis
+
+        redis_url = os.getenv("LIVE_ENTRIES_REDIS_URL") or os.getenv("REDIS_URL", "redis://redis:6379/0")
+        client = _redis.Redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=3)
+        client.ping()
+        return client
+    except Exception:
+        return None
 
 
 def register_bot_orchestrator_routes(app) -> None:
@@ -77,6 +98,79 @@ def register_bot_orchestrator_routes(app) -> None:
         return jsonify({
             "sessions": get_broker_session_store().list_sessions(user_id=request.args.get("user_id"))
         }), 200
+
+    @app.route("/api/v1/bot-orchestrator/daemon/start", methods=["POST"])
+    def start_bot_daemon():
+        payload = request.get_json(silent=True) or {}
+        enabled = bool(payload.get("enabled", False))
+        if not enabled:
+            return jsonify({"status": "disabled", "message": "Daemon requires enabled=true"}), 200
+
+        user_id = str(payload.get("user_id") or "anonymous")
+        bot_type = str(payload.get("bot_type") or "trading").lower()
+        exec_id = str(payload.get("exec_id") or "").strip()
+        symbol = str(payload.get("symbol") or "").replace("/", "").upper().strip()
+        tfs = [str(tf).strip().lower() for tf in (payload.get("tfs") or []) if str(tf).strip()]
+        broker = str(payload.get("broker") or "mt5").lower()
+        if not exec_id or not symbol or not tfs:
+            return jsonify({"status": "failed", "error": "exec_id, symbol and tfs are required"}), 400
+
+        daemon_id = _daemon_id(user_id, bot_type, exec_id, symbol)
+        with _DAEMONS_LOCK:
+            current = _DAEMONS.get(daemon_id)
+            if current and current.get("running"):
+                current["last_start_payload"] = _public_daemon_payload(payload)
+                return jsonify({"status": "already_running", "daemon_id": daemon_id, "daemon": _public_daemon(current)}), 200
+
+            stop_event = threading.Event()
+            state: dict[str, Any] = {
+                "id": daemon_id,
+                "running": True,
+                "stop_event": stop_event,
+                "started_at": int(time.time() * 1000),
+                "last_tick_at": None,
+                "last_error": None,
+                "orders_submitted": 0,
+                "last_start_payload": _public_daemon_payload(payload),
+            }
+            thread = threading.Thread(
+                target=_run_bot_daemon,
+                args=(state, {**payload, "user_id": user_id, "bot_type": bot_type, "exec_id": exec_id, "symbol": symbol, "tfs": tfs, "broker": broker}),
+                daemon=True,
+                name=f"bot-daemon-{bot_type}-{symbol}",
+            )
+            state["thread"] = thread
+            _DAEMONS[daemon_id] = state
+            thread.start()
+
+        return jsonify({"status": "started", "daemon_id": daemon_id, "daemon": _public_daemon(state)}), 200
+
+    @app.route("/api/v1/bot-orchestrator/daemon/stop", methods=["POST"])
+    def stop_bot_daemon():
+        payload = request.get_json(silent=True) or {}
+        daemon_id = str(payload.get("daemon_id") or "")
+        if not daemon_id:
+            daemon_id = _daemon_id(
+                str(payload.get("user_id") or "anonymous"),
+                str(payload.get("bot_type") or "trading").lower(),
+                str(payload.get("exec_id") or "").strip(),
+                str(payload.get("symbol") or "").replace("/", "").upper().strip(),
+            )
+        with _DAEMONS_LOCK:
+            state = _DAEMONS.get(daemon_id)
+            if not state:
+                return jsonify({"status": "not_found", "daemon_id": daemon_id}), 404
+            state["running"] = False
+            stop_event = state.get("stop_event")
+            if stop_event:
+                stop_event.set()
+        return jsonify({"status": "stopping", "daemon_id": daemon_id}), 200
+
+    @app.route("/api/v1/bot-orchestrator/daemon/status", methods=["GET"])
+    def bot_daemon_status():
+        with _DAEMONS_LOCK:
+            daemons = [_public_daemon(item) for item in _DAEMONS.values()]
+        return jsonify({"daemons": daemons}), 200
 
     @app.route("/api/v1/bot-orchestrator/reconcile", methods=["POST"])
     def reconcile_bot_positions():
@@ -369,6 +463,101 @@ def _resolve_libertex_session(payload: dict[str, Any], user_id: str) -> dict[str
     if latest:
         return latest[1]
     return {}
+
+
+def _public_daemon_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "user_id": payload.get("user_id"),
+        "bot_type": payload.get("bot_type"),
+        "exec_id": payload.get("exec_id"),
+        "symbol": payload.get("symbol"),
+        "tfs": payload.get("tfs"),
+        "broker": payload.get("broker"),
+        "interval_ms": payload.get("interval_ms"),
+        "enabled": bool(payload.get("enabled")),
+    }
+
+
+def _public_daemon(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": state.get("id"),
+        "running": bool(state.get("running")),
+        "started_at": state.get("started_at"),
+        "last_tick_at": state.get("last_tick_at"),
+        "last_error": state.get("last_error"),
+        "orders_submitted": state.get("orders_submitted", 0),
+        "last_start_payload": state.get("last_start_payload"),
+    }
+
+
+def _run_bot_daemon(state: dict[str, Any], payload: dict[str, Any]) -> None:
+    from markettool.interfaces.api.live_entries_routes import _get_entries_from_redis
+
+    redis_client = _redis_client_for_daemon()
+    service = get_bot_orchestrator_service()
+    interval_s = max(1.0, min(float(payload.get("interval_ms") or 5000) / 1000.0, 60.0))
+    user_id = str(payload.get("user_id") or "anonymous")
+    bot_type = str(payload.get("bot_type") or "trading").lower()
+    exec_id = str(payload.get("exec_id") or "")
+    symbol = str(payload.get("symbol") or "").replace("/", "").upper()
+    tfs = [str(tf).lower() for tf in (payload.get("tfs") or [])]
+    broker = str(payload.get("broker") or "mt5").lower()
+    since_ts = 0
+
+    while not state.get("stop_event").is_set():
+        try:
+            state["last_tick_at"] = int(time.time() * 1000)
+            entries = _get_entries_from_redis(redis_client, exec_id, symbol, tfs, since_ts)
+            for entry in entries:
+                entry_created = _entry_created_ms_safe(entry)
+                since_ts = max(since_ts, entry_created)
+                order_payload = {
+                    "user_id": user_id,
+                    "bot_type": bot_type,
+                    "action": "open",
+                    "broker": broker,
+                    "entry": entry,
+                    "execute_now": True,
+                    "platform": "backend-daemon",
+                    "idempotency_key": _daemon_order_key(user_id, bot_type, broker, entry),
+                }
+                order, created = service.create_order(order_payload)
+                if not created:
+                    continue
+                executed = _execute_order(order, order_payload)
+                if executed.status not in {"failed", "session_required"}:
+                    state["orders_submitted"] = int(state.get("orders_submitted") or 0) + 1
+            state["last_error"] = None
+        except Exception as exc:
+            logger.warning("Bot daemon tick failed: %s", exc, exc_info=True)
+            state["last_error"] = str(exc)
+        state.get("stop_event").wait(interval_s)
+    state["running"] = False
+
+
+def _daemon_order_key(user_id: str, bot_type: str, broker: str, entry: dict[str, Any]) -> str:
+    symbol = str(entry.get("symbol") or "").replace("/", "").upper()
+    tf = str(entry.get("timeframe") or entry.get("tf") or "").lower()
+    side = str(entry.get("side") or "").lower()
+    entry_id = str(entry.get("id") or entry.get("signalKey") or "")
+    return f"daemon:{user_id}:{bot_type}:{broker}:{symbol}:{tf}:{side}:{entry_id}"
+
+
+def _entry_created_ms_safe(entry: dict[str, Any]) -> int:
+    for key in ("created_at", "createdAt", "timestamp"):
+        value = entry.get(key)
+        if isinstance(value, (int, float)):
+            return int(value if value > 1e12 else value * 1000)
+        if value:
+            try:
+                from pandas import Timestamp
+
+                parsed = Timestamp(str(value))
+                if not parsed is None:
+                    return int(parsed.timestamp() * 1000)
+            except Exception:
+                pass
+    return int(time.time() * 1000)
 
 
 def _optional_float(value: Any) -> float | None:
