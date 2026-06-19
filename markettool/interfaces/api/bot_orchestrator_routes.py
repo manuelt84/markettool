@@ -31,7 +31,11 @@ def _redis_client_for_daemon():
     try:
         import redis as _redis
 
-        redis_url = os.getenv("LIVE_ENTRIES_REDIS_URL") or os.getenv("REDIS_URL", "redis://redis:6379/0")
+        redis_url = (
+            os.getenv("BOT_DAEMON_REDIS_URL")
+            or os.getenv("LIVE_ENTRIES_REDIS_URL")
+            or os.getenv("REDIS_URL", "redis://redis:6379/0")
+        )
         client = _redis.Redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=3)
         client.ping()
         return client
