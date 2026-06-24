@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -167,8 +168,9 @@ def register_bot_orchestrator_routes(app) -> None:
         with _DAEMONS_LOCK:
             current = _DAEMONS.get(daemon_id)
             if current and current.get("running"):
-                current["last_start_payload"] = _public_daemon_payload(payload)
-                current["payload"] = {**payload, "user_id": user_id, "bot_type": bot_type, "exec_id": exec_id, "symbol": symbol, "tfs": tfs, "broker": broker}
+                execution_config = _normalize_execution_config(payload, tfs)
+                current["last_start_payload"] = _public_daemon_payload({**payload, "execution_config": execution_config})
+                current["payload"] = {**payload, "user_id": user_id, "bot_type": bot_type, "exec_id": exec_id, "symbol": symbol, "tfs": tfs, "broker": broker, "execution_config": execution_config}
                 _write_daemon_status(redis_client, current)
                 return jsonify({"status": "already_running", "daemon_id": daemon_id, "daemon": _public_daemon(current)}), 200
             remote = _read_daemon_status(redis_client, daemon_id)
@@ -176,6 +178,7 @@ def register_bot_orchestrator_routes(app) -> None:
                 return jsonify({"status": "already_running", "daemon_id": daemon_id, "daemon": remote}), 200
 
             stop_event = threading.Event()
+            execution_config = _normalize_execution_config(payload, tfs)
             state: dict[str, Any] = {
                 "id": daemon_id,
                 "running": True,
@@ -184,9 +187,14 @@ def register_bot_orchestrator_routes(app) -> None:
                 "last_tick_at": None,
                 "last_error": None,
                 "orders_submitted": 0,
-                "last_start_payload": _public_daemon_payload(payload),
+                "entries_seen": 0,
+                "entries_rejected": 0,
+                "last_decision": None,
+                "paused": bool(execution_config.get("paused")),
+                "pause_reason": execution_config.get("pause_reason"),
+                "last_start_payload": _public_daemon_payload({**payload, "execution_config": execution_config}),
             }
-            state["payload"] = {**payload, "user_id": user_id, "bot_type": bot_type, "exec_id": exec_id, "symbol": symbol, "tfs": tfs, "broker": broker}
+            state["payload"] = {**payload, "user_id": user_id, "bot_type": bot_type, "exec_id": exec_id, "symbol": symbol, "tfs": tfs, "broker": broker, "execution_config": execution_config}
             thread = threading.Thread(
                 target=_run_bot_daemon,
                 args=(state, state["payload"]),
@@ -556,7 +564,257 @@ def _public_daemon_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "broker": payload.get("broker"),
         "interval_ms": payload.get("interval_ms"),
         "enabled": bool(payload.get("enabled")),
+        "execution_config": payload.get("execution_config"),
     }
+
+
+def _normalize_execution_config(payload: dict[str, Any], tfs: list[str]) -> dict[str, Any]:
+    raw = (
+        payload.get("execution_config")
+        or payload.get("executionConfig")
+        or payload.get("filters")
+        or payload.get("criteria")
+        or {}
+    )
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def _string_list(*keys: str, uppercase: bool = False) -> list[str]:
+        for key in keys:
+            value = raw.get(key)
+            if isinstance(value, list):
+                items = [str(item).strip() for item in value if str(item).strip()]
+                return [item.replace("/", "").upper() if uppercase else item.lower() for item in items]
+        return []
+
+    return {
+        "min_confidence": _optional_float(raw.get("min_confidence") or raw.get("minConfidence")),
+        "min_rr": _optional_float(raw.get("min_rr") or raw.get("minRR")),
+        "source_filters": _string_list("source_filters", "sourceFilters", "allowed_sources", "allowedSources"),
+        "timeframe_filters": _string_list("timeframe_filters", "timeframeFilters", "allowed_timeframes", "allowedTimeframes"),
+        "monitored_timeframes": _string_list("monitored_timeframes", "monitoredTimeframes") or [str(tf).lower() for tf in tfs],
+        "allowed_symbols": _string_list("allowed_symbols", "allowedSymbols", uppercase=True),
+        "max_daily_trades": _optional_float(raw.get("max_daily_trades") or raw.get("maxDailyTrades")),
+        "max_open_positions": _optional_float(raw.get("max_open_positions") or raw.get("maxOpenPositions")),
+        "require_lower_tf_confirmation": bool(raw.get("require_lower_tf_confirmation") or raw.get("requireLowerTfConfirmation")),
+        "require_higher_tf_bias": bool(raw.get("require_higher_tf_bias") or raw.get("requireHigherTfBias")),
+        "require_bollinger_direction": bool(raw.get("require_bollinger_direction") or raw.get("requireBollingerDirection")),
+        "require_rsi_stoch_direction": bool(raw.get("require_rsi_stoch_direction") or raw.get("requireRsiStochDirection")),
+        "paused": bool(raw.get("paused")),
+        "pause_reason": raw.get("pause_reason") or raw.get("pauseReason"),
+    }
+
+
+def _passes_backend_execution_config(
+    entry: dict[str, Any],
+    batch_entries: list[dict[str, Any]],
+    config: dict[str, Any],
+    service,
+    *,
+    user_id: str,
+    bot_type: str,
+    broker: str,
+    exec_id: str,
+    symbol: str,
+) -> tuple[bool, str]:
+    entry_symbol = _entry_symbol(entry)
+    entry_tf = _entry_tf(entry)
+    entry_side = _entry_side(entry)
+    if symbol and entry_symbol != symbol:
+        return False, f"symbol {entry_symbol} != daemon {symbol}"
+    if config.get("allowed_symbols") and entry_symbol not in set(config.get("allowed_symbols") or []):
+        return False, "symbol not enabled in backend criteria"
+
+    effective_tfs = set(config.get("timeframe_filters") or []) or set(config.get("monitored_timeframes") or [])
+    if effective_tfs and entry_tf not in effective_tfs:
+        return False, "timeframe not enabled in backend criteria"
+    if config.get("source_filters") and _entry_source(entry) not in set(config.get("source_filters") or []):
+        return False, "source not enabled in backend criteria"
+
+    max_daily = config.get("max_daily_trades")
+    if max_daily is not None and _daily_open_count(service, user_id, bot_type, broker, exec_id, entry_symbol) >= int(max_daily):
+        return False, "daily trade limit reached"
+    max_open = config.get("max_open_positions")
+    if max_open is not None and _open_position_count(service, user_id, bot_type, broker, entry_symbol) >= int(max_open):
+        return False, "open position limit reached"
+
+    monitored = set(config.get("monitored_timeframes") or [])
+    if config.get("require_lower_tf_confirmation") and not _has_tf_confirmation(entry, batch_entries, monitored, lower=True):
+        return False, "missing lower timeframe confirmation"
+    if config.get("require_higher_tf_bias") and not _has_tf_confirmation(entry, batch_entries, monitored, lower=False):
+        return False, "missing higher timeframe bias"
+    if (config.get("require_bollinger_direction") or config.get("require_rsi_stoch_direction")) and not _passes_indicator_direction(entry, config):
+        return False, "indicator direction rejected"
+
+    min_conf = config.get("min_confidence")
+    if min_conf is not None and _entry_adjusted_confidence(entry) < float(min_conf):
+        return False, "confidence below backend minimum"
+    min_rr = config.get("min_rr")
+    if min_rr is not None:
+        rr = _entry_rr(entry)
+        if rr is None or rr < float(min_rr):
+            return False, "risk/reward below backend minimum"
+    if not entry_side:
+        return False, "entry side is missing"
+    return True, "accepted"
+
+
+def _daily_open_count(service, user_id: str, bot_type: str, broker: str, exec_id: str, symbol: str) -> int:
+    today = datetime.now(timezone.utc).date()
+    total = 0
+    for order in service.list_orders(user_id=user_id):
+        request_payload = order.get("request") if isinstance(order.get("request"), dict) else {}
+        if order.get("action") != "open" or order.get("bot_type") != bot_type or order.get("broker") != broker:
+            continue
+        if request_payload.get("exec_id") and request_payload.get("exec_id") != exec_id:
+            continue
+        if str(order.get("symbol") or "").replace("/", "").upper() != symbol:
+            continue
+        if order.get("status") in {"failed", "session_required"}:
+            continue
+        created_at = int(order.get("created_at") or 0)
+        if created_at and datetime.fromtimestamp(created_at / 1000, timezone.utc).date() == today:
+            total += 1
+    return total
+
+
+def _open_position_count(service, user_id: str, bot_type: str, broker: str, symbol: str) -> int:
+    total = 0
+    for position in service.list_positions(user_id=user_id, status="open"):
+        if position.get("bot_type") != bot_type or position.get("broker") != broker:
+            continue
+        if str(position.get("symbol") or "").replace("/", "").upper() == symbol:
+            total += 1
+    return total
+
+
+def _entry_symbol(entry: dict[str, Any]) -> str:
+    return str(entry.get("symbol") or "").replace("/", "").upper()
+
+
+def _entry_tf(entry: dict[str, Any]) -> str:
+    return str(entry.get("timeframe") or entry.get("tf") or "").strip().lower()
+
+
+def _entry_side(entry: dict[str, Any]) -> str:
+    raw = str(entry.get("side") or entry.get("direction") or "").strip().lower()
+    if raw in {"buy", "long", "compra"}:
+        return "long"
+    if raw in {"sell", "short", "venta"}:
+        return "short"
+    return raw
+
+
+def _entry_source(entry: dict[str, Any]) -> str:
+    return str(entry.get("executionSourceKey") or entry.get("sourceKey") or entry.get("source") or entry.get("sourceTag") or "").strip().lower()
+
+
+def _entry_adjusted_confidence(entry: dict[str, Any]) -> float:
+    confidence = _optional_float(entry.get("confidence") or entry.get("confianza")) or 0.0
+    wr = next(
+        (
+            value
+            for value in (
+                _optional_float(entry.get("individualWR")),
+                _optional_float(entry.get("familyWR")),
+                _optional_float(entry.get("indicatorWinRate")),
+            )
+            if value is not None
+        ),
+        None,
+    )
+    if wr is not None:
+        if wr >= 65:
+            confidence *= 1.15
+        elif wr < 45:
+            confidence *= 0.85
+    return confidence
+
+
+def _entry_rr(entry: dict[str, Any]) -> float | None:
+    for key in ("rrNet", "rr", "riskReward", "risk_reward"):
+        value = _optional_float(entry.get(key))
+        if value is not None:
+            return value
+    entry_price = _optional_float(entry.get("entry") or entry.get("entry_price"))
+    tp = _optional_float(entry.get("tp") or entry.get("take_profit"))
+    sl = _optional_float(entry.get("sl") or entry.get("stop_loss"))
+    if entry_price is None or tp is None or sl is None:
+        return None
+    risk = abs(entry_price - sl)
+    return None if risk <= 0 else abs(tp - entry_price) / risk
+
+
+def _has_tf_confirmation(entry: dict[str, Any], entries: list[dict[str, Any]], monitored: set[str], *, lower: bool) -> bool:
+    current_rank = _tf_rank(_entry_tf(entry))
+    if current_rank is None:
+        return False
+    for other in entries:
+        other_tf = _entry_tf(other)
+        if monitored and other_tf not in monitored:
+            continue
+        other_rank = _tf_rank(other_tf)
+        if other_rank is None:
+            continue
+        if lower and other_rank >= current_rank:
+            continue
+        if not lower and other_rank <= current_rank:
+            continue
+        if _entry_symbol(other) == _entry_symbol(entry) and _entry_side(other) == _entry_side(entry):
+            return True
+    return False
+
+
+def _tf_rank(tf: str) -> int | None:
+    return {"1m": 1, "3m": 2, "5m": 3, "15m": 4, "30m": 5, "1h": 6, "2h": 7, "4h": 8, "1d": 9, "1w": 10}.get(str(tf).lower())
+
+
+def _passes_indicator_direction(entry: dict[str, Any], config: dict[str, Any]) -> bool:
+    side = _entry_side(entry)
+    if not side:
+        return False
+    if config.get("require_bollinger_direction"):
+        value = str(entry.get("bollingerSignal") or entry.get("bollinger_direction") or entry.get("bollinger") or "").lower()
+        if value and not _signal_matches_side(value, side):
+            return False
+    if config.get("require_rsi_stoch_direction"):
+        signals = [
+            str(entry.get("rsiSignal") or entry.get("rsi_signal") or entry.get("rsi") or "").lower(),
+            str(entry.get("stochasticSignal") or entry.get("stoch_signal") or entry.get("stochastic") or "").lower(),
+        ]
+        known = [value for value in signals if value]
+        if known and not any(_signal_matches_side(value, side) for value in known):
+            return False
+    return True
+
+
+def _signal_matches_side(signal: str, side: str) -> bool:
+    if side == "long":
+        return any(token in signal for token in ("long", "buy", "bull", "alcista", "compra"))
+    if side == "short":
+        return any(token in signal for token in ("short", "sell", "bear", "bajista", "venta"))
+    return False
+
+
+def _is_pause_worthy_broker_error(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "insufficient",
+            "saldo",
+            "balance",
+            "fondos",
+            "money",
+            "exposure",
+            "exposición",
+            "margin",
+            "margen",
+            "max amount",
+            "maximum amount",
+            "not enough",
+        )
+    )
 
 
 def _public_daemon(state: dict[str, Any]) -> dict[str, Any]:
@@ -568,7 +826,13 @@ def _public_daemon(state: dict[str, Any]) -> dict[str, Any]:
         "last_tick_at": state.get("last_tick_at"),
         "last_error": state.get("last_error"),
         "orders_submitted": state.get("orders_submitted", 0),
+        "entries_seen": state.get("entries_seen", 0),
+        "entries_rejected": state.get("entries_rejected", 0),
+        "last_decision": state.get("last_decision"),
+        "paused": bool(state.get("paused")),
+        "pause_reason": state.get("pause_reason"),
         "last_start_payload": state.get("last_start_payload"),
+        "execution_config": payload.get("execution_config"),
         "user_id": payload.get("user_id"),
         "bot_type": payload.get("bot_type"),
         "exec_id": payload.get("exec_id"),
@@ -601,6 +865,17 @@ def _run_bot_daemon(state: dict[str, Any], payload: dict[str, Any]) -> None:
             symbol = str(runtime_payload.get("symbol") or "").replace("/", "").upper()
             tfs = [str(tf).lower() for tf in (runtime_payload.get("tfs") or [])]
             broker = str(runtime_payload.get("broker") or "mt5").lower()
+            execution_config = _normalize_execution_config(runtime_payload, tfs)
+            state["paused"] = bool(execution_config.get("paused") or state.get("paused"))
+            if state.get("paused"):
+                state["last_decision"] = {
+                    "status": "paused",
+                    "reason": state.get("pause_reason") or execution_config.get("pause_reason") or "Backend daemon paused",
+                    "at": int(time.time() * 1000),
+                }
+                _write_daemon_status(redis_client, state)
+                state.get("stop_event").wait(interval_s)
+                continue
             state["last_tick_at"] = int(time.time() * 1000)
             _touch_worker(redis_client, _worker_id(exec_id, symbol))
             _write_daemon_status(redis_client, state)
@@ -608,6 +883,30 @@ def _run_bot_daemon(state: dict[str, Any], payload: dict[str, Any]) -> None:
             for entry in entries:
                 entry_created = _entry_created_ms_safe(entry)
                 since_ts = max(since_ts, entry_created)
+                state["entries_seen"] = int(state.get("entries_seen") or 0) + 1
+                passes, reason = _passes_backend_execution_config(
+                    entry,
+                    entries,
+                    execution_config,
+                    service,
+                    user_id=user_id,
+                    bot_type=bot_type,
+                    broker=broker,
+                    exec_id=exec_id,
+                    symbol=symbol,
+                )
+                if not passes:
+                    state["entries_rejected"] = int(state.get("entries_rejected") or 0) + 1
+                    state["last_decision"] = {
+                        "status": "rejected",
+                        "reason": reason,
+                        "entry_id": entry.get("id") or entry.get("signalKey"),
+                        "symbol": _entry_symbol(entry),
+                        "timeframe": _entry_tf(entry),
+                        "side": _entry_side(entry),
+                        "at": int(time.time() * 1000),
+                    }
+                    continue
                 order_payload = {
                     "user_id": user_id,
                     "bot_type": bot_type,
@@ -626,6 +925,25 @@ def _run_bot_daemon(state: dict[str, Any], payload: dict[str, Any]) -> None:
                 executed = _execute_order(order, order_payload)
                 if executed.status not in {"failed", "session_required"}:
                     state["orders_submitted"] = int(state.get("orders_submitted") or 0) + 1
+                    state["last_decision"] = {
+                        "status": "submitted",
+                        "order_id": executed.id,
+                        "entry_id": entry.get("id") or entry.get("signalKey"),
+                        "symbol": executed.symbol,
+                        "timeframe": executed.timeframe,
+                        "side": executed.side,
+                        "at": int(time.time() * 1000),
+                    }
+                elif _is_pause_worthy_broker_error(executed.message or executed.error or ""):
+                    state["paused"] = True
+                    state["pause_reason"] = executed.message or executed.error or "Broker rejected because balance or exposure limit was reached"
+                    state["last_decision"] = {
+                        "status": "paused",
+                        "reason": state["pause_reason"],
+                        "entry_id": entry.get("id") or entry.get("signalKey"),
+                        "at": int(time.time() * 1000),
+                    }
+                    break
             state["last_error"] = None
         except Exception as exc:
             logger.warning("Bot daemon tick failed: %s", exc, exc_info=True)
@@ -643,7 +961,7 @@ def _daemon_order_key(user_id: str, bot_type: str, broker: str, entry: dict[str,
     tf = str(entry.get("timeframe") or entry.get("tf") or "").lower()
     side = str(entry.get("side") or "").lower()
     entry_id = str(entry.get("id") or entry.get("signalKey") or "")
-    return f"daemon:{user_id}:{bot_type}:{broker}:{symbol}:{tf}:{side}:{entry_id}"
+    return f"{user_id}:{bot_type}:open:{broker}:{symbol}:{tf}:{side}:{entry_id}"
 
 
 def _entry_created_ms_safe(entry: dict[str, Any]) -> int:

@@ -205,14 +205,17 @@ def _time_bucket(value: Any) -> str:
     if isinstance(value, (int, float)):
         if value <= 0:
             return ""
-        return str(int(value if value > 1e12 else value * 1000))
+        ms = int(value if value > 1e12 else value * 1000)
+        # Bucket de 5 minutos para deduplicar entradas idénticas regeneradas
+        return str(ms // 300_000)
     raw = str(value).strip()
     if not raw:
         return ""
     try:
         parsed = pd.Timestamp(raw)
         if not pd.isna(parsed):
-            return str(int(parsed.timestamp() * 1000))
+            ms = int(parsed.timestamp() * 1000)
+            return str(ms // 300_000)
     except Exception:
         pass
     return raw
