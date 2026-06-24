@@ -131,16 +131,47 @@ class BotEvent:
 
 
 class BotOrchestratorService:
-    """Small durable JSON ledger for backend-managed bot operations."""
+    """Small durable JSON ledger for backend-managed bot operations.
+
+    Persists to local JSON file AND Redis (if available) for multi-pod durability.
+    """
+
+    _REDIS_LEDGER_KEY = "bot_orchestrator:ledger"
+    _REDIS_LEDGER_TTL_S = 86400 * 7  # 7 days
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or _default_store_path()
         self._lock = threading.RLock()
+        self._redis = self._init_redis()
+
+    def _init_redis(self) -> Any:
+        try:
+            import os, redis as _redis_mod
+            url = os.getenv("LIVE_ENTRIES_REDIS_URL") or os.getenv("REDIS_URL", "redis://redis:6379/0")
+            client = _redis_mod.Redis.from_url(url, decode_responses=True, socket_connect_timeout=3)
+            client.ping()
+            return client
+        except Exception:
+            return None
 
     def _empty_state(self) -> dict[str, Any]:
         return {"orders": {}, "positions": {}, "events": []}
 
     def _load(self) -> dict[str, Any]:
+        # Try Redis first (multi-pod source of truth)
+        if self._redis is not None:
+            try:
+                raw = self._redis.get(self._REDIS_LEDGER_KEY)
+                if raw:
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        data.setdefault("orders", {})
+                        data.setdefault("positions", {})
+                        data.setdefault("events", [])
+                        return data
+            except Exception:
+                pass
+        # Fallback to local file
         if not self.path.exists():
             return self._empty_state()
         try:
@@ -156,11 +187,18 @@ class BotOrchestratorService:
             return self._empty_state()
 
     def _save(self, state: dict[str, Any]) -> None:
+        # Save to local file
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as handle:
             json.dump(state, handle, ensure_ascii=False, sort_keys=True)
         tmp.replace(self.path)
+        # Also persist to Redis for multi-pod
+        if self._redis is not None:
+            try:
+                self._redis.setex(self._REDIS_LEDGER_KEY, self._REDIS_LEDGER_TTL_S, json.dumps(state, ensure_ascii=False))
+            except Exception:
+                pass
 
     def _append_event(self, state: dict[str, Any], order_id: str, event_type: str, payload: dict[str, Any]) -> None:
         event = BotEvent(

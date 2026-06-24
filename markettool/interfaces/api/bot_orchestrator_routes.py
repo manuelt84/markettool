@@ -842,11 +842,67 @@ def _public_daemon(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _auto_reconcile_positions(state: dict[str, Any], payload: dict[str, Any]) -> None:
+    """Auto-reconcile daemon positions with broker on startup."""
+    broker = str(payload.get("broker") or "mt5").lower()
+    user_id = str(payload.get("user_id") or "anonymous")
+    service = get_bot_orchestrator_service()
+    summary = {"broker": broker, "checked_at": int(time.time() * 1000), "matched": 0, "closed": 0, "orphaned": 0}
+    try:
+        ledger = service._load()
+        open_positions = {k: v for k, v in ledger.get("positions", {}).items() if str(v.get("status")) == "open"}
+        if not open_positions:
+            state["last_reconcile"] = summary
+            return
+        if broker == "libertex":
+            session_data = _resolve_libertex_session(payload, user_id)
+            if not session_data:
+                summary["error"] = "No session"
+                state["last_reconcile"] = summary
+                return
+            result, code = _libertex_get_open_positions(session_data)
+            if code == 200 and result.get("status") == "ok":
+                broker_positions = result.get("positions") or []
+                broker_ids = {str(bp.get("investId") or bp.get("id") or "") for bp in (broker_positions if isinstance(broker_positions, list) else [])}
+                for lp_id, lp in open_positions.items():
+                    pos_bid = str(lp.get("broker_position_id") or "")
+                    if pos_bid in broker_ids:
+                        summary["matched"] += 1
+                    else:
+                        service.update_position(lp_id, status="closed_externally", message="Closed externally")
+                        summary["closed"] += 1
+        elif broker == "mt5":
+            from markettool.interfaces.api.mt5_routes import get_mt5_service
+            mt5 = get_mt5_service()
+            positions = mt5.get_open_positions()
+            if isinstance(positions, list):
+                broker_ids = {str(p.get("ticket") or p.get("id") or "") for p in positions}
+                for lp_id, lp in open_positions.items():
+                    pos_bid = str(lp.get("broker_position_id") or lp.get("position_ticket") or "")
+                    if pos_bid in broker_ids:
+                        summary["matched"] += 1
+                    else:
+                        service.update_position(lp_id, status="closed_externally", message="Closed externally")
+                        summary["closed"] += 1
+    except Exception as exc:
+        summary["error"] = str(exc)
+    logger.info("[BotDaemon] Auto-reconcile %s: %s", broker, summary)
+    state["last_reconcile"] = summary
+
+
 def _run_bot_daemon(state: dict[str, Any], payload: dict[str, Any]) -> None:
     from markettool.interfaces.api.live_entries_routes import _get_entries_from_redis, _touch_worker, _worker_id
 
     redis_client = _redis_client_for_daemon()
     service = get_bot_orchestrator_service()
+
+    # Auto-reconcile on startup
+    try:
+        _auto_reconcile_positions(state, payload)
+    except Exception as exc:
+        logger.warning("[BotDaemon] Auto-reconcile failed: %s", exc)
+        state["last_reconcile"] = {"error": str(exc)}
+
     since_ts = 0
 
     while not state.get("stop_event").is_set():
