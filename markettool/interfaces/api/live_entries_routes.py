@@ -37,6 +37,8 @@ logger = logging.getLogger("MarketTool")
 # ─────────────────────────────────────────────
 EVENT_REPLAY_TTL_S = 300     # 5 min para replay SSE corto
 WORKER_IDLE_TIMEOUT_S = 300  # mata el worker si nadie hace GET en 5 min
+WORKER_ZOMBIE_TIMEOUT_S = 900  # mata el worker si hay TFs activos pero nadie polling en 15 min
+_POD_ID = os.environ.get("WORKER_ID", os.environ.get("HOSTNAME", "pod-unknown"))
 LIVE_WINDOW = 3              # candles finales a evaluar (homologa generateLiveEntries)
 MIN_CANDLES = 30
 
@@ -518,7 +520,7 @@ def _get_worker_last_touch(redis_client, worker_key: str) -> float:
 def _claim_worker_owner(redis_client, worker_key: str) -> bool:
     if redis_client is None:
         return True
-    owner = os.getenv("POD_NAME") or os.getenv("HOSTNAME") or "unknown"
+    owner = _POD_ID
     try:
         redis_client.delete(_redis_worker_stop_key(worker_key))
         return bool(redis_client.set(_redis_worker_owner_key(worker_key), owner, nx=True, ex=WORKER_IDLE_TIMEOUT_S))
@@ -1831,10 +1833,17 @@ async def _live_worker(
             except Exception as exc:
                 logger.warning("[LiveWorker] Error en TF reconciliation %s: %s", worker_key, exc)
 
-            # 2. Idle check: si Firestore mantiene TFs activos, el backend sigue aunque iOS suspenda el polling.
+            # 2. Idle check — proteccion contra zombies:
+            #    - Sin TFs activos: mata tras 5 min sin polling
+            #    - Con TFs activos pero sin polling (app cerrada/crash): mata tras 15 min
+            #    - Esto evita workers zombies que generan entradas que nadie consume
             last_poll = _get_worker_last_touch(redis_client, worker_key)
-            if not current_tfs and time.time() - last_poll > WORKER_IDLE_TIMEOUT_S:
+            idle_s = time.time() - last_poll
+            if not current_tfs and idle_s > WORKER_IDLE_TIMEOUT_S:
                 logger.info("[LiveWorker] IDLE TIMEOUT sin TFs activos %s — stopping", worker_key)
+                break
+            if current_tfs and idle_s > WORKER_ZOMBIE_TIMEOUT_S:
+                logger.info("[LiveWorker] ZOMBIE TIMEOUT con TFs activos pero sin polling %.0fs %s — stopping", idle_s, worker_key)
                 break
 
     except asyncio.CancelledError:
@@ -1926,8 +1935,19 @@ def register_live_entries_routes(app, *, services) -> None:
                 _touch_worker(redis_client, wid)
                 return jsonify({"ok": True, "worker_id": wid, "status": "already_running"}), 200
             if _has_worker_owner(redis_client, wid):
-                _touch_worker(redis_client, wid)
-                return jsonify({"ok": True, "worker_id": wid, "status": "already_running"}), 200
+                # Worker existe en Redis (posiblemente en otro pod).
+                # Verificar si está vivo: si el touch key expiró, el worker es zombie.
+                last_touch = _get_worker_last_touch(redis_client, wid)
+                touch_age = time.time() - last_touch
+                if touch_age > WORKER_IDLE_TIMEOUT_S:
+                    # Zombie detectado: el owner key existe pero nadie hace polling.
+                    # Forzar takeover: eliminar owner viejo y reclamar.
+                    logger.info("[LiveEntries] Zombie worker detectado %s (sin touch %.0fs) — takeover", wid, touch_age)
+                    _clear_worker_owner(redis_client, wid)
+                    _request_worker_stop(redis_client, wid)
+                else:
+                    _touch_worker(redis_client, wid)
+                    return jsonify({"ok": True, "worker_id": wid, "status": "already_running"}), 200
             if not _claim_worker_owner(redis_client, wid):
                 _touch_worker(redis_client, wid)
                 return jsonify({"ok": True, "worker_id": wid, "status": "already_running"}), 200
@@ -2131,6 +2151,44 @@ def register_live_entries_routes(app, *, services) -> None:
                 return jsonify({"ok": True, "stopped": wid}), 200
 
         return jsonify({"ok": True, "stopped": wid, "was_running": False}), 200
+
+    # ── GET /monitoreo/live-entries/workers ───────────────────────────────
+    @app.route("/monitoreo/live-entries/workers", methods=["GET"])
+    async def live_entries_workers():
+        """Lista workers activos en este pod + en Redis (multi-pod).
+        Permite detectar zombies: workers con owner en Redis pero sin touch reciente."""
+        local_workers = []
+        async with _WORKER_LOCK:
+            for wid, task in _WORKERS.items():
+                last_poll = _WORKER_LAST_POLL.get(wid, 0)
+                local_workers.append({
+                    "worker_id": wid,
+                    "running": not task.done(),
+                    "last_poll_ago_s": round(time.time() - last_poll, 1) if last_poll else None,
+                    "pod": _POD_ID,
+                })
+        redis_workers = []
+        if redis_client is not None:
+            try:
+                for key in redis_client.scan_iter("live_worker_owner:*"):
+                    wid = key.split(":", 1)[1] if isinstance(key, str) else key.decode().split(":", 1)[1]
+                    last_touch = _get_worker_last_touch(redis_client, wid)
+                    touch_age = time.time() - last_touch if last_touch else None
+                    redis_workers.append({
+                        "worker_id": wid,
+                        "owner_pod": redis_client.get(key) or "",
+                        "last_touch_ago_s": round(touch_age, 1) if touch_age else None,
+                        "is_zombie": touch_age is not None and touch_age > WORKER_ZOMBIE_TIMEOUT_S if touch_age else False,
+                    })
+            except Exception as exc:
+                logger.warning("[LiveEntries] workers list failed: %s", exc)
+        return jsonify({
+            "pod_id": _POD_ID,
+            "local_workers": local_workers,
+            "redis_workers": redis_workers,
+            "idle_timeout_s": WORKER_IDLE_TIMEOUT_S,
+            "zombie_timeout_s": WORKER_ZOMBIE_TIMEOUT_S,
+        }), 200
 
     # ── POST /monitoreo/live-entries/outcome ───────────────────────────────
     @app.route("/monitoreo/live-entries/outcome", methods=["POST"])
