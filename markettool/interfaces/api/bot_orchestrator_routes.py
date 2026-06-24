@@ -289,6 +289,39 @@ def register_bot_orchestrator_routes(app) -> None:
 
         return jsonify({"status": "failed", "error": f"Unsupported broker: {broker}"}), 400
 
+    @app.route("/api/v1/bot-orchestrator/closed-positions", methods=["GET"])
+    def get_closed_positions():
+        broker = request.args.get("broker", "mt5").lower()
+        if broker == "libertex":
+            session_data = _resolve_libertex_session({}, request.args.get("user_id", "anonymous"))
+            if not session_data:
+                return jsonify({"status": "session_required", "message": "Libertex session required"}), 428
+            result, code = _libertex_get_closed_positions(session_data, page=int(request.args.get("page", 1)), page_size=int(request.args.get("page_size", 20)))
+            return jsonify(result), code
+        return jsonify({"status": "failed", "error": f"Unsupported broker: {broker}"}), 400
+
+    @app.route("/api/v1/bot-orchestrator/accounts", methods=["GET"])
+    def get_broker_accounts():
+        broker = request.args.get("broker", "mt5").lower()
+        if broker == "libertex":
+            session_data = _resolve_libertex_session({}, request.args.get("user_id", "anonymous"))
+            if not session_data:
+                return jsonify({"status": "session_required", "message": "Libertex session required"}), 428
+            result, code = _libertex_get_accounts_list(session_data)
+            return jsonify(result), code
+        return jsonify({"status": "failed", "error": f"Unsupported broker: {broker}"}), 400
+
+    @app.route("/api/v1/bot-orchestrator/flow-funds", methods=["GET"])
+    def get_flow_funds():
+        broker = request.args.get("broker", "mt5").lower()
+        if broker == "libertex":
+            session_data = _resolve_libertex_session({}, request.args.get("user_id", "anonymous"))
+            if not session_data:
+                return jsonify({"status": "session_required", "message": "Libertex session required"}), 428
+            result, code = _libertex_get_flow_funds(session_data, page=int(request.args.get("page", 1)), page_size=int(request.args.get("page_size", 20)))
+            return jsonify(result), code
+        return jsonify({"status": "failed", "error": f"Unsupported broker: {broker}"}), 400
+
 
 def _status_code(status: str) -> int:
     if status in {"ack", "open", "closed"}:
@@ -537,6 +570,98 @@ def _libertex_get_open_positions(session_data: dict[str, Any]) -> tuple[dict[str
         result = {"text": resp.text[:1000], "http_status": resp.status_code}
     if resp.ok:
         return {"status": "ok", "broker": "libertex", "positions": result}, 200
+    return {"status": "failed", "broker": "libertex", "raw": result}, 502
+
+
+def _libertex_get_closed_positions(session_data: dict[str, Any], page: int = 1, page_size: int = 20, start_close_date: int | None = None) -> tuple[dict[str, Any], int]:
+    """Get closed positions history from Libertex. Endpoint: /spa/report/closed-positions"""
+    base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
+    csrf_token = str(session_data.get("csrf_token") or "")
+    cookies = session_data.get("session_cookies") or {}
+    if not csrf_token:
+        return {"status": "session_required", "message": "Missing csrf_token"}, 428
+    params = {"page": page, "pageSize": page_size, "order": "CloseTime", "orderDir": "desc"}
+    if start_close_date:
+        params["startCloseDate"] = start_close_date
+    resp = requests.get(
+        f"{base_url}/spa/report/closed-positions",
+        params=params,
+        headers={"X-Token": csrf_token, "Accept": "application/json"},
+        cookies=cookies,
+        timeout=15,
+    )
+    try:
+        result = resp.json()
+    except Exception:
+        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    if resp.ok:
+        return {"status": "ok", "broker": "libertex", "closed_positions": result}, 200
+    return {"status": "failed", "broker": "libertex", "raw": result}, 502
+
+
+def _libertex_get_accounts_list(session_data: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """Get accounts list with balances. Endpoint: /spa/account/get-accounts-list"""
+    base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
+    csrf_token = str(session_data.get("csrf_token") or "")
+    cookies = session_data.get("session_cookies") or {}
+    resp = requests.get(
+        f"{base_url}/spa/account/get-accounts-list",
+        params={"updateBalance": "true"},
+        headers={"X-Token": csrf_token, "Accept": "application/json"},
+        cookies=cookies,
+        timeout=15,
+    )
+    try:
+        result = resp.json()
+    except Exception:
+        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    if resp.ok:
+        return {"status": "ok", "broker": "libertex", "accounts": result}, 200
+    return {"status": "failed", "broker": "libertex", "raw": result}, 502
+
+
+def _libertex_get_trading_restrictions(session_data: dict[str, Any], account_code: str) -> tuple[dict[str, Any], int]:
+    """Get trading restrictions for account. Endpoint: /spa/dps/get-trading-restrictions"""
+    base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
+    csrf_token = str(session_data.get("csrf_token") or "")
+    cookies = session_data.get("session_cookies") or {}
+    resp = requests.post(
+        f"{base_url}/spa/dps/get-trading-restrictions",
+        data={"accountCode": account_code, "csrfToken": csrf_token},
+        headers={"Accept": "application/json"},
+        cookies=cookies,
+        timeout=15,
+    )
+    try:
+        result = resp.json()
+    except Exception:
+        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    if resp.ok:
+        return {"status": "ok", "broker": "libertex", "restrictions": result}, 200
+    return {"status": "failed", "broker": "libertex", "raw": result}, 502
+
+
+def _libertex_get_flow_funds(session_data: dict[str, Any], page: int = 1, page_size: int = 20, start_date: int | None = None) -> tuple[dict[str, Any], int]:
+    """Get flow of funds history. Endpoint: /spa/report/flow-funds"""
+    base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
+    csrf_token = str(session_data.get("csrf_token") or "")
+    cookies = session_data.get("session_cookies") or {}
+    params = {"page": page, "pageSize": page_size, "showOperationDetails": 0}
+    if start_date:
+        params["startDate"] = start_date
+    resp = requests.get(
+        f"{base_url}/spa/report/flow-funds",
+        params=params,
+        headers={"X-Token": csrf_token, "Accept": "application/json"},
+        cookies=cookies,
+        timeout=15,
+    )
+    try:
+        result = resp.json()
+    except Exception:
+        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    if resp.ok:
+        return {"status": "ok", "broker": "libertex", "flow_funds": result}, 200
     return {"status": "failed", "broker": "libertex", "raw": result}, 502
 
 
