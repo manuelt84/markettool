@@ -1358,6 +1358,200 @@ def _extract_sr_seed(niveles: dict | None) -> dict | None:
     r2 = niveles.get("resistencia_nivel_2")
     if s1 and r1:
         return {"s1": s1, "s2": s2, "r1": r1, "r2": r2}
+
+
+# ─────────────────────────────────────────────
+# Carga de niveles S/R desde GCS enriched (igual que RN/Web)
+# Compatible con modos: gcp, vps, vps_gcp, gcp_vps
+# ─────────────────────────────────────────────
+
+_enriched_niveles_cache: dict[str, dict] = {}  # (symbol, tf, exec_id) → niveles dict
+_enriched_niveles_ts: dict[str, float] = {}   # (symbol, tf, exec_id) → last load time
+_ENRICHED_NIVELES_TTL_S = 600  # 10 min cache en memoria para no ir a GCS cada beat
+
+
+def _get_gcs_bucket_for_enriched(services: Any = None):
+    """Obtiene bucket GCS o VpsJsonStore según el cloud backend mode."""
+    try:
+        from markettool.infra.storage.vps_json_store import vps_mode_enabled, VpsJsonStore
+        if vps_mode_enabled():
+            return VpsJsonStore.from_env(), "vps"
+        # GCS mode (gcp, vps_gcp, gcp_vps usan GCS para enriched)
+        bucket_name = getattr(services, "gcs_bucket_name", None) or os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
+        gcs_client = getattr(services, "gcs_client", None)
+        if gcs_client is None:
+            from google.cloud import storage as gcs_storage
+            gcs_client = gcs_storage.Client()
+        return gcs_client.bucket(bucket_name), "gcs"
+    except Exception as exc:
+        logger.warning("[LiveWorker] No se pudo obtener storage bucket: %s", exc)
+        return None, None
+
+
+def _get_firestore_client_for_enriched(services: Any = None):
+    """Obtiene cliente Firestore (GCP mode) o None (VPS-only mode)."""
+    try:
+        from markettool.infra.storage.vps_json_store import vps_mode_enabled
+        if vps_mode_enabled():
+            # En VPS mode, los metadatos están en Postgres, no en Firestore
+            return None
+        # GCP / hybrid mode: usar Firestore
+        if services and getattr(services, "db", None):
+            return services.db
+        import firebase_admin
+        from firebase_admin import firestore as fs_module
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app()
+        return fs_module.client()
+    except Exception as exc:
+        logger.warning("[LiveWorker] No se pudo obtener Firestore client: %s", exc)
+        return None
+
+
+def _load_enriched_niveles_from_gcs(
+    symbol: str,
+    tf: str,
+    exec_id: str,
+    services: Any = None,
+) -> dict | None:
+    """
+    Carga niveles S/R del análisis enriched desde GCS/VPS storage.
+    Replica el flujo de RN: Firestore archivos_generados → signed URL → enriched JSON → niveles.
+    Compatible con gcp, vps, vps_gcp, gcp_vps.
+    Retorna dict con soporte_nivel_1/2, resistencia_nivel_1/2, niveles_confirmados_orden_toques_all.
+    """
+    cache_key = f"{symbol.upper()}_{tf}_{exec_id}"
+    now = time.time()
+
+    # Cache en memoria para no ir a GCS cada beat (TTL 10 min)
+    if cache_key in _enriched_niveles_cache and (now - _enriched_niveles_ts.get(cache_key, 0)) < _ENRICHED_NIVELES_TTL_S:
+        return _enriched_niveles_cache[cache_key]
+
+    bucket, storage_mode = _get_gcs_bucket_for_enriched(services)
+    if bucket is None:
+        logger.debug("[LiveWorker] Sin storage bucket para enriched %s/%s", symbol, tf)
+        return None
+
+    sym_upper = symbol.upper()
+    tf_norm = tf.lower()
+    safe_sym = sym_upper.replace("/", "_")
+
+    # Normalizar TF para nombre de archivo (igual que backtest_routes_factory)
+    from markettool.infra.fmp import normalize_tf
+    gcs_tf = normalize_tf(tf_norm)
+
+    enriched_payload: dict | None = None
+
+    # 1. Intentar vía Firestore archivos_generados (igual que RN)
+    db = _get_firestore_client_for_enriched(services)
+    if db is not None:
+        try:
+            docs = list(db.collection("archivos_generados").where("exec_id", "==", exec_id).stream())
+            for doc in docs:
+                data = doc.to_dict() or {}
+                nombre = (data.get("metadata", {}).get("nombre") or data.get("gcs_path") or "").upper()
+                if sym_upper in nombre and gcs_tf.upper() in nombre and "ENRICHED" in nombre:
+                    gcs_path = data.get("gcs_path") or data.get("metadata", {}).get("gcs_path")
+                    if gcs_path and hasattr(bucket, "blob"):
+                        blob = bucket.blob(gcs_path)
+                        if hasattr(blob, "exists") and blob.exists():
+                            enriched_payload = json.loads(blob.download_as_text())
+                            break
+        except Exception as exc:
+            logger.debug("[LiveWorker] archivos_generados query failed: %s", exc)
+
+    # 2. Fallback: rutas canónicas en GCS/VPS (igual que backtest_routes)
+    if enriched_payload is None and hasattr(bucket, "blob"):
+        for path in [
+            f"analisis/exec/{exec_id}/{safe_sym}_{gcs_tf}_enriched.json",
+            f"exec/{exec_id}/{safe_sym}_{gcs_tf}_enriched.json",
+        ]:
+            try:
+                blob = bucket.blob(path)
+                if hasattr(blob, "exists") and blob.exists():
+                    enriched_payload = json.loads(blob.download_as_text())
+                    break
+            except Exception:
+                continue
+
+    # 3. VPS mode: buscar en filesystem directamente
+    if enriched_payload is None and storage_mode == "vps":
+        try:
+            from markettool.infra.storage.vps_json_store import VpsJsonStore
+            store = VpsJsonStore.from_env()
+            for path in [
+                f"analisis/exec/{exec_id}/{safe_sym}_{gcs_tf}_enriched.json",
+                f"exec/{exec_id}/{safe_sym}_{gcs_tf}_enriched.json",
+            ]:
+                p = store._path(path)
+                if p.exists():
+                    with open(p, "r", encoding="utf-8") as f:
+                        enriched_payload = json.load(f)
+                    break
+        except Exception as exc:
+            logger.debug("[LiveWorker] VPS filesystem enriched lookup failed: %s", exc)
+
+    if enriched_payload is None:
+        logger.info("[LiveWorker] No enriched JSON para %s/%s exec=%s", symbol, tf, exec_id)
+        _enriched_niveles_cache[cache_key] = {}  # cache negativo por 10 min
+        _enriched_niveles_ts[cache_key] = now
+        return None
+
+    # Extraer niveles del enriched (igual que parseEnriched de RN)
+    levels = enriched_payload.get("levels") or {}
+    entradas = enriched_payload.get("entradas") or {}
+
+    to_float = lambda v: float(v) if v is not None and str(v).strip() != "" and _is_numeric(v) else None
+
+    s1 = to_float(levels.get("soporte_nivel_1")) or to_float(entradas.get("soporte_nivel_1"))
+    s2 = to_float(levels.get("soporte_nivel_2")) or to_float(entradas.get("soporte_nivel_2"))
+    r1 = to_float(levels.get("resistencia_nivel_1")) or to_float(entradas.get("resistencia_nivel_1"))
+    r2 = to_float(levels.get("resistencia_nivel_2")) or to_float(entradas.get("resistencia_nivel_2"))
+
+    # niveles_confirmados_orden_toques_all (array de [level, touches] o strings)
+    niveles_toques_all = entradas.get("niveles_confirmados_orden_toques_all") or []
+    niveles_parsed: list[dict] = []
+    for item in niveles_toques_all:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            lvl = to_float(item[0])
+            tou = int(item[1]) if _is_numeric(item[1]) else 0
+            if lvl is not None:
+                niveles_parsed.append({"level": lvl, "touches": tou})
+        elif isinstance(item, str):
+            import re
+            m = re.match(r"(-?\d+(?:\.\d+)?)[^0-9\-+]*(-?\d+(?:\.\d+)?)", item)
+            if m:
+                lvl = to_float(m.group(1))
+                tou = int(float(m.group(2))) if _is_numeric(m.group(2)) else 0
+                if lvl is not None:
+                    niveles_parsed.append({"level": lvl, "touches": tou})
+
+    niveles_result = {
+        "soporte_nivel_1": s1,
+        "soporte_nivel_2": s2,
+        "resistencia_nivel_1": r1,
+        "resistencia_nivel_2": r2,
+        "niveles_confirmados_orden_toques_all": niveles_parsed,
+        "_source": "enriched_gcs",
+    }
+
+    # Cachear resultado
+    _enriched_niveles_cache[cache_key] = niveles_result
+    _enriched_niveles_ts[cache_key] = now
+
+    logger.info(
+        "[LiveWorker] Niveles enriched cargados %s/%s: S1=%s R1=%s (toques=%d, mode=%s)",
+        symbol, tf, s1, r1, len(niveles_parsed), storage_mode,
+    )
+    return niveles_result
+
+
+def _is_numeric(v) -> bool:
+    try:
+        float(v)
+        return True
+    except (TypeError, ValueError):
+        return False
     return None
 
 
@@ -1420,20 +1614,16 @@ def _generate_live_entries_sync(
 
     sr_levels = _extract_sr_seed(niveles) or {}
 
-    # Si no hay niveles del cache, calcular S/R basicos del DataFrame
+    # Si no hay niveles del análisis enriched, NO improvisar con min/max del DataFrame.
+    # Los niveles S/R son producto del análisis completo (toques confirmados, estructura).
+    # Sin ellos, las entradas que dependen de S/R confirmado no se generan.
     if not sr_levels:
-        try:
-            window = min(len(df), 50)
-            if window >= 10:
-                sr_levels = {
-                    "s1": float(df["low"].rolling(window=window).min().iloc[-1]),
-                    "s2": float(df["low"].rolling(window=window*2).min().iloc[-1]) if len(df) >= window*2 else float(df["low"].min()),
-                    "r1": float(df["high"].rolling(window=window).max().iloc[-1]),
-                    "r2": float(df["high"].rolling(window=window*2).max().iloc[-1]) if len(df) >= window*2 else float(df["high"].max()),
-                }
-                logger.debug("[LiveWorker] SR levels del DF %s/%s: S1=%.5f R1=%.5f", symbol, tf, sr_levels["s1"], sr_levels["r1"])
-        except Exception as sr_exc:
-            logger.debug("[LiveWorker] SR calc failed %s/%s: %s", symbol, tf, sr_exc)
+        logger.info(
+            "[LiveWorker] %s/%s sin niveles enriched — S/R entries serán omitidas",
+            symbol, tf,
+        )
+        # El wrapper aún puede generar entradas técnicas (RSI, MACD, etc.)
+        # sin necesidad de niveles S/R
 
     try:
         try:
@@ -1614,6 +1804,7 @@ async def _live_worker(
     calcular_entradas_sync_wrapper,
     charge_monitoreo_per_call,
     reponer_transaccion,
+    services: Any = None,
 ):
     """
     Worker asyncio. Lanza un sub-task por TF, cada uno con su propio intervalo.
@@ -1735,15 +1926,27 @@ async def _live_worker(
                 )
                 return
 
-            # 5. Niveles del indicators cache
+            # 5. Niveles desde GCS enriched (igual que RN: archivos_generados → enriched JSON)
+            #    El indicators_cache solo tiene indicadores técnicos, NO niveles S/R confirmados.
+            #    Los niveles del análisis se cargan desde GCS/VPS enriched JSON.
             niveles: dict | None = None
             try:
-                from markettool.infra.cache.indicators_cache import _INDICATORS_CACHE
-                cached = _INDICATORS_CACHE.get(symbol, norm)
-                if cached and isinstance(cached, dict):
-                    niveles = cached.get("niveles") or cached.get("levels")
-            except Exception:
-                pass
+                niveles = await asyncio.to_thread(
+                    _load_enriched_niveles_from_gcs,
+                    symbol, norm, exec_id, services,
+                )
+            except Exception as exc:
+                logger.warning("[LiveWorker] Error cargando niveles enriched %s/%s: %s", symbol, norm, exc)
+
+            # Fallback: indicators_cache (puede tener niveles si el cálculo de indicadores los incluyó)
+            if not niveles:
+                try:
+                    from markettool.infra.cache.indicators_cache import _INDICATORS_CACHE
+                    cached = _INDICATORS_CACHE.get(symbol, norm)
+                    if cached and isinstance(cached, dict):
+                        niveles = cached.get("niveles") or cached.get("levels")
+                except Exception:
+                    pass
 
             # 6. Eventos económicos
             df_eventos = pd.DataFrame()
@@ -1988,6 +2191,7 @@ def register_live_entries_routes(app, *, services) -> None:
                     calcular_entradas_sync_wrapper=calcular_entradas_sync_wrapper,
                     charge_monitoreo_per_call=charge_monitoreo_per_call,
                     reponer_transaccion=reponer_transaccion,
+                    services=services,
                 )
             )
             _WORKERS[wid] = task
