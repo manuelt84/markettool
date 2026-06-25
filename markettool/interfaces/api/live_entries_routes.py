@@ -325,10 +325,12 @@ def _normalize_source(raw: Any) -> str:
     if value in direct:
         return direct[value]
 
-    # Orden intencional: patrones basados en niveles se clasifican como S/R
-    # aunque incluyan palabras como breakout/breakdown.
+    # Orden intencional: solo pullback_S1/S2 y breakout_R1/R2 requieren SR confirmado.
+    # midpoint, scale_in, range_, reversion, bollinger son patrones tecnicos que no requieren SR.
     patterns: tuple[tuple[tuple[str, ...], str], ...] = (
-        (("pullback", "r1", "r2", "s1", "s2", "midpoint", "scale_in", "range_", "reversion"), "sr"),
+        (("pullback_s1", "pullback_s2", "breakout_r1", "breakout_r2"), "sr"),
+        (("pullback", "midpoint", "scale_in", "range_", "reversion", "bollinger"), "tech"),
+        (("r1", "r2", "s1", "s2"), "sr"),
         (("fibonacci", "fib_"), "fibonacci"),
         (("breaker",), "breaker"),
         (("inducement",), "inducement"),
