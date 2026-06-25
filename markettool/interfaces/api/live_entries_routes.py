@@ -1420,6 +1420,21 @@ def _generate_live_entries_sync(
 
     sr_levels = _extract_sr_seed(niveles) or {}
 
+    # Si no hay niveles del cache, calcular S/R basicos del DataFrame
+    if not sr_levels:
+        try:
+            window = min(len(df), 50)
+            if window >= 10:
+                sr_levels = {
+                    "s1": float(df["low"].rolling(window=window).min().iloc[-1]),
+                    "s2": float(df["low"].rolling(window=window*2).min().iloc[-1]) if len(df) >= window*2 else float(df["low"].min()),
+                    "r1": float(df["high"].rolling(window=window).max().iloc[-1]),
+                    "r2": float(df["high"].rolling(window=window*2).max().iloc[-1]) if len(df) >= window*2 else float(df["high"].max()),
+                }
+                logger.debug("[LiveWorker] SR levels del DF %s/%s: S1=%.5f R1=%.5f", symbol, tf, sr_levels["s1"], sr_levels["r1"])
+        except Exception as sr_exc:
+            logger.debug("[LiveWorker] SR calc failed %s/%s: %s", symbol, tf, sr_exc)
+
     try:
         try:
             from MarketTool import calcular_indicadores
