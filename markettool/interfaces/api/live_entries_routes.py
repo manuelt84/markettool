@@ -1389,20 +1389,19 @@ def _get_gcs_bucket_for_enriched(services: Any = None):
 
 
 def _get_firestore_client_for_enriched(services: Any = None):
-    """Obtiene cliente Firestore (GCP mode) o None (VPS-only mode)."""
+    """Obtiene cliente Firestore (GCP mode) o None (VPS-only mode).
+    Usa google.cloud.firestore directamente (igual que indicators_cache).
+    """
     try:
         from markettool.infra.storage.vps_json_store import vps_mode_enabled
         if vps_mode_enabled():
             # En VPS mode, los metadatos están en Postgres, no en Firestore
             return None
-        # GCP / hybrid mode: usar Firestore
+        # GCP / hybrid mode: usar Firestore via services o google.cloud
         if services and getattr(services, "db", None):
             return services.db
-        import firebase_admin
-        from firebase_admin import firestore as fs_module
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app()
-        return fs_module.client()
+        from google.cloud import firestore as fs_module
+        return fs_module.Client()
     except Exception as exc:
         logger.warning("[LiveWorker] No se pudo obtener Firestore client: %s", exc)
         return None
