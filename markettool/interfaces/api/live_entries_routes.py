@@ -1446,10 +1446,13 @@ def _load_enriched_niveles_from_gcs(
     if db is not None:
         try:
             docs = list(db.collection("archivos_generados").where("exec_id", "==", exec_id).stream())
+            # Patrón exacto: {SYMBOL}_{tf}_enriched.json (evita que 5min haga match con 15min)
+            target_pattern = f"{sym_upper}_{gcs_tf.upper()}_ENRICHED"
             for doc in docs:
                 data = doc.to_dict() or {}
-                nombre = (data.get("metadata", {}).get("nombre") or data.get("gcs_path") or "").upper()
-                if sym_upper in nombre and gcs_tf.upper() in nombre and "ENRICHED" in nombre:
+                gcs_path_raw = (data.get("gcs_path") or data.get("metadata", {}).get("gcs_path") or "").upper()
+                nombre = (data.get("nombre") or data.get("metadata", {}).get("nombre") or "").upper()
+                if target_pattern in gcs_path_raw or (sym_upper in nombre and gcs_tf.upper() in nombre and "ENRICHED" in nombre):
                     gcs_path = data.get("gcs_path") or data.get("metadata", {}).get("gcs_path")
                     if gcs_path and hasattr(bucket, "blob"):
                         blob = bucket.blob(gcs_path)
