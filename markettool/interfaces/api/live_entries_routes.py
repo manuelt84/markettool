@@ -1502,6 +1502,11 @@ def _load_enriched_niveles_from_gcs(
     # Extraer niveles del enriched (igual que parseEnriched de RN)
     levels = enriched_payload.get("levels") or {}
     entradas = enriched_payload.get("entradas") or {}
+    # entradas puede ser una lista en algunos formatos — convertir a dict vacío
+    if not isinstance(entradas, dict):
+        entradas = {}
+    if not isinstance(levels, dict):
+        levels = {}
 
     to_float = lambda v: float(v) if v is not None and str(v).strip() != "" and _is_numeric(v) else None
 
