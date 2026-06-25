@@ -265,26 +265,58 @@ def register_bot_orchestrator_routes(app) -> None:
     def reconcile_bot_positions():
         payload = request.get_json(silent=True) or {}
         broker = str(payload.get("broker") or "mt5").lower()
+        user_id = str(payload.get("user_id") or "anonymous")
+        service = get_bot_orchestrator_service()
+
+        # Get ledger positions
+        ledger = service._load()
+        open_positions = {k: v for k, v in ledger.get("positions", {}).items() if str(v.get("status")) == "open"}
+        summary = {"broker": broker, "checked_at": int(time.time() * 1000), "ledger_open": len(open_positions), "broker_positions": [], "matched": [], "closed_externally": [], "orphaned": []}
+
         if broker == "mt5":
             try:
                 from markettool.interfaces.api.mt5_routes import get_mt5_service
-
                 mt5 = get_mt5_service()
                 positions = mt5.get_open_positions()
-                return jsonify({"status": "ok", "broker": "mt5", "positions": positions}), 200
+                summary["broker_positions"] = positions
+                broker_ids = {str(p.get("ticket") or p.get("id") or "") for p in (positions if isinstance(positions, list) else [])}
+                for lp_id, lp in open_positions.items():
+                    pos_bid = str(lp.get("broker_position_id") or lp.get("position_ticket") or "")
+                    if pos_bid in broker_ids:
+                        summary["matched"].append(lp_id)
+                    else:
+                        service.update_position(lp_id, status="closed_externally", message="Closed externally — not found in MT5")
+                        summary["closed_externally"].append(lp_id)
+                ledger_ids = {str(lp.get("broker_position_id") or lp.get("position_ticket") or "") for lp in open_positions.values()}
+                for bid in broker_ids:
+                    if bid not in ledger_ids:
+                        summary["orphaned"].append(bid)
+                return jsonify({"status": "ok", **summary}), 200
             except Exception as exc:
                 logger.warning("MT5 reconcile failed: %s", exc, exc_info=True)
                 return jsonify({"status": "failed", "broker": "mt5", "error": str(exc)}), 500
 
         if broker == "libertex":
-            session_data = _resolve_libertex_session(payload, str(payload.get("user_id") or "anonymous"))
+            session_data = _resolve_libertex_session(payload, user_id)
             if not session_data:
-                return jsonify({
-                    "status": "session_required",
-                    "broker": "libertex",
-                    "message": "Libertex reconciliation requires an encrypted/passed session bundle.",
-                }), 428
+                return jsonify({"status": "session_required", "broker": "libertex", "message": "Libertex session required"}), 428
             result, code = _libertex_get_open_positions(session_data)
+            if code == 200 and result.get("status") == "ok":
+                broker_positions = result.get("positions") or []
+                summary["broker_positions"] = broker_positions if isinstance(broker_positions, list) else []
+                broker_ids = {str(bp.get("investId") or bp.get("id") or "") for bp in (broker_positions if isinstance(broker_positions, list) else [])}
+                for lp_id, lp in open_positions.items():
+                    pos_bid = str(lp.get("broker_position_id") or "")
+                    if pos_bid in broker_ids:
+                        summary["matched"].append(lp_id)
+                    else:
+                        service.update_position(lp_id, status="closed_externally", message="Closed externally — not found in Libertex")
+                        summary["closed_externally"].append(lp_id)
+                ledger_ids = {str(lp.get("broker_position_id") or "") for lp in open_positions.values()}
+                for bid in broker_ids:
+                    if bid not in ledger_ids:
+                        summary["orphaned"].append(bid)
+                return jsonify({"status": "ok", **summary}), 200
             return jsonify(result), code
 
         return jsonify({"status": "failed", "error": f"Unsupported broker: {broker}"}), 400
@@ -1060,6 +1092,16 @@ def _run_bot_daemon(state: dict[str, Any], payload: dict[str, Any]) -> None:
             state["last_tick_at"] = int(time.time() * 1000)
             _touch_worker(redis_client, _worker_id(exec_id, symbol))
             _write_daemon_status(redis_client, state)
+
+            # Periodic reconcile: every 5 min, check broker positions vs ledger
+            last_reconcile_ts = state.get("last_reconcile", {}).get("checked_at", 0)
+            if time.time() * 1000 - last_reconcile_ts > 300_000:  # 5 min
+                try:
+                    _auto_reconcile_positions(state, runtime_payload)
+                    _write_daemon_status(redis_client, state)
+                except Exception as exc:
+                    logger.warning("[BotDaemon] Periodic reconcile failed: %s", exc)
+
             entries = _get_entries_from_redis(redis_client, exec_id, symbol, tfs, since_ts)
             for entry in entries:
                 entry_created = _entry_created_ms_safe(entry)
