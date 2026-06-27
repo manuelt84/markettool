@@ -1835,6 +1835,11 @@ async def _live_worker(
         try:
             norm = norm_tf_fn(tf)
 
+            # 0. Mercado cerrado — no generar entradas (respeta crypto 24/7)
+            if not _market_pool_symbol_market_open(symbol):
+                logger.info("[LiveWorker] %s/%s mercado cerrado — skip beat", symbol, norm)
+                return
+
             # 1. Pool central Redis para activos comunes. Esto evita que cada
             # ejecución privada vuelva a consultar FMP si ya existe data viva.
             series_ms, pool_source = await _load_from_market_pool(
