@@ -10695,7 +10695,8 @@ def obtener_datos_con_hilos(
                         # series is at least as complete as what GCS already has.
                         success = save_to_gcs(symbol, tf, persist_df)
                         if success:
-                            _save_local_history_df(symbol, tf, persist_df)
+                            # _HIST.get() already saved local cache via save_cached_history;
+                            # no need to re-save here. Just update Firestore metadata.
                             # Update Firestore metadata so other pods know data is fresh
                             safe_sym = _safe_symbol_for_filename(symbol)
                             safe_tf = normalize_tf(tf)
