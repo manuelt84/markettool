@@ -177,6 +177,13 @@ def register_bot_orchestrator_routes(app) -> None:
             if remote and remote.get("running") and int(time.time() * 1000) - int(remote.get("last_tick_at") or remote.get("started_at") or 0) < 180_000:
                 return jsonify({"status": "already_running", "daemon_id": daemon_id, "daemon": remote}), 200
 
+            # Clear any stale Redis stop key so the new thread doesn't immediately exit
+            if redis_client is not None:
+                try:
+                    redis_client.delete(_redis_daemon_stop_key(daemon_id))
+                except Exception:
+                    pass
+
             stop_event = threading.Event()
             execution_config = _normalize_execution_config(payload, tfs)
             state: dict[str, Any] = {
