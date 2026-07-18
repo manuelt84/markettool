@@ -374,6 +374,91 @@ def _status_code(status: str) -> int:
     return 200
 
 
+def _libertex_response_payload(resp: requests.Response) -> dict[str, Any]:
+    try:
+        result = resp.json()
+        return result if isinstance(result, dict) else {"data": result}
+    except Exception:
+        text = (resp.text or "").strip()
+        title = ""
+        if "<title>" in text.lower():
+            import re
+
+            match = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+            title = " ".join(match.group(1).split()) if match else ""
+        if "cloudflare" in text.lower() or "just a moment" in text.lower():
+            return {
+                "status": "blocked",
+                "error": "Libertex Cloudflare/WAF challenge",
+                "message": "Libertex bloqueó la sesión backend con Cloudflare. Refresca/revalida la sesión del broker antes de ejecutar.",
+                "http_status": resp.status_code,
+                "title": title or "Just a moment...",
+                "text_snippet": text[:240],
+            }
+        return {
+            "status": "failed",
+            "error": f"Libertex returned non-JSON HTTP {resp.status_code}",
+            "message": f"Libertex returned non-JSON HTTP {resp.status_code}",
+            "http_status": resp.status_code,
+            "title": title,
+            "text_snippet": text[:240],
+        }
+
+
+def _libertex_error_message(result: dict[str, Any], resp: requests.Response) -> str:
+    message = result.get("message") or result.get("messages") or result.get("error")
+    if message:
+        return str(message)
+    if result.get("status") == "blocked":
+        return "Libertex Cloudflare/WAF challenge"
+    return f"Libertex HTTP {resp.status_code}"
+
+
+def _libertex_session_cookies(session_data: dict[str, Any]) -> dict[str, str]:
+    cookies = session_data.get("session_cookies") or {}
+    if not isinstance(cookies, dict):
+        return {}
+    return {str(key): str(value) for key, value in cookies.items() if key and value is not None}
+
+
+def _libertex_instance_id(cookies: dict[str, str]) -> str:
+    return str(cookies.get("instanceId") or cookies.get("INSTANCEID") or "").strip()
+
+
+def _libertex_headers(session_data: dict[str, Any], csrf_token: str, *, content_type: str | None = None) -> dict[str, str]:
+    base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
+    user_agent = str(session_data.get("user_agent") or "").strip()
+    cookies = _libertex_session_cookies(session_data)
+    headers = {
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Origin": base_url,
+        "Referer": f"{base_url}/",
+        "X-CSRF-Token": csrf_token,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    instance_id = _libertex_instance_id(cookies)
+    if instance_id:
+        headers["X-FX-Instance-Id"] = instance_id
+    return headers
+
+
+def _libertex_form_payload(values: dict[str, Any], csrf_token: str) -> dict[str, str]:
+    now_ms = str(int(time.time() * 1000))
+    payload = {
+        key: str(value)
+        for key, value in values.items()
+        if value is not None and value != ""
+    }
+    payload.setdefault("clientRequestTime", now_ms)
+    payload.setdefault("time", now_ms)
+    payload["csrfToken"] = csrf_token
+    return payload
+
+
 def _execute_order(order: BotOrder, payload: dict[str, Any]) -> BotOrder:
     service = get_bot_orchestrator_service()
     try:
@@ -500,7 +585,7 @@ def _execute_libertex_open(order: BotOrder, payload: dict[str, Any]) -> BotOrder
     entry = payload.get("entry") if isinstance(payload.get("entry"), dict) else payload
     base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
     csrf_token = str(session_data.get("csrf_token") or "")
-    cookies = session_data.get("session_cookies") or {}
+    cookies = _libertex_session_cookies(session_data)
     if not csrf_token:
         return get_bot_orchestrator_service().update_order(
             order.id,
@@ -508,28 +593,37 @@ def _execute_libertex_open(order: BotOrder, payload: dict[str, Any]) -> BotOrder
             message="Libertex session is missing csrf_token",
         )
 
-    body = {
-        "instrumentId": payload.get("instrument_id") or entry.get("instrumentId") or order.symbol,
-        "direction": "buy" if order.side == "buy" else "sell",
-        "amount": float(payload.get("amount") or payload.get("volume") or entry.get("amount") or 20),
-        "leverage": int(payload.get("leverage") or entry.get("leverage") or 1),
+    amount = float(payload.get("amount") or payload.get("volume") or entry.get("amount") or 20)
+    leverage = int(payload.get("leverage") or entry.get("leverage") or 1)
+    rate = payload.get("rate") or payload.get("entry_rate") or entry.get("entry") or entry.get("entryPrice")
+    form_values: dict[str, Any] = {
+        "symbol": payload.get("instrument_id") or entry.get("instrumentId") or order.symbol,
+        "sumInv": max(amount, 20),
+        "mult": leverage,
+        "direction": "growth" if order.side == "buy" else "reduction",
+        "openComm": payload.get("openComm") or "0.1",
+        "number": int(time.time() * 1000000),
+        "rate": rate,
+        "spread": payload.get("spread") or entry.get("spread") or 0,
+        "isAutoIncreaseEnabled": "0",
     }
     if entry.get("sl") or entry.get("stop_loss"):
-        body["stopLoss"] = float(entry.get("sl") or entry.get("stop_loss"))
+        form_values["stopLoss"] = float(entry.get("sl") or entry.get("stop_loss"))
     if entry.get("tp") or entry.get("take_profit"):
-        body["takeProfit"] = float(entry.get("tp") or entry.get("take_profit"))
+        form_values["takeProfit"] = float(entry.get("tp") or entry.get("take_profit"))
 
     resp = requests.post(
         f"{base_url}/spa/investing/open-position",
-        json=body,
-        headers={"X-Token": csrf_token, "Content-Type": "application/json", "Accept": "application/json"},
+        data=_libertex_form_payload(form_values, csrf_token),
+        headers=_libertex_headers(
+            session_data,
+            csrf_token,
+            content_type="application/x-www-form-urlencoded; charset=UTF-8",
+        ),
         cookies=cookies,
         timeout=15,
     )
-    try:
-        result = resp.json()
-    except Exception:
-        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    result = _libertex_response_payload(resp)
 
     if resp.ok and result.get("status") == "ok":
         raw_result = result.get("result") or {}
@@ -545,9 +639,9 @@ def _execute_libertex_open(order: BotOrder, payload: dict[str, Any]) -> BotOrder
     return get_bot_orchestrator_service().update_order(
         order.id,
         status="failed",
-        message=str(result.get("messages") or result.get("error") or f"Libertex HTTP {resp.status_code}"),
+        message=_libertex_error_message(result, resp),
         broker_response=result,
-        error=str(result),
+        error=_libertex_error_message(result, resp),
     )
 
 
@@ -562,18 +656,19 @@ def _execute_libertex_close(order: BotOrder, payload: dict[str, Any]) -> BotOrde
         )
     base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
     csrf_token = str(session_data.get("csrf_token") or "")
-    cookies = session_data.get("session_cookies") or {}
+    cookies = _libertex_session_cookies(session_data)
     resp = requests.post(
         f"{base_url}/spa/investing/close-position",
-        json={"investId": invest_id},
-        headers={"X-Token": csrf_token, "Content-Type": "application/json", "Accept": "application/json"},
+        data=_libertex_form_payload({"investId": invest_id}, csrf_token),
+        headers=_libertex_headers(
+            session_data,
+            csrf_token,
+            content_type="application/x-www-form-urlencoded; charset=UTF-8",
+        ),
         cookies=cookies,
         timeout=15,
     )
-    try:
-        result = resp.json()
-    except Exception:
-        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    result = _libertex_response_payload(resp)
     if resp.ok and result.get("status") == "ok":
         return get_bot_orchestrator_service().update_order(
             order.id,
@@ -585,28 +680,25 @@ def _execute_libertex_close(order: BotOrder, payload: dict[str, Any]) -> BotOrde
     return get_bot_orchestrator_service().update_order(
         order.id,
         status="failed",
-        message=str(result.get("messages") or result.get("error") or f"Libertex HTTP {resp.status_code}"),
+        message=_libertex_error_message(result, resp),
         broker_response=result,
-        error=str(result),
+        error=_libertex_error_message(result, resp),
     )
 
 
 def _libertex_get_open_positions(session_data: dict[str, Any]) -> tuple[dict[str, Any], int]:
     base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
     csrf_token = str(session_data.get("csrf_token") or "")
-    cookies = session_data.get("session_cookies") or {}
+    cookies = _libertex_session_cookies(session_data)
     if not csrf_token:
         return {"status": "session_required", "message": "Missing csrf_token"}, 428
     resp = requests.get(
         f"{base_url}/spa/user-investments",
-        headers={"X-Token": csrf_token, "Accept": "application/json"},
+        headers=_libertex_headers(session_data, csrf_token),
         cookies=cookies,
         timeout=15,
     )
-    try:
-        result = resp.json()
-    except Exception:
-        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    result = _libertex_response_payload(resp)
     if resp.ok:
         return {"status": "ok", "broker": "libertex", "positions": result}, 200
     return {"status": "failed", "broker": "libertex", "raw": result}, 502
@@ -616,7 +708,7 @@ def _libertex_get_closed_positions(session_data: dict[str, Any], page: int = 1, 
     """Get closed positions history from Libertex. Endpoint: /spa/report/closed-positions"""
     base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
     csrf_token = str(session_data.get("csrf_token") or "")
-    cookies = session_data.get("session_cookies") or {}
+    cookies = _libertex_session_cookies(session_data)
     if not csrf_token:
         return {"status": "session_required", "message": "Missing csrf_token"}, 428
     params = {"page": page, "pageSize": page_size, "order": "CloseTime", "orderDir": "desc"}
@@ -625,14 +717,11 @@ def _libertex_get_closed_positions(session_data: dict[str, Any], page: int = 1, 
     resp = requests.get(
         f"{base_url}/spa/report/closed-positions",
         params=params,
-        headers={"X-Token": csrf_token, "Accept": "application/json"},
+        headers=_libertex_headers(session_data, csrf_token),
         cookies=cookies,
         timeout=15,
     )
-    try:
-        result = resp.json()
-    except Exception:
-        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    result = _libertex_response_payload(resp)
     if resp.ok:
         return {"status": "ok", "broker": "libertex", "closed_positions": result}, 200
     return {"status": "failed", "broker": "libertex", "raw": result}, 502
@@ -642,18 +731,15 @@ def _libertex_get_accounts_list(session_data: dict[str, Any]) -> tuple[dict[str,
     """Get accounts list with balances. Endpoint: /spa/account/get-accounts-list"""
     base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
     csrf_token = str(session_data.get("csrf_token") or "")
-    cookies = session_data.get("session_cookies") or {}
+    cookies = _libertex_session_cookies(session_data)
     resp = requests.get(
         f"{base_url}/spa/account/get-accounts-list",
         params={"updateBalance": "true"},
-        headers={"X-Token": csrf_token, "Accept": "application/json"},
+        headers=_libertex_headers(session_data, csrf_token),
         cookies=cookies,
         timeout=15,
     )
-    try:
-        result = resp.json()
-    except Exception:
-        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    result = _libertex_response_payload(resp)
     if resp.ok:
         return {"status": "ok", "broker": "libertex", "accounts": result}, 200
     return {"status": "failed", "broker": "libertex", "raw": result}, 502
@@ -663,18 +749,19 @@ def _libertex_get_trading_restrictions(session_data: dict[str, Any], account_cod
     """Get trading restrictions for account. Endpoint: /spa/dps/get-trading-restrictions"""
     base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
     csrf_token = str(session_data.get("csrf_token") or "")
-    cookies = session_data.get("session_cookies") or {}
+    cookies = _libertex_session_cookies(session_data)
     resp = requests.post(
         f"{base_url}/spa/dps/get-trading-restrictions",
-        data={"accountCode": account_code, "csrfToken": csrf_token},
-        headers={"Accept": "application/json"},
+        data=_libertex_form_payload({"accountCode": account_code}, csrf_token),
+        headers=_libertex_headers(
+            session_data,
+            csrf_token,
+            content_type="application/x-www-form-urlencoded; charset=UTF-8",
+        ),
         cookies=cookies,
         timeout=15,
     )
-    try:
-        result = resp.json()
-    except Exception:
-        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    result = _libertex_response_payload(resp)
     if resp.ok:
         return {"status": "ok", "broker": "libertex", "restrictions": result}, 200
     return {"status": "failed", "broker": "libertex", "raw": result}, 502
@@ -684,21 +771,18 @@ def _libertex_get_flow_funds(session_data: dict[str, Any], page: int = 1, page_s
     """Get flow of funds history. Endpoint: /spa/report/flow-funds"""
     base_url = str(session_data.get("base_url") or "https://app.libertex.org").rstrip("/")
     csrf_token = str(session_data.get("csrf_token") or "")
-    cookies = session_data.get("session_cookies") or {}
+    cookies = _libertex_session_cookies(session_data)
     params = {"page": page, "pageSize": page_size, "showOperationDetails": 0}
     if start_date:
         params["startDate"] = start_date
     resp = requests.get(
         f"{base_url}/spa/report/flow-funds",
         params=params,
-        headers={"X-Token": csrf_token, "Accept": "application/json"},
+        headers=_libertex_headers(session_data, csrf_token),
         cookies=cookies,
         timeout=15,
     )
-    try:
-        result = resp.json()
-    except Exception:
-        result = {"text": resp.text[:1000], "http_status": resp.status_code}
+    result = _libertex_response_payload(resp)
     if resp.ok:
         return {"status": "ok", "broker": "libertex", "flow_funds": result}, 200
     return {"status": "failed", "broker": "libertex", "raw": result}, 502
@@ -795,6 +879,9 @@ def _passes_backend_execution_config(
     if config.get("source_filters") and _entry_source(entry) not in set(config.get("source_filters") or []):
         return False, "source not enabled in backend criteria"
 
+    if _has_open_symbol_exposure(service, user_id, broker, entry_symbol):
+        return False, "symbol already has open backend exposure"
+
     max_daily = config.get("max_daily_trades")
     if max_daily is not None and _daily_open_count(service, user_id, bot_type, broker, exec_id, entry_symbol) >= int(max_daily):
         return False, "daily trade limit reached"
@@ -850,6 +937,38 @@ def _open_position_count(service, user_id: str, bot_type: str, broker: str, symb
         if str(position.get("symbol") or "").replace("/", "").upper() == symbol:
             total += 1
     return total
+
+
+def _has_open_symbol_exposure(service, user_id: str, broker: str, symbol: str) -> bool:
+    norm_symbol = str(symbol or "").replace("/", "").upper()
+    if not norm_symbol:
+        return False
+
+    for position in service.list_positions(user_id=user_id):
+        if position.get("broker") != broker:
+            continue
+        if str(position.get("status") or "open").lower() not in {"open", "closing", "unknown", "orphan"}:
+            continue
+        if str(position.get("symbol") or "").replace("/", "").upper() == norm_symbol:
+            return True
+
+    exposure_statuses = {
+        "planned",
+        "queued",
+        "sent",
+        "ack",
+        "open",
+        "close_requested",
+        "reconcile_needed",
+    }
+    for order in service.list_orders(user_id=user_id):
+        if order.get("action") != "open" or order.get("broker") != broker:
+            continue
+        if str(order.get("status") or "").lower() not in exposure_statuses:
+            continue
+        if str(order.get("symbol") or "").replace("/", "").upper() == norm_symbol:
+            return True
+    return False
 
 
 def _entry_symbol(entry: dict[str, Any]) -> str:

@@ -37,6 +37,30 @@ from markettool.interfaces.api.health import register_health_routes, get_health_
 logger = logging.getLogger(__name__)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    value = str(raw).split("#", 1)[0].strip()
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("[Config] Invalid integer for %s=%r; using %s", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    value = str(raw).split("#", 1)[0].strip()
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("[Config] Invalid float for %s=%r; using %s", name, raw, default)
+        return default
+
+
 def _warmup_processpool():
     """Pre-spawn ProcessPool workers with dummy task to avoid cold start."""
     try:
@@ -50,7 +74,7 @@ def _warmup_processpool():
             return np.arange(10).sum()
 
         # Spawn a small pool to pre-warm processes (avoid heavy RAM use)
-        max_workers = int(os.environ.get("ANALYSIS_PRED_WORKERS", "2"))
+        max_workers = _env_int("ANALYSIS_PRED_WORKERS", 2)
         warmup_workers = max(1, min(2, max_workers))
         
         with ProcessPoolExecutor(
@@ -163,10 +187,10 @@ def _warmup_caches_principales():
         ]
         if env_timeframes:
             main_timeframes = env_timeframes
-        warmup_bars = int(os.environ.get("CACHE_WARMUP_BARS", "500"))
+        warmup_bars = _env_int("CACHE_WARMUP_BARS", 500)
         
         # FASE 2: Get concurrency level from env (default 12)
-        warmup_concurrency = int(os.environ.get("CACHE_WARMUP_CONCURRENCY", "12"))
+        warmup_concurrency = _env_int("CACHE_WARMUP_CONCURRENCY", 12)
         warmup_verbose = str(os.getenv("WARMUP_VERBOSE", "0")).strip().lower() in {
             "1", "true", "yes", "y", "on"
         }
@@ -418,8 +442,8 @@ def main() -> None:
         logger.info("[Hexagonal] Creating FMPClient instance...")
         
         # FMP configuration - use env vars or defaults
-        fmp_max_concurrency = int(os.environ.get("FMP_MAX_CONCURRENCY", "6"))
-        fmp_per_symbol_concurrency = int(os.environ.get("FMP_PER_SYMBOL_CONCURRENCY", "1"))
+        fmp_max_concurrency = _env_int("FMP_MAX_CONCURRENCY", 6)
+        fmp_per_symbol_concurrency = _env_int("FMP_PER_SYMBOL_CONCURRENCY", 1)
         fmp_intraday_source_tz = os.environ.get("FMP_INTRADAY_SOURCE_TZ", "America/New_York")
         
         fmp = FMPClient(
@@ -435,16 +459,16 @@ def main() -> None:
         
         # Phase 8: Setup Parallel Analysis Engine (Nivel 3: Máximo paralelismo)
         logger.info("[Parallel Analysis] Creating executors...")
-        analysis_max_workers = int(os.environ.get("ANALYSIS_MAX_WORKERS", "128"))
+        analysis_max_workers = _env_int("ANALYSIS_MAX_WORKERS", 128)
         indicators_executor = ThreadPoolExecutor(
             max_workers=analysis_max_workers,
             thread_name_prefix="analysis_indicators"
         )
         prediction_executor = ProcessPoolExecutor(
-            max_workers=int(os.environ.get("ANALYSIS_PRED_WORKERS", "8"))
+            max_workers=_env_int("ANALYSIS_PRED_WORKERS", 8)
         )
         analysis_executor = ThreadPoolExecutor(
-            max_workers=int(os.environ.get("ANALYSIS_ANALYSIS_WORKERS", "32")),
+            max_workers=_env_int("ANALYSIS_ANALYSIS_WORKERS", 32),
             thread_name_prefix="analysis_general"
         )
         logger.info("✅ Analysis executors created (indicators=%d, pred=8, analysis=32)",
@@ -452,16 +476,16 @@ def main() -> None:
         
         logger.info("[Parallel Analysis] Creating AnalysisConfig...")
         analysis_config = AnalysisConfig(
-            max_concurrent_assets=int(os.environ.get("PARALLEL_MAX_CONCURRENT_ASSETS", "18")),
-            batch_size_assets=int(os.environ.get("PARALLEL_BATCH_SIZE_ASSETS", "16")),
-            timeframe_fan_out=int(os.environ.get("PARALLEL_TIMEFRAME_FANOUT", "7")),
-            global_timeout=int(os.environ.get("PARALLEL_GLOBAL_TIMEOUT", "300")),
-            timeout_per_batch=int(os.environ.get("PARALLEL_TIMEOUT_BATCH", "120")),
-            timeout_per_asset=int(os.environ.get("PARALLEL_TIMEOUT_ASSET", "50")),
-            timeout_per_tf=int(os.environ.get("PARALLEL_TIMEOUT_TF", "10")),
-            timeout_prediction_arima=int(os.environ.get("PARALLEL_TIMEOUT_PREDICTION_ARIMA", "15")),
-            timeout_prediction_mc=int(os.environ.get("PARALLEL_TIMEOUT_PREDICTION_MC", "3")),
-            max_ram_percent=float(os.environ.get("PARALLEL_RAM_PERCENT_LIMIT", "80")),
+            max_concurrent_assets=_env_int("PARALLEL_MAX_CONCURRENT_ASSETS", 18),
+            batch_size_assets=_env_int("PARALLEL_BATCH_SIZE_ASSETS", 16),
+            timeframe_fan_out=_env_int("PARALLEL_TIMEFRAME_FANOUT", 7),
+            global_timeout=_env_int("PARALLEL_GLOBAL_TIMEOUT", 300),
+            timeout_per_batch=_env_int("PARALLEL_TIMEOUT_BATCH", 120),
+            timeout_per_asset=_env_int("PARALLEL_TIMEOUT_ASSET", 50),
+            timeout_per_tf=_env_int("PARALLEL_TIMEOUT_TF", 10),
+            timeout_prediction_arima=_env_int("PARALLEL_TIMEOUT_PREDICTION_ARIMA", 15),
+            timeout_prediction_mc=_env_int("PARALLEL_TIMEOUT_PREDICTION_MC", 3),
+            max_ram_percent=_env_float("PARALLEL_RAM_PERCENT_LIMIT", 80),
             indicators_executor=indicators_executor,
             prediction_executor=prediction_executor,
             analysis_executor=analysis_executor,
@@ -633,7 +657,7 @@ def main() -> None:
         
         # Start server
         webhook_url = os.environ.get("WEBHOOK_URL")
-        port = int(os.environ.get("PORT", os.environ.get("PUERTO", 8080)))
+        port = _env_int("PORT", _env_int("PUERTO", 8080))
         logger.info("WEBHOOK_URL = %s, PUERTO=%s", webhook_url, port)
 
         if webhook_url:

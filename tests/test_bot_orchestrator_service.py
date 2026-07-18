@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from markettool.application.services.bot_orchestrator_service import BotOrchestratorService
+from markettool.interfaces.api.bot_orchestrator_routes import (
+    _libertex_form_payload,
+    _libertex_headers,
+    _passes_backend_execution_config,
+)
 
 
 def test_bot_orchestrator_deduplicates_by_idempotency_key(tmp_path):
@@ -53,6 +58,30 @@ def test_bot_orchestrator_redacts_session_material(tmp_path):
     assert saved["request"]["libertex_session"] == "[redacted]"
 
 
+def test_libertex_backend_request_reuses_saved_webview_context():
+    session = {
+        "base_url": "https://app.libertex.org",
+        "csrf_token": "csrf-123",
+        "session_cookies": {"instanceId": "inst-1", "SID": "cookie-1"},
+        "user_agent": "MarketTool WebView",
+    }
+
+    headers = _libertex_headers(
+        session,
+        "csrf-123",
+        content_type="application/x-www-form-urlencoded; charset=UTF-8",
+    )
+    form = _libertex_form_payload({"symbol": "NZDCAD", "sumInv": 20}, "csrf-123")
+
+    assert headers["User-Agent"] == "MarketTool WebView"
+    assert headers["X-CSRF-Token"] == "csrf-123"
+    assert headers["X-FX-Instance-Id"] == "inst-1"
+    assert headers["Content-Type"] == "application/x-www-form-urlencoded; charset=UTF-8"
+    assert form["symbol"] == "NZDCAD"
+    assert form["csrfToken"] == "csrf-123"
+    assert "clientRequestTime" in form
+
+
 def test_bot_orchestrator_upserts_position_from_order(tmp_path):
     service = BotOrchestratorService(tmp_path / "bot_state.json")
     order, _ = service.create_order(
@@ -79,3 +108,58 @@ def test_bot_orchestrator_upserts_position_from_order(tmp_path):
     assert positions[0]["broker_position_id"] == "123456"
     assert positions[0]["symbol"] == "EURUSD"
     assert positions[0]["side"] == "sell"
+
+
+def test_backend_daemon_rejects_symbol_exposure_across_bot_types(tmp_path):
+    service = BotOrchestratorService(tmp_path / "bot_state.json")
+    existing_order, _ = service.create_order(
+        {
+            "user_id": "u1",
+            "bot_type": "trading",
+            "broker": "mt5",
+            "entry": {"id": "trading-1", "symbol": "EUR/USD", "timeframe": "5m", "side": "long"},
+        }
+    )
+    service.upsert_position_from_order(existing_order, {"mt5_order_id": 777})
+
+    accepted, reason = _passes_backend_execution_config(
+        {"id": "scalp-1", "symbol": "EURUSD", "timeframe": "1m", "side": "short", "confidence": 90, "rr": 2},
+        [],
+        {},
+        service,
+        user_id="u1",
+        bot_type="scalping",
+        broker="mt5",
+        exec_id="exec-scalping",
+        symbol="EURUSD",
+    )
+
+    assert accepted is False
+    assert reason == "symbol already has open backend exposure"
+
+
+def test_backend_daemon_rejects_symbol_exposure_from_pending_order(tmp_path):
+    service = BotOrchestratorService(tmp_path / "bot_state.json")
+    service.create_order(
+        {
+            "user_id": "u1",
+            "bot_type": "strategy",
+            "broker": "mt5",
+            "entry": {"id": "strategy-1", "symbol": "NZD/CAD", "timeframe": "15m", "side": "long"},
+        }
+    )
+
+    accepted, reason = _passes_backend_execution_config(
+        {"id": "trading-1", "symbol": "NZDCAD", "timeframe": "5m", "side": "long", "confidence": 90, "rr": 2},
+        [],
+        {},
+        service,
+        user_id="u1",
+        bot_type="trading",
+        broker="mt5",
+        exec_id="exec-trading",
+        symbol="NZDCAD",
+    )
+
+    assert accepted is False
+    assert reason == "symbol already has open backend exposure"
