@@ -1338,6 +1338,146 @@ def register_monitoreo_routes(app, *, services) -> None:
             logger.exception("Error en /api/monitoreos/list")
             return jsonify({"status": "error", "message": str(exc)}), 500
 
+    # ── Repair endpoint for subscription docs ──────────────────────────────
+    @app.route("/admin/repair-subscription", methods=["POST"])
+    def repair_subscription():
+        """
+        POST /admin/repair-subscription
+        Diagnose and repair subscription Firestore documents.
+        
+        Body:
+        {
+          "firebase_uid": "Q6ffvylrxQN6ONPm8pyhzuW8YYk2",
+          "alias_uuid": "555ba229-647e-4ff6-a63f-42f8ba2ff6de",
+          "telegram_id": 1407024046,
+          "action": "diagnose" | "repair"
+        }
+        """
+        SECRET = os.environ.get("REPAIR_SECRET", "dev-secret-12345")
+        provided_secret = request.headers.get("X-Repair-Secret", "")
+        
+        if provided_secret != SECRET:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+        
+        data = request.get_json() or {}
+        firebase_uid = data.get("firebase_uid", "Q6ffvylrxQN6ONPm8pyhzuW8YYk2")
+        alias_uuid = data.get("alias_uuid", "555ba229-647e-4ff6-a63f-42f8ba2ff6de")
+        telegram_id = data.get("telegram_id", 1407024046)
+        action = data.get("action", "diagnose")
+        
+        result = {
+            "status": "in_progress",
+            "firebase_uid": firebase_uid,
+            "alias_uuid": alias_uuid,
+            "telegram_id": telegram_id,
+            "action": action,
+            "checks": {}
+        }
+        
+        try:
+            # Check 1: Does canonical doc exist?
+            canonical_ref = db.collection("suscripciones_user").document(firebase_uid)
+            canonical_snap = canonical_ref.get()
+            result["checks"]["canonical_exists"] = canonical_snap.exists
+            if canonical_snap.exists:
+                result["checks"]["canonical_data"] = canonical_snap.to_dict()
+            
+            # Check 2: Does alias doc exist?
+            alias_ref = db.collection("suscripciones_user").document(alias_uuid)
+            alias_snap = alias_ref.get()
+            result["checks"]["alias_exists"] = alias_snap.exists
+            if alias_snap.exists:
+                result["checks"]["alias_data"] = alias_snap.to_dict()
+            
+            # Check 3: Can we find by query?
+            query_result = db.collection("suscripciones_user").where("user_id", "==", firebase_uid).limit(1).stream()
+            query_docs = list(query_result)
+            result["checks"]["query_by_firebase_uid_found"] = len(query_docs) > 0
+            if query_docs:
+                result["checks"]["query_result"] = query_docs[0].to_dict()
+            
+            # Check 4: Query by alias as user_id
+            alias_query_result = db.collection("suscripciones_user").where("user_id", "==", alias_uuid).limit(1).stream()
+            alias_query_docs = list(alias_query_result)
+            result["checks"]["query_by_alias_uuid_found"] = len(alias_query_docs) > 0
+            
+            if action == "diagnose":
+                result["status"] = "ok"
+                return jsonify(result), 200
+            
+            # REPAIR MODE
+            if action == "repair":
+                repairs = []
+                
+                # Repair 1: Create/update canonical doc
+                canonical_data = {
+                    "user_id": firebase_uid,
+                    "telegram_id": telegram_id,
+                    "estado": "activa",
+                    "transacciones_restantes": 11370,
+                    "doc_alias_of": None,
+                    "creado_en": datetime.utcnow().isoformat() if not canonical_snap.exists else None,
+                }
+                # Keep original fields if they exist
+                if canonical_snap.exists:
+                    existing = canonical_snap.to_dict()
+                    canonical_data.pop("creado_en", None)  # Don't override creation time
+                    for key in ["transacciones_restantes", "plan_tipo", "activo_desde"]:
+                        if key in existing:
+                            canonical_data[key] = existing[key]
+                
+                canonical_ref.set(canonical_data, merge=True)
+                repairs.append({
+                    "action": "create_or_update_canonical",
+                    "doc_id": firebase_uid,
+                    "status": "done"
+                })
+                
+                # Repair 2: Update alias to point to canonical
+                if alias_snap.exists:
+                    alias_data = alias_snap.to_dict()
+                    alias_data["user_id"] = firebase_uid  # Point to canonical
+                    alias_data["doc_alias_of"] = firebase_uid
+                    alias_ref.set(alias_data, merge=True)
+                    repairs.append({
+                        "action": "update_alias_pointer",
+                        "doc_id": alias_uuid,
+                        "points_to": firebase_uid,
+                        "status": "done"
+                    })
+                else:
+                    # Create alias if it doesn't exist
+                    alias_data = {
+                        "user_id": firebase_uid,
+                        "telegram_id": telegram_id,
+                        "doc_alias_of": firebase_uid,
+                        "alias_for": alias_uuid,
+                        "estado": "activa",
+                    }
+                    alias_ref.set(alias_data)
+                    repairs.append({
+                        "action": "create_alias",
+                        "doc_id": alias_uuid,
+                        "points_to": firebase_uid,
+                        "status": "done"
+                    })
+                
+                result["status"] = "ok"
+                result["repairs"] = repairs
+                
+                # Re-check
+                result["checks"]["post_repair_canonical"] = canonical_ref.get().to_dict()
+                result["checks"]["post_repair_alias"] = alias_ref.get().to_dict()
+                
+                return jsonify(result), 200
+            
+            result["status"] = "ok"
+            return jsonify(result), 200
+            
+        except Exception as e:
+            logging.exception("Error in repair-subscription endpoint")
+            return jsonify({"status": "error", "message": str(e)}), 500
+
     # ── Live-candle cache ──────────────────────────────────────────────────────
     # Short-lived per (symbol, tf) cache so consecutive polls within the same
     # second reuse the last FMP response instead of hitting the API again.
