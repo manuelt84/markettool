@@ -1757,6 +1757,18 @@ user_states = {}
 timeout_request_global = 10  # Tiempo máximo de espera en segundos
 max_workers_global = min(32, (os.cpu_count() or 1) * 2) #puede tener 64
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    value = str(raw).split("#", 1)[0].strip()
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("[Config] Invalid integer for %s=%r; using %s", name, raw, default)
+        return default
+
 # FASE 3: WORKER CONFIGURATION TUNING (AGGRESSIVE - MAXIMIZE HARDWARE)
 # ====================================================================
 # ✅ OPTIMIZED FOR REAL MACHINE HARDWARE (not container limits)
@@ -1782,9 +1794,9 @@ if _MACHINE_TYPE == "a":
     # Máquina A: i7-12700H (14 cores, 16GB RAM)
     # → HIGH cores, LOW RAM (1.1GB per core)
     # → Strategy: Use all cores, be careful with memory
-    _ANALYSIS_MAX_WORKERS = int(os.environ.get("ANALYSIS_MAX_WORKERS", "14"))  # 1:1 ratio
-    _ANALYSIS_PRED_WORKERS = int(os.environ.get("ANALYSIS_PRED_WORKERS", "12"))  # CPU-bound
-    _ANALYSIS_SEM = int(os.environ.get("ANALYSIS_SEMAPHORE", "12"))  # 85% for high utilization
+    _ANALYSIS_MAX_WORKERS = _env_int("ANALYSIS_MAX_WORKERS", 14)  # 1:1 ratio
+    _ANALYSIS_PRED_WORKERS = _env_int("ANALYSIS_PRED_WORKERS", 12)  # CPU-bound
+    _ANALYSIS_SEM = _env_int("ANALYSIS_SEMAPHORE", 12)  # 85% for high utilization
     warmup_concurrency = 12  # Conservative due to low RAM
 
 elif _MACHINE_TYPE in ("b", "c"):
@@ -1792,28 +1804,28 @@ elif _MACHINE_TYPE in ("b", "c"):
     # Máquina C: Ryzen 7 4800H (8 cores, 32GB RAM)
     # → MODERATE cores, HIGH RAM (4GB per core)
     # → Strategy: Aggressive 2x oversubscription (safe with RAM buffer)
-    _ANALYSIS_MAX_WORKERS = int(os.environ.get("ANALYSIS_MAX_WORKERS", "16"))  # 2:1 ratio
-    _ANALYSIS_PRED_WORKERS = int(os.environ.get("ANALYSIS_PRED_WORKERS", "8"))   # CPU-bound 1:1
-    _ANALYSIS_SEM = int(os.environ.get("ANALYSIS_SEMAPHORE", "12"))  # 75% allows good concurrency
+    _ANALYSIS_MAX_WORKERS = _env_int("ANALYSIS_MAX_WORKERS", 16)  # 2:1 ratio
+    _ANALYSIS_PRED_WORKERS = _env_int("ANALYSIS_PRED_WORKERS", 8)   # CPU-bound 1:1
+    _ANALYSIS_SEM = _env_int("ANALYSIS_SEMAPHORE", 12)  # 75% allows good concurrency
     warmup_concurrency = 18  # Aggressive with plenty of RAM
 
 else:  # "generic" or unknown
     # Fallback: Balanced formula (works for any machine)
     # Rule: MAX_WORKERS = CPU_COUNT (no oversubscription for safety)
-    _ANALYSIS_MAX_WORKERS = int(os.environ.get(
+    _ANALYSIS_MAX_WORKERS = _env_int(
         "ANALYSIS_MAX_WORKERS",
-        str(min(32, max(8, _CPU_COUNT)))  # Min 8, max 32, balanced with CPU
-    ))
-    _ANALYSIS_PRED_WORKERS = int(os.environ.get(
+        min(32, max(8, _CPU_COUNT))  # Min 8, max 32, balanced with CPU
+    )
+    _ANALYSIS_PRED_WORKERS = _env_int(
         "ANALYSIS_PRED_WORKERS",
-        str(min(12, _CPU_COUNT))  # 1:1 with CPU for CPU-bound
-    ))
-    _ANALYSIS_SEM = int(os.environ.get(
+        min(12, _CPU_COUNT)  # 1:1 with CPU for CPU-bound
+    )
+    _ANALYSIS_SEM = _env_int(
         "ANALYSIS_SEMAPHORE",
-        str(int(_ANALYSIS_MAX_WORKERS * 0.75))  # 75% for asset concurrency
-    ))
+        int(_ANALYSIS_MAX_WORKERS * 0.75)  # 75% for asset concurrency
+    )
 
-_ANALYSIS_INNER_WORKERS = int(os.environ.get("ANALYSIS_INNER_WORKERS", "4"))
+_ANALYSIS_INNER_WORKERS = _env_int("ANALYSIS_INNER_WORKERS", 4)
 _GCS_ASYNC_EXECUTOR = ThreadPoolExecutor(max_workers=4)  # Non-blocking GCS uploads
 _ANALYSIS_PRED_USE_PROCESS = os.environ.get("ANALYSIS_PRED_USE_PROCESS", "false").lower() == "true"
 
@@ -1852,10 +1864,10 @@ if _ANALYSIS_PRED_WORKERS > 0:
         _ANALYSIS_PRED_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_PRED_WORKERS))
 else:
     _ANALYSIS_PRED_EXECUTOR = None
-_ANALYSIS_PRED_WORKERS = int(os.environ.get(
+_ANALYSIS_PRED_WORKERS = _env_int(
     "ANALYSIS_PRED_WORKERS",
-    str(min(14, max(4, int(_CPU_COUNT * 1.5))))  # ← FASE 3 TUNED FOR CPU
-))
+    min(14, max(4, int(_CPU_COUNT * 1.5)))  # ← FASE 3 TUNED FOR CPU
+)
 _ANALYSIS_PRED_USE_PROCESS = os.environ.get("ANALYSIS_PRED_USE_PROCESS", "false").lower() == "true"
 
 _ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, _ANALYSIS_MAX_WORKERS))

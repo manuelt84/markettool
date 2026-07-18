@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 pass
@@ -1371,6 +1372,10 @@ def register_monitoreo_routes(app, *, services) -> None:
           }
         """
         try:
+            live_enabled = str(os.getenv("ENABLE_WORKING_LIVE", "false")).strip().lower() in {"1", "true", "yes", "y", "on"}
+            if not live_enabled:
+                return jsonify({"status": "disabled", "message": "working live disabled"}), 404
+
             symbol    = request.args.get("symbol",    "").strip().upper()
             timeframe = norm_tf(request.args.get("timeframe", "1min"))
 

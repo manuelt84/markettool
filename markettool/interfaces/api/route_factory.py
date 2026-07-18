@@ -30,6 +30,13 @@ if TYPE_CHECKING:
     from markettool.interfaces.containers import DIContainer
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 class _PonderacionCacheAdapter:
     """Minimal ponderacion cache adapter for API routes in hexagonal runtime."""
 
@@ -103,8 +110,14 @@ def register_all_routes(
     register_hexagonal_analysis_routes(app)
     register_risk_management_routes(app)
     register_signal_validation_routes(app)
-    register_mt5_routes(app)
-    register_bot_inject_routes(app)
+
+    # By default keep broker execution APIs disabled in production hardening mode.
+    if _env_flag("ENABLE_BROKER_EXECUTION", default=False):
+        register_mt5_routes(app)
+        register_bot_inject_routes(app)
+        logger.info("Broker execution routes enabled (ENABLE_BROKER_EXECUTION=true)")
+    else:
+        logger.info("Broker execution routes disabled (set ENABLE_BROKER_EXECUTION=true to enable)")
 
     # Ponderacion API routes
     ponderacion_cache = _PonderacionCacheAdapter(logger=logger)
