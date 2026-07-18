@@ -61,6 +61,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _warmup_processpool():
     """Pre-spawn ProcessPool workers with dummy task to avoid cold start."""
     try:
@@ -488,9 +495,16 @@ def main() -> None:
         )
         logger.info("✅ Health endpoints: /health, /ready, /healthz, /startup, /cache-status")
         
+        telegram_enabled = _env_flag("ENABLE_TELEGRAM_BOT", default=False)
+        telegram_app = get_telegram_application() if telegram_enabled else None
+        if telegram_enabled:
+            logger.info("Telegram bot enabled (ENABLE_TELEGRAM_BOT=true)")
+        else:
+            logger.info("Telegram bot disabled (ENABLE_TELEGRAM_BOT=false)")
+
         # Create legacy service bundle for migrated routes
         legacy_services = LegacyServices(
-            application=get_telegram_application(),
+            application=telegram_app,
             db=get_firestore_db(),
             logger=market_tool_logger,
             update_cls=Update,
@@ -559,7 +573,7 @@ def main() -> None:
             firestore_db=get_firestore_db(),
             gcs_client=get_gcs_client(),
             fmp_client=fmp,
-            telegram_app=get_telegram_application(),
+            telegram_app=telegram_app,
             default_chat_id=None,  # Would come from config
             legacy_services=legacy_services,
             logger=market_tool_logger,
@@ -573,41 +587,44 @@ def main() -> None:
 
         logger.info("✅ Legacy routes registered via route_factory")
         
-        # Register shutdown callbacks
-        async def shutdown_telegram_bot():
-            """Shutdown Telegram bot gracefully."""
-            logger.info("Shutting down Telegram bot...")
-            app = get_telegram_application()
-            if app:
-                await app.shutdown()
-                logger.info("✅ Telegram bot shutdown complete")
-        
-        register_shutdown_callback(shutdown_telegram_bot)
-        
-        # Initialize bot
-        logger.info("Step 6/6: Initializing Telegram bot...")
-        loop.run_until_complete(
-            initialize_bot_async(
-                get_telegram_application(),
-                container=container,
-                logger=market_tool_logger,
-                cargar_datos_subscription_user=cargar_datos_subscription_user,
-                cargar_datos_subscription_type=cargar_datos_subscription_type,
-                cargar_chat_ids=cargar_chat_ids,
-                cargar_admin_ids=cargar_admin_ids,
-                cargar_noticias_en_memoria=cargar_noticias_en_memoria,
-                cargar_datos_historicos_inicial=cargar_datos_historicos_inicial,
-                warmup_cache_all_assets=warmup_cache_all_assets,
-                guardar_noticias_forex_diarias=guardar_noticias_forex_diarias,
-                guardar_datos_historicos_diarios=guardar_datos_historicos_diarios,
-                actualizar_menus=actualizar_menus,
-                scheduler=scheduler,
-                pod_coordinator=_POD_COORDINATOR,
-                app_config=APP_CONFIG,
-                parallel_engine=parallel_engine,  # Inject parallel analysis engine
+        if telegram_enabled and telegram_app is not None:
+            # Register shutdown callbacks
+            async def shutdown_telegram_bot():
+                """Shutdown Telegram bot gracefully."""
+                logger.info("Shutting down Telegram bot...")
+                app = telegram_app
+                if app:
+                    await app.shutdown()
+                    logger.info("✅ Telegram bot shutdown complete")
+
+            register_shutdown_callback(shutdown_telegram_bot)
+
+            # Initialize bot
+            logger.info("Step 6/6: Initializing Telegram bot...")
+            loop.run_until_complete(
+                initialize_bot_async(
+                    telegram_app,
+                    container=container,
+                    logger=market_tool_logger,
+                    cargar_datos_subscription_user=cargar_datos_subscription_user,
+                    cargar_datos_subscription_type=cargar_datos_subscription_type,
+                    cargar_chat_ids=cargar_chat_ids,
+                    cargar_admin_ids=cargar_admin_ids,
+                    cargar_noticias_en_memoria=cargar_noticias_en_memoria,
+                    cargar_datos_historicos_inicial=cargar_datos_historicos_inicial,
+                    warmup_cache_all_assets=warmup_cache_all_assets,
+                    guardar_noticias_forex_diarias=guardar_noticias_forex_diarias,
+                    guardar_datos_historicos_diarios=guardar_datos_historicos_diarios,
+                    actualizar_menus=actualizar_menus,
+                    scheduler=scheduler,
+                    pod_coordinator=_POD_COORDINATOR,
+                    app_config=APP_CONFIG,
+                    parallel_engine=parallel_engine,  # Inject parallel analysis engine
+                )
             )
-        )
-        logger.info("✅ Bot initialization complete")
+            logger.info("✅ Bot initialization complete")
+        else:
+            logger.info("Step 6/6: Telegram bot initialization skipped")
         
         # Phase 9: Performance warmups (background threads)
         logger.info("Step 7/7: Starting performance warmup threads...")

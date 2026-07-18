@@ -52,6 +52,7 @@ class EnvironmentValidator:
         EnvVarConfig("PORT", required=False, default="8080", description="Server port"),
         EnvVarConfig("ENVIRONMENT", required=False, default="production", description="Environment name"),
         EnvVarConfig("WORKER_ID", required=False, default="A", description="Worker identifier"),
+        EnvVarConfig("ENABLE_TELEGRAM_BOT", required=False, default="false", description="Enable Telegram bot initialization"),
     ]
     
     # Telegram configuration
@@ -81,9 +82,13 @@ class EnvironmentValidator:
     
     def __init__(self) -> None:
         """Initialize environment validator."""
+        telegram_enabled = str(os.environ.get("ENABLE_TELEGRAM_BOT", "false")).strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+
         self.all_vars = (
             self.CORE_VARS +
-            self.TELEGRAM_VARS +
+            (self.TELEGRAM_VARS if telegram_enabled else []) +
             self.GCP_VARS +
             self.API_VARS +
             self.OPTIONAL_VARS
