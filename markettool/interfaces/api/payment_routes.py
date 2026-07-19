@@ -69,39 +69,126 @@ def _firestore_client():
     return firestore.Client(project="trading-449607")
 
 
-def _credit_transactions(user_id: str, pack_id: str, order_id: str) -> int:
-    """Increment transacciones_restantes and log payment_history. Returns new balance."""
+def _resolve_subscription_refs(db, user_key: str):
+    """Resolve canonical subscription doc and alias docs from user_id/uuid/telegram key."""
+    key = str(user_key or "").strip()
+    col = db.collection("suscripciones_user")
+
+    if not key:
+        return col.document(""), []
+
+    # 1) Direct lookup by document id.
+    direct_ref = col.document(key)
+    direct_snap = direct_ref.get()
+    if direct_snap.exists:
+        data = direct_snap.to_dict() or {}
+        is_numeric_id = key.isdigit()
+        candidate_uid = str(data.get("doc_alias_of") or data.get("user_id") or key)
+        looks_alias = bool(data.get("doc_alias_of")) or (
+            is_numeric_id and candidate_uid and candidate_uid != key
+        )
+
+        if looks_alias and candidate_uid:
+            canonical_ref = col.document(candidate_uid)
+            aliases = [direct_ref]
+            tg = data.get("telegram_id")
+            if tg is not None:
+                aliases.append(col.document(str(tg)))
+            return canonical_ref, aliases
+
+        canonical_id = str(data.get("user_id") or key)
+        canonical_ref = col.document(canonical_id)
+        aliases = []
+        tg = data.get("telegram_id")
+        if tg is not None:
+            aliases.append(col.document(str(tg)))
+        return canonical_ref, aliases
+
+    # 2) Lookup by user_id field.
+    qs_user = list(col.where("user_id", "==", key).limit(1).stream())
+    if qs_user:
+        snap = qs_user[0]
+        data = snap.to_dict() or {}
+        canonical_id = str(data.get("user_id") or snap.id)
+        canonical_ref = col.document(canonical_id)
+        aliases = []
+        tg = data.get("telegram_id")
+        if tg is not None:
+            aliases.append(col.document(str(tg)))
+        return canonical_ref, aliases
+
+    # 3) Lookup by telegram_id field.
+    qs_tg = list(col.where("telegram_id", "==", key).limit(1).stream())
+    if qs_tg:
+        snap = qs_tg[0]
+        data = snap.to_dict() or {}
+        canonical_id = str(data.get("user_id") or snap.id)
+        canonical_ref = col.document(canonical_id)
+        return canonical_ref, [col.document(key)]
+
+    # 4) Fallback: treat key as canonical id.
+    return col.document(key), []
+
+
+def _credit_transactions(user_key: str, pack_id: str, order_id: str) -> int:
+    """Increment transactions on canonical doc and mirror to aliases. Returns new balance."""
     from google.cloud import firestore
 
     pack = PACKS[pack_id]
     ops = pack["ops"]
     db = _firestore_client()
-    doc_ref = db.collection("suscripciones_user").document(user_id)
+    canonical_ref, alias_refs = _resolve_subscription_refs(db, user_key)
 
-    doc_ref.update(
-        {
-            "transacciones_restantes": firestore.Increment(ops),
-            "updated_at": firestore.SERVER_TIMESTAMP,
-        }
-    )
+    @firestore.transactional
+    def _tx(transaction: firestore.Transaction) -> int:
+        canonical_snap = canonical_ref.get(transaction=transaction)
+        canonical_data = canonical_snap.to_dict() or {}
+        current = int(canonical_data.get("transacciones_restantes") or 0)
+        new_balance = current + int(ops)
+        canonical_user_id = str(canonical_data.get("user_id") or canonical_ref.id)
+        canonical_telegram_id = canonical_data.get("telegram_id")
 
-    # Log in payment_history subcollection
-    db.collection("suscripciones_user").document(user_id).collection(
-        "payment_history"
-    ).document(order_id).set(
-        {
-            "order_id": order_id,
-            "pack_id": pack_id,
-            "ops": ops,
-            "price": pack["price"],
-            "plan": pack["plan"],
-            "status": "COMPLETED",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+        transaction.set(
+            canonical_ref,
+            {
+                "user_id": canonical_user_id,
+                "transacciones_restantes": new_balance,
+                "estado": "activa" if new_balance > 0 else "inactiva",
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            },
+            merge=True,
+        )
 
-    snap = doc_ref.get()
-    return int(snap.to_dict().get("transacciones_restantes", ops))
+        for alias_ref in alias_refs:
+            if alias_ref.id == canonical_ref.id:
+                continue
+            alias_payload = {
+                "user_id": canonical_user_id,
+                "doc_alias_of": canonical_user_id,
+                "transacciones_restantes": new_balance,
+                "estado": "activa" if new_balance > 0 else "inactiva",
+                "updated_at": firestore.SERVER_TIMESTAMP,
+            }
+            if canonical_telegram_id is not None:
+                alias_payload["telegram_id"] = canonical_telegram_id
+            transaction.set(alias_ref, alias_payload, merge=True)
+
+        transaction.set(
+            canonical_ref.collection("payment_history").document(order_id),
+            {
+                "order_id": order_id,
+                "pack_id": pack_id,
+                "ops": ops,
+                "price": pack["price"],
+                "plan": pack["plan"],
+                "status": "COMPLETED",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            },
+            merge=True,
+        )
+        return new_balance
+
+    return _tx(db.transaction())
 
 
 # ── Blueprint ─────────────────────────────────────────────────────────────────
@@ -304,9 +391,10 @@ def mp_webhook():
 
     try:
         db = _firestore_client()
+        canonical_ref, _ = _resolve_subscription_refs(db, user_id)
         hist_ref = (
             db.collection("suscripciones_user")
-            .document(user_id)
+            .document(canonical_ref.id)
             .collection("payment_history")
             .document(payment_id)
         )
@@ -314,28 +402,22 @@ def mp_webhook():
             logger.info("MP webhook: payment %s already credited, skipping", payment_id)
             return jsonify({"status": "already_credited"}), 200
 
-        pack = PACKS[pack_id]
-        from google.cloud import firestore
-        doc_ref = db.collection("suscripciones_user").document(user_id)
-        doc_ref.update(
-            {
-                "transacciones_restantes": firestore.Increment(pack["ops"]),
-                "updated_at": firestore.SERVER_TIMESTAMP,
-            }
-        )
+        new_balance = _credit_transactions(user_id, pack_id, payment_id)
         hist_ref.set(
             {
-                "order_id": payment_id,
-                "pack_id": pack_id,
-                "ops": pack["ops"],
-                "price": pack["price"],
-                "plan": pack["plan"],
                 "status": "approved",
                 "provider": "mercadopago",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
+            },
+            merge=True,
         )
-        logger.info("MP webhook credited %d ops to user %s (payment %s)", pack["ops"], user_id, payment_id)
+        logger.info(
+            "MP webhook credited %d ops to user %s (payment %s). new_balance=%d canonical=%s",
+            PACKS[pack_id]["ops"],
+            user_id,
+            payment_id,
+            new_balance,
+            canonical_ref.id,
+        )
         return jsonify({"status": "ok"}), 200
     except Exception as exc:
         logger.exception("MP webhook credit error: %s", exc)
@@ -363,9 +445,10 @@ def paypal_webhook():
                     try:
                         # Only credit if not already done (idempotency check)
                         db = _firestore_client()
+                        canonical_ref, _ = _resolve_subscription_refs(db, user_id)
                         hist_ref = (
                             db.collection("suscripciones_user")
-                            .document(user_id)
+                            .document(canonical_ref.id)
                             .collection("payment_history")
                             .document(order_id)
                         )
