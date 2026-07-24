@@ -65,3 +65,5 @@ credentials.json
 # Models directory (built inside container, not copied from host)
 # This prevents COPY . . from overwriting downloaded models
 models/
+backup
+indicators
