@@ -61,6 +61,20 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable (true/false, 1/0, yes/no)."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    value = str(raw).split("#", 1)[0].strip().lower()
+    if value in ("true", "1", "yes", "on"):
+        return True
+    if value in ("false", "0", "no", "off"):
+        return False
+    logger.warning("[Config] Invalid boolean for %s=%r; using %s", name, raw, default)
+    return default
+
+
 
 def _warmup_processpool():
     """Pre-spawn ProcessPool workers with dummy task to avoid cold start."""
