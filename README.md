@@ -123,6 +123,7 @@ curl http://localhost:8080/healthz
 
 **Quick Access**:
 - 📊 [Project Status](./docs/PROJECT_STATUS.md) - Current status & metrics
+- 🔎 [Backend QA Audit 2026-05-15](./docs/BACKEND_QA_AUDIT_2026-05-15.md) - Monitoreo contracts, entradas async, broker fields, Docker QA risks
 - 🏗️ [Architecture](./docs/architecture/ARQUITECTURA_HEXAGONAL.md) - Hexagonal design
 - 🚀 [Quick Start](./docs/guides/QUICK_START_PERFORMANCE.md) - Setup in 5 minutes
 - ⚡ [Performance Guide](./docs/optimization/OPTIMIZATION_REPORT.md) - Tuning & metrics
@@ -130,7 +131,7 @@ curl http://localhost:8080/healthz
 
 **By Role**:
 - 🧑‍💼 **Product Manager**: [PROJECT_STATUS.md](./docs/PROJECT_STATUS.md), [FINAL_SUMMARY.md](./docs/FINAL_SUMMARY.md)
-- 👨‍💻 **Developer**: [Architecture](./docs/architecture/), [Setup Guides](./docs/guides/)
+- 👨‍💻 **Developer**: [Backend QA Audit](./docs/BACKEND_QA_AUDIT_2026-05-15.md), [Architecture](./docs/architecture/), [Setup Guides](./docs/guides/)
 - 🔧 **DevOps**: [Deployment](./deployment/gke/), [Validation](./docs/guides/FINAL_VERIFICATION.md)
 - ⚡ **Performance Engineer**: [Optimization](./docs/optimization/), [Audits](./docs/audits/)
 

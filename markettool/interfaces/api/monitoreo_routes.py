@@ -14,6 +14,7 @@ from flask import jsonify, request
 
 from markettool.application.use_cases.legacy import LegacyMonitoreoUseCase
 from markettool.core.cache_config import get_freshness_requirement_for_timeframe
+from markettool.infra.fmp.ledger import fmp_context
 
 
 def register_monitoreo_routes(app, *, services) -> None:
@@ -69,6 +70,92 @@ def register_monitoreo_routes(app, *, services) -> None:
             ),
             402,
         )
+
+    def _tf_has_explicit_stop(exec_id: str, symbol: str, timeframe: str) -> bool:
+        try:
+            doc_id = f"{exec_id}__{(symbol or '').upper()}"
+            snap = db.collection("monitoreos").document(doc_id).get()
+            if not snap.exists:
+                return False
+            data = snap.to_dict() or {}
+            tf_states = data.get("tf_states") or {}
+            tf_canonical = norm_tf(timeframe)
+            state = (
+                tf_states.get(tf_canonical)
+                or tf_states.get(timeframe)
+                or data.get(tf_canonical)
+                or data.get(timeframe)
+                or {}
+            )
+            if not isinstance(state, dict):
+                return False
+            estado = str(state.get("estado") or state.get("status") or "").strip().lower()
+            reason = str(state.get("reason") or data.get("last_reason") or "").strip().lower()
+            stop_reason = str(state.get("stop_reason") or "").strip().lower()
+            if (
+                estado in {"access_denied", "denied"}
+                or "cuota" in reason
+                or "transacciones" in reason
+                or "quota" in reason
+                or stop_reason == "subscription_inactive_or_expired"
+            ):
+                return False
+            if estado in {"stopped", "detenido", "inactivo", "access_denied", "denied"}:
+                return True
+            return state.get("enabled") is False
+        except Exception as exc:
+            logger.debug(
+                "TF explicit stop lookup failed exec=%s symbol=%s tf=%s: %s",
+                exec_id,
+                symbol,
+                timeframe,
+                exc,
+            )
+            return False
+
+    def _tf_access_denied_reason(exec_id: str, symbol: str, timeframe: str) -> str | None:
+        try:
+            doc_id = f"{exec_id}__{(symbol or '').upper()}"
+            snap = db.collection("monitoreos").document(doc_id).get()
+            if not snap.exists:
+                return None
+            data = snap.to_dict() or {}
+            tf_states = data.get("tf_states") or {}
+            tf_canonical = norm_tf(timeframe)
+            state = (
+                tf_states.get(tf_canonical)
+                or tf_states.get(timeframe)
+                or data.get(tf_canonical)
+                or data.get(timeframe)
+                or {}
+            )
+            if not isinstance(state, dict):
+                return None
+
+            estado = str(state.get("estado") or state.get("status") or "").strip().lower()
+            stop_reason = str(state.get("stop_reason") or "").strip().lower()
+            reason = str(state.get("reason") or data.get("last_reason") or "").strip()
+            reason_l = reason.lower()
+
+            is_access_denied = estado in {"access_denied", "denied"}
+            is_quota_reason = (
+                "cuota" in reason_l
+                or "transacciones" in reason_l
+                or "quota" in reason_l
+                or stop_reason == "subscription_inactive_or_expired"
+            )
+            if is_access_denied or is_quota_reason:
+                return reason or "No cuenta con la cuota de transacciones requerida. Por favor, adquiere un paquete."
+            return None
+        except Exception as exc:
+            logger.debug(
+                "TF access_denied lookup failed exec=%s symbol=%s tf=%s: %s",
+                exec_id,
+                symbol,
+                timeframe,
+                exc,
+            )
+            return None
 
     async def _mark_tf_stopped_access_denied(
         exec_id: str,
@@ -286,13 +373,14 @@ def register_monitoreo_routes(app, *, services) -> None:
                 from_eff, to_eff = to_eff, from_eff
 
             fetch_to = min(to_eff + tf_value_ms, closed_end + tf_value_ms)
-            hist_payload = await asyncio.to_thread(
-                fetch_historical_range,
-                symbol,
-                tf_value,
-                from_eff,
-                fetch_to,
-            )
+            with fmp_context(usage_kind="monitoring_history_refresh", source="monitoreo_1min_refresh", symbol=symbol, timeframe=tf_value):
+                hist_payload = await asyncio.to_thread(
+                    fetch_historical_range,
+                    symbol,
+                    tf_value,
+                    from_eff,
+                    fetch_to,
+                )
             hist_series = _history_payload_to_series_ms(hist_payload, tf_value)
             if not hist_series:
                 return False
@@ -389,7 +477,7 @@ def register_monitoreo_routes(app, *, services) -> None:
 
             # Auto-renovar heartbeat solo si está cerca de expirar (optimización de Firestore)
             # Simplificado: siempre renovar si enabled es False, para recuperación rápida
-            if exec_id and symbol and not enabled:
+            if exec_id and symbol and not enabled and not _tf_has_explicit_stop(exec_id, symbol, tf_api):
                 try:
                     now_ms = int(time.time() * 1000)
                     
@@ -398,6 +486,8 @@ def register_monitoreo_routes(app, *, services) -> None:
                             tf_api: {
                                 "enabled": True,
                                 "estado": "running",
+                                "reason": None,
+                                "stop_reason": None,
                                 "last_heartbeat_ms": now_ms,
                                 "last_ts": now_ms,
                             }
@@ -409,6 +499,9 @@ def register_monitoreo_routes(app, *, services) -> None:
                     logging.warning("INC AUTO-RENEW fallido para %s %s: %s", symbol, tf_api, e)
 
             if not enabled:
+                denied_reason = _tf_access_denied_reason(exec_id, symbol, tf_api)
+                if denied_reason:
+                    return _quota_error_response(denied_reason)
                 return (
                     jsonify(
                         {
@@ -481,13 +574,14 @@ def register_monitoreo_routes(app, *, services) -> None:
                     hist_from_ms = closed_end - (bars_target - 1) * tf_value_ms
                     hist_to_ms = min(closed_end + tf_value_ms, int(time.time() * 1000))
 
-                    hist_payload = await asyncio.to_thread(
-                        fetch_historical_range,
-                        symbol,
-                        tf_value,
-                        hist_from_ms,
-                        hist_to_ms,
-                    )
+                    with fmp_context(usage_kind="monitoring_history_refresh", source="monitoreo_cold_start", symbol=symbol, timeframe=tf_value):
+                        hist_payload = await asyncio.to_thread(
+                            fetch_historical_range,
+                            symbol,
+                            tf_value,
+                            hist_from_ms,
+                            hist_to_ms,
+                        )
 
                     hist_series = _history_payload_to_series_ms(hist_payload, tf_value)
                     if hist_series:
@@ -834,9 +928,10 @@ def register_monitoreo_routes(app, *, services) -> None:
 
                         fetch_to = min(to_eff + tf_ms_value, closed_end + tf_ms_value)
 
-                        rng = await asyncio.to_thread(
-                            fetch_historical_range, symbol, timeframe, from_eff, fetch_to
-                        )
+                        with fmp_context(usage_kind="monitoring_history_refresh", source="monitoreo_gapfill", symbol=symbol, timeframe=timeframe):
+                            rng = await asyncio.to_thread(
+                                fetch_historical_range, symbol, timeframe, from_eff, fetch_to
+                            )
                         gapfill_meta["fetched"] = len(rng or [])
 
                         if rng:
@@ -959,7 +1054,7 @@ def register_monitoreo_routes(app, *, services) -> None:
 
             # Auto-renovar heartbeat solo si está cerca de expirar (optimización de Firestore)
             # Simplificado: siempre renovar si enabled es False, para recuperación rápida
-            if exec_id and symbol and not enabled:
+            if exec_id and symbol and not enabled and not _tf_has_explicit_stop(exec_id, symbol, tf_api):
                 try:
                     now_ms = int(time.time() * 1000)
                     
@@ -968,6 +1063,8 @@ def register_monitoreo_routes(app, *, services) -> None:
                             tf_api: {
                                 "enabled": True,
                                 "estado": "running",
+                                "reason": None,
+                                "stop_reason": None,
                                 "last_heartbeat_ms": now_ms,
                                 "last_ts": now_ms,
                             }
@@ -985,6 +1082,9 @@ def register_monitoreo_routes(app, *, services) -> None:
                     logging.warning("HIST AUTO-RENEW fallido para %s %s: %s", symbol, tf_api, e)
 
             if not enabled:
+                denied_reason = _tf_access_denied_reason(exec_id, symbol, tf_api)
+                if denied_reason:
+                    return _quota_error_response(denied_reason)
                 return (
                     jsonify(
                         {
@@ -1111,9 +1211,10 @@ def register_monitoreo_routes(app, *, services) -> None:
 
                             fetch_to = min(to_eff + tf_ms_value, closed_end + tf_ms_value)
 
-                            rng = await asyncio.to_thread(
-                                fetch_historical_range, symbol, timeframe, from_eff, fetch_to
-                            )
+                            with fmp_context(usage_kind="monitoring_history_refresh", source="monitoreo_gapfill", symbol=symbol, timeframe=timeframe):
+                                rng = await asyncio.to_thread(
+                                    fetch_historical_range, symbol, timeframe, from_eff, fetch_to
+                                )
                             gapfill_meta["fetched"] = len(rng or [])
 
                             if rng:
@@ -1286,6 +1387,12 @@ def register_monitoreo_routes(app, *, services) -> None:
                         "estado": data.get("estado"),
                         "updated_at": data.get("updated_at"),
                         "allowed_timeframes": data.get("allowed_timeframes", []),
+                        "timeframes_permitidas": data.get("timeframes_permitidas", []),
+                        "selected_tfs": data.get("selected_tfs", []),
+                        "monitor_selected_tfs": data.get("monitor_selected_tfs", []),
+                        "selectedTFs": data.get("selectedTFs", []),
+                        "tfs": data.get("tfs", []),
+                        "running": data.get("running", []),
                     })
                 
                 logger.info(f"[MonitoreosAPI] Strategy=RECENT user={user_id} count={len(monitoreos)}")
@@ -1321,6 +1428,12 @@ def register_monitoreo_routes(app, *, services) -> None:
                                 "estado": data.get("estado"),
                                 "updated_at": data.get("updated_at"),
                                 "allowed_timeframes": data.get("allowed_timeframes", []),
+                                "timeframes_permitidas": data.get("timeframes_permitidas", []),
+                                "selected_tfs": data.get("selected_tfs", []),
+                                "monitor_selected_tfs": data.get("monitor_selected_tfs", []),
+                                "selectedTFs": data.get("selectedTFs", []),
+                                "tfs": data.get("tfs", []),
+                                "running": data.get("running", []),
                             })
                     
                     logger.info(f"[MonitoreosAPI] Strategy=FALLBACK user={user_id} count={len(monitoreos)}")
@@ -1409,9 +1522,10 @@ def register_monitoreo_routes(app, *, services) -> None:
             from_ms      = bucket_start - tf_ms_value               # one bar back
             to_ms        = now_ms + tf_ms_value                     # a bit ahead
 
-            candles = await asyncio.to_thread(
-                fetch_historical_range, symbol, timeframe, from_ms, to_ms
-            )
+            with fmp_context(usage_kind="monitoring_live_refresh", source="live_candle", symbol=symbol, timeframe=timeframe):
+                candles = await asyncio.to_thread(
+                    fetch_historical_range, symbol, timeframe, from_ms, to_ms
+                )
 
             if not candles:
                 _lc_cache[cache_key] = {"data": None, "ts": now}

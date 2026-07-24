@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 from flask import Flask, jsonify, request
 
 from markettool.infra.fmp.client import normalize_tf
+from markettool.infra.storage.vps_json_store import PostgresDocumentStore, VpsJsonStore, vps_mode_enabled
 
 from markettool.application.services.backtesting_service import get_backtesting_service
 
@@ -21,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 def _get_firestore_db(services: Any):
+    if vps_mode_enabled():
+        return PostgresDocumentStore.from_env()
     if hasattr(services, "db") and services.db is not None:
         return services.db
     try:
@@ -36,11 +39,16 @@ def _get_firestore_db(services: Any):
 
 def _get_gcs_bucket(services: Any):
     try:
-        from google.cloud import storage as gcs_storage
+        if vps_mode_enabled():
+            return VpsJsonStore.from_env()
         bucket_name = getattr(services, "gcs_bucket_name", None) or "markettool_bucket"
-        return gcs_storage.Client().bucket(bucket_name)
+        gcs_client = getattr(services, "gcs_client", None)
+        if gcs_client is None:
+            from google.cloud import storage as gcs_storage
+            gcs_client = gcs_storage.Client()
+        return gcs_client.bucket(bucket_name)
     except Exception as exc:
-        logger.warning("Could not get GCS bucket: %s", exc)
+        logger.warning("Could not get JSON storage bucket: %s", exc)
         return None
 
 

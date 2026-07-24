@@ -11,12 +11,14 @@ import socket
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Callable, Optional, Tuple
 
 import pandas as pd
 from google.cloud import firestore
 from google.cloud import storage
+from requests.adapters import HTTPAdapter
 
 from markettool.infra.fmp import normalize_tf
 from markettool.core.cache_config import CACHE_CONFIG
@@ -27,12 +29,23 @@ logger = logging.getLogger("MarketTool")
 _INDICATORS_CACHE_ENABLED = os.environ.get("INDICATORS_CACHE_ENABLED", "true").lower() == "true"
 _INDICATORS_CACHE_TTL_HOURS = int(os.environ.get("INDICATORS_CACHE_TTL_HOURS", "8"))
 _INDICATORS_FORCE_RECALC = os.environ.get("INDICATORS_FORCE_RECALC", "false").lower() == "true"
-_INDICATORS_MEMORY_CACHE_SIZE = int(os.environ.get("INDICATORS_MEMORY_CACHE_SIZE", "10"))
+_INDICATORS_MEMORY_CACHE_SIZE = int(os.environ.get("INDICATORS_MEMORY_CACHE_SIZE", "1024"))
 _INDICATORS_LOCK_TIMEOUT_SEC = int(os.environ.get("INDICATORS_LOCK_TIMEOUT_SEC", "180"))
+_INDICATORS_REMOTE_SAVE_WORKERS = max(1, int(os.environ.get("INDICATORS_REMOTE_SAVE_WORKERS", "4")))
+_INDICATORS_REMOTE_SAVE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_INDICATORS_REMOTE_SAVE_WORKERS,
+    thread_name_prefix="indicators-remote-save",
+)
 
+_CLOUD_BACKEND = os.environ.get("MARKETTOOL_CLOUD_BACKEND", "").strip().lower()
+_VPS_BACKEND_ENABLED = _CLOUD_BACKEND in {"vps", "postgres", "local", "filesystem", "fs", "vps_gcp", "vps-gcp", "vps_fallback_gcp", "vps-fallback-gcp"}
+_VPS_STORAGE_ROOT = os.environ.get("MARKETTOOL_VPS_STORAGE_ROOT", "/app/storage/markettool-json")
 _GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
+_GCS_ENABLED = os.environ.get("GCS_ENABLED", "true").lower() == "true" and not _VPS_BACKEND_ENABLED
+_GCS_POOL_CONNECTIONS = int(os.environ.get("GCS_POOL_CONNECTIONS", "64"))
+_GCS_POOL_MAXSIZE = int(os.environ.get("GCS_POOL_MAXSIZE", "64"))
 _FIRESTORE_CLIENT = None
-_FIRESTORE_ENABLED = os.environ.get("FIRESTORE_ENABLED", "true").lower() == "true"
+_FIRESTORE_ENABLED = os.environ.get("FIRESTORE_ENABLED", "true").lower() == "true" and not _VPS_BACKEND_ENABLED
 
 UTC = timezone.utc
 
@@ -69,12 +82,38 @@ def hash_dataframe(df: pd.DataFrame) -> str:
         return hashlib.sha256(f"{df.shape}_{time.time()}".encode()).hexdigest()[:16]
 
 
+def _tune_storage_client(client: storage.Client) -> storage.Client:
+    try:
+        adapter = HTTPAdapter(
+            pool_connections=_GCS_POOL_CONNECTIONS,
+            pool_maxsize=_GCS_POOL_MAXSIZE,
+            pool_block=False,
+        )
+        http = getattr(client, "_http", None)
+        if http is not None and hasattr(http, "mount"):
+            http.mount("https://", adapter)
+            http.mount("http://", adapter)
+    except Exception as exc:
+        logger.debug("[IndicatorsCache] Could not tune GCS HTTP pool: %s", exc)
+    return client
+
+
 def merge_indicators_incremental(cached: dict, new: dict, split_index: int, window_context: int) -> dict:
     """Combina indicadores cacheados + nuevos calculados incrementalmente."""
     merged = {}
-    for key in new.keys():
+    expected_old_rows = max(0, int(split_index or 0))
+    for key in set(cached.keys()) | set(new.keys()):
+        if key not in new:
+            merged[key] = cached[key]
+            continue
+
         if key not in cached:
-            merged[key] = new[key]
+            new_val = new[key]
+            if isinstance(new_val, list):
+                new_part = new_val[window_context:] if len(new_val) > window_context else new_val
+                merged[key] = ([None] * expected_old_rows) + new_part
+            else:
+                merged[key] = new_val
             continue
 
         cached_val = cached[key]
@@ -105,7 +144,10 @@ class IndicatorsCache:
         self._memory_cache_max = _INDICATORS_MEMORY_CACHE_SIZE
         self._memory_cache_ttl_sec = CACHE_CONFIG['memory_ttl_seconds']  # Use unified config
         self._memory_cache_lock = threading.RLock()  # PROPOSAL 3: Thread-safe lock
-        self._local_dir = os.environ.get("INDICATORS_DIR", "indicators")
+        self._local_dir = os.environ.get(
+            "INDICATORS_DIR",
+            os.path.join(_VPS_STORAGE_ROOT, "indicators") if _VPS_BACKEND_ENABLED else "indicators",
+        )
 
         self._enabled = _INDICATORS_CACHE_ENABLED
 
@@ -120,9 +162,11 @@ class IndicatorsCache:
 
     @property
     def bucket(self):
+        if not _GCS_ENABLED:
+            return None
         if self._bucket is None and self._enabled:
             try:
-                self._bucket = storage.Client().bucket(self.bucket_name)
+                self._bucket = _tune_storage_client(storage.Client()).bucket(self.bucket_name)
             except Exception as exc:
                 logger.warning("[IndicatorsCache] GCS not available: %s", exc)
         return self._bucket
@@ -315,41 +359,22 @@ class IndicatorsCache:
                     "indicators": indicators,
                 }
 
+                self._memory_put(symbol, tf, payload)
                 self._save_local(symbol, tf, payload)
 
                 if self.bucket is None or self.db is None:
                     logger.warning("[IndicatorsCache] GCS/Firestore not available, local cache saved only")
                 else:
-                    gcs_path = self._gcs_path(symbol, tf)
-                    blob = self.bucket.blob(gcs_path)
-                    blob.upload_from_string(
-                        json.dumps(payload, default=str),
-                        content_type="application/json",
+                    _INDICATORS_REMOTE_SAVE_EXECUTOR.submit(
+                        self._save_remote_async,
+                        symbol,
+                        tf,
+                        payload,
+                        now_utc,
+                        data_hash,
+                        final_calc_index,
+                        audit,
                     )
-
-                    doc_id = self._metadata_doc_id(symbol, tf)
-                    self.db.collection("indicators_metadata").document(doc_id).set({
-                        "symbol": symbol.upper(),
-                        "timeframe": normalize_tf(tf),
-                        "gcs_path": f"gs://{self.bucket_name}/{gcs_path}",
-                        "last_update_utc": now_utc,
-                        "data_hash": data_hash,
-                        "rows_count": len(df_historicos),
-                        "last_calc_index": final_calc_index,
-                        "indicators_list": list(indicators.keys()),
-                        "calc_duration_ms": calc_duration_ms,
-                        "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
-                        "is_valid": True,
-                        "analysis_audit": {
-                            "last_mode": audit.get("last_mode"),
-                            "last_bootstrap_at": (now_utc if audit.get("last_mode") == "bootstrap" else audit.get("last_bootstrap_at")),
-                            "last_incremental_at": (now_utc if audit.get("last_mode") == "incremental" else audit.get("last_incremental_at")),
-                            "last_incremental_bars": audit.get("last_incremental_bars"),
-                            "last_data_mismatch_at": (now_utc if audit.get("last_mode") == "data_mismatch" else audit.get("last_data_mismatch_at")),
-                        },
-                    }, merge=True)
-
-                self._memory_put(symbol, tf, payload)
 
                 logger.info(
                     "[IndicatorsCache] Saved: %s/%s (%d rows, %.0fms, pod=%s)",
@@ -362,6 +387,51 @@ class IndicatorsCache:
 
         except Exception as exc:
             logger.error("[IndicatorsCache] Save error %s/%s: %s", symbol, tf, exc)
+
+    def _save_remote_async(
+        self,
+        symbol: str,
+        tf: str,
+        payload: dict,
+        now_utc: datetime,
+        data_hash: str,
+        final_calc_index: int,
+        audit: dict,
+    ) -> None:
+        try:
+            if self.bucket is None or self.db is None:
+                return
+
+            gcs_path = self._gcs_path(symbol, tf)
+            blob = self.bucket.blob(gcs_path)
+            blob.upload_from_string(
+                json.dumps(payload, default=str),
+                content_type="application/json",
+            )
+
+            metadata = payload.get("metadata", {})
+            self.db.collection("indicators_metadata").document(self._metadata_doc_id(symbol, tf)).set({
+                "symbol": symbol.upper(),
+                "timeframe": normalize_tf(tf),
+                "gcs_path": f"gs://{self.bucket_name}/{gcs_path}",
+                "last_update_utc": now_utc,
+                "data_hash": data_hash,
+                "rows_count": int(metadata.get("rows_count") or 0),
+                "last_calc_index": final_calc_index,
+                "indicators_list": list(metadata.get("indicators_list") or []),
+                "calc_duration_ms": metadata.get("calc_duration_ms", 0),
+                "ttl_hours": _INDICATORS_CACHE_TTL_HOURS,
+                "is_valid": True,
+                "analysis_audit": {
+                    "last_mode": audit.get("last_mode"),
+                    "last_bootstrap_at": (now_utc if audit.get("last_mode") == "bootstrap" else audit.get("last_bootstrap_at")),
+                    "last_incremental_at": (now_utc if audit.get("last_mode") == "incremental" else audit.get("last_incremental_at")),
+                    "last_incremental_bars": audit.get("last_incremental_bars"),
+                    "last_data_mismatch_at": (now_utc if audit.get("last_mode") == "data_mismatch" else audit.get("last_data_mismatch_at")),
+                },
+            }, merge=True)
+        except Exception as exc:
+            logger.error("[IndicatorsCache] Async remote save error %s/%s: %s", symbol, tf, exc)
 
     def invalidate(self, symbol: str, tf: str) -> None:
         try:
@@ -845,6 +915,36 @@ class IndicatorsCache:
                 if lock_acquired:
                     self._release_lock(symbol, tf)
 
+        if 0 < current_rows < cached_rows:
+            tail_indicators = self._slice_indicators_tail(cached["indicators"], current_rows)
+            if tail_indicators is not None:
+                df_result, override = self._apply_indicators_or_recalc(
+                    df_historicos,
+                    tail_indicators,
+                    symbol,
+                    tf,
+                    calc_func,
+                )
+                if override is not None:
+                    return df_result, override
+                logger.info(
+                    "[IndicatorsCache] Tail slice hit: %s/%s (cached=%d, current=%d, pod=%s)",
+                    symbol,
+                    tf,
+                    cached_rows,
+                    current_rows,
+                    self._pod_id,
+                )
+                return df_result, {
+                    "cache_hit": True,
+                    "incremental": False,
+                    "calc_time_ms": 0,
+                    "source": "cache_tail_slice",
+                    "cached_rows": cached_rows,
+                    "total_rows": current_rows,
+                    "pod_id": self._pod_id,
+                }
+
         lock_acquired = self._acquire_lock(symbol, tf)
 
         try:
@@ -887,7 +987,7 @@ class IndicatorsCache:
 
     def _extract_indicators_from_df(self, df: pd.DataFrame) -> dict:
         indicators = {}
-        base_cols = {"open", "high", "low", "close", "volume", "time"}
+        base_cols = {"open", "high", "low", "close", "volume", "time", "index", "_index"}
         indicator_cols = [col for col in df.columns if col not in base_cols]
 
         for col in indicator_cols:
@@ -903,6 +1003,8 @@ class IndicatorsCache:
     def _apply_indicators_to_df(self, df: pd.DataFrame, indicators: dict) -> pd.DataFrame:
         mismatch = False
         for col, values in indicators.items():
+            if col in {"index", "_index"}:
+                continue
             try:
                 if len(values) == len(df):
                     df[col] = values
@@ -915,6 +1017,16 @@ class IndicatorsCache:
         if mismatch:
             raise ValueError("indicator_length_mismatch")
         return df
+
+    def _slice_indicators_tail(self, indicators: dict, rows: int) -> dict | None:
+        if rows <= 0:
+            return None
+        sliced: dict = {}
+        for col, values in indicators.items():
+            if not isinstance(values, list) or len(values) < rows:
+                return None
+            sliced[col] = values[-rows:]
+        return sliced
 
     def _apply_indicators_or_recalc(
         self,

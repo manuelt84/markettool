@@ -54,7 +54,14 @@ class CacheConfig:
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
     
     # GCS
-    GCS_ENABLED = CACHE_ENABLED and ("gcs" in CACHE_STRATEGY or "redis_gcs" in CACHE_STRATEGY)
+    _GCS_ENV_ENABLED = str(os.getenv("GCS_ENABLED", "true")).lower() == "true"
+    _VPS_BACKEND_ENABLED = str(os.getenv("MARKETTOOL_CLOUD_BACKEND", "")).strip().lower() in {"vps", "postgres", "local", "filesystem", "fs", "vps_gcp", "vps-gcp", "vps_fallback_gcp", "vps-fallback-gcp"}
+    GCS_ENABLED = (
+        CACHE_ENABLED
+        and _GCS_ENV_ENABLED
+        and not _VPS_BACKEND_ENABLED
+        and ("gcs" in CACHE_STRATEGY or "redis_gcs" in CACHE_STRATEGY)
+    )
     GCS_BUCKET = os.getenv("GCS_BUCKET")
     
     # Memory cache (always available as fallback)

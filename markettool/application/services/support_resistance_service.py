@@ -73,7 +73,8 @@ class SupportResistanceService:
         window: int,
         atr_multiplier: float = 2.0,
         current_price: Optional[float] = None,
-        min_levels: int = 5
+        min_levels: int = 5,
+        min_touches: int = 2
     ) -> SupportResistanceLevels:
         """
         Calculate support and resistance levels using local minima/maxima.
@@ -83,7 +84,8 @@ class SupportResistanceService:
             window: Window size for level detection
             atr_multiplier: ATR multiplier for filtering levels
             current_price: Current price (default: last close)
-            min_levels: Minimum number of levels to return
+            min_levels: Maximum number of confirmed levels to return
+            min_touches: Minimum historical reactions required for operational levels
         
         Returns:
             SupportResistanceLevels with supports, resistances, and ATR
@@ -92,8 +94,8 @@ class SupportResistanceService:
             self.logger.warning(f"Insufficient data for S/R calc: {len(df)} < {window}")
             last_close = float(df['close'].iloc[-1])
             return SupportResistanceLevels(
-                supports=[last_close * 0.99],
-                resistances=[last_close * 1.01],
+                supports=[],
+                resistances=[],
                 atr=last_close * 0.01,
                 window_used=len(df)
             )
@@ -125,17 +127,16 @@ class SupportResistanceService:
         # Filter by distance from current price
         supports = self._filter_by_distance(supports, current_price, atr, max_distance=3.0)
         resistances = self._filter_by_distance(resistances, current_price, atr, max_distance=3.0)
-        
-        # Ensure minimum number of levels
-        if len(supports) < min_levels:
-            # Add simple support levels
-            for i in range(1, min_levels - len(supports) + 1):
-                supports.append(current_price - (i * atr))
-        
-        if len(resistances) < min_levels:
-            # Add simple resistance levels
-            for i in range(1, min_levels - len(resistances) + 1):
-                resistances.append(current_price + (i * atr))
+
+        if min_touches > 1:
+            supports = [
+                level for level in supports
+                if self._count_touches(level, df['low'], tolerance) >= min_touches
+            ]
+            resistances = [
+                level for level in resistances
+                if self._count_touches(level, df['high'], tolerance) >= min_touches
+            ]
         
         # Sort
         supports = sorted(supports, reverse=True)[:min_levels]
@@ -308,6 +309,22 @@ class SupportResistanceService:
                 filtered.append(level)
         
         return filtered
+
+    def _count_touches(
+        self,
+        level: float,
+        prices: pd.Series,
+        tolerance: float
+    ) -> int:
+        """Count historical price reactions around a level."""
+        try:
+            level_float = float(level)
+            if not np.isfinite(level_float) or level_float <= 0:
+                return 0
+            tol = max(float(tolerance), level_float * 0.001)
+            return int((np.abs(prices.astype(float) - level_float) <= tol).sum())
+        except Exception:
+            return 0
     
     def _filter_by_distance(
         self,

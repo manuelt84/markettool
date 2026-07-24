@@ -19,6 +19,7 @@ from markettool.core.ports.historical_data_provider import HistoricalDataProvide
 from markettool.core.errors import PlanNotAllowed
 from markettool.infra.fmp import normalize_tf
 from markettool.infra.cache.historicos_cache import load_cached_history, save_cached_history
+from markettool.infra.storage.vps_json_store import PostgresDocumentStore, vps_mode_enabled
 
 
 logger = logging.getLogger("MarketTool")
@@ -184,7 +185,9 @@ class HistoryManager:
 
         if not hasattr(self, "_valid_symbols"):
             try:
-                db = firestore.Client()
+                db = PostgresDocumentStore.from_env() if vps_mode_enabled() else firestore.Client()
+                if db is None:
+                    raise RuntimeError("Postgres document store is not configured")
                 activos = set()
                 activos_docs = db.collection("config").document("activos").get()
                 if activos_docs.exists:

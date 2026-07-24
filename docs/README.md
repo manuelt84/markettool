@@ -86,6 +86,7 @@ Complete documentation for MarketTool Hexagonal Architecture Refactoring
 - [guides/LOCAL_TESTING_GUIDE.md](./guides/LOCAL_TESTING_GUIDE.md) - Setup
 
 **QA/Tester**:
+- [BACKEND_QA_AUDIT_2026-05-15.md](./BACKEND_QA_AUDIT_2026-05-15.md) - Backend contract audit for monitoreo, entradas async, broker fields, deploy risks
 - [guides/TESTING_Y_VALIDACION.md](./guides/TESTING_Y_VALIDACION.md) - Test plan
 - [guides/FINAL_VERIFICATION.md](./guides/FINAL_VERIFICATION.md) - Deployment checks
 
@@ -136,6 +137,7 @@ Complete documentation for MarketTool Hexagonal Architecture Refactoring
 - Bottleneck analysis → [audits/BOTTLENECK_AUDIT.md](./audits/BOTTLENECK_AUDIT.md)
 
 **Testing**:
+- Backend QA audit → [BACKEND_QA_AUDIT_2026-05-15.md](./BACKEND_QA_AUDIT_2026-05-15.md)
 - Test procedures → [guides/TESTING_Y_VALIDACION.md](./guides/TESTING_Y_VALIDACION.md)
 - Deployment checks → [guides/FINAL_VERIFICATION.md](./guides/FINAL_VERIFICATION.md)
 - Build checklist → [guides/PRE_BUILD_CHECKLIST.md](./guides/PRE_BUILD_CHECKLIST.md)

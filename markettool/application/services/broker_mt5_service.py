@@ -290,8 +290,15 @@ class BrokerMT5Service:
     
     def update_ea_account_info(self, account_info: dict) -> None:
         """Update account info received from EA."""
+        # Si el EA envía open_positions, las guardamos separado para que la app pueda consultarlas
+        if 'open_positions' in account_info:
+            self.ea_open_positions = account_info.get('open_positions', [])
         self.ea_account_info = account_info
         self.ea_last_poll = time.time()
+
+    def get_ea_open_positions(self) -> list:
+        """Return the last list of open positions reported by the EA."""
+        return getattr(self, 'ea_open_positions', [])
     
     def report_order_result(self, order_id: str, result: dict) -> None:
         """
@@ -326,6 +333,15 @@ class BrokerMT5Service:
             return
         
         # Store result and mark as completed/failed
+        open_price = result.get("openPrice") or result.get("open_price") or result.get("price")
+        if open_price is not None:
+            result["openPrice"] = open_price
+            result["open_price"] = open_price
+            result["brokerOpenPrice"] = open_price
+        open_commission = result.get("openCommission") or result.get("open_commission") or result.get("commission")
+        if open_commission is not None:
+            result["openCommission"] = open_commission
+            result["open_commission"] = open_commission
         pending.result = result
         success = result.get("success", False)
         pending.state = OrderState.COMPLETED if success else OrderState.FAILED

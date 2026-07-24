@@ -386,7 +386,13 @@ class BacktestingService:
         Returns:
             Dict with backtest stats matching the RN app format.
         """
-        ALL_SOURCE_KEYS = ["tech", "sr", "mt", "event"]
+        ALL_SOURCE_KEYS = [
+            "tech", "sr", "ob", "fvg", "smc", "breaker", "inducement",
+            "divergence", "confluence", "mt", "event", "fibonacci",
+            "ema_cross_3_9", "triada", "engulfing_reclaim",
+            "inside_bar_breakout", "opening_reclaim", "pinbar_reversal",
+            "three_bar_reversal",
+        ]
 
         # Filter out non-dict entries
         entries = [e for e in entries if isinstance(e, dict)]
@@ -413,10 +419,42 @@ class BacktestingService:
             "tecnico": "tech", "tech": "tech", "technical": "tech",
             "market_tool": "mt", "mt": "mt", "markettool": "mt",
             "evento": "event", "event": "event", "eventos": "event",
+            "fibonacci": "fibonacci", "fib": "fibonacci",
+            "breaker": "breaker",
+            "inducement": "inducement",
+            "divergence": "divergence", "divergencia": "divergence",
+            "confluence": "confluence", "confluencia": "confluence",
+            "ob": "ob", "order_block": "ob", "order_blocks": "ob",
+            "fvg": "fvg",
+            "smc": "smc",
+            "ema_cross_3_9": "ema_cross_3_9",
+            "triada": "triada",
+            "engulfing_reclaim": "engulfing_reclaim",
+            "inside_bar_breakout": "inside_bar_breakout",
+            "opening_reclaim": "opening_reclaim",
+            "pinbar_reversal": "pinbar_reversal",
+            "three_bar_reversal": "three_bar_reversal",
         }
         # Pattern-based: basado_en values like pullback_R1, scale_in_midpoint, range_upper_reversion
         SR_PATTERNS = ["pullback", "r1", "r2", "s1", "s2", "midpoint", "range_", "reversion", "scale_in"]
-        TECH_PATTERNS = ["ema", "macd", "rsi", "bollinger", "stoch", "momentum", "breakout"]
+        FIB_PATTERNS = ["fibonacci", "fib_"]
+        BREAKER_PATTERNS = ["breaker"]
+        INDUCEMENT_PATTERNS = ["inducement"]
+        DIVERGENCE_PATTERNS = ["diverg"]
+        CONFLUENCE_PATTERNS = ["conflu"]
+        OB_PATTERNS = ["order_block", "orderblock"]
+        FVG_PATTERNS = ["fvg", "imbalance"]
+        SMC_PATTERNS = ["smc", "smart_money"]
+        CANDLE_STRATEGY_PATTERNS = {
+            "ema_cross_3_9": ["ema_cross_3_9", "ema_3_9"],
+            "triada": ["triada"],
+            "engulfing_reclaim": ["engulfing_reclaim"],
+            "inside_bar_breakout": ["inside_bar_breakout"],
+            "opening_reclaim": ["opening_reclaim"],
+            "pinbar_reversal": ["pinbar"],
+            "three_bar_reversal": ["three_bar"],
+        }
+        TECH_PATTERNS = ["ema", "macd", "rsi", "bollinger", "stoch", "momentum", "breakout", "breakdown"]
         EVENT_PATTERNS = ["event", "news", "economic", "calendar"]
 
         for e in entries:
@@ -426,6 +464,27 @@ class BacktestingService:
                 if not mapped:
                     if any(p in raw for p in SR_PATTERNS):
                         mapped = "sr"
+                    elif any(p in raw for p in FIB_PATTERNS):
+                        mapped = "fibonacci"
+                    elif any(p in raw for p in BREAKER_PATTERNS):
+                        mapped = "breaker"
+                    elif any(p in raw for p in INDUCEMENT_PATTERNS):
+                        mapped = "inducement"
+                    elif any(p in raw for p in DIVERGENCE_PATTERNS):
+                        mapped = "divergence"
+                    elif any(p in raw for p in CONFLUENCE_PATTERNS):
+                        mapped = "confluence"
+                    elif any(p in raw for p in OB_PATTERNS):
+                        mapped = "ob"
+                    elif any(p in raw for p in FVG_PATTERNS):
+                        mapped = "fvg"
+                    elif any(p in raw for p in SMC_PATTERNS):
+                        mapped = "smc"
+                    elif any(p in raw for patterns in CANDLE_STRATEGY_PATTERNS.values() for p in patterns):
+                        mapped = next(
+                            key for key, patterns in CANDLE_STRATEGY_PATTERNS.items()
+                            if any(p in raw for p in patterns)
+                        )
                     elif any(p in raw for p in TECH_PATTERNS):
                         mapped = "tech"
                     elif any(p in raw for p in EVENT_PATTERNS):

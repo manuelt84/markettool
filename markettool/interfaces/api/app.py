@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from flask import Flask, request, make_response
-from asgiref.wsgi import WsgiToAsgi
+from asgiref.sync import sync_to_async
+from asgiref.wsgi import WsgiToAsgi, WsgiToAsgiInstance
 
 if TYPE_CHECKING:
     from markettool.interfaces.containers import DIContainer
@@ -17,6 +20,34 @@ logger = logging.getLogger(__name__)
 _webhook_app: Flask | None = None
 _asgi_app: WsgiToAsgi | None = None
 _routes_registered: bool = False
+_wsgi_executor: ThreadPoolExecutor | None = None
+
+
+def _get_wsgi_executor() -> ThreadPoolExecutor:
+    global _wsgi_executor
+    if _wsgi_executor is None:
+        max_workers = int(os.getenv("ASGI_WSGI_MAX_WORKERS", "256"))
+        _wsgi_executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="wsgi-request",
+        )
+        logger.info("✅ ASGI WSGI executor created max_workers=%s", max_workers)
+    return _wsgi_executor
+
+
+class ConcurrentWsgiToAsgiInstance(WsgiToAsgiInstance):
+    async def run_wsgi_app(self, body):  # type: ignore[override]
+        run_sync = sync_to_async(
+            super().run_wsgi_app.__wrapped__,
+            thread_sensitive=False,
+            executor=_get_wsgi_executor(),
+        )
+        return await run_sync(self, body)
+
+
+class ConcurrentWsgiToAsgi(WsgiToAsgi):
+    async def __call__(self, scope, receive, send):
+        await ConcurrentWsgiToAsgiInstance(self.wsgi_application)(scope, receive, send)
 
 
 def get_webhook_app(
@@ -96,10 +127,10 @@ def get_asgi_app(
     global _asgi_app
     
     if _asgi_app is None:
-        _asgi_app = WsgiToAsgi(
+        _asgi_app = ConcurrentWsgiToAsgi(
             get_webhook_app(container=container)
         )
-        logger.info("✅ ASGI app (WsgiToAsgi wrapper) created")
+        logger.info("✅ ASGI app (concurrent WsgiToAsgi wrapper) created")
     
     return _asgi_app
 

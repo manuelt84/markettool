@@ -61,12 +61,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
-
 
 def _warmup_processpool():
     """Pre-spawn ProcessPool workers with dummy task to avoid cold start."""
@@ -146,6 +140,13 @@ def _warmup_caches_principales():
     ✅ RESILIENT: Fast-fail on FMP errors, graceful degradation
     """
     try:
+        warmup_enabled = str(os.getenv("CACHE_WARMUP_ENABLED", "true")).strip().lower() in {
+            "1", "true", "yes", "y", "on"
+        }
+        if not warmup_enabled:
+            logger.info("[Warmup] Cache warmup disabled by CACHE_WARMUP_ENABLED")
+            return
+
         # Check if FMP_API_KEY is available first
         fmp_api_key = (os.environ.get("FMP_API_KEY") or "").strip()
         if not fmp_api_key:
@@ -154,32 +155,40 @@ def _warmup_caches_principales():
                 "This is fine if using pre-cached data or local history."
             )
             return
-        
+
         t0 = time.time()
-        
+
         # Import functions that naturally populate caches
-        from MarketTool import obtener_datos_con_hilos, calcular_indicadores
-        
-        # ✅ EXPANDED WARMUP: Activos más líquidos y frecuentemente analizados
-        # Categorías:
-        # - Majors (7): EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD, NZDUSD
-        # - Cruces (3): EURGBP, EURJPY, GBPJPY
-        # - Crypto (2): BTCUSD, ETHUSD
-        # - Commodities (1): XAUUSD (oro)
-        # Total: 13 activos × 2 timeframes = 26 combinaciones
-        main_assets = [
-            # Forex Majors (más volumen y liquidez)
-            'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
-            # Cruces importantes
-            'EURGBP', 'EURJPY', 'GBPJPY',
-            # Crypto
-            'BTCUSD', 'ETHUSD',
-            # Commodities
-            'XAUUSD'
+        from MarketTool import obtener_datos_con_hilos, calcular_indicadores, _ensure_globals_loaded, _universe_symbols
+
+        # Activos comunes: salen del mismo config/categorias que usan RN/Web
+        # para los menús. Los símbolos fuera de categorías son exclusivos y no
+        # se precalientan aquí salvo override explícito por env.
+        _ensure_globals_loaded()
+        main_assets = sorted(_universe_symbols())[: int(os.getenv("CACHE_WARMUP_MAX_SYMBOLS", "80"))]
+        if not main_assets:
+            main_assets = [
+                'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD',
+                'EURGBP', 'EURJPY', 'GBPJPY', 'BTCUSD', 'ETHUSD', 'XAUUSD'
+            ]
+        env_assets = [
+            s.strip().upper()
+            for s in os.getenv("CACHE_WARMUP_SYMBOLS", "").split(",")
+            if s.strip()
         ]
+        if env_assets:
+            main_assets = env_assets
         
         # Timeframes estratégicos: 1hour (swing) y 1day (tendencia)
         main_timeframes = ['1hour', '1day']
+        env_timeframes = [
+            tf.strip()
+            for tf in os.getenv("CACHE_WARMUP_TIMEFRAMES", "").split(",")
+            if tf.strip()
+        ]
+        if env_timeframes:
+            main_timeframes = env_timeframes
+        warmup_bars = _env_int("CACHE_WARMUP_BARS", 500)
         
         # FASE 2: Get concurrency level from env (default 12)
         warmup_concurrency = _env_int("CACHE_WARMUP_CONCURRENCY", 12)
@@ -204,8 +213,21 @@ def _warmup_caches_principales():
             """Warmup a single (symbol, timeframe) combination."""
             symbol, tf = symbol_tf_tuple
             try:
-                # Fetch históricos (popula cache de históricos, niveles, ATR)
-                df = obtener_datos_con_hilos(symbol, tf, bars=500)
+                tf_norm = {
+                    "1minute": "1min", "1m": "1min",
+                    "5m": "5min", "15m": "15min", "30m": "30min",
+                    "1h": "1hour", "4h": "4hour",
+                    "1d": "1day", "1w": "1week",
+                }.get(str(tf).strip().lower(), tf)
+                fmp_windows = {tf: warmup_bars, tf_norm: warmup_bars}
+                # Fetch históricos (popula cache de históricos, niveles, ATR).
+                # obtener_datos_con_hilos recibe recortes por cfg/fmpWindows,
+                # no por keyword bars.
+                df = obtener_datos_con_hilos(
+                    symbol,
+                    tf,
+                    cfg={"fmpWindows": fmp_windows},
+                )
                 if df is not None and not df.empty:
                     # Calcular indicadores (popula cache de indicadores)
                     _ = calcular_indicadores(df, tf, symbol=symbol)
@@ -352,6 +374,7 @@ def main() -> None:
             temporalidades,
             _ensure_globals_loaded,
             filtrar_activos_por_moneda,
+            compute_analysis_transaction_units,
             activos,
             compute_lock_ttl,
             acquire_user_lock,
@@ -370,6 +393,7 @@ def main() -> None:
             es_grafico_de_velas,
             analizar_con_yolo,
             descontar_transaccion,
+            reponer_transaccion,
             STOP_EVENTS,
             STOP_EVENTS_LOCK,
             _optimize_records_for_upload,
@@ -516,6 +540,7 @@ def main() -> None:
             temporalidades=temporalidades,
             ensure_globals_loaded=_ensure_globals_loaded,
             filtrar_activos_por_moneda=filtrar_activos_por_moneda,
+            compute_analysis_transaction_units=compute_analysis_transaction_units,
             activos_ref=activos,
             compute_lock_ttl=compute_lock_ttl,
             acquire_user_lock=acquire_user_lock,
@@ -534,6 +559,7 @@ def main() -> None:
             es_grafico_de_velas=es_grafico_de_velas,
             analizar_con_yolo=analizar_con_yolo,
             descontar_transaccion=descontar_transaccion,
+            reponer_transaccion=reponer_transaccion,
             stop_events_ref=STOP_EVENTS,
             stop_events_lock=STOP_EVENTS_LOCK,
             optimize_records_for_upload=_optimize_records_for_upload,
@@ -561,6 +587,7 @@ def main() -> None:
             merge_bars_series=merge_bars_series,
             backfill_internal_gaps=_backfill_internal_gaps,
             bucket_name=BUCKET_NAME,
+            gcs_client=get_gcs_client(),
             indicators_cache=_INDICATORS_CACHE,
             cache_enabled=_INDICATORS_CACHE_ENABLED,
             ttl_hours=_INDICATORS_CACHE_TTL_HOURS,

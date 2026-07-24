@@ -13,6 +13,20 @@ except Exception:
     load_dotenv = None
 
 
+def _default_hist_dir() -> str:
+    configured = os.environ.get("HIST_DIR")
+    if configured:
+        return configured
+    fallback_enabled = os.environ.get("MARKETTOOL_VPS_FALLBACK_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    storage_root = os.environ.get("MARKETTOOL_VPS_STORAGE_ROOT")
+    if fallback_enabled and storage_root:
+        return os.path.join(storage_root, "historicos")
+    if os.environ.get("MARKETTOOL_CLOUD_BACKEND", "").strip().lower() in {"vps", "postgres", "local", "filesystem", "fs", "vps_gcp", "vps-gcp", "vps_fallback_gcp", "vps-fallback-gcp"}:
+        root = storage_root or "/app/storage/markettool-json"
+        return os.path.join(root, "historicos")
+    return "historicos"
+
+
 @dataclass
 class AppConfig:
     storage_format: str = field(default_factory=lambda: os.environ.get("STORAGE_FORMAT", "json").strip().lower())
@@ -21,7 +35,7 @@ class AppConfig:
     http_timeout: int = field(default_factory=lambda: int(os.environ.get("HTTP_TIMEOUT", "10")))
     http_retries: int = field(default_factory=lambda: int(os.environ.get("HTTP_RETRIES", "3")))
     http_backoff: float = field(default_factory=lambda: float(os.environ.get("HTTP_BACKOFF", "1.8")))
-    hist_dir: str = field(default_factory=lambda: os.environ.get("HIST_DIR", "historicos"))
+    hist_dir: str = field(default_factory=_default_hist_dir)
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
     econ_chunk_days: int = field(default_factory=lambda: int(os.environ.get("ECON_CHUNK_DAYS", "31")))
     cache_ttl_config: int = field(default_factory=lambda: int(os.environ.get("CACHE_TTL_CONFIG", "600")))

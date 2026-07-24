@@ -6,6 +6,8 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
+from flask import abort, send_file
+
 from markettool.interfaces.api.historicos_routes import register_historicos_routes
 from markettool.interfaces.api.quotes_routes import register_quotes_routes
 from markettool.interfaces.api.analysis_routes import register_analysis_routes
@@ -19,10 +21,16 @@ from markettool.interfaces.api.risk_management_routes import register_risk_manag
 from markettool.interfaces.api.signal_validation_routes import register_signal_validation_routes
 from markettool.interfaces.api.mt5_routes import register_mt5_routes
 from markettool.interfaces.api.bot_inject_routes import register_bot_inject_routes
+from markettool.interfaces.api.bot_orchestrator_routes import register_bot_orchestrator_routes
 from markettool.interfaces.api.ponderacion_routes import register_ponderacion_routes
 from markettool.interfaces.api.ponderacion_history import PonderacionHistory
 from markettool.interfaces.api.ponderacion_alerts import PonderacionAlert
 from markettool.interfaces.api.payment_routes import register_payment_routes
+from markettool.interfaces.api.whatsapp_routes import register_whatsapp_routes
+from markettool.interfaces.api.live_entries_routes import register_live_entries_routes
+from markettool.interfaces.api.fmp_ledger_routes import register_fmp_ledger_routes
+from markettool.interfaces.api.firestore_vps_routes import register_firestore_vps_routes
+from markettool.infra.storage.vps_json_store import VpsJsonStore, vps_storage_routes_enabled
 # backtest_routes removed — backtest is now 100% client-side
 
 if TYPE_CHECKING:
@@ -110,14 +118,16 @@ def register_all_routes(
     register_hexagonal_analysis_routes(app)
     register_risk_management_routes(app)
     register_signal_validation_routes(app)
-
-    # By default keep broker execution APIs disabled in production hardening mode.
+    # Broker execution APIs disabled by default in production hardening mode.
     if _env_flag("ENABLE_BROKER_EXECUTION", default=False):
         register_mt5_routes(app)
         register_bot_inject_routes(app)
+        register_bot_orchestrator_routes(app)
         logger.info("Broker execution routes enabled (ENABLE_BROKER_EXECUTION=true)")
     else:
         logger.info("Broker execution routes disabled (set ENABLE_BROKER_EXECUTION=true to enable)")
+
+    register_fmp_ledger_routes(app)
 
     # Ponderacion API routes
     ponderacion_cache = _PonderacionCacheAdapter(logger=logger)
@@ -135,6 +145,14 @@ def register_all_routes(
     register_payment_routes(app)
     logger.info("✅ Payment routes registered")
 
+    # WhatsApp support routes (UltraMsg external service)
+    register_whatsapp_routes(app)
+    logger.info("✅ WhatsApp routes registered")
+
+    # Firestore-compatible REST routes for VPS/PostgreSQL mode.
+    register_firestore_vps_routes(app)
+    logger.info("✅ Firestore VPS compatibility routes registered")
+
     # Legacy routes migrated into hexagonal registration
     legacy_services = getattr(container, "legacy_services", None)
     if legacy_services is not None:
@@ -142,6 +160,7 @@ def register_all_routes(
         register_webhook_routes(app, services=legacy_services)
         register_monitoreo_routes(app, services=legacy_services)
         register_cache_routes_legacy(app, services=legacy_services)
+        register_live_entries_routes(app, services=legacy_services)
         # backtest routes removed — backtest is now 100% client-side
         logger.info("✅ Legacy routes registered via container")
     
@@ -153,5 +172,22 @@ def register_all_routes(
             "service": "MarketTool API",
             "version": "2.0.0",
         }, 200
+
+    @app.route("/storage/files/<path:rel_path>", methods=["GET", "HEAD"])
+    def storage_file(rel_path: str):
+        if not vps_storage_routes_enabled():
+            abort(404)
+        store = VpsJsonStore.from_env()
+        full_path = (store.root / rel_path).resolve()
+        root = store.root.resolve()
+        if root not in full_path.parents and full_path != root:
+            abort(400)
+        if not full_path.exists() or not full_path.is_file():
+            abort(404)
+        response = send_file(full_path, conditional=False, max_age=0)
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
     
     logger.info("✅ All API routes registered")

@@ -15,9 +15,9 @@ class LegacyMonitoreoUseCase:
     async def eventos(self, body: dict | None) -> Tuple[dict, int]:
         try:
             body = body or {}
-            user_id = str(body.get("user_id") or "").strip()
-            exec_id = str(body.get("exec_id") or "").strip()
-            symbol = str(body.get("symbol") or "").strip().upper()
+            user_id = str(body.get("user_id") or body.get("usuario_id") or "").strip()
+            exec_id = str(body.get("exec_id") or body.get("id_ejecucion") or "").strip()
+            symbol = str(body.get("symbol") or body.get("simbolo") or "").strip().upper()
             hours_back = int(body.get("hours_back", 6))
             minutes_fwd = int(body.get("minutes_fwd", 5))
             cursor_hash = str(body.get("cursor_hash") or "").strip()
@@ -100,7 +100,29 @@ class LegacyMonitoreoUseCase:
                 }
                 return out, 200
 
-            df = df[df["impact"].isin(["High", "Medium"])].copy()
+            impact_norm = (
+                df["impact"]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+            df = df[
+                impact_norm.eq("high")
+                | impact_norm.eq("medium")
+                | impact_norm.eq("alta")
+                | impact_norm.eq("media")
+                | impact_norm.eq("3")
+                | impact_norm.eq("2")
+                | impact_norm.str.contains("high", na=False)
+                | impact_norm.str.contains("medium", na=False)
+                | impact_norm.str.contains("alta", na=False)
+                | impact_norm.str.contains("media", na=False)
+            ].copy()
+            df["impact"] = impact_norm.loc[df.index].map(
+                lambda v: "High"
+                if v in {"high", "alta", "3"} or "high" in v or "alta" in v
+                else "Medium"
+            )
             df = self._services.filter_by_symbol_currencies(df, symbol)
 
             events = [

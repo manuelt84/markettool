@@ -20,6 +20,7 @@ class LegacyServices:
     temporalidades: Any
     ensure_globals_loaded: Callable[..., Any]
     filtrar_activos_por_moneda: Callable[..., Any]
+    compute_analysis_transaction_units: Callable[..., Any]
     activos_ref: Any
     compute_lock_ttl: Callable[..., Any]
     acquire_user_lock: Callable[..., Any]
@@ -38,6 +39,7 @@ class LegacyServices:
     es_grafico_de_velas: Callable[..., Any]
     analizar_con_yolo: Callable[..., Any]
     descontar_transaccion: Callable[..., Any]
+    reponer_transaccion: Callable[..., Any]
     stop_events_ref: dict
     stop_events_lock: Any
     optimize_records_for_upload: Callable[..., Any]
@@ -69,3 +71,4 @@ class LegacyServices:
     cache_enabled: bool
     ttl_hours: int
     force_recalc: bool
+    gcs_client: Any = None

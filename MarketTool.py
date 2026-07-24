@@ -115,6 +115,7 @@ import warnings
 from markettool.core.config import AppConfig, load_config
 from markettool.infra.http.session import build_session
 from markettool.infra.fmp import FMPClient, FMPError, FMPPlanNotAllowed, normalize_tf
+from markettool.infra.fmp.ledger import fmp_context, get_fmp_ledger_summary, record_fmp_call
 from markettool.infra.cache.redis_cache import (
     get_indicators_cache,
     get_ohlcv_cache,
@@ -125,6 +126,14 @@ from markettool.application.services import (
     get_risk_service,
     get_confluence_service,
     get_zone_validator,
+)
+from markettool.infra.storage.vps_json_store import (
+    PostgresDocumentStore,
+    VpsJsonStore,
+    gcp_to_vps_enabled,
+    hybrid_mode_enabled,
+    vps_to_gcp_enabled,
+    vps_mode_enabled,
 )
 try:
     import psutil
@@ -148,7 +157,7 @@ class PonderacionCache:
     Falls back to in-memory dict if Redis unavailable.
     Includes Pub/Sub for inter-pod cache invalidation.
     """
-    
+
     def __init__(self):
         self.redis_url = os.getenv("REDIS_URL", None)
         self.redis_client = None
@@ -170,7 +179,7 @@ class PonderacionCache:
                 print(f"[PonderacionCache] Redis connection failed ({e}). Using in-memory fallback.")
                 self.redis_client = None
                 self.pubsub_client = None
-    
+
     def _get_ttl_seconds(self, timeframe: str) -> int:
         """Returns TTL in seconds based on timeframe."""
         ttl_map = {
@@ -369,9 +378,50 @@ def _fmp_http_get(
     params: Dict[str, Any] | None = None,
     timeout: int | None = None,
     symbol: str | None = None,
+    source: str | None = None,
+    timeframe: str | None = None,
 ) -> requests.Response:
-    with _fmp_http_guard(symbol):
-        return HTTP_SESSION.get(url, params=params, timeout=timeout or APP_CONFIG.http_timeout)
+    start = time.perf_counter()
+    status_code = None
+    response_bytes = 0
+    error = None
+    rows = None
+    try:
+        with _fmp_http_guard(symbol):
+            resp = HTTP_SESSION.get(url, params=params, timeout=timeout or APP_CONFIG.http_timeout)
+        status_code = resp.status_code
+        try:
+            response_bytes = len(resp.content or b"")
+        except Exception:
+            response_bytes = 0
+        try:
+            payload = resp.json()
+            if isinstance(payload, list):
+                rows = len(payload)
+            elif isinstance(payload, dict):
+                historical = payload.get("historical")
+                if isinstance(historical, list):
+                    rows = len(historical)
+                else:
+                    rows = 1 if payload else 0
+        except Exception:
+            rows = None
+        return resp
+    except Exception as exc:
+        error = exc
+        raise
+    finally:
+        record_fmp_call(
+            url=url,
+            status_code=status_code,
+            elapsed_ms=int((time.perf_counter() - start) * 1000),
+            response_bytes=response_bytes,
+            symbol=symbol,
+            timeframe=timeframe,
+            rows=rows,
+            source=source,
+            error=str(error) if error else None,
+        )
 
 
 # Structured logging
@@ -695,13 +745,18 @@ def _mark_tf_stopped_by_subscription(exec_id: str, symbol: str, tf_canonical: st
         )
         tf_states[tf_canonical] = tf_state
 
-        ref.set(
-            {
-                "tf_states": tf_states,
-                "updated_at": now_ms,
-            },
-            merge=True,
-        )
+        payload = {
+            "tf_states": tf_states,
+            "updated_at": now_ms,
+        }
+        try:
+            ref.set(payload, merge=True)
+        except Exception as exc:
+            if not hybrid_mode_enabled():
+                raise
+            logger.warning("[HybridFirestore] Firestore set failed for monitoreos/%s: %s", doc_id, exc)
+        _mirror_firestore_set("monitoreos", doc_id, payload, merge=True)
+        _mirror_firestore_set_to_gcp("monitoreos", doc_id, payload, merge=True)
     except Exception:
         pass
 
@@ -938,6 +993,71 @@ ANALYSIS_GAP_LOOKBACK_BARS = {
     "1day": 30,
     "1week": 12,
 }
+
+ANALYSIS_DEEP_GAPFILL_ENABLED = (
+    os.environ.get("ANALYSIS_DEEP_GAPFILL_ENABLED", "false").strip().lower() == "true"
+)
+ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_MIN = int(
+    os.environ.get("ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_MIN", "12")
+)
+ANALYSIS_DEEP_GAPFILL_MIN_SECONDS_BETWEEN_CALLS = float(
+    os.environ.get("ANALYSIS_DEEP_GAPFILL_MIN_SECONDS_BETWEEN_CALLS", "3")
+)
+ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_RUN = int(
+    os.environ.get("ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_RUN", "3")
+)
+ANALYSIS_GAPFILL_TIME_BUDGET_SECONDS = float(
+    os.environ.get("ANALYSIS_GAPFILL_TIME_BUDGET_SECONDS", "5")
+)
+ANALYSIS_DEEP_GAPFILL_FULL_HISTORY = (
+    os.environ.get("ANALYSIS_DEEP_GAPFILL_FULL_HISTORY", "false").strip().lower()
+    in {"1", "true", "yes", "y", "on"}
+)
+ANALYSIS_DEEP_GAPFILL_LOOKBACK_BARS = {
+    "1min": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_1MIN", "360")),
+    "5min": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_5MIN", "288")),
+    "15min": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_15MIN", "192")),
+    "30min": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_30MIN", "144")),
+    "1hour": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_1HOUR", "96")),
+    "4hour": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_4HOUR", "72")),
+    "1day": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_1DAY", "45")),
+    "1week": int(os.environ.get("ANALYSIS_DEEP_GAPFILL_LOOKBACK_1WEEK", "16")),
+}
+_DEEP_GAPFILL_RATE_LOCK = threading.Lock()
+_DEEP_GAPFILL_RATE_MINUTE = -1
+_DEEP_GAPFILL_RATE_COUNT = 0
+_DEEP_GAPFILL_LAST_CALL_TS = 0.0
+_DEEP_GAPFILL_REDIS_CLIENT = None
+FMP_RANGE_VALIDATION_ENABLED = (
+    os.environ.get("FMP_RANGE_VALIDATION_ENABLED", "true").strip().lower() == "true"
+)
+FMP_RANGE_OUT_OF_RANGE_WARN_RATIO = float(
+    os.environ.get("FMP_RANGE_OUT_OF_RANGE_WARN_RATIO", "0.25")
+)
+FMP_RANGE_ADAPTIVE_ENABLED = (
+    os.environ.get("FMP_RANGE_ADAPTIVE_ENABLED", "true").strip().lower() == "true"
+)
+FMP_RANGE_ADAPTIVE_CLIP_RATIO = float(
+    os.environ.get("FMP_RANGE_ADAPTIVE_CLIP_RATIO", "0.75")
+)
+FMP_RANGE_ADAPTIVE_MIN_BARS = int(
+    os.environ.get("FMP_RANGE_ADAPTIVE_MIN_BARS", "30")
+)
+FMP_RANGE_ADAPTIVE_TTL_SECONDS = int(
+    os.environ.get("FMP_RANGE_ADAPTIVE_TTL_SECONDS", "21600")
+)
+FMP_RANGE_ADAPTIVE_DEFAULT_MAX_BARS = int(
+    os.environ.get("FMP_RANGE_ADAPTIVE_DEFAULT_MAX_BARS", "180")
+)
+GCS_HISTORY_INCREMENTAL_MIN_COVERAGE = float(
+    os.environ.get("GCS_HISTORY_INCREMENTAL_MIN_COVERAGE", "0.20")
+)
+GCS_HISTORY_INCREMENTAL_ALLOW_INVALID = (
+    os.environ.get("GCS_HISTORY_INCREMENTAL_ALLOW_INVALID", "false").strip().lower() == "true"
+)
+_FMP_RANGE_ADAPTIVE_HINTS: dict[tuple[str, str], tuple[int, float]] = {}
+_FMP_RANGE_STATS_LOCK = threading.Lock()
+_FMP_RANGE_STATS: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _should_force_fresh_intraday(tf: str) -> bool:
@@ -1385,15 +1505,15 @@ def _parse_history_refresh_ttl_minutes() -> dict[str, int]:
     """
     Cache-first TTL (minutes) per timeframe.
     Env override:
-      HISTORY_REFRESH_TTL_MINUTES="1min:1,5min:5,15min:15,30min:30,1hour:60,4hour:240,1day:1440,1week:10080"
+      HISTORY_REFRESH_TTL_MINUTES="1min:5,5min:15,15min:45,30min:90,1hour:180,4hour:480,1day:1440,1week:10080"
     """
     policy = {
-        "1min": 1,
-        "5min": 5,
-        "15min": 15,
-        "30min": 30,
-        "1hour": 60,
-        "4hour": 240,
+        "1min": 5,
+        "5min": 15,
+        "15min": 45,
+        "30min": 90,
+        "1hour": 180,
+        "4hour": 480,
         "1day": 1440,
         "1week": 10080,
     }
@@ -1674,11 +1794,13 @@ class HistoryManager:
                     try:
                         if _is_intraday(tf):
                             base_tf = self._base_interval_for(tf)
-                            raw = self.client.historical_intraday(symbol, base_tf, from_dt, to_dt)
+                            with fmp_context(source="history_manager", symbol=symbol, timeframe=base_tf):
+                                raw = self.client.historical_intraday(symbol, base_tf, from_dt, to_dt)
                             raw = ensure_utc_index(raw)
                             new_df = self._maybe_resample(raw, tf)
                         else:
-                            raw = self.client.historical_eod(symbol, from_dt, to_dt)
+                            with fmp_context(source="history_manager", symbol=symbol, timeframe=tf):
+                                raw = self.client.historical_eod(symbol, from_dt, to_dt)
                             raw = ensure_utc_index(raw)
                             new_df = self._maybe_resample_eod(raw, tf) if tf in EOD_RESAMPLE_RULE else raw
                     except FMPPlanNotAllowed:
@@ -1953,6 +2075,8 @@ _analysis_pred_monitor = ExecutorHealthMonitor("ANALYSIS_PRED")
 subscriptions = {}
 subscriptions_type = {}
 admin_ids = {}
+_admin_role_cache: dict[str, tuple[float, bool]] = {}
+_admin_role_cache_lock = threading.Lock()
 
 # ✅ FIX: Use RLock (Reentrant Lock) to allow same thread to acquire lock multiple times
 user_states_lock = threading.RLock()  # Reentrant: safe for nested lock acquisitions
@@ -2145,10 +2269,163 @@ if not API_KEY:
 # These are initialized on-demand, not at import time
 _db = None
 _storage_client = None
+_vps_json_store = None
+_postgres_doc_store = None
+_HYBRID_MIRROR_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, int(os.environ.get("MARKETTOOL_HYBRID_MIRROR_WORKERS", "2")))
+)
+_HYBRID_MIRROR_PENDING = 0
+_HYBRID_MIRROR_LOCK = threading.Lock()
+_HYBRID_MIRROR_WARN_PENDING = max(100, int(os.environ.get("MARKETTOOL_HYBRID_MIRROR_WARN_PENDING", "5000")))
+
+
+def _submit_hybrid_mirror(label: str, fn, *args, **kwargs) -> None:
+    """Queue fallback backup work without blocking analysis requests."""
+    if not hybrid_mode_enabled():
+        return
+
+    global _HYBRID_MIRROR_PENDING
+    with _HYBRID_MIRROR_LOCK:
+        _HYBRID_MIRROR_PENDING += 1
+        pending = _HYBRID_MIRROR_PENDING
+        if pending >= _HYBRID_MIRROR_WARN_PENDING:
+            logger.warning(
+                "[HybridMirror] queue high (%s pending), still running %s asynchronously",
+                pending,
+                label,
+            )
+
+    def _run():
+        global _HYBRID_MIRROR_PENDING
+        try:
+            fn(*args, **kwargs)
+        except Exception as exc:
+            logger.warning("[HybridMirror] %s failed: %s", label, exc)
+        finally:
+            with _HYBRID_MIRROR_LOCK:
+                _HYBRID_MIRROR_PENDING = max(0, _HYBRID_MIRROR_PENDING - 1)
+
+    _HYBRID_MIRROR_EXECUTOR.submit(_run)
+
+
+def get_vps_json_store() -> VpsJsonStore:
+    """Lazy-load VPS/local JSON storage."""
+    global _vps_json_store
+    if _vps_json_store is None:
+        _vps_json_store = VpsJsonStore.from_env()
+    return _vps_json_store
+
+
+def _mirror_bytes_to_vps(path: str, payload: bytes) -> None:
+    """Best-effort backup for hybrid mode: GCP is primary, VPS is fallback."""
+    if not gcp_to_vps_enabled():
+        return
+    _submit_hybrid_mirror("storage bytes", get_vps_json_store().write_bytes, path, payload)
+
+
+def _mirror_file_to_vps(path: str, source_path: str) -> None:
+    if not gcp_to_vps_enabled():
+        return
+    try:
+        payload = Path(source_path).read_bytes()
+    except Exception as exc:
+        logger.warning("[HybridMirror] could not snapshot storage file %s: %s", source_path, exc)
+        return
+    _submit_hybrid_mirror("storage file", get_vps_json_store().write_bytes, path, payload)
+
+
+def _mirror_bytes_to_gcp(path: str, payload: bytes, content_type: str = "application/octet-stream") -> None:
+    """Best-effort backup for hybrid mode: VPS is primary, GCP is fallback."""
+    if not vps_to_gcp_enabled():
+        return
+
+    def _write():
+        client = storage.Client()
+        bucket = client.bucket(BUCKET_NAME)
+        blob = bucket.blob(path)
+        blob.upload_from_string(payload, content_type=content_type)
+        try:
+            blob.make_public()
+        except Exception:
+            pass
+
+    _submit_hybrid_mirror("storage bytes to gcp", _write)
+
+
+def _mirror_file_to_gcp(path: str, source_path: str, content_type: str = "application/octet-stream") -> None:
+    if not vps_to_gcp_enabled():
+        return
+    try:
+        payload = Path(source_path).read_bytes()
+    except Exception as exc:
+        logger.warning("[HybridMirror] could not snapshot storage file %s for GCP: %s", source_path, exc)
+        return
+    _mirror_bytes_to_gcp(path, payload, content_type=content_type)
+
+
+def get_postgres_doc_store() -> Optional[PostgresDocumentStore]:
+    """Lazy-load PostgreSQL metadata store used in VPS mode."""
+    global _postgres_doc_store
+    if _postgres_doc_store is None:
+        _postgres_doc_store = PostgresDocumentStore.from_env()
+    return _postgres_doc_store
+
+
+def _mirror_firestore_set(collection: str, doc_id: str, data: dict[str, Any], *, merge: bool = False) -> None:
+    """Best-effort Firestore metadata backup for hybrid mode."""
+    if not gcp_to_vps_enabled():
+        return
+
+    def _write():
+        store = get_postgres_doc_store()
+        if store is not None:
+            store.set_document(str(collection), str(doc_id), data or {}, merge=merge)
+
+    _submit_hybrid_mirror(f"firestore set {collection}/{doc_id}", _write)
+
+
+def _mirror_firestore_update(collection: str, doc_id: str, data: dict[str, Any]) -> None:
+    """Best-effort Firestore metadata update backup for hybrid mode."""
+    if not gcp_to_vps_enabled():
+        return
+
+    def _write():
+        store = get_postgres_doc_store()
+        if store is not None:
+            store.update_document(str(collection), str(doc_id), data or {})
+
+    _submit_hybrid_mirror(f"firestore update {collection}/{doc_id}", _write)
+
+
+def _mirror_firestore_set_to_gcp(collection: str, doc_id: str, data: dict[str, Any], *, merge: bool = False) -> None:
+    """Best-effort Firestore metadata backup when VPS is primary and GCP is fallback."""
+    if not vps_to_gcp_enabled():
+        return
+
+    def _write():
+        firestore.Client().collection(str(collection)).document(str(doc_id)).set(data or {}, merge=merge)
+
+    _submit_hybrid_mirror(f"firestore set to gcp {collection}/{doc_id}", _write)
+
+
+def _mirror_firestore_update_to_gcp(collection: str, doc_id: str, data: dict[str, Any]) -> None:
+    """Best-effort Firestore metadata update when VPS is primary and GCP is fallback."""
+    if not vps_to_gcp_enabled():
+        return
+
+    def _write():
+        firestore.Client().collection(str(collection)).document(str(doc_id)).update(data or {})
+
+    _submit_hybrid_mirror(f"firestore update to gcp {collection}/{doc_id}", _write)
 
 def get_firestore_db():
     """Lazy-load Firestore client on first use."""
     global _db
+    if vps_mode_enabled():
+        store = get_postgres_doc_store()
+        if store is None:
+            raise RuntimeError("MARKETTOOL_CLOUD_BACKEND=vps requiere MARKETTOOL_POSTGRES_DSN o DATABASE_URL")
+        return store
     if _db is None:
         try:
             _db = firestore.Client()
@@ -2242,6 +2519,8 @@ db = _LazyFirestoreProxy()
 def get_gcs_client():
     """Lazy-load GCS client on first use."""
     global _storage_client
+    if vps_mode_enabled():
+        return get_vps_json_store()
     if _storage_client is None:
         try:
             _storage_client = storage.Client()
@@ -2352,6 +2631,30 @@ _TF_MINUTES = {
     '1day': 1440,
     '1week': 10080,
 }
+
+SR_MAX_CANDLES_BY_TF = {
+    '1min': 900,
+    '5min': 900,
+    '15min': 900,
+    '30min': 900,
+    '1hour': 900,
+    '4hour': 700,
+    '1day': 420,
+    '1week': 260,
+}
+
+SR_DYNAMIC_MAX_FACTOR_BY_TF = {
+    '1min': 5,
+    '5min': 5,
+    '15min': 5,
+    '30min': 4,
+    '1hour': 4,
+    '4hour': 3,
+    '1day': 2,
+    '1week': 2,
+}
+
+SR_LEVEL_CANDIDATE_LIMIT = int(os.getenv("SR_LEVEL_CANDIDATE_LIMIT", "64"))
 
 TF_MAP = {
     '1m':'1min','5m':'5min','15m':'15min','30m':'30min',
@@ -2630,7 +2933,14 @@ def fs_marcar_worker(
         payload["updated_at_server"] = SERVER_TS
 
     # merge=True para no pisar otros campos (resumen, urls, etc.)
-    db.collection("ejecuciones").document(exec_id).set(payload, merge=True)
+    try:
+        db.collection("ejecuciones").document(exec_id).set(payload, merge=True)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore set failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_set("ejecuciones", exec_id, payload, merge=True)
+    _mirror_firestore_set_to_gcp("ejecuciones", exec_id, payload, merge=True)
 
 
 def fs_heartbeat(exec_id: str, progress: dict | None = None):
@@ -2659,7 +2969,14 @@ def fs_heartbeat(exec_id: str, progress: dict | None = None):
             "timestamp": ts
         }
     
-    db.collection("ejecuciones").document(exec_id).set(update_data, merge=True)
+    try:
+        db.collection("ejecuciones").document(exec_id).set(update_data, merge=True)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore heartbeat failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_set("ejecuciones", exec_id, update_data, merge=True)
+    _mirror_firestore_set_to_gcp("ejecuciones", exec_id, update_data, merge=True)
     
     # ⬇️ Mantén vivo el user_state (sirve para que el watchdog no lo resetee por error)
     try:
@@ -2668,9 +2985,16 @@ def fs_heartbeat(exec_id: str, progress: dict | None = None):
         # la ejecución guarda ambos; usa el que haya
         key = d.get("user_id") or (f"tg_{d.get('chat_id')}" if d.get("chat_id") else None)
         if key:
-            db.collection("user_states").document(key).set(
-                {"updated_at_unix": ts}, merge=True
-            )
+            user_state_payload = {"updated_at_unix": ts}
+            try:
+                db.collection("user_states").document(key).set(
+                    user_state_payload, merge=True
+                )
+            except Exception:
+                if not hybrid_mode_enabled():
+                    raise
+            _mirror_firestore_set("user_states", key, user_state_payload, merge=True)
+            _mirror_firestore_set_to_gcp("user_states", key, user_state_payload, merge=True)
     except Exception:
         pass
 
@@ -3665,7 +3989,14 @@ def fs_crear_ejecucion(
         "created_at": firestore.SERVER_TIMESTAMP,
         "updated_at": firestore.SERVER_TIMESTAMP,
     })
-    db.collection("ejecuciones").document(exec_id).set(payload)
+    try:
+        db.collection("ejecuciones").document(exec_id).set(payload)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore create failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_set("ejecuciones", exec_id, payload, merge=False)
+    _mirror_firestore_set_to_gcp("ejecuciones", exec_id, payload, merge=False)
     return exec_id
 
 #@profile
@@ -3674,15 +4005,30 @@ def fs_actualizar_ejecucion(exec_id: str, **campos):
     if not isinstance(campos, dict):
         campos = {}
     campos["updated_at"] = firestore.SERVER_TIMESTAMP
-    db.collection("ejecuciones").document(exec_id).update(campos)
+    try:
+        db.collection("ejecuciones").document(exec_id).update(campos)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore update failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_update("ejecuciones", exec_id, campos)
+    _mirror_firestore_update_to_gcp("ejecuciones", exec_id, campos)
 
 #@profile
 def fs_finalizar_ejecucion(exec_id: str, estado: str = "completado", resumen: dict | None = None):
-    db.collection("ejecuciones").document(exec_id).update({
+    payload = {
         "estado": str(estado),
         "resumen": _sanitize_for_firestore(resumen or {}),
         "updated_at": firestore.SERVER_TIMESTAMP
-    })
+    }
+    try:
+        db.collection("ejecuciones").document(exec_id).update(payload)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore finalize failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_update("ejecuciones", exec_id, payload)
+    _mirror_firestore_update_to_gcp("ejecuciones", exec_id, payload)
 
 #@profile
 def fs_registrar_archivo_generado(
@@ -3704,11 +4050,28 @@ def fs_registrar_archivo_generado(
         "metadata": metadata or {},
         "created_at": firestore.SERVER_TIMESTAMP,
     })
-    db.collection("archivos_generados").add(payload)
-    db.collection("ejecuciones").document(exec_id).update({
+    archivo_doc_id = uuid.uuid4().hex
+    try:
+        db.collection("archivos_generados").document(archivo_doc_id).set(payload)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore create failed for archivos_generados/%s: %s", archivo_doc_id, exc)
+    _mirror_firestore_set("archivos_generados", archivo_doc_id, payload, merge=False)
+    _mirror_firestore_set_to_gcp("archivos_generados", archivo_doc_id, payload, merge=False)
+
+    exec_update = {
         "archivos": firestore.Increment(1),
         "updated_at": firestore.SERVER_TIMESTAMP
-    })
+    }
+    try:
+        db.collection("ejecuciones").document(exec_id).update(exec_update)
+    except Exception as exc:
+        if not hybrid_mode_enabled():
+            raise
+        logger.warning("[HybridFirestore] Firestore archivo counter failed for ejecuciones/%s: %s", exec_id, exc)
+    _mirror_firestore_update("ejecuciones", exec_id, exec_update)
+    _mirror_firestore_update_to_gcp("ejecuciones", exec_id, exec_update)
 
 #@profile
 async def guardar_json_en_storage_y_registrar(
@@ -3741,7 +4104,7 @@ async def guardar_json_en_storage_y_registrar(
         chat_id=chat_id, 
         tipo="json", 
         nombre=nombre, 
-        gcs_path=object_path,
+        gcs_path=f"analisis/{object_path}",
         signed_url=url_publica, 
         content_type="application/json",
         metadata=metadata or {},
@@ -3821,11 +4184,10 @@ def _universe_symbols() -> set:
         out.update(forex or [])
     except Exception:
         pass
-    # si tienes categorías, agrega todo
+    # si tienes categorías, agrega solo activos hoja; las categorías/subcategorías
+    # son navegación de menú, no símbolos para precalentar.
     try:
-        for k, arr in (categorias or {}).items():
-            if isinstance(arr, list):
-                out.update(arr)
+        out.update(_categorized_assets())
     except Exception:
         pass
     cleaned = set(s.strip().upper() for s in out if isinstance(s, str) and s.strip())
@@ -3855,6 +4217,39 @@ def _memory_usage_percent() -> Optional[float]:
     except Exception:
         return None
 
+
+def _acquire_cache_warmup_distributed_lock(reason: str) -> bool:
+    if str(os.getenv("CACHE_WARMUP_DISTRIBUTED_LOCK", "true")).strip().lower() not in {"1", "true", "yes", "on"}:
+        return True
+    if redis is None:
+        logger.info("[Warmup] %s: Redis no disponible para lock distribuido; continua con coordinador local", reason)
+        return True
+    redis_url = (
+        os.getenv("MARKET_DATA_REDIS_URL")
+        or os.getenv("LIVE_ENTRIES_REDIS_URL")
+        or os.getenv("REDIS_URL")
+        or ""
+    ).strip()
+    if not redis_url:
+        logger.info("[Warmup] %s: sin Redis compartido para lock distribuido; continua", reason)
+        return True
+    ttl = max(300, int(os.getenv("CACHE_WARMUP_DISTRIBUTED_LOCK_TTL_SECONDS", "3600")))
+    key = os.getenv("CACHE_WARMUP_DISTRIBUTED_LOCK_KEY", "cache_warmup:distributed_lock")
+    owner = f"{os.getenv('MARKET_DATA_NODE_ID') or os.getenv('WORKER_ID') or os.getpid()}:{reason}:{int(time.time())}"
+    try:
+        client = redis.Redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=1, socket_timeout=2)
+        acquired = bool(client.set(key, owner, nx=True, ex=ttl))
+        if not acquired:
+            current = client.get(key) or "unknown"
+            logger.info("[Warmup] %s: SKIPPED por lock distribuido activo owner=%s", reason, current)
+            return False
+        logger.info("[Warmup] %s: lock distribuido adquirido owner=%s ttl=%ss", reason, owner, ttl)
+        return True
+    except Exception as exc:
+        logger.info("[Warmup] %s: lock distribuido no disponible (%s); continua", reason, exc)
+        return True
+
+
 async def warmup_cache_all_assets(reason: str = "scheduled"):
     """
     Precalienta cachés para historicos, indicadores, noticias y eventos.
@@ -3869,6 +4264,9 @@ async def warmup_cache_all_assets(reason: str = "scheduled"):
     # Verificación de liderazgo: solo si EXPLÍCITAMENTE está configurado que solo el líder lo haga
     if APP_CONFIG.cache_warmup_leader_only and not _POD_COORDINATOR.should_run_scheduled_task("warmup_cache"):
         logger.info("[Warmup] %s: SKIPPED (leader-only mode, this pod is not the leader)", reason)
+        return
+
+    if not _acquire_cache_warmup_distributed_lock(reason):
         return
 
     _ensure_globals_loaded()
@@ -5038,6 +5436,19 @@ async def subir_a_bucket_y_obtener_url(fuente, nombre_remoto=None, carpeta='anal
 
     def _upload_sync():
         """Operación sincrónica envuelta para ejecutarse en thread pool"""
+        object_path = f"{carpeta}/{nombre_remoto}".replace("//", "/")
+        if vps_mode_enabled():
+            store = get_vps_json_store()
+            if isinstance(fuente, BytesIO):
+                fuente.seek(0)
+                payload = fuente.getvalue()
+                url = store.write_bytes(object_path, payload)
+                _mirror_bytes_to_gcp(object_path, payload, content_type=content_type)
+                return url
+            url = store.upload_file(fuente, object_path)
+            _mirror_file_to_gcp(object_path, fuente, content_type=content_type)
+            return url
+
         client = storage.Client()
         bucket = client.bucket(BUCKET_NAME)
         blob = bucket.blob(f"{carpeta}/{nombre_remoto}")
@@ -5046,11 +5457,14 @@ async def subir_a_bucket_y_obtener_url(fuente, nombre_remoto=None, carpeta='anal
         if isinstance(fuente, BytesIO):
             # Upload desde buffer en memoria (sin I/O a disco)
             fuente.seek(0)  # Reset position to start
-            blob.upload_from_string(fuente.getvalue(), content_type=content_type)
-            logger.info(f"[BytesIO Upload] {nombre_remoto} ({len(fuente.getvalue())} bytes)")
+            payload = fuente.getvalue()
+            blob.upload_from_string(payload, content_type=content_type)
+            _mirror_bytes_to_vps(object_path, payload)
+            logger.info(f"[BytesIO Upload] {nombre_remoto} ({len(payload)} bytes)")
         else:
             # Upload desde archivo en disco (compatibilidad)
             blob.upload_from_filename(fuente)
+            _mirror_file_to_vps(object_path, fuente)
             logger.info(f"[File Upload] {nombre_remoto}")
         
         blob.make_public()  # O usar signed_url si prefieres enlaces temporales
@@ -5359,6 +5773,39 @@ def acquire_user_lock(
     lease_until = now_unix + ttl
 
     doc_ref = _user_state_doc_by_uuid(uuid)
+
+    if vps_mode_enabled():
+        try:
+            snap = doc_ref.get()
+            data = snap.to_dict() or {}
+
+            current_owner = str(data.get("lock_owner") or "")
+            current_lease = int(data.get("lease_until_unix") or 0)
+            current_state = str(data.get("estado") or "").lower()
+
+            if current_lease > now_unix and current_state in USER_STATE_BUSY_VALUES:
+                current_lock_id = str(data.get("lock_id") or "")
+                if current_lock_id and current_lock_id != lock_id:
+                    return False
+                if not current_lock_id:
+                    return False
+
+            doc_ref.set(
+                {
+                    "estado": "ocupado",
+                    "lock_owner": MY_ID,
+                    "lock_id": lock_id,
+                    "lease_until_unix": lease_until,
+                    "updated_at_unix": now_unix,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                merge=True,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[user_lock] acquire failed: {e}")
+            return False
+
     transaction = db.transaction()
 
     @firestore.transactional
@@ -5372,8 +5819,10 @@ def acquire_user_lock(
 
         # Lock válido si lease no expiró
         if current_lease > now_unix and current_state in USER_STATE_BUSY_VALUES:
-            # Si otro pod tiene lock, no adquirimos
-            if current_owner and current_owner != MY_ID:
+            current_lock_id = str(data.get("lock_id") or "")
+            if current_lock_id and current_lock_id != lock_id:
+                return False
+            if not current_lock_id:
                 return False
 
         payload = {
@@ -6085,7 +6534,8 @@ class LazyHistoricosLoader:
         Guarda un DataFrame en el caché (manualmente).
         Útil para actualizar caché después de cargar de GCS o FMP.
         """
-        cache_key = f"{symbol.upper()}"
+        safe_tf = normalize_tf(temporalidad)
+        cache_key = f"{symbol.upper()}__{safe_tf}"
         with self._lock:
             # Eviction si es necesario
             if len(self._cache) >= self.maxsize:
@@ -6096,7 +6546,7 @@ class LazyHistoricosLoader:
             
             self._cache[cache_key] = df.copy()
             self._cache_times[cache_key] = time.time()
-            logger.debug(f"[LazyLoader] Cached {symbol} ({len(df)} rows)")
+            logger.debug(f"[LazyLoader] Cached {symbol}/{safe_tf} ({len(df)} rows)")
     
     def clear_cache(self):
         """Limpia el caché completo."""
@@ -6108,7 +6558,7 @@ class LazyHistoricosLoader:
 
 # Instancia global del lazy loader
 _LAZY_HIST_LOADER = LazyHistoricosLoader(
-    hist_dir=os.environ.get("HIST_DIR", "historicos"),
+    hist_dir=APP_CONFIG.hist_dir,
     maxsize=APP_CONFIG.cache_max_size_historicos,
     ttl_seconds=APP_CONFIG.cache_ttl_historicos
 )
@@ -6121,13 +6571,15 @@ _LAZY_HIST_LOADER = LazyHistoricosLoader(
 _GCS_CLIENT = None
 _GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
 _GCS_ENABLED = os.environ.get("GCS_ENABLED", "true").lower() == "true"
-_GCS_BACKUP_THROTTLE_SECONDS = 600  # ✅ Increased from 300s (5min) to 600s (10min) - lazy-load optimization
+_GCS_BACKUP_THROTTLE_SECONDS = int(os.environ.get("GCS_BACKUP_THROTTLE_SECONDS", "1800"))
 _last_gcs_backup_time = {}  # {(symbol, tf): timestamp}
 _last_gcs_backup_hash = {}  # {(symbol, tf): data_hash} - detect delta changes
 
 def _get_gcs_bucket():
     """Inicializa lazy el cliente de GCS."""
     global _GCS_CLIENT
+    if vps_mode_enabled():
+        return get_vps_json_store()
     if not _GCS_ENABLED:
         return None
     
@@ -6157,12 +6609,15 @@ def load_from_gcs(symbol: str, tf: str) -> Optional[pd.DataFrame]:
         safe_tf = normalize_tf(tf)
         gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
         
-        blob = bucket.blob(gcs_path)
-        if not blob.exists():
-            return None
-        
-        # Descargar y parsear
-        json_data = blob.download_as_text(encoding="utf-8")
+        if vps_mode_enabled():
+            if not bucket.exists(gcs_path):
+                return None
+            json_data = bucket.read_bytes(gcs_path).decode("utf-8")
+        else:
+            blob = bucket.blob(gcs_path)
+            if not blob.exists():
+                return None
+            json_data = blob.download_as_text(encoding="utf-8")
         data = json.loads(json_data)
         
         # Soportar formato {"data": [...]} o directamente [...]
@@ -6186,7 +6641,7 @@ def load_from_gcs(symbol: str, tf: str) -> Optional[pd.DataFrame]:
         # Normalizar columnas OHLCV
         df = _ensure_cols(df)
         
-        logger.debug(f"[GCS] Loaded {symbol}/{tf} from gs://{_GCS_BUCKET_NAME}/{gcs_path} ({len(df)} rows)")
+        logger.debug(f"[Storage] Loaded {symbol}/{tf} from {gcs_path} ({len(df)} rows)")
         return df
     
     except Exception as e:
@@ -6233,14 +6688,21 @@ def save_to_gcs(symbol: str, tf: str, df: pd.DataFrame) -> bool:
         # Mantener solo últimas 1000 filas para no exceder límites
         payload = out[["time", "open", "high", "low", "close", "volume"]].tail(1000).to_dict(orient="records")
         
-        # Subir a GCS
-        blob = bucket.blob(gcs_path)
-        blob.upload_from_string(
-            json.dumps(payload, ensure_ascii=False),
-            content_type="application/json"
-        )
-        
-        logger.debug(f"[GCS] Saved {symbol}/{tf} to gs://{_GCS_BUCKET_NAME}/{gcs_path} ({len(payload)} rows)")
+        if vps_mode_enabled():
+            raw_payload = json.dumps(payload, ensure_ascii=False)
+            encoded_payload = raw_payload.encode("utf-8")
+            bucket.write_bytes(gcs_path, encoded_payload)
+            _mirror_bytes_to_gcp(gcs_path, encoded_payload, content_type="application/json")
+        else:
+            raw_payload = json.dumps(payload, ensure_ascii=False)
+            blob = bucket.blob(gcs_path)
+            blob.upload_from_string(
+                raw_payload,
+                content_type="application/json"
+            )
+            _mirror_bytes_to_vps(gcs_path, raw_payload.encode("utf-8"))
+
+        logger.debug(f"[Storage] Saved {symbol}/{tf} to {gcs_path} ({len(payload)} rows)")
         return True
     
     except Exception as e:
@@ -6256,9 +6718,11 @@ def save_to_gcs(symbol: str, tf: str, df: pd.DataFrame) -> bool:
 _FIRESTORE_CLIENT = None
 _FIRESTORE_ENABLED = os.environ.get("FIRESTORE_ENABLED", "true").lower() == "true"
 
-def _get_firestore_client() -> Optional[firestore.Client]:
+def _get_firestore_client():
     """Initializes Firestore client lazily."""
     global _FIRESTORE_CLIENT
+    if vps_mode_enabled():
+        return get_postgres_doc_store()
     if not _FIRESTORE_ENABLED:
         return None
     
@@ -6507,6 +6971,178 @@ def hash_dataframe(df: pd.DataFrame) -> str:
         return hashlib.sha256(f"{df.shape}_{time.time()}".encode()).hexdigest()[:16]
 
 
+def _history_expected_step_ms(tf: str) -> Optional[int]:
+    tf_norm = normalize_tf(tf)
+    return {
+        "1min": 60_000,
+        "5min": 300_000,
+        "15min": 900_000,
+        "30min": 1_800_000,
+        "1hour": 3_600_000,
+        "4hour": 14_400_000,
+        "1day": 86_400_000,
+        "1week": 604_800_000,
+    }.get(tf_norm)
+
+
+def _validate_history_series_for_persist(
+    df: pd.DataFrame,
+    symbol: str,
+    tf: str,
+    *,
+    source: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Normalize and score a full OHLCV series before local/Redis/GCS persistence."""
+    diag: dict[str, Any] = {
+        "symbol": str(symbol).upper(),
+        "tf": normalize_tf(tf),
+        "source": source,
+        "valid": False,
+        "rows": 0,
+        "first_ts": None,
+        "last_ts": None,
+        "duplicates_removed": 0,
+        "invalid_rows_removed": 0,
+        "gap_count": 0,
+        "max_gap_ms": 0,
+        "coverage_ratio": 0.0,
+        "span_ms": 0,
+    }
+    if df is None or getattr(df, "empty", True):
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]), diag
+
+    try:
+        out = df.copy()
+        if not isinstance(out.index, pd.DatetimeIndex):
+            if "time" in out.columns:
+                out["time"] = pd.to_datetime(out["time"], utc=True, errors="coerce")
+                out = out.dropna(subset=["time"]).set_index("time")
+            elif "date" in out.columns:
+                out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
+                out = out.dropna(subset=["date"]).set_index("date")
+            else:
+                out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
+
+        idx = pd.DatetimeIndex(pd.to_datetime(out.index, utc=True, errors="coerce"))
+        valid_idx = ~idx.isna()
+        diag["invalid_rows_removed"] += int((~valid_idx).sum())
+        out = out.loc[valid_idx].copy()
+        idx = idx[valid_idx]
+        if out.empty:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]), diag
+
+        out.index = idx
+        out = _ensure_cols(out).sort_index()
+        before_dupes = len(out)
+        out = out[~out.index.duplicated(keep="last")]
+        diag["duplicates_removed"] = int(before_dupes - len(out))
+
+        price_cols = ["open", "high", "low", "close"]
+        finite_price = np.isfinite(out[price_cols]).all(axis=1)
+        positive_price = (out[price_cols] > 0).all(axis=1)
+        high_ok = out["high"] >= out[["open", "close"]].max(axis=1)
+        low_ok = out["low"] <= out[["open", "close"]].min(axis=1)
+        volume_ok = out["volume"].isna() | (out["volume"] >= 0)
+        valid_rows = finite_price & positive_price & high_ok & low_ok & volume_ok
+        diag["invalid_rows_removed"] += int((~valid_rows).sum())
+        out = out.loc[valid_rows].copy()
+        if out.empty:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]), diag
+
+        first = out.index[0]
+        last = out.index[-1]
+        diag["valid"] = True
+        diag["rows"] = int(len(out))
+        diag["first_ts"] = first.isoformat()
+        diag["last_ts"] = last.isoformat()
+        diag["span_ms"] = int(max(0, (last - first).total_seconds() * 1000))
+
+        step_ms = _history_expected_step_ms(tf)
+        if len(out) > 1 and step_ms:
+            diffs_ms = pd.Series(out.index).diff().dropna().dt.total_seconds().mul(1000)
+            gaps = diffs_ms[diffs_ms > (step_ms * 1.5)]
+            diag["gap_count"] = int(len(gaps))
+            diag["max_gap_ms"] = int(diffs_ms.max()) if not diffs_ms.empty else 0
+            expected_rows = int(diag["span_ms"] // step_ms) + 1
+            if expected_rows > 0:
+                diag["coverage_ratio"] = round(float(max(0.0, min(1.0, len(out) / expected_rows))), 6)
+        else:
+            diag["coverage_ratio"] = 1.0
+
+        return out, diag
+    except Exception as exc:
+        logger.warning("[HIST][SERIES_VALIDATE] failed for %s/%s source=%s: %s", symbol, tf, source, exc)
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"]), diag
+
+
+def _history_quality_score(diag: dict[str, Any]) -> tuple:
+    if not diag or not diag.get("valid"):
+        return (0, 0.0, 0, 0, 0, "")
+    last_ts = diag.get("last_ts") or ""
+    return (
+        1,
+        int(diag.get("rows") or 0),
+        int(diag.get("span_ms") or 0),
+        float(diag.get("coverage_ratio") or 0.0),
+        -int(diag.get("gap_count") or 0),
+        str(last_ts),
+    )
+
+
+def _select_history_for_persistence(
+    symbol: str,
+    tf: str,
+    candidate_df: pd.DataFrame,
+) -> tuple[Optional[pd.DataFrame], dict[str, Any]]:
+    """Pick the best full series to persist without overwriting GCS with worse data."""
+    candidate, cand_diag = _validate_history_series_for_persist(candidate_df, symbol, tf, source="candidate")
+    decision: dict[str, Any] = {
+        "action": "skip_invalid_candidate",
+        "candidate": cand_diag,
+        "existing": None,
+        "selected": None,
+    }
+    if candidate.empty:
+        return None, decision
+
+    existing_df = None
+    try:
+        existing_df = load_from_gcs(symbol, tf)
+    except Exception as exc:
+        logger.debug("[HIST][PERSIST_SELECT] GCS load failed for %s/%s: %s", symbol, tf, exc)
+
+    if existing_df is None or getattr(existing_df, "empty", True):
+        decision["action"] = "save_candidate_no_existing"
+        decision["selected"] = cand_diag
+        return candidate, decision
+
+    existing, existing_diag = _validate_history_series_for_persist(existing_df, symbol, tf, source="gcs_existing")
+    decision["existing"] = existing_diag
+    if existing.empty:
+        decision["action"] = "replace_invalid_existing"
+        decision["selected"] = cand_diag
+        return candidate, decision
+
+    merged = merge_histories(existing, candidate)
+    merged, merged_diag = _validate_history_series_for_persist(merged, symbol, tf, source="merged")
+    merged_score = _history_quality_score(merged_diag)
+    existing_score = _history_quality_score(existing_diag)
+    candidate_score = _history_quality_score(cand_diag)
+
+    if merged_score > existing_score:
+        decision["action"] = "save_merged_improved"
+        decision["selected"] = merged_diag
+        return merged, decision
+    if candidate_score > existing_score:
+        decision["action"] = "replace_with_candidate_better"
+        decision["selected"] = cand_diag
+        return candidate, decision
+
+    decision["action"] = "skip_existing_better_or_equal"
+    decision["selected"] = existing_diag
+    return None, decision
+
+
 def merge_indicators_incremental(cached: dict, new: dict, split_index: int, window_context: int) -> dict:
     """
     Combina indicadores cacheados + nuevos calculados incrementalmente.
@@ -6523,10 +7159,21 @@ def merge_indicators_incremental(cached: dict, new: dict, split_index: int, wind
     merged = {}
     
     # Indicadores que son listas de valores (por fila)
-    for key in new.keys():
+    expected_old_rows = max(0, int(split_index or 0))
+    for key in set(cached.keys()) | set(new.keys()):
+        if key not in new:
+            merged[key] = cached[key]
+            continue
+
         if key not in cached:
-            # Indicador nuevo que no existía en cache
-            merged[key] = new[key]
+            # Indicador nuevo que no existía en cache. En un cálculo parcial
+            # hay que rellenar las filas anteriores para conservar el largo.
+            new_val = new[key]
+            if isinstance(new_val, list):
+                new_part = new_val[window_context:] if len(new_val) > window_context else new_val
+                merged[key] = ([None] * expected_old_rows) + new_part
+            else:
+                merged[key] = new_val
             continue
         
         cached_val = cached[key]
@@ -7560,7 +8207,7 @@ class UserStateCache:
         indicators = {}
         
         # Columnas de indicadores (excluir OHLCV originales)
-        base_cols = {'open', 'high', 'low', 'close', 'volume', 'time'}
+        base_cols = {'open', 'high', 'low', 'close', 'volume', 'time', 'index', '_index'}
         indicator_cols = [col for col in df.columns if col not in base_cols]
         
         for col in indicator_cols:
@@ -7578,6 +8225,8 @@ class UserStateCache:
         """Aplica indicadores desde dict a DataFrame."""
         mismatch = False
         for col, values in indicators.items():
+            if col in {'index', '_index'}:
+                continue
             try:
                 if len(values) == len(df):
                     df[col] = values
@@ -9079,6 +9728,7 @@ def obtener_eventos_economicos(
     desde_inicio: bool = False,
     last_days: int | None = None,
     grace_minutes: int = 10,
+    allow_investing_fallback: bool = True,
 ) -> pd.DataFrame:
     """
     Pulls economic events around the FX window:
@@ -9135,7 +9785,7 @@ def obtener_eventos_economicos(
         logger.info("[Eventos] %s; enabling Investing fallback", need_reason)
 
     # Try investing.com only if enabled and missing actuals for past events
-    if need_investing and APP_CONFIG.investing_scraping_enabled:
+    if need_investing and allow_investing_fallback and APP_CONFIG.investing_scraping_enabled:
         try:
             inv_com = _investing_com_econ_fetch(
                 timeout=APP_CONFIG.http_timeout,
@@ -9148,13 +9798,14 @@ def obtener_eventos_economicos(
             logger.warning("[Eventos] investing.com scraping failed: %s", e)
 
     # Fallback to investiny
-    try:
-        inv = _investing_econ_fetch()
-        if not inv.empty:
-            logger.info("[Eventos] Got %d events from investiny", len(inv))
-            parts.append(inv)
-    except Exception as e:
-        logger.warning("[Eventos] investiny failed: %s", e)
+    if allow_investing_fallback:
+        try:
+            inv = _investing_econ_fetch()
+            if not inv.empty:
+                logger.info("[Eventos] Got %d events from investiny", len(inv))
+                parts.append(inv)
+        except Exception as e:
+            logger.warning("[Eventos] investiny failed: %s", e)
 
     if not parts:
         return pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
@@ -9357,6 +10008,23 @@ def _to_utc_datetime(dt_like) -> datetime | None:
     except Exception:
         return None
 
+def _json_safe_event_value(value):
+    """Return a Firestore/Postgres JSON-safe event value, replacing NaN/Inf with None."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {str(k): _json_safe_event_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_event_value(v) for v in value]
+    return value
+
 def _firestore_save_events(events: list[dict]) -> None:
     """
     Persiste eventos en 'eventos_completos' usando batch en trozos de 400.
@@ -9374,7 +10042,7 @@ def _firestore_save_events(events: list[dict]) -> None:
     for i in range(0, len(events), chunk):
         batch = db.batch()
         for row in events[i:i + chunk]:
-            data = dict(row)  # copia defensiva
+            data = _json_safe_event_value(dict(row))  # copia defensiva + JSON-safe
 
             # 2.1) Asegurar date_utc (preferida para queries)
             date_val = data.get("date_utc") or data.get("date")
@@ -9389,7 +10057,8 @@ def _firestore_save_events(events: list[dict]) -> None:
             for key in ("actual", "estimate", "previous"):
                 if key in data:
                     try:
-                        data[key] = float(data[key]) if data[key] is not None else None
+                        numeric_val = float(data[key]) if data[key] is not None else None
+                        data[key] = numeric_val if numeric_val is not None and math.isfinite(numeric_val) else None
                     except Exception:
                         data[key] = None
 
@@ -9781,6 +10450,27 @@ def _get_last_timestamp_from_gcs(symbol: str, tf: str) -> Optional[pd.Timestamp]
         # Try to load GCS with only last row to get timestamp efficiently
         df_gcs = load_from_gcs(symbol, tf)
         if df_gcs is not None and not df_gcs.empty:
+            _, gcs_diag = _validate_history_series_for_persist(df_gcs, symbol, tf, source="gcs_peek")
+            invalid_rows = int(gcs_diag.get("invalid_rows_removed") or 0)
+            coverage = float(gcs_diag.get("coverage_ratio") or 0.0)
+            if invalid_rows > 0 and not GCS_HISTORY_INCREMENTAL_ALLOW_INVALID:
+                logger.info(
+                    "[GCS_PEEK] %s/%s skipped incremental: invalid_rows=%d coverage=%.4f",
+                    symbol,
+                    tf,
+                    invalid_rows,
+                    coverage,
+                )
+                return None
+            if coverage < GCS_HISTORY_INCREMENTAL_MIN_COVERAGE:
+                logger.info(
+                    "[GCS_PEEK] %s/%s skipped incremental: coverage=%.4f < min=%.4f",
+                    symbol,
+                    tf,
+                    coverage,
+                    GCS_HISTORY_INCREMENTAL_MIN_COVERAGE,
+                )
+                return None
             last_ts = df_gcs.index[-1]
             logger.debug(f"[GCS_PEEK] Got last_ts from {symbol}/{tf}: {last_ts}")
             return last_ts
@@ -9929,6 +10619,43 @@ def obtener_datos_con_hilos(
         diag = _build_analysis_data_quality_diag(df_out, symbol, tf)
         diag["gaps_filled"] = int(gapfill_added)
         df_out.attrs["analysis_data_quality"] = diag
+
+        persist_df = None
+        persist_decision = None
+        if gapfill_added > 0:
+            try:
+                # Persist only a validated full series. If GCS already has a
+                # better version, keep the current analysis result in memory but
+                # do not downgrade local/Redis/GCS persistence.
+                persist_df, persist_decision = _select_history_for_persistence(symbol, tf, df_out)
+                if persist_df is not None and not persist_df.empty:
+                    save_cached_history(symbol, tf, persist_df)
+                    selected = (persist_decision or {}).get("selected") or {}
+                    logger.info(
+                        "[ANALYSIS_GAPFILL] %s/%s persisted validated local/redis rows=%d added=%d action=%s coverage=%.4f gaps=%d",
+                        symbol,
+                        tf,
+                        len(persist_df),
+                        gapfill_added,
+                        (persist_decision or {}).get("action"),
+                        float(selected.get("coverage_ratio") or 0.0),
+                        int(selected.get("gap_count") or 0),
+                    )
+                else:
+                    logger.info(
+                        "[ANALYSIS_GAPFILL] %s/%s skipped local/redis persist after validation action=%s added=%d",
+                        symbol,
+                        tf,
+                        (persist_decision or {}).get("action"),
+                        gapfill_added,
+                    )
+            except Exception as cache_exc:
+                logger.warning(
+                    "[ANALYSIS_GAPFILL] local/redis persist failed for %s/%s: %s",
+                    symbol,
+                    tf,
+                    cache_exc,
+                )
         
         # ✅ NIVEL 1.5: Guardar en Redis para próxima vez (non-blocking)
         try:
@@ -9943,37 +10670,74 @@ def obtener_datos_con_hilos(
         # ✅ PERSIST TO GCS AFTER SUCCESSFUL FETCH (with throttling)
         # Backup strategy:
         # - ALWAYS backup on cold_start (initial fetch)
-        # - For subsequent fetches: only backup if >5min since last backup (avoid excessive writes)
+        # - For subsequent fetches: only backup after the throttle window.
+        # - After a container restart, prime the in-memory throttle instead
+        #   of treating every symbol/TF as overdue for periodic GCS backup.
         backup_key = (symbol, tf)
         last_backup = _last_gcs_backup_time.get(backup_key, 0)
         now_ts = datetime.now(UTC).timestamp()
         time_since_last_backup = now_ts - last_backup
-        should_backup = cold_start or (time_since_last_backup > _GCS_BACKUP_THROTTLE_SECONDS)
+        first_seen_after_boot = last_backup <= 0 and not cold_start
+        if first_seen_after_boot:
+            _last_gcs_backup_time[backup_key] = now_ts
+            time_since_last_backup = 0
+
+        periodic_due = (not first_seen_after_boot) and time_since_last_backup > _GCS_BACKUP_THROTTLE_SECONDS
+        should_backup = cold_start or ((gapfill_added > 0 or periodic_due) and not first_seen_after_boot)
         
         if should_backup:
             try:
-                # ✅ LAZY-LOAD: Only persist if data actually changed (delta detection)
-                current_hash = hash_dataframe(df_out)
-                last_hash = _last_gcs_backup_hash.get(backup_key)
-                
-                if cold_start or last_hash is None or current_hash != last_hash:
-                    # Only save if cold_start or data has delta
-                    success = save_to_gcs(symbol, tf, df_out)
-                    if success:
-                        _save_local_history_df(symbol, tf, df_out)
-                        # Update Firestore metadata so other pods know data is fresh
-                        safe_sym = _safe_symbol_for_filename(symbol)
-                        safe_tf = normalize_tf(tf)
-                        gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
-                        rows_to_persist = min(1000, len(df_out))
-                        set_historicos_metadata(symbol, tf, gcs_path, rows_to_persist, ttl_seconds=1800)
-                        _last_gcs_backup_time[backup_key] = now_ts
-                        _last_gcs_backup_hash[backup_key] = current_hash
-                        reason = "cold_start" if cold_start else f"periodic (delta detected, last={int(time_since_last_backup)}s ago)"
-                        logging.info("[HIST][GCS_BACKUP] %s-%s → %d rows (%s)", symbol, tf, len(df_out), reason)
+                if persist_df is None:
+                    persist_df, persist_decision = _select_history_for_persistence(symbol, tf, df_out)
+                skip_gcs_after_validation = persist_df is None or persist_df.empty
+                if skip_gcs_after_validation:
+                    logger.info(
+                        "[HIST][GCS_BACKUP] Skipped %s/%s after validation action=%s",
+                        symbol,
+                        tf,
+                        (persist_decision or {}).get("action"),
+                    )
                 else:
-                    # Data hasn't changed, skip GCS save
-                    logger.info(f"[HIST][GCS_BACKUP] Skipped {symbol}/{tf} (no delta, hash unchanged)")
+                    # ✅ LAZY-LOAD: Only persist if data actually changed (delta detection)
+                    current_hash = hash_dataframe(persist_df)
+                    last_hash = _last_gcs_backup_hash.get(backup_key)
+
+                    if cold_start or last_hash is None or current_hash != last_hash:
+                        # Only save if cold_start or data has delta, and the chosen
+                        # series is at least as complete as what GCS already has.
+                        success = save_to_gcs(symbol, tf, persist_df)
+                        if success:
+                            # _HIST.get() already saved local cache via save_cached_history;
+                            # no need to re-save here. Just update Firestore metadata.
+                            # Update Firestore metadata so other pods know data is fresh
+                            safe_sym = _safe_symbol_for_filename(symbol)
+                            safe_tf = normalize_tf(tf)
+                            gcs_path = f"historicos/{safe_sym}__{safe_tf}.json"
+                            max_gcs_rows = int(os.getenv("GCS_HISTORY_MAX_ROWS", "1000"))
+                            rows_to_persist = len(persist_df) if max_gcs_rows <= 0 else min(max_gcs_rows, len(persist_df))
+                            set_historicos_metadata(symbol, tf, gcs_path, rows_to_persist, ttl_seconds=1800)
+                            _last_gcs_backup_time[backup_key] = now_ts
+                            _last_gcs_backup_hash[backup_key] = current_hash
+                            if cold_start:
+                                reason = "cold_start"
+                            elif gapfill_added > 0:
+                                reason = f"gapfill_added={gapfill_added}"
+                            else:
+                                reason = f"periodic (delta detected, last={int(time_since_last_backup)}s ago)"
+                            selected = (persist_decision or {}).get("selected") or {}
+                            logging.info(
+                                "[HIST][GCS_BACKUP] %s-%s → %d rows (%s, action=%s, coverage=%.4f, gaps=%d)",
+                                symbol,
+                                tf,
+                                len(persist_df),
+                                reason,
+                                (persist_decision or {}).get("action"),
+                                float(selected.get("coverage_ratio") or 0.0),
+                                int(selected.get("gap_count") or 0),
+                            )
+                    else:
+                        # Data hasn't changed, skip GCS save
+                        logger.info(f"[HIST][GCS_BACKUP] Skipped {symbol}/{tf} (no delta, hash unchanged)")
             except Exception as e:
                 logger.warning(f"[HIST][GCS_BACKUP] Failed to persist {symbol}/{tf}: {e}")
                 # Don't fail analysis, just log the issue
@@ -12206,6 +12970,51 @@ def filtrar_niveles_numba(niveles, tolerancia):
             niveles_filtrados.append(nivel)
     return niveles_filtrados
 
+
+def _sr_max_candles(tf: str) -> int:
+    raw = os.getenv(f"SR_MAX_CANDLES_{str(tf or '').upper()}")
+    if raw:
+        try:
+            return max(50, int(raw))
+        except Exception:
+            pass
+    return SR_MAX_CANDLES_BY_TF.get(_tf_backend(tf), 900)
+
+
+def _sr_dynamic_max_factor(tf: str) -> int:
+    raw = os.getenv(f"SR_DYNAMIC_MAX_FACTOR_{str(tf or '').upper()}")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except Exception:
+            pass
+    return SR_DYNAMIC_MAX_FACTOR_BY_TF.get(_tf_backend(tf), 4)
+
+
+def _slice_sr_df(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    max_candles = _sr_max_candles(tf)
+    if df is None or len(df) <= max_candles:
+        return df
+    return df.iloc[-max_candles:].copy()
+
+
+def _df_cache_marker(df: pd.DataFrame) -> str:
+    try:
+        last_index = str(df.index[-1])
+    except Exception:
+        last_index = "noindex"
+    return f"{len(df)}:{last_index}"
+
+
+def _limit_sr_candidates(levels, precio_actual: float, side: str, limit: int):
+    if not levels or limit <= 0:
+        return levels
+    if side == "support":
+        filtered = [float(v) for v in levels if v < precio_actual]
+        return sorted(filtered, reverse=True)[:limit]
+    filtered = [float(v) for v in levels if v > precio_actual]
+    return sorted(filtered)[:limit]
+
 #@profile
 def calcular_soportes_resistencias(df, window, atr_multiplier, precio_actual, min_levels=5, symbol='', temporalidad=''):
 
@@ -12218,8 +13027,9 @@ def calcular_soportes_resistencias(df, window, atr_multiplier, precio_actual, mi
     min_indices = argrelextrema(df['low'].values, np.less, order=order)[0]
     max_indices = argrelextrema(df['high'].values, np.greater, order=order)[0]
 
-    soportes = df['low'].iloc[min_indices].tolist()
-    resistencias = df['high'].iloc[max_indices].tolist()
+    candidate_limit = max(SR_LEVEL_CANDIDATE_LIMIT, min_levels * 4)
+    soportes = _limit_sr_candidates(df['low'].iloc[min_indices].tolist(), precio_actual, "support", candidate_limit)
+    resistencias = _limit_sr_candidates(df['high'].iloc[max_indices].tolist(), precio_actual, "resistance", candidate_limit)
 
     if 'atr' in df.columns:
         atr_mean = df['atr'].mean()
@@ -12314,15 +13124,20 @@ _atr_cache_hits = 0
 _atr_cache_misses = 0
 _ATR_CACHE_LOCK = threading.Lock()
 
-def _get_niveles_cache_key(symbol: str, tf: str, df_len: int, precio_actual: float | None = None) -> str:
-    """Genera clave de cache para niveles basada en símbolo, TF y tamaño del DF.
-    Opcionalmente incluye precio discretizado si NIVELES_CACHE_INCLUDE_PRICE=true.
+def _get_niveles_cache_key(symbol: str, tf: str, df_marker: str | int, precio_actual: float | None = None) -> str:
+    """Genera clave de cache para niveles S/R.
+
+    Los niveles se filtran por lado del precio, así que la clave incluye un
+    bucket de precio y la última vela; sólo usar len(df) podía reutilizar
+    niveles viejos cuando entraba una vela nueva con la misma cantidad de filas.
     """
-    include_price = os.environ.get("NIVELES_CACHE_INCLUDE_PRICE", "false").lower() == "true"
-    if include_price and precio_actual is not None:
-        precio_hash = int(precio_actual * 100)
-        return f"{symbol}|{tf}|{precio_hash}|{df_len}"
-    return f"{symbol}|{tf}|{df_len}"
+    precio_hash = "noprice"
+    if precio_actual is not None:
+        try:
+            precio_hash = str(int(float(precio_actual) * 10000))
+        except Exception:
+            precio_hash = "badprice"
+    return f"{symbol}|{tf}|{precio_hash}|{df_marker}"
 
 def _get_atr_cache_key(symbol: str, tf: str, df_len: int) -> str:
     """Genera clave de cache para ATR basada en símbolo, TF y tamaño del DF."""
@@ -12558,9 +13373,17 @@ def filtrar_por_distancia(niveles, atr, precio_actual, max_distancia=1.5):
 
     return niveles_filtrados
 
+MIN_SR_TOUCHES_OPERATIVO = 2
+
 #@profile
 def contar_toques(nivel, precios, umbral=0.01):
-    return sum(abs(precios - nivel) / nivel <= umbral)
+    try:
+        nivel_float = float(nivel)
+        if not np.isfinite(nivel_float) or nivel_float <= 0:
+            return 0
+        return int(sum(abs(precios - nivel_float) / nivel_float <= umbral))
+    except Exception:
+        return 0
 
 #@profile
 def unificar_niveles(symbol):
@@ -12736,6 +13559,20 @@ def detectar_rango_zigzag(
 # OPT2: Manual cache for level calculations (symbol, temporalidad -> niveles)
 _NIVELES_CACHE = {}
 
+
+def _df_ohlc_tail_hash(df, rows=120):
+    try:
+        if df is None or df.empty:
+            return "empty"
+        cols = [c for c in ("open", "high", "low", "close") if c in df.columns]
+        if not cols:
+            return f"len:{len(df)}"
+        tail = df[cols].tail(rows).round(8)
+        payload = tail.to_json(date_format="iso", orient="split")
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return f"len:{len(df) if df is not None else 0}"
+
 #@profile
 def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol, temporalidad_actual, umbral_atr=2.0, max_niveles=5):
     """
@@ -12756,7 +13593,15 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
         dict: Niveles clave confirmados con toques
     """
     # OPT2: Check cache first (using hashable parameters only)
-    cache_key = (symbol, temporalidad_actual)
+    try:
+        last_marker = (
+            len(df),
+            str(df.index[-1]) if len(df.index) else "",
+            _df_ohlc_tail_hash(df),
+        )
+    except Exception:
+        last_marker = (len(df), "", None)
+    cache_key = (symbol, temporalidad_actual, last_marker)
     if cache_key in _NIVELES_CACHE:
         result = _NIVELES_CACHE[cache_key]
         result["DataFrame Actualizado"] = df  # Add current df
@@ -12828,23 +13673,14 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
     precio_actual = df['close'].iloc[-1]
     umbral = atr * umbral_atr
 
-    # Filtrar soportes y resistencias cercanos al precio actual
-    soportes_cercanos = [s for s in soportes if abs(precio_actual - s) <= umbral and s < precio_actual]
-    resistencias_cercanas = [r for r in resistencias if abs(precio_actual - r) <= umbral and r > precio_actual]
-
-    # Si no hay suficientes datos cercanos, expandir búsqueda
-    if len(soportes_cercanos) < max_niveles:
-        soportes_cercanos.extend([s for s in soportes if s not in soportes_cercanos])
-
-    if len(resistencias_cercanas) < max_niveles:
-        resistencias_cercanas.extend([r for r in resistencias if r not in resistencias_cercanas])
-
-    soportes_cercanos = sorted(list(aplanar_niveles(soportes_cercanos)), reverse=True)  # Ordenar de mayor a menor
-    resistencias_cercanas = sorted(list(aplanar_niveles(resistencias_cercanas)))       # Ordenar de menor a mayor
-
-    # Confirmar soportes y resistencias con más toques
-    soportes_confirmados = [(s, contar_toques(s, df['low'])) for s in soportes_cache]
-    resistencias_confirmadas = [(r, contar_toques(r, df['high'])) for r in resistencias_cache]
+    # Confirmar soportes y resistencias con toques reales. Los niveles operativos
+    # para entradas no pueden ser simples candidatos/pivots sin reaccion previa.
+    soportes_candidatos = sorted(set(soportes + soportes_cache), reverse=True)
+    resistencias_candidatas = sorted(set(resistencias + resistencias_cache))
+    soportes_con_toques = [(s, contar_toques(s, df['low'])) for s in soportes_candidatos]
+    resistencias_con_toques = [(r, contar_toques(r, df['high'])) for r in resistencias_candidatas]
+    soportes_confirmados = [(s, t) for s, t in soportes_con_toques if t >= MIN_SR_TOUCHES_OPERATIVO]
+    resistencias_confirmadas = [(r, t) for r, t in resistencias_con_toques if t >= MIN_SR_TOUCHES_OPERATIVO]
 
     # Mezclar soportes y resistencias en una sola lista
     niveles_combinados = soportes_confirmados + resistencias_confirmadas
@@ -12878,6 +13714,22 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
 
     soportes_confirmados_orden = sorted(list(soportes_rebote), reverse=True)
     resistencias_confirmadas_orden = sorted(list(resistencias_rebote))
+
+    # Filtrar soportes y resistencias cercanos al precio actual usando solo niveles confirmados.
+    soportes_operativos = [s for s, _ in soportes_confirmados]
+    resistencias_operativas = [r for r, _ in resistencias_confirmadas]
+    soportes_cercanos = [s for s in soportes_operativos if abs(precio_actual - s) <= umbral and s < precio_actual]
+    resistencias_cercanas = [r for r in resistencias_operativas if abs(precio_actual - r) <= umbral and r > precio_actual]
+
+    # Si no hay suficientes datos cercanos, expandir búsqueda, pero siempre dentro de confirmados.
+    if len(soportes_cercanos) < max_niveles:
+        soportes_cercanos.extend([s for s in soportes_operativos if s not in soportes_cercanos])
+
+    if len(resistencias_cercanas) < max_niveles:
+        resistencias_cercanas.extend([r for r in resistencias_operativas if r not in resistencias_cercanas])
+
+    soportes_cercanos = sorted(list(aplanar_niveles(soportes_cercanos)), reverse=True)
+    resistencias_cercanas = sorted(list(aplanar_niveles(resistencias_cercanas)))
 
     # Inicializar valores predeterminados como None
     soporte_nivel_2, soporte_nivel_1 = None, None
@@ -13041,8 +13893,8 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
     }
 
     # Usar filtrar_por_distancia para identificar niveles importantes
-    niveles_importantes_soportes = filtrar_por_distancia(soportes, atr, precio_actual)
-    niveles_importantes_resistencias = filtrar_por_distancia(resistencias, atr, precio_actual)
+    niveles_importantes_soportes = filtrar_por_distancia(soportes_operativos, atr, precio_actual)
+    niveles_importantes_resistencias = filtrar_por_distancia(resistencias_operativas, atr, precio_actual)
 
     # OPT2: Build result and cache it before returning
     result = {
@@ -13062,7 +13914,7 @@ def obtener_niveles_clave(df, soportes_dinamicos, resistencias_dinamicas, symbol
     }
     
     # Cache the result (excluding DataFrame for memory efficiency)
-    cache_key = (symbol, temporalidad_actual)
+    cache_key = (symbol, temporalidad_actual, last_marker)
     cache_result = {k: v for k, v in result.items() if k != "DataFrame Actualizado"}
     _NIVELES_CACHE[cache_key] = cache_result
     
@@ -14743,6 +15595,15 @@ def procesar_simbolo_temporalidad(
     calc_windows: dict[str,int] | None = None,
     cfg: dict | None = None
 ):
+    perf_enabled = str(os.environ.get("ANALYSIS_TIMING_VERBOSE", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    perf_threshold_s = float(os.environ.get("ANALYSIS_TIMING_THRESHOLD_SEC", "2.0"))
+    t_task_start = time.time()
+    perf_marks: list[tuple[str, float]] = []
+
+    def _mark_perf(label: str, started_at: float):
+        if perf_enabled:
+            perf_marks.append((label, time.time() - started_at))
+
     # Asegurar notación backend de TF (1min, 4hour, 1day, 1week…)
     tf = _tf_backend(temporalidad)  # <- este es el valor correcto a usar en todo el flujo
 
@@ -14783,9 +15644,11 @@ def procesar_simbolo_temporalidad(
         # Solo pasa fmpWindows si viene; si no, deja cfg vacío => bars=None
         cfg_local = {"fmpWindows": fmp_windows} if isinstance(fmp_windows, dict) and fmp_windows else {}
 
+        t_phase = time.time()
         df_combinado = obtener_datos_con_hilos(
             symbol, tf, user_chat_id=user_chat_id, cfg=cfg_local
         )
+        _mark_perf("historicos", t_phase)
         if df_combinado is None or df_combinado.empty:
             logger.info(f"No hay datos combinados para {symbol} en {tf}.")
             return None
@@ -14814,7 +15677,9 @@ def procesar_simbolo_temporalidad(
         logger.warning(f"[VALIDACIÓN] Error validando OHLCV para {symbol}-{tf}: {e}")
     
     try:
+        t_phase = time.time()
         df_indicadores = calcular_indicadores(df_combinado, tf, symbol=symbol)
+        _mark_perf("indicadores", t_phase)
         if df_indicadores is None or df_indicadores.empty:
             logger.info(f"No hay indicadores para {symbol} en {tf}.")
             return None
@@ -14829,10 +15694,12 @@ def procesar_simbolo_temporalidad(
     # ------------------- Entradas / señales -------------------
     # ✅ PHASE 7: Use async-refactored entry calculation
     try:
+        t_phase = time.time()
         entradas = calcular_entradas_sync_wrapper(
             df_indicadores, df_eventos, symbol, tf, user_chat_id,
             calc_windows=calc_windows
         )
+        _mark_perf("entradas_async", t_phase)
         if not entradas:
             logger.info(f"No se pudieron calcular entradas para {symbol} en {tf}.")
             return None
@@ -14858,6 +15725,7 @@ def procesar_simbolo_temporalidad(
 
     # ✅ FASE 3: WHITELISTING - Evaluar si autorizado operar
     try:
+        t_phase = time.time()
         whitelist_result = evaluar_si_autorizado_operar(
             symbol=symbol,
             tf=tf,
@@ -14870,6 +15738,7 @@ def procesar_simbolo_temporalidad(
             tecnica_meta=entradas.get('tecnica_meta'),
             whitelist_cfg=(cfg or {}).get("whitelist")
         )
+        _mark_perf("whitelist", t_phase)
         es_autorizado_operar = whitelist_result.get('autorizado', False)
         score_whitelist = whitelist_result.get('score_final', 0)
         expectativa_val = whitelist_result.get('expectativa', 0.0)
@@ -14978,6 +15847,11 @@ def procesar_simbolo_temporalidad(
     }
 
 
+    total_elapsed = time.time() - t_task_start
+    if perf_enabled and (total_elapsed >= perf_threshold_s or any(v >= perf_threshold_s for _, v in perf_marks)):
+        timing = ", ".join(f"{name}={elapsed:.2f}s" for name, elapsed in perf_marks)
+        logger.info("[Timing][Task] %s/%s total=%.2fs %s", symbol, tf, total_elapsed, timing)
+
     return resultado
 
 
@@ -15012,9 +15886,16 @@ def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
 
     # Filtro especial para todas las monedas
     if moneda_filtro in {"all", "todos"}:
-        return lista_activos
+        categorized = _categorized_assets()
+        return sorted(categorized) if categorized else lista_activos
 
-    # Filtros por categorías específicas
+    # Filtros por categorías dinámicas de Firestore. Esto evita confundir
+    # nombres de categorías/subcategorías con símbolos exclusivos.
+    dynamic_category = _resolve_category_assets(raw_filter)
+    if dynamic_category:
+        return dynamic_category
+
+    # Filtros por categorías específicas legacy
     categorias_especiales = {
         "cruces": categorias.get("Cruces", []),
         "exóticos": categorias.get("Exóticos", []),
@@ -15031,9 +15912,11 @@ def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
 
     # Filtros específicos por divisas principales
     if moneda_filtro.upper() == "USD":
-        return relacionados_usd
+        return _currency_filter_assets("USD", lista_activos) or relacionados_usd
     if moneda_filtro.upper() in categorias.get("Principales", []):
-        return [activo for activo in forex if moneda_filtro.upper() in activo]
+        return _currency_filter_assets(moneda_filtro.upper(), lista_activos) or [
+            activo for activo in forex if moneda_filtro.upper() in activo
+        ]
 
     # Verificar si es un par específico o un símbolo no conocido
     if moneda_filtro.upper() not in [activo.upper() for activo in lista_activos]:
@@ -15042,6 +15925,159 @@ def filtrar_activos_por_moneda(lista_activos, moneda_filtro):
 
     # Filtrar activos que contengan la moneda o parte del nombre
     return [activo for activo in lista_activos if moneda_filtro.upper() in activo]
+
+
+def _asset_key(value) -> str:
+    import unicodedata
+    text = str(value or "").strip().upper()
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(ch)
+    )
+    return text
+
+
+def _category_key_map() -> dict[str, str]:
+    try:
+        return {
+            _asset_key(name): str(name)
+            for name in (categorias or {}).keys()
+            if isinstance(name, str) and str(name).strip()
+        }
+    except Exception:
+        return {}
+
+
+def _currency_filter_assets(currency_code: str, lista_activos=None) -> list[str]:
+    """Expand menu currency filters such as Principales -> USD/EUR to pairs."""
+    code = _asset_key(currency_code)
+    if len(code) != 3 or code not in _CURRENCY_CODES:
+        return []
+    universe = list(lista_activos or [])
+    try:
+        if not universe:
+            universe.extend(forex or [])
+    except Exception:
+        pass
+    try:
+        if code == "USD" and relacionados_usd:
+            universe.extend(relacionados_usd)
+    except Exception:
+        pass
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in universe:
+        sym = _asset_key(item)
+        if not sym or sym in seen:
+            continue
+        if len(sym) == 3:
+            continue
+        if code in sym:
+            seen.add(sym)
+            out.append(sym)
+    return out
+
+
+def _resolve_category_assets(category_name, _seen: set[str] | None = None) -> list[str]:
+    """Resolve a Firestore category/subcategory to executable symbols.
+
+    Some menus intentionally contain currency filters (Principales -> USD/EUR).
+    Those are not assets, but they must expand to their related pairs.
+    """
+    key_map = _category_key_map()
+    category_key = _asset_key(category_name)
+    real_name = key_map.get(category_key)
+    if not real_name:
+        return []
+
+    _seen = _seen or set()
+    if category_key in _seen:
+        return []
+    _seen.add(category_key)
+
+    out: list[str] = []
+    seen_symbols: set[str] = set()
+    values = (categorias or {}).get(real_name, [])
+    if not isinstance(values, list):
+        return []
+
+    for item in values:
+        item_key = _asset_key(item)
+        if not item_key:
+            continue
+        if item_key in key_map:
+            for nested in _resolve_category_assets(key_map[item_key], _seen):
+                nested_key = _asset_key(nested)
+                if nested_key and nested_key not in seen_symbols:
+                    seen_symbols.add(nested_key)
+                    out.append(nested_key)
+            continue
+        if item_key in {"TODOS", "ALL"}:
+            continue
+        if len(item_key) == 3 and item_key in _CURRENCY_CODES:
+            for sym in _currency_filter_assets(item_key):
+                sym_key = _asset_key(sym)
+                if sym_key and sym_key not in seen_symbols:
+                    seen_symbols.add(sym_key)
+                    out.append(sym_key)
+            continue
+        if item_key not in seen_symbols:
+            seen_symbols.add(item_key)
+            out.append(item_key)
+    return out
+
+
+def _categorized_assets() -> set[str]:
+    """All menu/category leaf assets. Anything outside this set is exclusive."""
+    out: set[str] = set()
+    try:
+        for category_name in (categorias or {}).keys():
+            out.update(_resolve_category_assets(category_name))
+    except Exception:
+        pass
+    return set(s for s in out if s and s not in {"TODOS", "ALL"})
+
+
+def classify_common_exclusive_assets(resolved_assets: list[str] | tuple[str, ...] | set[str]) -> dict:
+    common_set = _categorized_assets()
+    resolved = []
+    for item in resolved_assets or []:
+        key = _asset_key(item)
+        if key and key not in resolved:
+            resolved.append(key)
+    common = [sym for sym in resolved if sym in common_set]
+    exclusive = [sym for sym in resolved if sym not in common_set]
+    return {
+        "common": common,
+        "exclusive": exclusive,
+        "common_count": len(common),
+        "exclusive_count": len(exclusive),
+        "known_common_universe": len(common_set),
+    }
+
+
+def compute_analysis_transaction_units(resolved_assets, tfs) -> tuple[int, dict]:
+    """Commercial billing units for analysis.
+
+    Common assets are those present in Firestore menu categories. Symbols not
+    categorized there are treated as exclusive and charged with a higher unit
+    multiplier because they tend to require private FMP/cache work.
+    """
+    tfs_count = max(1, len(list(tfs or [])))
+    classification = classify_common_exclusive_assets(list(resolved_assets or []))
+    exclusive_multiplier = max(1, int(os.getenv("EXCLUSIVE_ASSET_TRANSACTION_MULTIPLIER", "3")))
+    common_units = classification["common_count"] * tfs_count
+    exclusive_units = classification["exclusive_count"] * tfs_count * exclusive_multiplier
+    total = max(1, common_units + exclusive_units)
+    metadata = {
+        **classification,
+        "timeframes_count": tfs_count,
+        "exclusive_multiplier": exclusive_multiplier,
+        "common_units": common_units,
+        "exclusive_units": exclusive_units,
+        "total_units": total,
+    }
+    return total, metadata
 
 # Función principal para ejecutar el análisis usando hilos
 #@profile
@@ -15090,6 +16126,8 @@ async def ejecutar_analisis_con_hilos(
         else None
     )
     slow_task_sec = int(os.environ.get("ANALYSIS_SLOW_TASK_SEC", "30"))
+    progress_update_every_n = max(1, int(os.environ.get("ANALYSIS_PROGRESS_EVERY_N", "5")))
+    progress_update_min_interval = max(0.5, float(os.environ.get("ANALYSIS_PROGRESS_MIN_INTERVAL_SEC", "2.0")))
     
     # Calculate effective concurrency limit
     # Note: _ANALYSIS_SEM is the global limit; per_symbol_concurrency adds per-symbol restrictions
@@ -15171,20 +16209,24 @@ async def ejecutar_analisis_con_hilos(
     if prefetch_enabled and total_tasks > 10 and not is_small_analysis:  # Solo para análisis medianos/grandes
         t_prefetch_start = time.time()
         
-        # Sample 5 random (symbol, tf) combos to check cache hit rate
+        # Sample enough (symbol, tf) combos to catch partial cold caches. A
+        # 5-item sample was too optimistic in large runs and skipped prefetch
+        # even while many assets missed historical cache during analysis.
         import random
+        sample_size = min(50, max(10, total_tasks // 10), total_tasks)
         sample_combos = random.sample(
             [(s, tf) for s in activos_filtrados for tf in temps],
-            min(5, total_tasks)
+            sample_size
         )
-        sample_hits = sum(
-            1 for s, tf in sample_combos 
-            if not (load_cached_history(s, tf) is None or load_cached_history(s, tf).empty)
-        )
+        sample_hits = 0
+        for s, tf in sample_combos:
+            cached_sample = load_cached_history(s, tf)
+            if cached_sample is not None and not cached_sample.empty:
+                sample_hits += 1
         cache_hit_rate = sample_hits / len(sample_combos) if sample_combos else 1.0
         
-        # Si cache hit rate < 50% → hacer pre-fetch agresivo
-        if cache_hit_rate < 0.5:
+        # Si el cache no está casi completo, hacer pre-fetch agresivo.
+        if cache_hit_rate < 0.9:
             logger.info(
                 f"[Prefetch] Cache hit rate bajo ({cache_hit_rate:.1%}), "
                 f"pre-fetching {total_tasks} históricos en paralelo..."
@@ -15225,31 +16267,39 @@ async def ejecutar_analisis_con_hilos(
             )
 
     # --- Análisis principal (PARALELIZACIÓN OPTIMIZADA) ---
-    # Opción 2: asyncio.gather() con return_exceptions=True
-    # Beneficio: Procesa todos los resultados, capturando excepciones sin perder contexto
+    # Cada task devuelve su metadata junto al resultado. Eso permite reportar
+    # progreso por finalización real sin bloquearse por un chunk lento.
     analisis_tasks = []
-    task_meta = []  # Parallel list: task_meta[i] = (symbol, temporalidad) for task i
+    task_meta = []  # Se conserva para logs/compatibilidad con el procesamiento final.
+
+    async def _bounded_analysis_with_meta(symbol, temporalidad):
+        try:
+            result = await bounded_analysis(symbol, temporalidad)
+        except Exception as exc:
+            result = exc
+        return symbol, temporalidad, result
 
     for symbol in activos_filtrados:
         for temporalidad in temps:
-            task = asyncio.create_task(bounded_analysis(symbol, temporalidad))
+            task = asyncio.create_task(_bounded_analysis_with_meta(symbol, temporalidad))
             analisis_tasks.append(task)
             task_meta.append((symbol, temporalidad))
 
-    # 🚀 Ejecutar todas las tareas con gather (return_exceptions=True para capturar errores)
-    # Cada resultado se alinea con su correspondiente (symbol, temporalidad) por índice
+    # 🚀 Ejecutar todas las tareas en paralelo y mantener metadata por resultado.
     if analisis_tasks:
         t_gather_start = time.time()
         logger.info(
-            f"[Analisis] 🚀 Iniciando gather() de {len(analisis_tasks)} tasks "
+            f"[Analisis] 🚀 Iniciando análisis paralelo de {len(analisis_tasks)} tasks "
             f"(sem={_ANALYSIS_SEM}, per_symbol={per_symbol_concurrency}, workers={max_workers})"
         )
         
-        # ✅ Progress tracking: Process in chunks with periodic updates (safe + reactive)
+        completed_with_meta = []
+
+        # ✅ Progress tracking reactivo: actualiza cada vez que termina cualquier task.
+        # Antes se esperaba por chunks en orden; si el primer chunk incluía un TF lento,
+        # la UI podía quedar en 0% aunque otros análisis ya hubieran terminado.
         if exec_id:
             total_tasks = len(analisis_tasks)
-            chunk_size = max(1, total_tasks // 10)  # Divide into ~10 chunks for updates
-            results = []
             
             # Update progress at start
             try:
@@ -15268,20 +16318,21 @@ async def ejecutar_analisis_con_hilos(
             except Exception as e:
                 logger.error(f"[Progress] CRITICAL: Error updating INITIAL progress - exec_id={exec_id}, error={type(e).__name__}: {e}", exc_info=True)
             
-            # Process in chunks for periodic progress updates
-            for chunk_idx in range(0, len(analisis_tasks), chunk_size):
-                chunk_end = min(chunk_idx + chunk_size, len(analisis_tasks))
-                chunk = analisis_tasks[chunk_idx:chunk_end]
-                
-                # Execute this chunk
-                chunk_results = await asyncio.gather(*chunk, return_exceptions=True)
-                results.extend(chunk_results)
-                
-                # Update progress after chunk completes
-                completed_count = len(results)
+            last_progress_update_ts = 0.0
+            for finished in asyncio.as_completed(analisis_tasks):
+                symbol_done, tf_done, result = await finished
+                completed_with_meta.append((symbol_done, tf_done, result))
+                completed_count = len(completed_with_meta)
                 if completed_count < total_tasks:  # Don't update at 100% yet
+                    now_progress = time.time()
+                    should_update_progress = (
+                        completed_count == 1 or
+                        completed_count % progress_update_every_n == 0 or
+                        (now_progress - last_progress_update_ts) >= progress_update_min_interval
+                    )
+                    if not should_update_progress:
+                        continue
                     try:
-                        current_symbol, current_tf = task_meta[min(completed_count - 1, len(task_meta) - 1)] if task_meta else (None, None)
                         await asyncio.to_thread(
                             fs_heartbeat,
                             exec_id,
@@ -15289,15 +16340,21 @@ async def ejecutar_analisis_con_hilos(
                                 "analyzed": completed_count,
                                 "total": total_tasks,
                                 "percentage": round((completed_count / total_tasks) * 100, 1),
-                                "current_symbol": current_symbol,
-                                "current_tf": current_tf
+                                "current_symbol": symbol_done,
+                                "current_tf": tf_done
                             }
                         )
+                        last_progress_update_ts = now_progress
                     except Exception as e:
-                        logger.debug(f"[Progress] Skipped progress update (chunk {chunk_idx}): {type(e).__name__}")
+                        logger.debug(f"[Progress] Skipped progress update ({completed_count}/{total_tasks}): {type(e).__name__}")
             
             # Final progress update at 100%
             try:
+                final_symbol, final_tf = (
+                    (completed_with_meta[-1][0], completed_with_meta[-1][1])
+                    if completed_with_meta
+                    else (None, None)
+                )
                 await asyncio.to_thread(
                     fs_heartbeat,
                     exec_id,
@@ -15305,15 +16362,17 @@ async def ejecutar_analisis_con_hilos(
                         "analyzed": total_tasks,
                         "total": total_tasks,
                         "percentage": 100.0,
-                        "current_symbol": task_meta[-1][0] if task_meta else None,
-                        "current_tf": task_meta[-1][1] if task_meta else None
+                        "current_symbol": final_symbol,
+                        "current_tf": final_tf
                     }
                 )
             except Exception as e:
                 logger.error(f"[Progress] CRITICAL: Error updating FINAL progress - {type(e).__name__}: {e}", exc_info=True)
         else:
-            # Original behavior: simple gather without progress tracking
-            results = await asyncio.gather(*analisis_tasks, return_exceptions=True)
+            completed_with_meta = await asyncio.gather(*analisis_tasks, return_exceptions=False)
+
+        task_meta = [(symbol, temporalidad) for symbol, temporalidad, _ in completed_with_meta]
+        results = [result for _, _, result in completed_with_meta]
         
         t_gather_elapsed = (time.time() - t_gather_start)
         avg_time_per_task = (t_gather_elapsed / len(analisis_tasks)) if analisis_tasks else 0
@@ -15850,6 +16909,31 @@ async def procesar_resultado(
             out[sym] = str(top_tf)
         return out
 
+    def _build_monitoring_selection(row: dict | None, source: str) -> dict:
+        if not isinstance(row, dict) or not row:
+            return {}
+        symbol = str(row.get("Activo") or "").strip().upper()
+        timeframe = str(row.get("Temporalidad") or "").strip()
+        if not symbol or not timeframe:
+            return {}
+        score = (
+            row.get("Ponderacion")
+            if row.get("Ponderacion") is not None
+            else row.get("Score Final")
+        )
+        try:
+            score = float(score) if score is not None else None
+        except Exception:
+            score = None
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "source": source,
+            "score": score,
+            "tipo_operacion": row.get("Tipo de Operacion"),
+            "oportunidad": bool(row.get("Oportunidad")) if row.get("Oportunidad") is not None else None,
+        }
+
     async def _upload_enriched(res: dict):
         if not isinstance(res, dict):
             return None
@@ -16120,6 +17204,10 @@ async def procesar_resultado(
             },
             "top_timeframe": top_timeframe_temp,
             "top_timeframe_by_asset": top_timeframe_by_asset_temp,
+            "selected_symbol": None,
+            "selected_timeframe": None,
+            "selection": {},
+            "selection_pending": True,
         }
 
         try:
@@ -16252,6 +17340,8 @@ async def procesar_resultado(
     t_ui_final_start = time.time()
     # ✅ Esto permite navegación inmediata con el activo top seleccionado
     top_asset = None
+    selected_timeframe_final = None
+    monitoring_selection = {}
     if can_archive:
 
         cols_ui = [
@@ -16326,11 +17416,28 @@ async def procesar_resultado(
         except Exception:
             pass
 
-        top_timeframe_final = _pick_top_timeframe(ordenados_top)
+        # Selección única para monitoreo: preferir la mejor oportunidad final.
+        # Si no hay oportunidad válida, caer al top general final. Esto evita que
+        # el preview/warmup o la frecuencia de TFs contradigan el par que se abre
+        # al volver a entrar.
+        selection_source = "final_opportunity"
+        selection_row = None
+        if not df_filtrado.empty:
+            try:
+                selection_row = df_filtrado.iloc[0].to_dict()
+            except Exception:
+                selection_row = None
+        if not selection_row and ordenados_top:
+            selection_source = "final_ranking"
+            selection_row = ordenados_top[0]
+
+        monitoring_selection = _build_monitoring_selection(selection_row, selection_source)
+        selected_timeframe_final = monitoring_selection.get("timeframe") or _pick_top_timeframe(ordenados_top)
+        top_timeframe_final = selected_timeframe_final
         top_timeframe_by_asset_final = _pick_top_timeframe_by_asset(ordenados_top)
         if ordenados_top:
             try:
-                top_asset = str(ordenados_top[0].get("Activo") or "").strip().upper() or None
+                top_asset = monitoring_selection.get("symbol") or str(ordenados_top[0].get("Activo") or "").strip().upper() or None
             except Exception:
                 top_asset = None
 
@@ -16352,8 +17459,13 @@ async def procesar_resultado(
             },
             "top_timeframe": top_timeframe_final,
             "top_timeframe_by_asset": top_timeframe_by_asset_final,
+            "selected_symbol": monitoring_selection.get("symbol"),
+            "selected_timeframe": monitoring_selection.get("timeframe"),
+            "selection": monitoring_selection,
+            "selection_pending": False,
             "priority_assets": priority_assets,  # ✅ Activos prioritarios para monitoreo
             "ready_for_monitoring": [],  # Se actualizará a medida que se suban
+            "ready_for_monitoring_pairs": [],
         }
 
         # ✅ DEBUG: Verificar que ordenados_top[0] tiene niveles antes de sanitizar
@@ -16371,7 +17483,7 @@ async def procesar_resultado(
             logger.info(
                 f"[ui_resumen final] top_timeframe={top_timeframe_final} "
                 f"top_timeframe_by_asset={top_timeframe_by_asset_final} "
-                f"priority_assets={priority_assets}"
+                f"priority_assets={priority_assets} selection={monitoring_selection}"
             )
         except Exception:
             pass
@@ -16396,24 +17508,23 @@ async def procesar_resultado(
     rest_tasks = []
     json_tasks = []
     ready_for_monitoring = []
+    ready_for_monitoring_pairs = []
     resultados_selected_sorted = []
     resultados_priority_sorted = []
     resultados_rest_sorted = []
 
-    # Resolver activo seleccionado (debe coincidir con el elegido por el usuario)
+    # Resolver activo seleccionado desde la selección final calculada por backend.
+    # No usar user_states.par_seleccionado aquí: puede quedar con un activo de una
+    # ejecución anterior y adelantar uploads/ready de un par distinto al final.
     selected_asset = None
     try:
-        if user_chat_id is not None:
-            selected_asset = user_states.get(str(user_chat_id), {}).get("par_seleccionado")
-        if not selected_asset and user_id is not None:
-            selected_asset = user_states.get(str(user_id), {}).get("par_seleccionado")
-        if selected_asset:
-            selected_asset = str(selected_asset).strip().upper()
+        selected_asset = str((monitoring_selection or {}).get("symbol") or "").strip().upper() or None
     except Exception:
         selected_asset = None
     if not selected_asset and top_asset:
         selected_asset = top_asset
         logger.info(f"ℹ️ Sin activo seleccionado; usando más optado para prioridad: {selected_asset}")
+    selected_tf = selected_timeframe_final
 
     # === FASE DE PREPARACIÓN ===
     # 7) Preparar uploads de enriquecidos con orden:
@@ -16440,7 +17551,10 @@ async def procesar_resultado(
 
         resultados_selected_sorted = sorted(
             resultados_selected,
-            key=lambda r: _tf_priority(r.get("Temporalidad"))
+            key=lambda r: (
+                0 if selected_tf and str(r.get("Temporalidad") or "").strip() == str(selected_tf).strip() else 1,
+                _tf_priority(r.get("Temporalidad")),
+            )
         )
         resultados_priority_sorted = sorted(
             resultados_priority,
@@ -16593,14 +17707,20 @@ async def procesar_resultado(
                 elif result:
                     urls_generadas.append(result)
                     sym = resultados_selected_sorted[i].get("Activo")
+                    tf = resultados_selected_sorted[i].get("Temporalidad")
                     if sym and sym not in ready_for_monitoring:
                         ready_for_monitoring.append(sym)
+                    if sym and tf:
+                        pair = {"symbol": str(sym).strip().upper(), "timeframe": str(tf).strip()}
+                        if pair not in ready_for_monitoring_pairs:
+                            ready_for_monitoring_pairs.append(pair)
 
             if ready_for_monitoring:
                 # ✅ FIX: Usar dot-notation para merge en lugar de sobrescribir ui_resumen completo
                 fs_actualizar_ejecucion(
                     exec_id,
                     **{"ui_resumen.ready_for_monitoring": ready_for_monitoring},
+                    **{"ui_resumen.ready_for_monitoring_pairs": ready_for_monitoring_pairs},
                     upload_state={
                         "status": "publishing",
                         "phase": "priority_ready",
@@ -16625,14 +17745,20 @@ async def procesar_resultado(
                 elif result:
                     urls_generadas.append(result)
                     sym = resultados_priority_sorted[i].get("Activo")
+                    tf = resultados_priority_sorted[i].get("Temporalidad")
                     if sym and sym not in ready_for_monitoring:
                         ready_for_monitoring.append(sym)
+                    if sym and tf:
+                        pair = {"symbol": str(sym).strip().upper(), "timeframe": str(tf).strip()}
+                        if pair not in ready_for_monitoring_pairs:
+                            ready_for_monitoring_pairs.append(pair)
 
             if ready_for_monitoring:
                 # ✅ FIX: Usar dot-notation para merge en lugar de sobrescribir ui_resumen completo
                 fs_actualizar_ejecucion(
                     exec_id,
                     **{"ui_resumen.ready_for_monitoring": ready_for_monitoring},
+                    **{"ui_resumen.ready_for_monitoring_pairs": ready_for_monitoring_pairs},
                 )
 
             logger.info("✅ uploads de principales completados en %.1fs", time.time() - t_priority_start)
@@ -16666,8 +17792,13 @@ async def procesar_resultado(
                     elif result:
                         urls_generadas.append(result)
                         sym = resultados_rest_sorted[i].get("Activo")
+                        tf = resultados_rest_sorted[i].get("Temporalidad")
                         if sym and sym not in ready_for_monitoring:
                             ready_for_monitoring.append(sym)
+                        if sym and tf:
+                            pair = {"symbol": str(sym).strip().upper(), "timeframe": str(tf).strip()}
+                            if pair not in ready_for_monitoring_pairs:
+                                ready_for_monitoring_pairs.append(pair)
                     rest_count += 1
                 else:
                     if isinstance(result, Exception):
@@ -16681,6 +17812,7 @@ async def procesar_resultado(
                 fs_actualizar_ejecucion(
                     exec_id,
                     **{"ui_resumen.ready_for_monitoring": ready_for_monitoring},
+                    **{"ui_resumen.ready_for_monitoring_pairs": ready_for_monitoring_pairs},
                 )
 
             logger.info(
@@ -16943,16 +18075,25 @@ async def procesar_resultado(
             # Aquí NO descontamos nada para evitar doble cargo.
 
     if can_archive:
+        final_archivos = len(_solo_strings_urls(urls_generadas))
         fs_actualizar_ejecucion(
             exec_id,
+            archivos=final_archivos,
             upload_state={
                 "status": "completed",
                 "phase": "done",
                 "updated_at": datetime.now(UTC).isoformat() + "Z",
             },
         )
+        logger.info("[preview] final archivos count reconciled: %s", final_archivos)
 
     urls_generadas = _solo_strings_urls(urls_generadas)
+    logger.info(
+        "[AnalisisTiming] phase=procesar_resultado_total exec_id=%s elapsed=%.2fs urls=%d",
+        exec_id,
+        time.time() - t_proc_start,
+        len(urls_generadas),
+    )
     logger.info(f"Devolviendo URLs al frontend: {urls_generadas}")
     return urls_generadas
 
@@ -18041,8 +19182,10 @@ async def ejecutar_recurrente(
     cfg_overrides = operatoria_cfg or {}
     temps = cfg_overrides.get("tfs") or temporalidades
 
-    # Contabilizar transacciones (activo x tf) - protegido con lock
-    n = len(activos_filtrados) * len(temps)
+    # Contabilizar transacciones comerciales:
+    # activos de menú/categoría = comunes; símbolos fuera de categorías = exclusivos.
+    n, billing_meta = compute_analysis_transaction_units(activos_filtrados, temps)
+    logger.info("[Billing] analysis units=%s meta=%s", n, billing_meta)
     with user_states_lock:
         if user_id:
             user_states.setdefault(str(user_id), {})["numero_transacciones"] = n
@@ -18198,6 +19341,7 @@ async def ejecutar_recurrente(
                 exec_id,
                 activos_resueltos=activos_filtrados,
                 numero_transacciones=n,
+                billing_meta=billing_meta,
             )
         except Exception as e:
             logger.warning(f"No se pudo actualizar ejecución {exec_id}: {e}")
@@ -18288,11 +19432,16 @@ async def ejecutar_recurrente(
             return  # ya se manejó y se liberará estado en finally
 
         start_time = datetime.now()
+        perf_start = time.perf_counter()
+        perf_events_sec = 0.0
+        perf_analysis_sec = 0.0
+        perf_publish_sec = 0.0
 
         # Eventos económicos (tolerante a error) ✅ Con caché multi-pod
         # ✅ OPTIMIZACION: Si es un solo activo/temporalidad, posponer eventos económicos
         # para evitar latencia innecesaria. Se cargarán lazy al procesar.
         single_asset_analysis = len(activos_filtrados) == 1 and len(temps) <= 2
+        t_events_start = time.perf_counter()
         if single_asset_analysis:
             logger.info(f"[OptiAnalisis] Análisis de activo único detectado, aplicando modo fast-track")
             df_eventos = None  # Se cargarán lazy en procesar_simbolo_temporalidad si se necesitan
@@ -18303,7 +19452,14 @@ async def ejecutar_recurrente(
             except Exception as e:
                 logger.warning(f"Error al obtener eventos económicos: {e}")
                 df_eventos = None
+        perf_events_sec = time.perf_counter() - t_events_start
+        logger.info(
+            "[AnalisisTiming] phase=eventos exec_id=%s elapsed=%.2fs",
+            exec_id,
+            perf_events_sec,
+        )
 
+        t_analysis_start = time.perf_counter()
         resultados = await ejecutar_analisis_con_hilos(
             df_eventos,
             activos_filtrados,
@@ -18317,6 +19473,13 @@ async def ejecutar_recurrente(
             },
             cfg=cfg,
             exec_id=exec_id,  # 🆕 Pass exec_id for progress tracking
+        )
+        perf_analysis_sec = time.perf_counter() - t_analysis_start
+        logger.info(
+            "[AnalisisTiming] phase=calculo exec_id=%s elapsed=%.2fs resultados=%d",
+            exec_id,
+            perf_analysis_sec,
+            len(resultados) if resultados else 0,
         )
         logger.info(f"[Analisis completado] Retornando {len(resultados) if resultados else 0} resultados")
 
@@ -18333,10 +19496,18 @@ async def ejecutar_recurrente(
 
         try:
             logger.info(f"[procesar_resultado] Iniciando procesamiento de {len(resultados)} resultados")
+            t_publish_start = time.perf_counter()
             url_generadas = await procesar_resultado(
                 resultados, df_eventos, context, update,
                 moneda_filtro, user_id, user_chat_id, opciones_usuario, origen,
                 exec_id=exec_id, cfg=cfg
+            )
+            perf_publish_sec = time.perf_counter() - t_publish_start
+            logger.info(
+                "[AnalisisTiming] phase=publicacion exec_id=%s elapsed=%.2fs urls=%d",
+                exec_id,
+                perf_publish_sec,
+                len(url_generadas) if url_generadas else 0,
             )
             logger.info(f"[procesar_resultado] Completado, {len(url_generadas) if url_generadas else 0} URLs generadas")
         except Exception as e:
@@ -18354,9 +19525,19 @@ async def ejecutar_recurrente(
             raise  # Re-raise para que sea capturado por el bloque except principal
 
         elapsed_time = (datetime.now() - start_time).total_seconds()
+        perf_total_sec = time.perf_counter() - perf_start
         logger.info(
             f"[{datetime.now()}] Análisis finalizado (chat={user_chat_id}, uuid={user_id}). "
             f"Tiempo: {elapsed_time:.2f}s."
+        )
+        logger.info(
+            "[AnalisisTiming] phase=total exec_id=%s eventos=%.2fs calculo=%.2fs publicacion=%.2fs total=%.2fs overhead=%.2fs",
+            exec_id,
+            perf_events_sec,
+            perf_analysis_sec,
+            perf_publish_sec,
+            perf_total_sec,
+            max(0.0, perf_total_sec - perf_events_sec - perf_analysis_sec - perf_publish_sec),
         )
         return url_generadas
 
@@ -18818,7 +19999,53 @@ async def guardar_datos(data: dict):
 # Función para verificar si un usuario es administrador
 #@profile
 def es_administrador(user_id):
-    return user_id in admin_ids
+    key = str(user_id or "").strip()
+    if not key:
+        return False
+    if any(str(admin_id) == key for admin_id in (admin_ids or [])):
+        return True
+
+    now_ts = time.time()
+    with _admin_role_cache_lock:
+        cached = _admin_role_cache.get(key)
+        if cached and cached[0] > now_ts:
+            return cached[1]
+
+    try:
+        candidate_ids = {key}
+        for col_name in ("suscripciones_user", "user_ids", "chat_ids"):
+            try:
+                snap = db.collection(col_name).document(key).get()
+                if snap.exists:
+                    data = snap.to_dict() or {}
+                    for linked in (data.get("user_id"), data.get("telegram_id"), data.get("doc_alias_of"), data.get("chat_id")):
+                        if linked:
+                            candidate_ids.add(str(linked))
+            except Exception:
+                pass
+
+        for linked_key in list(candidate_ids):
+            for col_name in ("suscripciones_user", "user_ids", "chat_ids"):
+                if not linked_key:
+                    continue
+                try:
+                    snap = db.collection(col_name).document(linked_key).get()
+                    if snap.exists:
+                        data = snap.to_dict() or {}
+                        for linked in (data.get("user_id"), data.get("telegram_id"), data.get("doc_alias_of"), data.get("chat_id")):
+                            if linked:
+                                candidate_ids.add(str(linked))
+                except Exception:
+                    pass
+
+        admin_set = {str(admin_id) for admin_id in (admin_ids or [])}
+        is_admin = bool(candidate_ids & admin_set)
+    except Exception:
+        is_admin = False
+
+    with _admin_role_cache_lock:
+        _admin_role_cache[key] = (now_ts + 300, is_admin)
+    return is_admin
 
 
 def parse_iso_aware(s: str):
@@ -19403,6 +20630,58 @@ async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen
     if not canon_ref:
         return False, f"❌ No se encontró suscripción para {user_key}."
 
+    if vps_mode_enabled():
+        try:
+            canon_snap = canon_ref.get()
+            if not canon_snap.exists:
+                raise ValueError("No existe el documento canónico.")
+
+            sus = canon_snap.to_dict() or {}
+            curr = int(sus.get("transacciones_restantes") or 0)
+
+            if curr < dec:
+                if curr <= 0:
+                    inactive_payload = {
+                        "transacciones_restantes": 0,
+                        "estado": "inactiva",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    canon_ref.set(inactive_payload, merge=True)
+                    if alias_ref is not None:
+                        alias_ref.set(
+                            {
+                                "user_id": sus.get("user_id") or canon_ref.id,
+                                "doc_alias_of": sus.get("user_id") or canon_ref.id,
+                                **inactive_payload,
+                            },
+                            merge=True,
+                        )
+                return False, "No cuenta con la cuota de transacciones requerida. Por favor, adquiere un paquete."
+
+            nuevo = max(curr - dec, 0)
+            estado = "activa" if nuevo > 0 else "inactiva"
+            payload = {
+                "transacciones_restantes": nuevo,
+                "estado": estado,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            canon_ref.set(payload, merge=True)
+            if alias_ref is not None:
+                alias_ref.set(
+                    {
+                        "user_id": sus.get("user_id") or canon_ref.id,
+                        "doc_alias_of": sus.get("user_id") or canon_ref.id,
+                        **payload,
+                    },
+                    merge=True,
+                )
+
+            if nuevo <= 0:
+                return True, "✅ Transacción aplicada. Te quedan 0; tu suscripción quedó inactiva."
+            return True, f"✅ Transacción aplicada. Te quedan {nuevo}."
+        except Exception as e:
+            return False, f"❌ Error inesperado al descontar transacción: {e}"
+
     @firestore.transactional
     def _tx(transaction: firestore.Transaction):
         canon_snap = canon_ref.get(transaction=transaction)
@@ -19490,10 +20769,93 @@ async def descontar_transaccion(user_key: str, numero_transacciones_in=1, origen
         return False, f"❌ Error inesperado al descontar transacción: {e}"
 
 
+async def reponer_transaccion(user_key: str, numero_transacciones_in=1, origen="telegram") -> Tuple[bool, str]:
+    """
+    Repone transacciones cobradas por llamadas externas que no llegaron a entregar datos.
+    Usa el mismo doc canónico/alias que descontar_transaccion para mantener el saldo coherente.
+    """
+    try:
+        inc = int(numero_transacciones_in) if int(numero_transacciones_in) > 0 else 1
+    except Exception:
+        inc = 1
+
+    canon_ref, alias_ref, _ = _resolve_refs_from_key(user_key)
+    if not canon_ref:
+        return False, f"❌ No se encontró suscripción para {user_key}."
+
+    if vps_mode_enabled():
+        try:
+            canon_snap = canon_ref.get()
+            if not canon_snap.exists:
+                raise ValueError("No existe el documento canónico.")
+
+            sus = canon_snap.to_dict() or {}
+            curr = int(sus.get("transacciones_restantes") or 0)
+            nuevo = curr + inc
+
+            fin = parse_iso_aware(sus.get("fin") or "")
+            estado = "activa" if fin and fin >= _now_utc() and nuevo > 0 else sus.get("estado", "activa")
+            payload = {
+                "transacciones_restantes": nuevo,
+                "estado": estado,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            canon_ref.set(payload, merge=True)
+            if alias_ref is not None:
+                alias_ref.set(
+                    {
+                        "user_id": sus.get("user_id") or canon_ref.id,
+                        "doc_alias_of": sus.get("user_id") or canon_ref.id,
+                        **payload,
+                    },
+                    merge=True,
+                )
+            return True, f"✅ Transacción repuesta. Te quedan {nuevo}."
+        except Exception as e:
+            return False, f"❌ Error inesperado al reponer transacción: {e}"
+
+    @firestore.transactional
+    def _tx(transaction: firestore.Transaction):
+        canon_snap = canon_ref.get(transaction=transaction)
+        if not canon_snap.exists:
+            raise ValueError("No existe el documento canónico.")
+
+        sus = canon_snap.to_dict() or {}
+        curr = int(sus.get("transacciones_restantes") or 0)
+        nuevo = curr + inc
+
+        fin = parse_iso_aware(sus.get("fin") or "")
+        estado = "activa" if fin and fin >= _now_utc() and nuevo > 0 else sus.get("estado", "activa")
+        payload = {
+            "transacciones_restantes": nuevo,
+            "estado": estado,
+            "updated_at": firestore.SERVER_TIMESTAMP,
+        }
+        transaction.set(canon_ref, payload, merge=True)
+        if alias_ref is not None:
+            transaction.set(
+                alias_ref,
+                {
+                    "user_id": sus.get("user_id") or canon_ref.id,
+                    "doc_alias_of": sus.get("user_id") or canon_ref.id,
+                    **payload,
+                },
+                merge=True,
+            )
+        return {"ok": True, "remaining": nuevo}
+
+    try:
+        result = _tx(db.transaction())
+        remaining = int((result or {}).get("remaining") or 0)
+        return True, f"✅ Transacción repuesta. Te quedan {remaining}."
+    except Exception as e:
+        return False, f"❌ Error inesperado al reponer transacción: {e}"
+
+
 # =========================
 # Monitoreo: cobro por llamada
 # =========================
-async def _charge_monitoreo_per_call(user_id: str, origen: str = "app") -> Tuple[bool, str]:
+async def _charge_monitoreo_per_call(user_id: str, origen: str = "app", units: int = 1) -> Tuple[bool, str]:
     """
     Cobra 1 transacción por cada llamada a endpoints de monitoreo.
     - Se cobra por cada consulta de activo_temporalidad
@@ -19504,7 +20866,11 @@ async def _charge_monitoreo_per_call(user_id: str, origen: str = "app") -> Tuple
         return False, "user_id es obligatorio"
     if es_administrador(user_id):
         return True, "admin"
-    return await descontar_transaccion(user_id, 1, origen=origen)
+    try:
+        dec = max(1, int(units))
+    except Exception:
+        dec = 1
+    return await descontar_transaccion(user_id, dec, origen=origen)
 
 
 # =========================
@@ -20665,6 +22031,14 @@ async def calcular_entradas_async(
         Dict with entry signal analysis (complete legacy format)
     """
     salida = {}
+    perf_enabled = str(os.environ.get("ANALYSIS_TIMING_VERBOSE", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    perf_threshold_s = float(os.environ.get("ANALYSIS_TIMING_THRESHOLD_SEC", "2.0"))
+    t_entry_total = time.time()
+    perf_marks: list[tuple[str, float]] = []
+
+    def _mark_perf(label: str, started_at: float):
+        if perf_enabled:
+            perf_marks.append((label, time.time() - started_at))
     
     # ✅ NIVEL 0: Redis Cache (ultra-fast para cálculos determinísticos)
     tf = _tf_backend(temporalidad)
@@ -20759,6 +22133,7 @@ async def calcular_entradas_async(
                 return (50.0, None)
         
         # Gather all parallel tasks
+        t_phase = time.time()
         patrones_result, rango_result, tecnica_meta, fundamental_result = await asyncio.gather(
             _detect_patterns(),
             _detect_range(),
@@ -20766,6 +22141,7 @@ async def calcular_entradas_async(
             _analyze_fundamental(),
             return_exceptions=False
         )
+        _mark_perf("base_parallel", t_phase)
         
         # Process pattern results
         patrones_detectados = {}
@@ -20813,12 +22189,14 @@ async def calcular_entradas_async(
                 return (50, 50)
         
         try:
+            t_phase = time.time()
             predicciones_arima, predicciones_media_movil, mc_result = await asyncio.gather(
                 _predict_arima(),
                 _predict_mm(),
                 _predict_mc(),
                 return_exceptions=False
             )
+            _mark_perf("predictions", t_phase)
             
             if mc_result and isinstance(mc_result, tuple):
                 probabilidad_alza, probabilidad_baja = mc_result
@@ -20834,30 +22212,40 @@ async def calcular_entradas_async(
             probabilidad_alza, probabilidad_baja = 50, 50
         
         # ===== DYNAMIC SUPPORT/RESISTANCE (WITH CACHE) =====
-        cache_key = _get_niveles_cache_key(symbol, tf, len(df), precio_actual)
+        df_sr_calc = _slice_sr_df(df, tf)
+        cache_key = _get_niveles_cache_key(symbol, tf, _df_cache_marker(df_sr_calc), precio_actual)
         soportes_cached, resistencias_cached = _get_cached_niveles(cache_key)
         
         if soportes_cached is not None and resistencias_cached is not None:
             soportes_dinamicos = soportes_cached
             resistencias_dinamicas = resistencias_cached
+            _mark_perf("support_resistance_cache", time.time())
         else:
             try:
-                df, soportes_dinamicos, resistencias_dinamicas = await asyncio.wait_for(
+                t_phase = time.time()
+                _df_sr, soportes_dinamicos, resistencias_dinamicas = await asyncio.wait_for(
                     loop.run_in_executor(
                         None,
                         lambda: ajustar_window_dinamico_optimizado(
-                            df,
+                            df_sr_calc,
                             symbol,
                             tf,
                             precio_actual,
                             calc_windows=calc_windows,
                             max_incremento=5,
                             min_factor=2,
-                            max_factor=8,
+                            max_factor=_sr_dynamic_max_factor(tf),
                             min_levels=2,
                         ),
                     ),
-                    timeout=60.0  # INCREASED: 30s→60s (complex analysis under high concurrency)
+                    timeout=30.0
+                )
+                _mark_perf("support_resistance_calc", t_phase)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timeout calculando S/R dinámicos para %s-%s; usando fallback estático",
+                    symbol,
+                    tf,
                 )
             except Exception as e:
                 logger.warning(
@@ -20869,10 +22257,10 @@ async def calcular_entradas_async(
                         loop.run_in_executor(
                             None,
                             lambda: calcular_soportes_resistencias_para_window(
-                                window, df, precio_actual, 2, symbol, tf
+                                min(window, len(df_sr_calc)), df_sr_calc, precio_actual, 2, symbol, tf
                             ),
                         ),
-                        timeout=20.0,  # INCREASED: 10s→20s for fallback S/R calculation
+                        timeout=10.0,
                     )
                     logger.info(f"[Fallback S/R] {symbol}-{tf}: usando niveles estáticos (window={window})")
                 except Exception as e_fallback:
@@ -20917,6 +22305,7 @@ async def calcular_entradas_async(
             logger.info(f"[ATR] Fallback usado para {symbol}/{tf}: ATR={ATR}")
         
         # ===== PROBABILITY CALCULATIONS =====
+        t_phase = time.time()
         probabilidad_tecnica = round(ajustar_probabilidad_tecnica(
             df, tf, window, cfg, niveles=niveles_clave, symbol=symbol
         ), 2)
@@ -20925,6 +22314,7 @@ async def calcular_entradas_async(
             probabilidad_tecnica, probabilidad_fundamental, cfg
         )
         probabilidad_general = round(probabilidad_general if probabilidad_general is not None else 50, 2)
+        _mark_perf("probabilities", t_phase)
         
         # ===== ZONE VERIFICATION =====
         verificar_znt = True
@@ -21000,6 +22390,7 @@ async def calcular_entradas_async(
         enable_retest = os.environ.get("ENTRADA_ENABLE_RETEST", "false").lower() == "true"
         enable_range_revert = os.environ.get("ENTRADA_ENABLE_RANGE_REVERT", "true").lower() == "true"
         
+        t_phase = time.time()
         entradas_mult = generar_entradas_multiples(
             precio_actual=precio_actual,
             ATR=ATR,
@@ -21017,6 +22408,7 @@ async def calcular_entradas_async(
             enable_breakout_retest=enable_retest,
             enable_range_mean_revert=enable_range_revert,
         )
+        _mark_perf("entries", t_phase)
         
         # Attach metadata to entries
         try:
@@ -21039,14 +22431,17 @@ async def calcular_entradas_async(
         
         # ===== LEGACY ENTRY SELECTION (fallback if no entries) =====
         best = entradas_mult[0] if entradas_mult else None
+        legacy_side = None
         if best:
             precio_entrada = best.get("precio_entrada")
             take_profit = best.get("take_profit")
             stop_loss = best.get("stop_loss")
+            legacy_side = best.get("side")
         else:
             if tipo_operacion in señales_compra or (
                 tipo_operacion == "Neutral" and en_rango["estructura_tendencia"] in ("alcista", "indefinida")
             ):
+                legacy_side = "long"
                 precio_entrada = (
                     (niveles_clave["resistencia_nivel_1"] + niveles_clave["soporte_nivel_1"]) / 2
                     if niveles_clave["resistencia_nivel_1"] and niveles_clave["soporte_nivel_1"]
@@ -21061,6 +22456,7 @@ async def calcular_entradas_async(
             elif tipo_operacion in señales_venta or (
                 tipo_operacion == "Neutral" and en_rango["estructura_tendencia"] in ("bajista", "indefinida")
             ):
+                legacy_side = "short"
                 precio_entrada = (
                     (niveles_clave["resistencia_nivel_1"] + niveles_clave["soporte_nivel_1"]) / 2
                     if niveles_clave["resistencia_nivel_1"] and niveles_clave["soporte_nivel_1"]
@@ -21073,6 +22469,7 @@ async def calcular_entradas_async(
                     )
                     stop_loss, take_profit = np.nan, np.nan
             else:
+                legacy_side = None
                 precio_entrada = None
                 take_profit = None
                 stop_loss = None
@@ -21183,7 +22580,42 @@ async def calcular_entradas_async(
             "zona_sobrecompra": zona_sobrecompra,
             "entradas": entradas_mult,
         }
-        
+
+        # ✅ CONSISTENCIA: Si entradas_mult vacío pero hay entry legacy, empaquetarlo en el array
+        # Esto garantiza que "entradas" SIEMPRE sea un array con al menos 1 elemento cuando hay señal
+        if not entradas_mult and precio_entrada is not None:
+            import math as _math
+            def _finite_local(v):
+                try: return v is not None and not _math.isnan(v) and not _math.isinf(v)
+                except: return False
+            if _finite_local(precio_entrada):
+                _rrr = None
+                try:
+                    if _finite_local(take_profit) and _finite_local(stop_loss):
+                        _diff_tp = abs(take_profit - precio_entrada)
+                        _diff_sl = abs(precio_entrada - stop_loss)
+                        _rrr = round(_diff_tp / _diff_sl, 3) if _diff_sl > 0 else None
+                except Exception:
+                    pass
+                _side = legacy_side if legacy_side in ("long", "short") else "long" if tipo_operacion in ("Compra",) else "short" if tipo_operacion in ("Venta",) else "neutral"
+                salida["entradas"] = [{
+                    "precio_entrada": precio_entrada,
+                    "take_profit": take_profit if _finite_local(take_profit) else None,
+                    "stop_loss": stop_loss if _finite_local(stop_loss) else None,
+                    "side": _side,
+                    "rrr": _rrr,
+                    "score": salida.get("confianza"),
+                    "basado_en": "legacy_fallback",
+                    "rebotes": salida.get("rebotes"),
+                    "ultimo_valor": precio_actual,
+                    "meta": {},
+                }]
+
+        total_entry_elapsed = time.time() - t_entry_total
+        if perf_enabled and (total_entry_elapsed >= perf_threshold_s or any(v >= perf_threshold_s for _, v in perf_marks)):
+            timing = ", ".join(f"{name}={elapsed:.2f}s" for name, elapsed in perf_marks)
+            logger.info("[Timing][Entradas] %s/%s total=%.2fs %s", symbol, tf, total_entry_elapsed, timing)
+
         # ✅ NIVEL 0.5: Guardar resultado en Redis para próxima vez (non-blocking)
         try:
             entradas_cache = get_entradas_cache()
@@ -21206,7 +22638,7 @@ async def calcular_entradas_async(
         if not salida:
             salida = {}
         salida.setdefault("entradas_multiples", [])
-        salida.setdefault("entradas", {"lista": []})
+        salida.setdefault("entradas", [])
         return json_safe(salida)
 
 
@@ -21735,22 +23167,33 @@ def _gcs_file_name_for(symbol: str, timeframe: str) -> str:
 
 
 def _download_json_from_gcs(path: str) -> Any:
-    client = storage.Client()
     """
     Lee un JSON de GCS (usando storage_client global si ya existe).
     Retorna dict/list. Lanza excepción si falla.
     """
-    # Requiere google-cloud-storage y que tengas storage_client global (ya suele existir en tu app).
-    bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(path)
-    data = blob.download_as_bytes()
-    return json.loads(data.decode("utf-8"))
+    if vps_mode_enabled():
+        try:
+            data = get_vps_json_store().read_bytes(path)
+            return json.loads(data.decode("utf-8"))
+        except Exception:
+            if not vps_to_gcp_enabled():
+                raise
+    try:
+        client = get_gcs_client()
+        bucket = client.bucket(BUCKET_NAME)
+        blob = bucket.blob(path)
+        data = blob.download_as_bytes()
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        if not gcp_to_vps_enabled():
+            raise
+        data = get_vps_json_store().read_bytes(path)
+        return json.loads(data.decode("utf-8"))
 
 
 
 def _persist_if_needed(exec_id: str, symbol: str, timeframe: str, force: bool = False) -> Optional[str]:
     try:
-        client = storage.Client()
         key = (exec_id, symbol.upper(), timeframe)
         with _MON_CACHE_LOCK:
             state = _MON_CACHE.get(key)
@@ -21766,19 +23209,29 @@ def _persist_if_needed(exec_id: str, symbol: str, timeframe: str, force: bool = 
             logging.info(f"PERSIST START: {key} -> {path} ({series_count} candles, force={force})")
             
             payload = json.dumps(state["series"], ensure_ascii=False).encode("utf-8")
-            bucket = client.bucket(BUCKET_NAME)
-            blob = bucket.blob(path)
-            
-            blob.upload_from_string(payload, content_type="application/json")
-            blob.reload()
+            if vps_mode_enabled():
+                get_vps_json_store().write_bytes(path, payload)
+                _mirror_bytes_to_gcp(path, payload, content_type="application/json")
+                blob = None
+            else:
+                client = get_gcs_client()
+                bucket = client.bucket(BUCKET_NAME)
+                blob = bucket.blob(path)
+                blob.upload_from_string(payload, content_type="application/json")
+                _mirror_bytes_to_vps(path, payload)
+                blob.reload()
             
             state["dirty"] = False
             # >>> reflejar metadata para que _maybe_refresh_from_gcs no re-baje de inmediato
             state["gcs_path"] = path
-            try:
-                state["gcs_generation"] = blob.generation
-                state["gcs_updated"] = blob.updated.timestamp() if blob.updated else time.time()
-            except Exception:
+            if blob is not None:
+                try:
+                    state["gcs_generation"] = blob.generation
+                    state["gcs_updated"] = blob.updated.timestamp() if blob.updated else time.time()
+                except Exception:
+                    state["gcs_updated"] = time.time()
+            else:
+                state["gcs_generation"] = None
                 state["gcs_updated"] = time.time()
             state["ts_loaded"] = time.time()
             
@@ -21854,18 +23307,26 @@ def fs_touch_monitoreo(exec_id: str, symbol: str, data: Dict[str, Any]) -> None:
 
         cur.update(data)
         cur["updated_at"] = int(time.time() * 1000)
-        ref.set(cur, merge=True)
+        try:
+            ref.set(cur, merge=True)
+        except Exception as exc:
+            if not hybrid_mode_enabled():
+                raise
+            logger.warning("[HybridFirestore] Firestore set failed for monitoreos/%s: %s", doc_id, exc)
+        _mirror_firestore_set("monitoreos", doc_id, cur, merge=True)
+        _mirror_firestore_set_to_gcp("monitoreos", doc_id, cur, merge=True)
     except Exception:
         pass
 
 
 def _maybe_refresh_from_gcs(exec_id: str, symbol: str, timeframe: str, st: dict, max_age_s: int = 30):
     try:
-        client = storage.Client()
-        for path in (
-            _gcs_stream_path(exec_id, symbol, timeframe),  # type: ignore[name-defined]
-            f"{_gcs_exec_base(exec_id)}{_gcs_file_name_for(symbol, timeframe)}",
-        ):
+        client = get_gcs_client()
+        paths = [f"{_gcs_exec_base(exec_id)}{_gcs_file_name_for(symbol, timeframe)}"]
+        stream_path_fn = globals().get("_gcs_stream_path")
+        if callable(stream_path_fn):
+            paths.insert(0, stream_path_fn(exec_id, symbol, timeframe))
+        for path in paths:
             bucket = client.bucket(BUCKET_NAME)
             blob = bucket.blob(path)
             if not blob.exists():
@@ -22149,6 +23610,212 @@ def _normalize_fmp_bars(raw: list) -> list:
     out.sort(key=lambda x: x["t"])
     return out
 
+
+def _validate_fmp_range_bars(
+    bars: list[dict],
+    symbol: str,
+    tf: str,
+    from_ms: int,
+    to_ms: int,
+    source: str,
+) -> list[dict]:
+    """Keep only valid bars inside the requested range before merging/persisting."""
+    if not FMP_RANGE_VALIDATION_ENABLED or not bars:
+        return bars or []
+
+    tfms = _tf_ms(tf)
+    # FMP boundaries can be inclusive/exclusive depending on endpoint; allow one
+    # bucket of tolerance, then snap/dedupe after filtering.
+    lower = int(from_ms) - tfms
+    upper = int(to_ms) + tfms
+    valid: list[dict] = []
+    out_of_range = 0
+    invalid_ohlc = 0
+
+    for bar in bars:
+        try:
+            ts = int(bar.get("t", 0))
+            o = float(bar.get("o"))
+            h = float(bar.get("h"))
+            l = float(bar.get("l"))
+            c = float(bar.get("c"))
+            v = float(bar.get("v", 0) or 0)
+            if not all(math.isfinite(x) for x in (o, h, l, c, v)):
+                invalid_ohlc += 1
+                continue
+            if h < max(o, c) or l > min(o, c):
+                invalid_ohlc += 1
+                continue
+            if ts < lower or ts > upper:
+                out_of_range += 1
+                continue
+            valid.append({"t": ts, "o": o, "h": h, "l": l, "c": c, "v": v})
+        except Exception:
+            invalid_ohlc += 1
+
+    if not valid:
+        _record_fmp_range_stats(
+            symbol,
+            tf,
+            source,
+            raw_count=len(bars),
+            kept_count=0,
+            out_of_range_count=out_of_range,
+            invalid_ohlc_count=invalid_ohlc,
+            from_ms=from_ms,
+            to_ms=to_ms,
+        )
+        logging.warning(
+            "[FMP_RANGE_VALIDATE] rejected %s/%s source=%s: no bars in requested range "
+            "UTC:[%s -> %s], raw=%d, out_of_range=%d, invalid_ohlc=%d",
+            symbol,
+            tf,
+            source,
+            _ms_to_iso_utc(from_ms),
+            _ms_to_iso_utc(to_ms),
+            len(bars),
+            out_of_range,
+            invalid_ohlc,
+        )
+        return []
+
+    total = max(1, len(bars))
+    out_ratio = out_of_range / total
+    _record_fmp_range_stats(
+        symbol,
+        tf,
+        source,
+        raw_count=len(bars),
+        kept_count=len(valid),
+        out_of_range_count=out_of_range,
+        invalid_ohlc_count=invalid_ohlc,
+        from_ms=from_ms,
+        to_ms=to_ms,
+    )
+    if out_ratio > FMP_RANGE_OUT_OF_RANGE_WARN_RATIO:
+        logging.warning(
+            "[FMP_RANGE_VALIDATE] clipped %s/%s source=%s: kept=%d raw=%d out_of_range=%d "
+            "invalid_ohlc=%d requested_UTC:[%s -> %s]",
+            symbol,
+            tf,
+            source,
+            len(valid),
+            len(bars),
+            out_of_range,
+            invalid_ohlc,
+            _ms_to_iso_utc(from_ms),
+            _ms_to_iso_utc(to_ms),
+        )
+
+    return _snap_and_dedupe_to_minutes(valid, tf)
+
+
+def _record_fmp_range_stats(
+    symbol: str,
+    tf: str,
+    source: str,
+    *,
+    raw_count: int,
+    kept_count: int,
+    out_of_range_count: int,
+    invalid_ohlc_count: int,
+    from_ms: int,
+    to_ms: int,
+) -> None:
+    if raw_count <= 0:
+        return
+    tf_norm = _norm_tf(tf)
+    key = (str(symbol).upper(), tf_norm)
+    clip_ratio = float(out_of_range_count) / float(max(1, raw_count))
+    try:
+        with _FMP_RANGE_STATS_LOCK:
+            stats = _FMP_RANGE_STATS.setdefault(
+                key,
+                {
+                    "calls": 0,
+                    "raw": 0,
+                    "kept": 0,
+                    "out_of_range": 0,
+                    "invalid_ohlc": 0,
+                    "last_clip_ratio": 0.0,
+                    "last_requested_bars": 0,
+                    "last_source": source,
+                },
+            )
+            stats["calls"] = int(stats.get("calls") or 0) + 1
+            stats["raw"] = int(stats.get("raw") or 0) + int(raw_count)
+            stats["kept"] = int(stats.get("kept") or 0) + int(kept_count)
+            stats["out_of_range"] = int(stats.get("out_of_range") or 0) + int(out_of_range_count)
+            stats["invalid_ohlc"] = int(stats.get("invalid_ohlc") or 0) + int(invalid_ohlc_count)
+            stats["last_clip_ratio"] = round(clip_ratio, 6)
+            stats["last_requested_bars"] = max(1, int((int(to_ms) - int(from_ms)) // max(1, _tf_ms(tf_norm))) + 1)
+            stats["last_source"] = source
+    except Exception:
+        pass
+
+    if not FMP_RANGE_ADAPTIVE_ENABLED:
+        return
+    if clip_ratio < FMP_RANGE_ADAPTIVE_CLIP_RATIO:
+        return
+    try:
+        requested_bars = max(1, int((int(to_ms) - int(from_ms)) // max(1, _tf_ms(tf_norm))) + 1)
+        current_hint = _get_fmp_range_adaptive_max_bars(symbol, tf_norm)
+        next_hint = max(FMP_RANGE_ADAPTIVE_MIN_BARS, min(current_hint, requested_bars // 2 or requested_bars))
+        if next_hint < current_hint:
+            _set_fmp_range_adaptive_max_bars(symbol, tf_norm, next_hint)
+            logging.info(
+                "[FMP_RANGE_ADAPT] %s/%s source=%s clip_ratio=%.3f raw=%d kept=%d requested_bars=%d next_max_bars=%d",
+                symbol,
+                tf_norm,
+                source,
+                clip_ratio,
+                raw_count,
+                kept_count,
+                requested_bars,
+                next_hint,
+            )
+    except Exception as exc:
+        logging.debug("[FMP_RANGE_ADAPT] failed for %s/%s: %s", symbol, tf, exc)
+
+
+def _get_fmp_range_adaptive_max_bars(symbol: str, tf: str) -> int:
+    if not FMP_RANGE_ADAPTIVE_ENABLED:
+        return max(1, FMP_RANGE_ADAPTIVE_DEFAULT_MAX_BARS)
+    symbol_key = str(symbol).upper()
+    tf_norm = _norm_tf(tf)
+    cache_key = (symbol_key, tf_norm)
+    now = time.time()
+    hint = _FMP_RANGE_ADAPTIVE_HINTS.get(cache_key)
+    if hint and hint[1] > now:
+        return max(1, int(hint[0]))
+
+    try:
+        client = _get_deep_gapfill_redis_client()
+        if client is not None:
+            raw = client.get(f"fmp_range_adapt:max_bars:{symbol_key}:{tf_norm}")
+            if raw:
+                val = max(1, int(raw))
+                _FMP_RANGE_ADAPTIVE_HINTS[cache_key] = (val, now + min(FMP_RANGE_ADAPTIVE_TTL_SECONDS, 600))
+                return val
+    except Exception:
+        pass
+
+    return max(1, FMP_RANGE_ADAPTIVE_DEFAULT_MAX_BARS)
+
+
+def _set_fmp_range_adaptive_max_bars(symbol: str, tf: str, max_bars: int) -> None:
+    symbol_key = str(symbol).upper()
+    tf_norm = _norm_tf(tf)
+    val = max(1, int(max_bars))
+    expires_at = time.time() + max(60, FMP_RANGE_ADAPTIVE_TTL_SECONDS)
+    _FMP_RANGE_ADAPTIVE_HINTS[(symbol_key, tf_norm)] = (val, expires_at)
+    try:
+        client = _get_deep_gapfill_redis_client()
+        if client is not None:
+            client.setex(f"fmp_range_adapt:max_bars:{symbol_key}:{tf_norm}", max(60, FMP_RANGE_ADAPTIVE_TTL_SECONDS), val)
+    except Exception:
+        pass
+
 # ---------- paths ----------
 def _gcs_enriched_path(exec_id: str, symbol: str, tf: str) -> str:
     # gs://markettool_bucket/analisis/exec/{exec_id}/{SYMBOL}_{TF}_enriched.json
@@ -22292,7 +23959,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
         # 1) estable/realtime (forex)
         url1 = f"https://financialmodelingprep.com/stable/quote?symbol={symbol}&apikey={API_KEY}"
         logging.info(f"[Quote-Fallback-v4] URL: {url1}")
-        r = _fmp_http_get(url1, timeout=8, symbol=symbol)
+        r = _fmp_http_get(url1, timeout=8, symbol=symbol, source="quote_stable")
         if r.ok:
             arr = r.json() or []
             if isinstance(arr, list) and arr:
@@ -22301,7 +23968,7 @@ def _fetch_quote(symbol: str) -> Optional[float]:
         # 2) fallback v3
         url2 = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={API_KEY}"
         logging.info(f"[Quote-Fallback-v3] URL: {url2}")
-        r = _fmp_http_get(url2, timeout=8, symbol=symbol)
+        r = _fmp_http_get(url2, timeout=8, symbol=symbol, source="quote_v3")
         if r.ok:
             arr = r.json() or []
             if isinstance(arr, list) and arr:
@@ -22319,7 +23986,7 @@ def _fetch_historical(symbol: str, tf: str) -> list[dict]:
         iv = _fmp_interval(tf)
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}?apikey={API_KEY}"
         logging.info(f"[Historical-Fetch] URL: {url}")
-        r = _fmp_http_get(url, timeout=5, symbol=symbol)
+        r = _fmp_http_get(url, timeout=5, symbol=symbol, timeframe=tf, source="live_historical")
         if not r.ok:
             return []
         arr = r.json() or []
@@ -22430,7 +24097,7 @@ def gcs_blob_exists(bucket_name: str, path: str) -> bool:
     Verifica si existe un blob en GCS.
     """
     try:
-        client = storage.Client()
+        client = get_gcs_client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(path)
         return blob.exists()
@@ -22444,16 +24111,29 @@ def read_json_from_gcs(bucket_name: str, path: str) -> Any:
     Lee un JSON (UTF-8) desde GCS y lo parsea.
     Retorna list/dict o {} si falla.
     """
+    if vps_mode_enabled():
+        try:
+            return json.loads(get_vps_json_store().read_bytes(path).decode("utf-8"))
+        except Exception:
+            if not vps_to_gcp_enabled():
+                return {}
     try:
-        client = storage.Client()
+        client = get_gcs_client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(path)
         if not blob.exists():
+            if gcp_to_vps_enabled() and get_vps_json_store().exists(path):
+                return json.loads(get_vps_json_store().read_bytes(path).decode("utf-8"))
             return {}
         data = blob.download_as_bytes()
         # Si algún día subes gz, aquí podrías detectar y descomprimir
         return json.loads(data.decode("utf-8"))
     except Exception:
+        if gcp_to_vps_enabled():
+            try:
+                return json.loads(get_vps_json_store().read_bytes(path).decode("utf-8"))
+            except Exception:
+                pass
         return {}
 
 
@@ -22465,10 +24145,15 @@ def write_json_to_gcs(bucket_name: str, path: str, obj: Any, content_type: str =
     """
     try:
         payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        client =  storage.Client()
+        if vps_mode_enabled():
+            get_vps_json_store().write_bytes(path, payload)
+            _mirror_bytes_to_gcp(path, payload, content_type=content_type)
+            return None
+        client = get_gcs_client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(path)
         blob.upload_from_string(payload, content_type=content_type)
+        _mirror_bytes_to_vps(path, payload)
         # Devuelve la generación para control de cambios
         blob.reload()  # actualiza metadata local
         return str(blob.generation) if getattr(blob, "generation", None) else None
@@ -22575,12 +24260,117 @@ def _current_closed_bucket_start(tf: str) -> int:
 def _ms_to_iso_utc(ts_ms: int) -> str:
     # "YYYY-MM-DD HH:MM:SS" en UTC (formato que acepta FMP en historical-chart)
     return datetime.utcfromtimestamp(ts_ms/1000).strftime("%Y-%m-%d %H:%M:%S")
-def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> list[dict]:
+
+def _get_deep_gapfill_redis_client():
+    global _DEEP_GAPFILL_REDIS_CLIENT
+    if _DEEP_GAPFILL_REDIS_CLIENT is not None:
+        return _DEEP_GAPFILL_REDIS_CLIENT
+    if redis is None:
+        return None
+    redis_url = (
+        os.getenv("MARKET_DATA_REDIS_URL")
+        or os.getenv("LIVE_ENTRIES_REDIS_URL")
+        or os.getenv("REDIS_URL")
+    )
+    if not redis_url:
+        return None
+    try:
+        client = redis.Redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=1, socket_timeout=2)
+        client.ping()
+        _DEEP_GAPFILL_REDIS_CLIENT = client
+        return client
+    except Exception:
+        return None
+
+
+def _deep_gapfill_acquire_fmp_slot(symbol: str, tf: str) -> bool:
+    if not ANALYSIS_DEEP_GAPFILL_ENABLED:
+        return True
+    max_per_min = max(0, ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_MIN)
+    if max_per_min <= 0:
+        logging.info("[DeepGapfill] FMP call skipped: disabled by ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_MIN=0")
+        return False
+
+    min_gap = max(0.0, ANALYSIS_DEEP_GAPFILL_MIN_SECONDS_BETWEEN_CALLS)
+    client = _get_deep_gapfill_redis_client()
+    if client is not None:
+        try:
+            if min_gap > 0:
+                lock_key = "deep_gapfill:fmp_spacing"
+                sleep_until = time.time() + min(min_gap, 30.0)
+                while not client.set(lock_key, f"{symbol}:{tf}:{time.time():.3f}", nx=True, ex=max(1, int(math.ceil(min_gap)))):
+                    remaining = sleep_until - time.time()
+                    if remaining <= 0:
+                        logging.info("[DeepGapfill] FMP call skipped by spacing throttle %s/%s", symbol, tf)
+                        return False
+                    time.sleep(min(0.25, remaining))
+
+            minute = int(time.time() // 60)
+            key = f"deep_gapfill:fmp_calls:{minute}"
+            count = int(client.incr(key))
+            if count == 1:
+                client.expire(key, 120)
+            if count > max_per_min:
+                logging.info(
+                    "[DeepGapfill] FMP call skipped by per-minute throttle %s/%s count=%s limit=%s",
+                    symbol, tf, count, max_per_min,
+                )
+                return False
+            return True
+        except Exception as exc:
+            logging.debug("[DeepGapfill] Redis throttle unavailable: %s", exc)
+
+    global _DEEP_GAPFILL_RATE_MINUTE, _DEEP_GAPFILL_RATE_COUNT, _DEEP_GAPFILL_LAST_CALL_TS
+    with _DEEP_GAPFILL_RATE_LOCK:
+        now = time.time()
+        wait_s = (_DEEP_GAPFILL_LAST_CALL_TS + min_gap) - now
+        if wait_s > 0:
+            time.sleep(min(wait_s, 30.0))
+            now = time.time()
+        minute = int(now // 60)
+        if minute != _DEEP_GAPFILL_RATE_MINUTE:
+            _DEEP_GAPFILL_RATE_MINUTE = minute
+            _DEEP_GAPFILL_RATE_COUNT = 0
+        if _DEEP_GAPFILL_RATE_COUNT >= max_per_min:
+            logging.info(
+                "[DeepGapfill] FMP call skipped by in-memory per-minute throttle %s/%s count=%s limit=%s",
+                symbol, tf, _DEEP_GAPFILL_RATE_COUNT, max_per_min,
+            )
+            return False
+        _DEEP_GAPFILL_RATE_COUNT += 1
+        _DEEP_GAPFILL_LAST_CALL_TS = now
+        return True
+
+
+def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int, source: str = "historical_range") -> list[dict]:
     if not API_KEY: return []
     try:
         iv = _fmp_interval(tf)
         if to_ms <= from_ms:
             return []
+        if source == "deep_gapfill" and not _deep_gapfill_acquire_fmp_slot(symbol, tf):
+            return []
+        tfms = _tf_ms(tf)
+        requested_from_ms = int(from_ms)
+        requested_to_ms = int(to_ms)
+        if FMP_RANGE_ADAPTIVE_ENABLED:
+            max_bars = max(1, _get_fmp_range_adaptive_max_bars(symbol, tf))
+            max_span_ms = max_bars * tfms
+            if (requested_to_ms - requested_from_ms) > max_span_ms:
+                # Query the oldest missing slice first so every successful
+                # call makes deterministic progress through the gap.
+                to_ms = min(requested_to_ms, requested_from_ms + max_span_ms)
+                logging.info(
+                    "[FMP_RANGE_ADAPT] capped request %s/%s source=%s requested_UTC:[%s -> %s] capped_UTC:[%s -> %s] max_bars=%d",
+                    symbol,
+                    tf,
+                    source,
+                    _ms_to_iso_utc(requested_from_ms),
+                    _ms_to_iso_utc(requested_to_ms),
+                    _ms_to_iso_utc(requested_from_ms),
+                    _ms_to_iso_utc(to_ms),
+                    max_bars,
+                )
         url = f"https://financialmodelingprep.com/api/v3/historical-chart/{iv}/{symbol}"
         params = {
             "apikey": API_KEY,
@@ -22588,11 +24378,12 @@ def _fetch_historical_range(symbol: str, tf: str, from_ms: int, to_ms: int) -> l
             "to":   _ms_to_fmp_local(to_ms)
         }
         logging.info(f"[Historical-Range] URL: {url} params: from={params['from']} to={params['to']}")
-        r = _fmp_http_get(url, params=params, timeout=5, symbol=symbol)
+        r = _fmp_http_get(url, params=params, timeout=5, symbol=symbol, timeframe=tf, source=source)
         if not r.ok:
             logging.info(f"[Historical-Range] HTTP {r.status_code}: {r.text[:200]}")
             return []
-        return _normalize_fmp_bars(r.json())
+        bars = _normalize_fmp_bars(r.json())
+        return _validate_fmp_range_bars(bars, symbol, tf, from_ms, to_ms, source)
     except Exception as e:
         logging.warning(f"[Historical-Range] Error: {e}")
         return []
@@ -22612,17 +24403,31 @@ def _backfill_internal_gaps(
         return 0
     tfms = _tf_ms(tf)
     closed_end = _current_closed_bucket_start(tf) - tfms
+    min_backfill_ms = None
+    norm_tf = normalize_tf(tf)
+    if ANALYSIS_DEEP_GAPFILL_ENABLED:
+        if not ANALYSIS_DEEP_GAPFILL_FULL_HISTORY:
+            lookback_bars = ANALYSIS_DEEP_GAPFILL_LOOKBACK_BARS.get(
+                norm_tf,
+                ANALYSIS_GAP_LOOKBACK_BARS.get(norm_tf, 120),
+            )
+            min_backfill_ms = closed_end - (max(1, lookback_bars) * tfms)
+    else:
+        lookback_bars = ANALYSIS_GAP_LOOKBACK_BARS.get(norm_tf, 120)
+        min_backfill_ms = closed_end - (lookback_bars * tfms)
     total_added = 0
 
     cooldown = _INTERNAL_GAP_COOLDOWN_S.get(tf, 300)
     now_s = time.time()
 
     start = now_s
+    max_calls_per_run = max(1, ANALYSIS_DEEP_GAPFILL_MAX_CALLS_PER_RUN) if ANALYSIS_DEEP_GAPFILL_ENABLED else 1_000_000
+    attempted_calls = 0
 
     i = 0
     while i < len(base_ms) - 1:
 
-        if time.time() - start > 5:  # o 8, como prefieras
+        if time.time() - start > ANALYSIS_GAPFILL_TIME_BUDGET_SECONDS:
             logging.info(
                 "BACKFILL_INTERNAL_GAPS time budget exceeded (%.3fs), "
                 "symbol=%s tf=%s total_added=%d; saliendo",
@@ -22645,6 +24450,11 @@ def _backfill_internal_gaps(
         if gap_buckets > 0:
             from_ms = a["t"] + tfms
             to_ms   = min(b["t"] - tfms, closed_end)
+            if min_backfill_ms is not None and to_ms < min_backfill_ms:
+                i += 1
+                continue
+            if min_backfill_ms is not None:
+                from_ms = max(from_ms, min_backfill_ms)
             if to_ms >= from_ms:
                 cap_to_ms = min(from_ms + max_minutes_per_call * tfms, to_ms)
 
@@ -22657,7 +24467,15 @@ def _backfill_internal_gaps(
 
                 _LAST_INTERNAL_GAP_ATTEMPT[key] = now_s
                 logging.info(f"GAPFILL {symbol} {tf} from={_ms_to_iso_utc(from_ms)} to={_ms_to_iso_utc(cap_to_ms)} gap_bars={gap_buckets} (INT)")
-                rng = _fetch_historical_range(symbol, tf, from_ms, cap_to_ms)
+                if attempted_calls >= max_calls_per_run:
+                    logging.info(
+                        "BACKFILL_INTERNAL_GAPS call budget exceeded, symbol=%s tf=%s attempts=%d limit=%d",
+                        symbol, tf, attempted_calls, max_calls_per_run,
+                    )
+                    break
+                attempted_calls += 1
+                source = "deep_gapfill" if ANALYSIS_DEEP_GAPFILL_ENABLED else "historical_range"
+                rng = _fetch_historical_range(symbol, tf, from_ms, cap_to_ms, source=source)
 
                 # después (muestra UTC y lo que se envía a FMP en ET)
                 et_from = _ms_to_fmp_local(from_ms)     # UTC -> America/New_York "YYYY-MM-DD HH:MM:SS"
@@ -22750,8 +24568,18 @@ def obtener_monedas(symbol: str) -> Tuple[str,str]:
 # - Future events (>2h) or old: 30 min
 # This maintains reactivity for critical events while reducing API load
 _EVENTS_MEMO: Dict[str, Dict[str, Any]] = {}  # {symbol: {"df":DataFrame,"ts":epoch}}
+_EVENTS_MEMO_LOCK = threading.Lock()
+_EVENTS_FETCH_LOCKS: Dict[str, threading.Lock] = {}
 _LAST_ACTUAL: Dict[Tuple[str, Tuple[str,str,int]], float] = {}  # (symbol,(cur,event,ms)) -> actual
 _LAST_HASH: Dict[Tuple[str,str], str] = {}  # (exec_id,symbol) -> hash
+
+def _get_events_fetch_lock(memo_key: str) -> threading.Lock:
+    with _EVENTS_MEMO_LOCK:
+        lock = _EVENTS_FETCH_LOCKS.get(memo_key)
+        if lock is None:
+            lock = threading.Lock()
+            _EVENTS_FETCH_LOCKS[memo_key] = lock
+        return lock
 
 def _event_row_key(row: pd.Series) -> Tuple[str,str,int]:
     """ Llave estable por fila de evento (currency, event, date_ms UTC). """
@@ -22902,61 +24730,79 @@ def _fetch_events_for(symbol: str, hours_back: int = 6, minutes_fwd: int = 5) ->
     # ⚠️ IMPORTANTE: No usar desde_inicio=True que hace queries desde 1900 (200+ requests)
     # En su lugar, traer últimos 12 meses que es suficiente para backtesting normal
     is_backtest = hours_back > 720  # 30 dias
+    memo_key = f"{symbol}|hb={int(hours_back)}|mf={int(minutes_fwd)}|bt={int(is_backtest)}"
     
     logger.info("[eventos] Backtest detection: hours_back=%d > 720? is_backtest=%s", hours_back, is_backtest)
-    
-    if is_backtest:
-        # Para backtesting: obtener eventos de últimos 12 meses (NO desde 1900!)
-        # Esto evita 200+ requests FMP que generan timeouts en nginx
-        # last_days=365 trae ~4-5 requests FMP (una por ~85 días)
-        logger.info("[eventos] BACKTEST MODE detected (hours_back=%d > 720), fetching last 365 days of events", hours_back)
-        df = obtener_eventos_economicos(
-            plan=APP_CONFIG.fmp_plan,
-            last_days=365,  # ← últimos 12 meses en lugar de desde 1900
-            grace_minutes=0,
-        )
-        logger.info("[eventos] Got %d events for backtest (last 12 months)", len(df))
-    else:
-        # Para live trading: ventana de ±6 horas
-        a = now - timedelta(hours=int(hours_back))
-        b = now + timedelta(minutes=int(minutes_fwd))
 
-        memo = _EVENTS_MEMO.get(symbol)
-        
-        # Verificar cache con TTL adaptativo
-        if memo:
-            df_cached = memo.get("df")
-            cache_age = time.time() - memo.get("ts", 0)
-            ttl = _calculate_adaptive_ttl(df_cached, now)
-            
-            if cache_age < ttl:
-                logger.info("[eventos] Cache HIT %s age=%.1fs ttl=%.1fs", symbol, cache_age, ttl)
-                return df_cached.copy()
-            else:
-                logger.info("[eventos] Cache EXPIRED %s age=%.1fs ttl=%.1fs", symbol, cache_age, ttl)
-        
-        # Cache miss o expirado - fetch nuevo
-        df = obtener_eventos_guardados_o_futuros(
-            _iso(a),
-            _iso(b),
-            grace_minutes=0,
-        )
-    if df is None or df.empty:
-        df = pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
-    # normaliza tipos
-    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
-    for c in ["actual","estimate","previous"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["impact"] = df["impact"].astype(str).str.capitalize()
-    df = df.sort_values("date", ascending=True).reset_index(drop=True)
-    
-    # Guardar en cache con nuevo TTL
-    _EVENTS_MEMO[symbol] = {"df": df.copy(), "ts": time.time()}
-    
-    new_ttl = _calculate_adaptive_ttl(df, now)
-    logger.info("[eventos] _fetch_events_for %s tardó %.3fs - nuevo TTL: %.1fs", symbol, time.time() - t0, new_ttl)
+    def _read_events_memo() -> tuple[pd.DataFrame | None, bool]:
+        with _EVENTS_MEMO_LOCK:
+            memo = _EVENTS_MEMO.get(memo_key)
+        if not memo:
+            return None, False
+        df_cached = memo.get("df")
+        cache_age = time.time() - memo.get("ts", 0)
+        ttl = 1800.0 if is_backtest else _calculate_adaptive_ttl(df_cached, now)
+        if cache_age < ttl:
+            logger.info("[eventos] Cache HIT %s age=%.1fs ttl=%.1fs", memo_key, cache_age, ttl)
+            return df_cached.copy(), True
+        logger.info("[eventos] Cache EXPIRED %s age=%.1fs ttl=%.1fs", memo_key, cache_age, ttl)
+        return None, False
 
-    return df
+    cached_df, hit = _read_events_memo()
+    if hit and cached_df is not None:
+        return cached_df
+
+    fetch_lock = _get_events_fetch_lock(memo_key)
+    with fetch_lock:
+        cached_df, hit = _read_events_memo()
+        if hit and cached_df is not None:
+            return cached_df
+
+        if is_backtest:
+            # Para backtesting: respetar la ventana pedida por el cliente.
+            # No usar 365d fijo ni fallbacks de Investing: esos caminos pueden superar
+            # el timeout de nginx/RN y terminan devolviendo [] en la app.
+            backtest_days = max(7, min(120, int(math.ceil(int(hours_back) / 24)) + 2))
+            logger.info(
+                "[eventos] BACKTEST MODE detected (hours_back=%d > 720), fetching last %d days of FMP events",
+                hours_back,
+                backtest_days,
+            )
+            df = obtener_eventos_economicos(
+                plan=APP_CONFIG.fmp_plan,
+                last_days=backtest_days,
+                grace_minutes=0,
+                allow_investing_fallback=False,
+            )
+            logger.info("[eventos] Got %d events for backtest (last %d days)", len(df), backtest_days)
+        else:
+            # Para live trading: ventana de ±6 horas
+            a = now - timedelta(hours=int(hours_back))
+            b = now + timedelta(minutes=int(minutes_fwd))
+
+            # Cache miss o expirado - fetch nuevo
+            df = obtener_eventos_guardados_o_futuros(
+                _iso(a),
+                _iso(b),
+                grace_minutes=0,
+            )
+        if df is None or df.empty:
+            df = pd.DataFrame(columns=["date","currency","event","actual","estimate","previous","impact","date_country"])
+        # normaliza tipos
+        df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
+        for c in ["actual","estimate","previous"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["impact"] = df["impact"].astype(str).str.capitalize()
+        df = df.sort_values("date", ascending=True).reset_index(drop=True)
+
+        # Guardar en cache con nuevo TTL
+        with _EVENTS_MEMO_LOCK:
+            _EVENTS_MEMO[memo_key] = {"df": df.copy(), "ts": time.time()}
+
+        new_ttl = _calculate_adaptive_ttl(df, now)
+        logger.info("[eventos] _fetch_events_for %s tardó %.3fs - nuevo TTL: %.1fs", symbol, time.time() - t0, new_ttl)
+
+        return df
 
 def _detect_new_results(symbol: str, df: pd.DataFrame) -> List[dict]:
     """
@@ -23368,4 +25214,3 @@ if __name__ == "__main__":
     # Only import here to avoid circular dependencies
     from markettool.bootstrap import main
     main()
-

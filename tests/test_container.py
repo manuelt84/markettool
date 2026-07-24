@@ -86,11 +86,18 @@ class TestDIContainer(unittest.TestCase):
         all_uc = self.container.get_all()
         
         self.assertIsInstance(all_uc, dict)
-        self.assertEqual(len(all_uc), 4)
-        self.assertIn('get_historicos', all_uc)
-        self.assertIn('get_quote', all_uc)
-        self.assertIn('run_analysis', all_uc)
-        self.assertIn('warm_cache', all_uc)
+        expected_keys = {
+            'get_historicos',
+            'get_quote',
+            'run_analysis',
+            'warm_cache',
+            'history_manager',
+            'health_service',
+            'get_market_symbols',
+            'signal_repository',
+            'legacy_services',
+        }
+        self.assertEqual(set(all_uc), expected_keys)
     
     def test_container_with_different_dependencies(self):
         """Test creating container with different dependencies."""
@@ -140,12 +147,12 @@ class TestContainerWiring(unittest.TestCase):
     def test_use_case_has_repo(self):
         """Test that GetHistoricosUseCase has repository."""
         uc = self.container.get_historicos
-        self.assertIsNotNone(uc.historicos_repo)
+        self.assertIsNotNone(uc.repo)
     
     def test_use_case_has_cache(self):
         """Test that GetHistoricosUseCase has cache."""
         uc = self.container.get_historicos
-        self.assertIsNotNone(uc.cache_provider)
+        self.assertIsNotNone(uc.cache)
     
     def test_quote_use_case_has_provider(self):
         """Test that GetQuoteUseCase has quote provider."""
@@ -155,7 +162,7 @@ class TestContainerWiring(unittest.TestCase):
     def test_analysis_use_case_has_cache(self):
         """Test that RunAnalysisUseCase has cache."""
         uc = self.container.run_analysis
-        self.assertIsNotNone(uc.cache_provider)
+        self.assertIsNotNone(uc.cache)
 
 
 if __name__ == '__main__':

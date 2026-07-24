@@ -1,0 +1,19 @@
+{
+  "rule": [
+    {
+      "action": {
+        "type": "Delete"
+      },
+      "condition": {
+        "age": 60,
+        "matchesPrefix": [
+          "db-backups/",
+          "database-backups/",
+          "postgres-backups/",
+          "markettool-db-backups/",
+          "markettool-db-backups-encrypted/"
+        ]
+      }
+    }
+  ]
+}

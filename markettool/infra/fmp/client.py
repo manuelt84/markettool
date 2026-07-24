@@ -7,11 +7,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 import threading
 import logging
+import time
 import requests
 import pandas as pd
 import pytz
 from zoneinfo import ZoneInfo
 from datetime import datetime
+
+from markettool.infra.fmp.ledger import record_fmp_call
 
 
 class FMPError(Exception):
@@ -29,6 +32,7 @@ class FMPClient:
     timeout: int = 10
     http_session: requests.Session | None = None
     intraday_source_tz: str = "America/New_York"
+    daily_source_tz: str | None = None
     max_concurrency: int = 6
     per_symbol_concurrency: int = 1
 
@@ -41,6 +45,9 @@ class FMPClient:
         self._symbol_sems: dict[str, threading.BoundedSemaphore] = {}
         self._symbol_sems_lock = threading.Lock()
         self._log = logging.getLogger("MarketTool.FMP")
+        if not self.daily_source_tz:
+            import os
+            self.daily_source_tz = os.getenv("FMP_DAILY_SOURCE_TZ") or self.intraday_source_tz
 
     def _get_symbol_sem(self, symbol: str) -> threading.BoundedSemaphore | None:
         if self.per_symbol_concurrency <= 0:
@@ -77,8 +84,44 @@ class FMPClient:
         params.setdefault("apikey", self.api_key)
         if self.http_session is None:
             self.http_session = requests.Session()
-        with self._http_guard(symbol):
-            r = self.http_session.get(url, params=params, timeout=self.timeout)
+        start = time.perf_counter()
+        status_code = None
+        response_bytes = 0
+        error = None
+        rows = None
+        try:
+            with self._http_guard(symbol):
+                r = self.http_session.get(url, params=params, timeout=self.timeout)
+            status_code = r.status_code
+            try:
+                response_bytes = len(r.content or b"")
+            except Exception:
+                response_bytes = 0
+            try:
+                payload = r.json()
+                if isinstance(payload, list):
+                    rows = len(payload)
+                elif isinstance(payload, dict):
+                    historical = payload.get("historical")
+                    if isinstance(historical, list):
+                        rows = len(historical)
+                    else:
+                        rows = 1 if payload else 0
+            except Exception:
+                rows = None
+        except Exception as exc:
+            error = exc
+            raise
+        finally:
+            record_fmp_call(
+                url=url,
+                status_code=status_code,
+                elapsed_ms=int((time.perf_counter() - start) * 1000),
+                response_bytes=response_bytes,
+                symbol=symbol,
+                rows=rows,
+                error=str(error) if error else None,
+            )
         if r.status_code == 402:
             raise FMPPlanNotAllowed(f"402 Payment Required: {url}")
         return r
@@ -145,7 +188,7 @@ class FMPClient:
         
         # ✅ FIX: Convert UTC to NY timezone for FMP API consistency
         try:
-            ny_tz = pytz.timezone(self.intraday_source_tz)  # "America/New_York"
+            ny_tz = pytz.timezone(self.daily_source_tz or self.intraday_source_tz)
         except Exception:
             ny_tz = pytz.timezone("America/New_York")
         
@@ -167,7 +210,10 @@ class FMPClient:
         cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
         df = df[cols].copy()
 
-        ny = ZoneInfo("America/New_York")
+        try:
+            ny = ZoneInfo(self.daily_source_tz or self.intraday_source_tz)
+        except Exception:
+            ny = ZoneInfo("America/New_York")
         dt_day = pd.to_datetime(df["date"], errors="coerce")
         df["date"] = (
             dt_day.dt.tz_localize(ny)

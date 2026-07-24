@@ -50,8 +50,8 @@ class DIContainer:
         quote_provider: QuoteProvider,
         cache_provider: CacheProvider,
         notifier: Notifier,
-        historical_data_provider: HistoricalDataProvider,
-        signal_repository: SignalRepository,
+        historical_data_provider: Optional[HistoricalDataProvider] = None,
+        signal_repository: Optional[SignalRepository] = None,
         telegram_app: Optional[Any] = None,
         firestore_db: Optional[Any] = None,
         legacy_services: Optional[LegacyServices] = None,
@@ -69,6 +69,7 @@ class DIContainer:
             cache_provider: Cache implementation
             notifier: Notification service
             historical_data_provider: Historical data provider (for HistoryManager)
+            signal_repository: Signal repository
             telegram_app: Telegram application instance (for health checks)
             firestore_db: Firestore database client (for health checks)
             legacy_services: Legacy MarketTool services
@@ -251,12 +252,16 @@ class DIContainer:
         local_cache = LocalCache(cache_dir=cache_dir, logger=_logger)
         _logger.info(f"✅ LocalCache created (dir: {cache_dir})")
         
-        # Optionally create GCS cache if client available
+        # Optionally create GCS cache if explicitly enabled and not running in VPS mode.
         gcs_cache = None
-        if gcs_client:
+        gcs_enabled = os.environ.get("GCS_ENABLED", "true").lower() == "true"
+        vps_backend_enabled = os.environ.get("MARKETTOOL_CLOUD_BACKEND", "").strip().lower() in {"vps", "postgres", "local", "filesystem", "fs", "vps_gcp", "vps-gcp", "vps_fallback_gcp", "vps-fallback-gcp"}
+        if gcs_client and gcs_enabled and not vps_backend_enabled:
             bucket_name = os.environ.get("GCS_BUCKET_NAME", "markettool_bucket")
             gcs_cache = GCSCache(bucket_name=bucket_name, logger=_logger)
             _logger.info(f"✅ GCSCache created (bucket: {bucket_name})")
+        else:
+            _logger.info("GCSCache disabled (GCS_ENABLED=%s, vps_backend=%s)", gcs_enabled, vps_backend_enabled)
         
         # Create multi-layer cache provider with fallback chain
         cache_provider = MultiLayerCacheProvider(
@@ -265,7 +270,7 @@ class DIContainer:
             gcs_cache=gcs_cache,
             logger=_logger,
         )
-        _logger.info("✅ MultiLayerCacheProvider created (Memory → Local → GCS)")
+        _logger.info("✅ MultiLayerCacheProvider created (Memory → Local%s)", " → GCS" if gcs_cache else "")
         
         notifier = TelegramNotifier(
             telegram_app=telegram_app,
