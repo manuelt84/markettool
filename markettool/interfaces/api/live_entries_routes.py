@@ -44,22 +44,24 @@ MIN_CANDLES = 30
 
 # Homologa LIVE_TTL_BY_TF de RN/Web para que el backend no expire señales antes
 # que el cliente cuando se activa el push/poll backend.
+# CORRECCIÓN 2026-07-27: TTL extendido para TFs cortos
+# Anteriormente 1m: 30min, 5m: 2h → Ahora el doble para dar más tiempo de visualización
 ENTRY_TTL_BY_TF_S: dict[str, int] = {
-    "1m": 30 * 60,
-    "1min": 30 * 60,
-    "5m": 2 * 3600,
-    "5min": 2 * 3600,
-    "15m": 6 * 3600,
+    "1m": 60 * 60,       # 1 hora (antes 30 min)
+    "1min": 60 * 60,
+    "5m": 4 * 3600,      # 4 horas (antes 2h)
+    "5min": 4 * 3600,
+    "15m": 6 * 3600,     # 6 horas (igual)
     "15min": 6 * 3600,
-    "30m": 12 * 3600,
+    "30m": 12 * 3600,    # 12 horas (igual)
     "30min": 12 * 3600,
-    "1h": 24 * 3600,
+    "1h": 24 * 3600,     # 24 horas (igual)
     "1hour": 24 * 3600,
-    "4h": 3 * 86400,
+    "4h": 3 * 86400,     # 3 días (igual)
     "4hour": 3 * 86400,
-    "1d": 7 * 86400,
+    "1d": 7 * 86400,     # 7 días (igual)
     "1day": 7 * 86400,
-    "1w": 30 * 86400,
+    "1w": 30 * 86400,    # 30 días (igual)
     "1week": 30 * 86400,
 }
 _DEFAULT_ENTRY_TTL_S = 24 * 3600
@@ -202,14 +204,21 @@ def _price_ticks(value: Any) -> str:
 
 
 def _time_bucket(value: Any) -> str:
+    """
+    Retorna timestamp exacto en milisegundos para fingerprint.
+    
+    CORRECCIÓN 2026-07-27: Eliminado bucketing de 5 minutos que causaba
+    colisión de fingerprints para entradas válidas generadas dentro de
+    la misma ventana de 5 min. Ahora coincide con frontend (Web/RN).
+    """
     if value is None:
         return ""
     if isinstance(value, (int, float)):
         if value <= 0:
             return ""
         ms = int(value if value > 1e12 else value * 1000)
-        # Bucket de 5 minutos para deduplicar entradas idénticas regeneradas
-        return str(ms // 300_000)
+        # Timestamp exacto (sin bucketing) para coincidir con frontend
+        return str(ms)
     raw = str(value).strip()
     if not raw:
         return ""
@@ -217,7 +226,8 @@ def _time_bucket(value: Any) -> str:
         parsed = pd.Timestamp(raw)
         if not pd.isna(parsed):
             ms = int(parsed.timestamp() * 1000)
-            return str(ms // 300_000)
+            # Timestamp exacto (sin bucketing) para coincidir con frontend
+            return str(ms)
     except Exception:
         pass
     return raw
@@ -395,7 +405,12 @@ def _get_events_for_replay(redis_client, exec_id: str, symbol: str, last_event_i
 
 
 def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, entries: list[dict]) -> list[dict]:
-    """Persiste entradas nuevas con TTL por entrada. Dedup igual que RN/Web."""
+    """
+    Persiste entradas nuevas con TTL por entrada. Dedup igual que RN/Web.
+    
+    CORRECCIÓN 2026-07-27: Agregado logging diagnóstico para monitorear
+    deduplicación y expiración de entradas.
+    """
     ttl_s = _entry_ttl_s(tf)
     key = _redis_entries_key(exec_id, symbol, tf)
     now_ms = int(time.time() * 1000)
@@ -403,23 +418,63 @@ def _push_entries_to_redis(redis_client, exec_id: str, symbol: str, tf: str, ent
         existing = _MEM_ENTRIES.get(key, [])
         if time.time() >= _MEM_EXPIRY.get(key, 0):
             existing = []
+        
+        # Filtrar entradas expiradas
+        expired_count = sum(1 for e in existing if _is_entry_expired(e, tf, now_ms))
         existing = _dedupe_entries([e for e in existing if not _is_entry_expired(e, tf, now_ms)])
+        
+        if expired_count > 0:
+            logger.debug(
+                "[DEDUPE] %s/%s: %d entradas expiradas removidas",
+                symbol, tf, expired_count
+            )
+        
         existing_fps = {_entry_fingerprint(e) for e in existing}
+        original_count = len(entries)
         new_entries = [e for e in _dedupe_entries(entries) if _entry_fingerprint(e) not in existing_fps]
+        filtered_count = original_count - len(new_entries)
+        
+        if filtered_count > 0:
+            logger.info(
+                "[DEDUPE] %s/%s: %d generadas → %d nuevas (%d filtradas por fingerprint)",
+                symbol, tf, original_count, len(new_entries), filtered_count
+            )
+        
         if not new_entries:
             _persist_entries(redis_client, key, existing, ttl_s)
             return []
+        
         merged = _dedupe_entries(existing + new_entries)
         _persist_entries(redis_client, key, merged, ttl_s)
         return new_entries
 
     existing_raw = redis_client.get(key)
     existing: list[dict] = json.loads(existing_raw) if existing_raw else []
+    
+    # Filtrar entradas expiradas y loggear
+    expired_count = sum(1 for e in existing if _is_entry_expired(e, tf, now_ms))
     existing = _dedupe_entries([e for e in existing if not _is_entry_expired(e, tf, now_ms)])
-
+    
+    if expired_count > 0:
+        logger.debug(
+            "[DEDUPE] %s/%s: %d entradas expiradas removidas (Redis)",
+            symbol, tf, expired_count
+        )
+    
     existing_fps = {_entry_fingerprint(e) for e in existing}
+    original_count = len(entries)
     new_entries = [e for e in _dedupe_entries(entries) if _entry_fingerprint(e) not in existing_fps]
+    filtered_count = original_count - len(new_entries)
+    
+    if filtered_count > 0:
+        logger.info(
+            "[DEDUPE] %s/%s: %d generadas → %d nuevas (%d filtradas por fingerprint)",
+            symbol, tf, original_count, len(new_entries), filtered_count
+        )
+    
     if not new_entries:
+        _persist_entries(redis_client, key, existing, ttl_s)
+        return []
         _persist_entries(redis_client, key, existing, ttl_s)
         return []
 
