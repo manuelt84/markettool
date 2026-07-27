@@ -121,9 +121,9 @@ if (cached && cached.hash === cacheHash && !isFirstSeed) {
 
 | Repositorio | Commits | Archivos | Líneas (+/-) |
 |-------------|---------|----------|--------------|
-| **markettool** (backend) | 1 | 1 | +70 / -15 |
-| **markettool-web** | 1 | 1 | +77 / -23 |
-| **markettool-app** | 0 | 0 | 0 (ya tenía las mejoras) |
+| **markettool** (backend) | 2 | 2 | +70 / -15 |
+| **markettool-web** | 2 | 2 | +88 / -26 |
+| **markettool-app** | 1 | 1 | +11 / -3 |
 
 ---
 
@@ -131,13 +131,17 @@ if (cached && cached.hash === cacheHash && !isFirstSeed) {
 
 ### Cuantitativo:
 - **Más entradas visibles:** Reducción de filtrado incorrecto por fingerprint collision
+  - Fix #1: Timestamp exacto vs bucketing 5min
+  - Fix #3: TP/SL incluidos en liveHistoryFingerprint
 - **Menos expiración:** TTL 2x más largo para TFs cortos
 - **Mejor UX:** Cache hit rate estimado ~60-80% en condiciones normales
+- **Mejor diagnóstico:** Logs [DEDUPE] permiten monitoreo en tiempo real
 
 ### Cualitativo:
 - **Consistencia:** Backend y frontend ahora usan mismo fingerprint (timestamp exacto)
 - **Diagnóstico:** Logs permiten monitorear pérdida de entradas en tiempo real
 - **Paridad Web/RN:** Web ahora tiene caché de entradas como RN
+- **Fingerprint preciso:** liveHistoryFingerprint incluye TP/SL para evitar colisiones
 
 ---
 
@@ -192,6 +196,7 @@ if (cached && cached.hash === cacheHash && !isFirstSeed) {
 
 ### Backend (markettool)
 ```
+ee248ed 📋 Documentación de CAMBIOS_APLICADOS 2026-07-27
 f84c256 🔴 CORRECCIONES CRÍTICAS aplicadas en entradas en vivo
 a600448 📊 COMPARATIVA EXHAUSTIVA Web vs RN en entradas en vivo
 166e6ac 🔴 PROBLEMAS CRÍTICOS IDENTIFICADOS en entradas en vivo
@@ -200,13 +205,27 @@ a600448 📊 COMPARATIVA EXHAUSTIVA Web vs RN en entradas en vivo
 
 ### Frontend Web (markettool-web)
 ```
+dc48ef5 🔴 CRÍTICO: Mejorar liveHistoryFingerprint para incluir TP y SL
 3191f5d 🟡 MEJORA UX: Agregar caché de entradas por hash (igual que RN)
 ```
 
 ### Frontend RN (markettool-app)
 ```
-Sin cambios necesarios - ya tenía las mejoras implementadas
+221d0fb 🔴 CRÍTICO: Mejorar liveHistoryFingerprint para incluir TP y SL
 ```
+
+---
+
+## ✅ Estado de Problemas Identificados
+
+| # | Problema | Estado | Corrección Aplicada |
+|---|----------|--------|---------------------|
+| 1 | Fingerprint mismatch backend vs frontend | ✅ RESUELTO | Backend eliminó bucketing → timestamp exacto |
+| 2 | TTL expiración muy corto | ✅ RESUELTO | Extendido 2x para 1m (30min→1h) y 5m (2h→4h) |
+| 3 | liveHistoryFingerprint demasiado grosero | ✅ RESUELTO | Ahora incluye TP y SL en el fingerprint |
+| 4 | Logging insuficiente | ✅ RESUELTO | Logs [DEDUPE] con métricas de filtrado |
+
+**Total:** 4/4 problemas críticos resueltos ✅
 
 ---
 
