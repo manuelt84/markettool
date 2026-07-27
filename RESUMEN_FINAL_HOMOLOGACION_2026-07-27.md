@@ -10,8 +10,11 @@
 Homologar cálculo de entradas en vivo entre Web y React Native, asegurando:
 1. ✅ Ambos calculan localmente por defecto
 2. ✅ Eventos económicos OFF por defecto (ahorro de recursos)
-3. ✅ Chip/botón opcional para consultar backend
-4. ✅ Mismos parámetros y lógica en ambas plataformas
+3. ✅ Chip/botón opcional para consultar backend (calendario económico)
+4. ✅ Infraestructura lista para usar events en generación de entradas
+5. ✅ Mismos parámetros y lógica en ambas plataformas
+
+**NOTA IMPORTANTE:** El chip de "Eventos Económicos" controla el **polling y visualización del calendario**, NO automáticamente la generación de entradas. Para que las entradas se generen con eventos, el sistema ya tiene la infraestructura (`trainingData` + `events` en config), pero la conexión automática del toggle requiere implementación adicional futura.
 
 ---
 
