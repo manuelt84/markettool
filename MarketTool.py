@@ -2679,6 +2679,10 @@ USER_LOCK_TTL_SECONDS    = int(os.getenv("USER_LOCK_TTL_SECONDS", "1800"))      
 USER_LOCK_MIN_SECONDS    = int(os.getenv("USER_LOCK_MIN_SECONDS", "120"))       # 2 min
 USER_LOCK_MAX_SECONDS    = int(os.getenv("USER_LOCK_MAX_SECONDS", "1800"))      # 30 min
 USER_LOCK_SEC_PER_ASSET  = int(os.getenv("USER_LOCK_SEC_PER_ASSET", "50"))      # 50s por activo
+
+# 🆕 Watchdog de ejecuciones - detecta análisis trabados por heartbeat expirado
+EXEC_HEARTBEAT_STALE_SECONDS = int(os.getenv("EXEC_HEARTBEAT_STALE_SECONDS", "300"))  # 5 min sin heartbeat = ejecución muerta
+EXEC_WATCHDOG_SWEEP_EVERY    = int(os.getenv("EXEC_WATCHDOG_SWEEP_EVERY", "120"))     # verificar cada 2 min
 USER_STATE_BUSY_VALUES   = {
     "ocupado",
     "en_ejecucion",
@@ -2838,12 +2842,17 @@ def _sweep_stuck_user_states_once():
 
                 # si nunca tuvo timestamp o está vencido, liberamos
                 if (ts is None) or (ts < cutoff):
+                    # 🆕 También limpiar lock_owner y lease_until_unix para evitar locks fantasma
+                    # Esto ocurre cuando el análisis falla pero el lock no se liberó correctamente
                     batch.set(
                         doc.reference,
                         {
                             "estado": "disponible",
                             "updated_at_unix": now,
                             "fecha_fin": datetime.now(timezone.utc).isoformat(),
+                            "lock_owner": None,  # Limpiar owner del lock
+                            "lease_until_unix": 0,  # Expirar lock inmediatamente
+                            "lock_id": None,  # Limpiar ID del lock
                         },
                         merge=True,
                     )
@@ -2884,6 +2893,101 @@ def _user_states_watchdog_loop():
 if os.getenv("ENABLE_USER_STATE_WATCHDOG", "1") == "1":
     threading.Thread(target=_user_states_watchdog_loop, daemon=True).start()
 # ====== /Watchdog user_states ======
+
+# ====== Watchdog de ejecuciones (detecta análisis trabados) ======
+def _sweep_stuck_executions_once():
+    """Busca ejecuciones con heartbeat expirado y las marca como fallidas, liberando locks."""
+    now = int(time.time())
+    cutoff = now - EXEC_HEARTBEAT_STALE_SECONDS
+
+    try:
+        def _load_and_sweep():
+            firestore_db = get_firestore_db()
+            docs = firestore_db.collection("ejecuciones").stream()
+            batch = firestore_db.batch()
+            pending = 0
+
+            for doc in docs:
+                data = doc.to_dict() or {}
+                estado = str(data.get("estado") or "").lower()
+                
+                # Solo procesar ejecuciones activas (running, en_progreso, etc.)
+                if estado not in ("running", "en_progreso", "procesando", "analyzing"):
+                    continue
+
+                last_hb = _as_unix(data.get("last_heartbeat"))
+                
+                # Si no hay heartbeat o está vencido, marcar como fallida
+                if (last_hb is None) or (last_hb < cutoff):
+                    exec_id = doc.id
+                    user_id = data.get("user_id")
+                    chat_id = data.get("chat_id")
+                    
+                    logger.warning(
+                        f"[exec-watchdog] Ejecución {exec_id} stale (heartbeat: {last_hb}, cutoff: {cutoff}). Marcando como fallida."
+                    )
+                    
+                    # Marcar ejecución como fallida usando fs_marcar_worker
+                    try:
+                        fs_marcar_worker(exec_id, estado="fallido", detalles_worker={"error": "Heartbeat expirado"})
+                    except Exception as e:
+                        logger.error(f"[exec-watchdog] Error marcando ejecucion {exec_id}: {e}")
+                    
+                    # 🆕 Liberar lock del usuario asociado
+                    if user_id or chat_id:
+                        uuid = resolve_user_uuid(user_id=user_id, chat_id=chat_id)
+                        if uuid:
+                            try:
+                                user_ref = firestore_db.collection("user_states").document(uuid)
+                                batch.set(
+                                    user_ref,
+                                    {
+                                        "estado": "disponible",
+                                        "updated_at_unix": now,
+                                        "fecha_fin": datetime.now(timezone.utc).isoformat(),
+                                        "lock_owner": None,
+                                        "lease_until_unix": 0,
+                                        "lock_id": None,
+                                    },
+                                    merge=True,
+                                )
+                                logger.info(f"[exec-watchdog] Lock liberado para usuario {uuid}")
+                            except Exception as e:
+                                logger.error(f"[exec-watchdog] Error liberando lock {uuid}: {e}")
+                    
+                    pending += 1
+                    if pending % 100 == 0:
+                        batch.commit()
+                        batch = firestore_db.batch()
+
+            if pending:
+                batch.commit()
+            
+            return pending
+        
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_load_and_sweep)
+            try:
+                pending = future.result(timeout=90)
+                if pending > 0:
+                    logger.info(f"[exec-watchdog] Limpiadas {pending} ejecuciones stuck")
+            except FutureTimeoutError:
+                logger.error("[exec-watchdog] Firestore timeout after 90s - skipping this sweep")
+                future.cancel()
+
+    except Exception as e:
+        logger.warning(f"[exec-watchdog] error barriendo ejecuciones: {e}")
+
+def _executions_watchdog_loop():
+    time.sleep(10)  # delay inicial
+    while True:
+        _sweep_stuck_executions_once()
+        time.sleep(EXEC_WATCHDOG_SWEEP_EVERY)
+
+if os.getenv("ENABLE_EXEC_WATCHDOG", "1") == "1":
+    threading.Thread(target=_executions_watchdog_loop, daemon=True).start()
+# ====== /Watchdog de ejecuciones ======
 
 def _now_unix() -> int:
     return int(time.time())
