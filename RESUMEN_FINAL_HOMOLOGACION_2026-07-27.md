@@ -1,7 +1,7 @@
 # ✅ RESUMEN FINAL: Homologación Completa Web ↔ RN
 
 **Fecha:** 2026-07-27 13:10 GMT-4  
-**Estado:** COMPLETADO - Deploy exitoso v79.83
+**Estado:** COMPLETADO - Deploy exitoso v79.84
 
 ---
 
@@ -57,7 +57,8 @@ Homologar cálculo de entradas en vivo entre Web y React Native, asegurando:
 | `221d0fb` | 🔴 liveHistoryFingerprint incluye TP/SL |
 | `82d0261` | 🔧 HOMOLOGAR: agregar trainingData/events a MonitoreoConfig |
 | `00e7f66` | 🔧 ecoPollingEnabled default false |
-| `4419e6c` | 📦 Bump version: 79.82 → 79.83 |
+| `2d6ee11` | 🔧 USAR HOOK POLLING: eventos en tiempo real igual que Web |
+| `acbbac2` | 📦 Bump version: 79.83 → 79.84 |
 
 ---
 
@@ -75,10 +76,10 @@ Homologar cálculo de entradas en vivo entre Web y React Native, asegurando:
 - **Versión:** Con correcciones de entradas en vivo
 
 ### React Native APK
-- **Build:** ✅ 1m 12s
-- **Versión:** **79.83** (versionCode 225)
+- **Build:** ✅ 1m 6s
+- **Versión:** **79.84** (versionCode 226)
 - **Deploy VPS:** ✅ `/markettool.apk` y `/downloads/markettool.apk`
-- **URL APK:** https://markettool.mtlabsx.com/markettool.apk?v=79.83
+- **URL APK:** https://markettool.mtlabsx.com/markettool.apk?v=79.84
 
 ---
 
@@ -120,7 +121,6 @@ Homologar cálculo de entradas en vivo entre Web y React Native, asegurando:
    - Actualmente 0% (sesión nueva)
 
 ### Posibles Issues a Vigilar
-- ⚠️ RN no tiene toggle UI para eventos económicos (infraestructura lista)
 - ⚠️ Usuarios podrían notar "más entradas" de repente (es correcto)
 - ⚠️ Memoria Redis podría aumentar ~50-100% por TTL extendido (esperado)
 
@@ -147,11 +147,11 @@ Homologar cálculo de entradas en vivo entre Web y React Native, asegurando:
 - Infraestructura lista para activar eventos si se necesita ✅
 - Fingerprint y lógica idénticos ✅
 - Deploy completado exitosamente ✅
-- APK v79.83 publicada ✅
+- APK v79.84 publicada ✅
 
 **Proyecto listo para producción.**
 
 ---
 
 **Firma:** Luna (asistente OpenClaw)  
-**Timestamp:** 2026-07-27 13:10 GMT-4
+**Timestamp:** 2026-07-27 13:26 GMT-4
