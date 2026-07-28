@@ -197,8 +197,19 @@ def _norm_side_for_fp(side: Any) -> str:
 
 
 def _price_ticks(value: Any) -> str:
+    """
+    Convierte precio a ticks (1e5) para fingerprint.
+    
+    CORRECCIÓN 2026-07-27: Agregar clamp para valores extremos (>1 billón o <-1 billón)
+    para homologar con frontend (Web/RN) y evitar fingerprints excesivamente largos.
+    """
     try:
-        return str(round(float(value) * 1e5))
+        n = float(value)
+        if n != n:  # NaN check
+            return "na"
+        # Clamp para evitar overflow en casos extremos (>1 billón o <-1 billón)
+        clamped = max(-1e9, min(1e9, n))
+        return str(round(clamped * 1e5))
     except Exception:
         return "na"
 
