@@ -51,6 +51,15 @@ DEFAULT_CREDENTIALS = Path.home() / ".openclaw/workspace/trading-firestore.json"
 POSTGRES_DSN_FILE = "/run/secrets/markettool_postgres_dsn"  # Para VPS
 STATE_FILE = Path.home() / ".openclaw/workspace/gcs_local_sync_state.json"
 
+# Prefijos/directorios a sincronizar en el bucket
+SYNC_PREFIXES = [
+    "analisis/",
+    "archivos_generados/",
+    "historicos/",
+    "historicos_backups/",
+    "indicators/",
+]
+
 
 def get_gcs_client(credentials_path: Path) -> storage.Client:
     """Inicializar cliente de GCS."""
@@ -106,25 +115,30 @@ def get_local_files(local_dir: Path, max_age_hours: int = 168) -> Dict[str, Dict
     return files
 
 
-def get_gcs_files(bucket: storage.Bucket, prefix: str = "archivos_generados/") -> Dict[str, Dict[str, Any]]:
-    """Obtener lista de archivos en GCS con metadata."""
+def get_gcs_files(bucket: storage.Bucket, prefixes: List[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Obtener lista de archivos en GCS con metadata para múltiples prefijos."""
     files = {}
     
-    try:
-        blobs = bucket.list_blobs(prefix=prefix)
-        for blob in blobs:
-            if blob.name.endswith('/'):
-                continue
-            
-            rel_path = blob.name[len(prefix):] if blob.name.startswith(prefix) else blob.name
-            files[rel_path] = {
-                "name": blob.name,
-                "size": blob.size,
-                "md5": blob.md5_hash,
-                "updated": blob.updated.isoformat() if blob.updated else None,
-            }
-    except Exception as e:
-        logger.warning(f"Error listando blobs en GCS: {e}")
+    if prefixes is None:
+        prefixes = SYNC_PREFIXES
+    
+    for prefix in prefixes:
+        try:
+            blobs = bucket.list_blobs(prefix=prefix)
+            for blob in blobs:
+                if blob.name.endswith('/'):
+                    continue
+                
+                # Guardar con el path completo incluyendo el prefijo
+                files[blob.name] = {
+                    "name": blob.name,
+                    "size": blob.size,
+                    "md5": blob.md5_hash,
+                    "updated": blob.updated.isoformat() if blob.updated else None,
+                    "prefix": prefix,
+                }
+        except Exception as e:
+            logger.warning(f"Error listando blobs en GCS con prefix {prefix}: {e}")
     
     return files
 
@@ -230,8 +244,7 @@ def sync(
     delete_local_after_upload: bool = False,
     dry_run: bool = False,
 ) -> Tuple[int, int, int]:
-    """Sincronizar archivos entre local y GCS."""
-    prefix = "archivos_generados/"
+    """Sincronizar archivos entre local y GCS para todos los prefijos configurados."""
     uploaded = 0
     downloaded = 0
     skipped = 0
@@ -239,14 +252,15 @@ def sync(
     logger.info(f"=== Sincronización {'DRY-RUN' if dry_run else ''} ===")
     logger.info(f"Dirección: {direction}")
     logger.info(f"Local: {local_dir}")
-    logger.info(f"GCS: gs://{bucket.name}/{prefix}")
+    logger.info(f"GCS: gs://{bucket.name}/")
+    logger.info(f"Prefijos a sincronizar: {', '.join(SYNC_PREFIXES)}")
     logger.info(f"Max age: {max_age_hours} horas")
     logger.info(f"Delete after upload: {delete_local_after_upload}")
     logger.info("")
     
     # Obtener listas de archivos
     local_files = get_local_files(local_dir, max_age_hours)
-    gcs_files = get_gcs_files(bucket, prefix)
+    gcs_files = get_gcs_files(bucket)
     
     logger.info(f"Archivos locales (últimas {max_age_hours}h): {len(local_files)}")
     logger.info(f"Archivos en GCS: {len(gcs_files)}")
@@ -265,10 +279,11 @@ def sync(
     if direction in ("upload", "both"):
         logger.info("--- Subiendo archivos a GCS ---")
         for rel_path, info in local_files.items():
-            gcs_path = f"{prefix}{rel_path}"
+            # El path en GCS es igual al relativo local
+            gcs_path = rel_path
             
-            if rel_path in gcs_files:
-                gcs_info = gcs_files[rel_path]
+            if gcs_path in gcs_files:
+                gcs_info = gcs_files[gcs_path]
                 if info["md5"] == gcs_info.get("md5"):
                     skipped += 1
                     continue
@@ -276,8 +291,8 @@ def sync(
             if upload_to_gcs(bucket, info["path"], gcs_path, dry_run):
                 uploaded += 1
                 
-                # Actualizar metadata en PostgreSQL
-                if not dry_run and pg_dsn:
+                # Actualizar metadata en PostgreSQL solo para archivos_generados
+                if not dry_run and pg_dsn and gcs_path.startswith("archivos_generados/"):
                     gcs_url = f"https://storage.googleapis.com/{bucket.name}/{gcs_path}"
                     update_postgres_metadata(rel_path, gcs_url, pg_dsn)
                 
@@ -297,11 +312,11 @@ def sync(
     if direction in ("download", "both"):
         downloaded = 0
         logger.info("--- Descargando archivos desde GCS ---")
-        for rel_path, info in gcs_files.items():
-            local_path = local_dir / rel_path
+        for gcs_path, info in gcs_files.items():
+            local_path = local_dir / gcs_path
             
-            if rel_path in local_files:
-                local_info = local_files[rel_path]
+            if gcs_path in local_files:
+                local_info = local_files[gcs_path]
                 if info.get("md5") == local_info.get("md5"):
                     continue
             
