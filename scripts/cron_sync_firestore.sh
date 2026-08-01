@@ -62,6 +62,8 @@ python3 "$SCRIPT_DIR/sync_firestore_incremental.py" \
     --collections suscripciones_user \
     --collections iap_tokens \
     --collections user_states \
+    --collections indicators_metadata \
+    --collections historicos_metadata \
     --hours 2 \
     --batch-size 100 \
     --page-size 500 \
@@ -72,6 +74,31 @@ EXIT_CODE=$?
 
 if [ $EXIT_CODE -eq 0 ]; then
     log "✅ Sync completed successfully"
+    
+    # Validar integridad después de sync exitoso
+    log "=== Starting integrity validation ==="
+    python3 "$SCRIPT_DIR/validate_sync_integrity.py" \
+        --collections ejecuciones \
+        --collections user_ids \
+        --collections monitoreos \
+        --collections suscripciones_user \
+        --collections iap_tokens \
+        --collections user_states \
+        --collections indicators_metadata \
+        --collections historicos_metadata \
+        --hours 2 \
+        --tolerance 0 \
+        --verbose \
+        >> "$LOG_FILE" 2>&1
+    
+    VALIDATION_EXIT=$?
+    
+    if [ $VALIDATION_EXIT -eq 0 ]; then
+        log "✅ Integrity validation passed"
+    else
+        log "❌ Integrity validation FAILED - check logs for details"
+        # No fallar el cron job, pero registrar el warning
+    fi
 else
     log "❌ Sync failed with exit code $EXIT_CODE"
 fi

@@ -24,12 +24,17 @@ from google.oauth2 import service_account
 
 # Colecciones críticas a sincronizar por defecto
 DEFAULT_COLLECTIONS = [
+    # Datos de negocio críticos
     "ejecuciones",
     "user_ids",
     "monitoreos",
-    "suscripciones_user",
-    "iap_tokens",
+    "suscripciones_user",      # ⭐ CRÍTICO: Estado de suscripciones y quotas
+    "iap_tokens",              # ⭐ CRÍTICO: Compras in-app
     "user_states",
+    
+    # Metadata de cache (NUEVO - para trazabilidad y auditoría)
+    "indicators_metadata",     # ⭐ Metadata de indicadores precalculados
+    "historicos_metadata",     # ⭐ Metadata de datos históricos OHLCV
 ]
 
 
