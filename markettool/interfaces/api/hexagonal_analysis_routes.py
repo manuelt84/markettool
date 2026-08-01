@@ -339,6 +339,46 @@ def calculate_entry_signals():
             cfg=config
         )
         
+        # ✅ OPCION C: Disparar procesamiento MTF asíncrono para backtesting
+        # Respuesta inmediata al frontend, MTF se calcula en background
+        try:
+            from markettool.services.async_mtf_processor import get_async_mtf_processor
+            import hashlib
+            
+            # Construir multi_tf_context desde config o datos disponibles
+            multi_tf_context = config.get('multi_tf_context')
+            if multi_tf_context and multi_tf_context.get('enabled', False):
+                processor = get_async_mtf_processor()
+                
+                # Generar cache key único
+                data_hash = hashlib.md5(
+                    f"{symbol}:{timeframe}:{len(df)}:{df['close'].iloc[-1]:.6f}".encode()
+                ).hexdigest()[:12]
+                cache_key = f"markettool:backtest:mtf:{symbol}:{timeframe}:{data_hash}"
+                
+                # Extraer entradas para procesar
+                entries = result.get('entradas') or result.get('resumen_senal') or []
+                
+                # Enviar a cola de procesamiento
+                await processor.submit_job(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    entries=entries.copy(),  # Copia para no modificar original
+                    multi_tf_context=multi_tf_context,
+                    cache_key=cache_key,
+                )
+                
+                # Agregar metadata a respuesta indicando que MTF está en proceso
+                result['mtf_pending'] = True
+                result['mtf_cache_key'] = cache_key
+                logger.info(
+                    "[Analysis] %s/%s: MTF processing started (async job queued, key=%s)",
+                    symbol, timeframe, cache_key
+                )
+        except Exception as mtf_exc:
+            # Non-critical error, no fallar la respuesta principal
+            logger.warning("[Analysis] MTF async processor error: %s", mtf_exc)
+        
         return jsonify(result), 200
     
     except Exception as e:
