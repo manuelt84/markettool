@@ -16,6 +16,16 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 
+try:
+    from .strategy_activation_service import (
+        get_strategy_activation_service,
+        ActivationMode,
+        MultiTFContext,
+    )
+    STRATEGY_ACTIVATION_AVAILABLE = True
+except ImportError:
+    STRATEGY_ACTIVATION_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -365,6 +375,122 @@ class BacktestingService:
         return max_streak
     
     # ==================== ENRICHED JSON BACKTEST ====================
+
+    def apply_strategy_activation(
+        self,
+        entries: List[Dict[str, Any]],
+        symbol: str,
+        timeframe: str,
+        mode: str = 'backtest',
+        multi_tf_context: Optional[Dict[str, Any]] = None,
+        available_tfs: Optional[List[str]] = None,
+        feature_flags: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Apply differential strategy activation to filter/weight entries.
+        
+        Args:
+            entries: List of entry dicts to filter
+            symbol: Symbol name
+            timeframe: Primary timeframe
+            mode: 'backtest' or 'live'
+            multi_tf_context: Multi-timeframe context if available
+            available_tfs: List of user-selected timeframes
+            feature_flags: Feature flags to control activation
+        
+        Returns:
+            Tuple of (filtered_entries, activation_stats)
+        """
+        # Check if feature is enabled
+        if not STRATEGY_ACTIVATION_AVAILABLE:
+            self.logger.warning("StrategyActivationService not available, skipping activation")
+            return entries, {'activated': False, 'reason': 'service_unavailable'}
+        
+        flags = feature_flags or {}
+        if not flags.get('enableStrategyActivation', True):
+            self.logger.info("Strategy activation disabled by feature flag")
+            return entries, {'activated': False, 'reason': 'feature_flag_disabled'}
+        
+        service = get_strategy_activation_service()
+        activation_mode = ActivationMode.BACKTEST if mode == 'backtest' else ActivationMode.LIVE
+        
+        # Convert multi_tf_context dict to MultiTFContext object
+        mtf_ctx = None
+        if multi_tf_context:
+            mtf_ctx = MultiTFContext(
+                enabled=multi_tf_context.get('enabled', False),
+                higher_tf_1=multi_tf_context.get('higher_tf_1'),
+                higher_tf_2=multi_tf_context.get('higher_tf_2'),
+                staleness_min=multi_tf_context.get('staleness_min', 0.0),
+                inference_available=multi_tf_context.get('inference_available', False),
+            )
+        
+        filtered_entries = []
+        skipped_by_source: Dict[str, int] = {}
+        weighted_by_source: Dict[str, float] = {}
+        
+        for entry in entries:
+            source_id = entry.get('source', 'unknown')
+            entry_tf = entry.get('timeframe', timeframe)
+            
+            # Check activation
+            result = service.should_activate_strategy(
+                source_id=source_id,
+                timeframe=entry_tf,
+                mode=activation_mode,
+                multi_tf_context=mtf_ctx,
+                available_tfs=available_tfs,
+            )
+            
+            if not result.activate:
+                # Track skipped entries
+                skipped_by_source[source_id] = skipped_by_source.get(source_id, 0) + 1
+                self.logger.debug(
+                    "[Backtest] Skip %s/%s entry: %s",
+                    symbol, entry_tf, result.reason
+                )
+                continue
+            
+            # Apply weight to entry confidence
+            original_confidence = entry.get('confidence', 0.5)
+            adjusted_confidence = original_confidence * result.weight
+            
+            # Store activation metadata
+            entry['_activation'] = {
+                'weight': result.weight,
+                'original_confidence': original_confidence,
+                'adjusted_confidence': adjusted_confidence,
+                'reason': result.reason,
+                'fallback_mode': result.fallback_mode,
+                'warnings': result.warnings,
+            }
+            
+            # Update confidence if adjustment is significant
+            if result.weight != 1.0:
+                entry['confidence'] = adjusted_confidence
+                weighted_by_source[source_id] = result.weight
+            
+            filtered_entries.append(entry)
+        
+        activation_stats = {
+            'activated': True,
+            'mode': mode,
+            'original_count': len(entries),
+            'filtered_count': len(filtered_entries),
+            'skipped_count': len(entries) - len(filtered_entries),
+            'skipped_by_source': skipped_by_source,
+            'weighted_by_source': weighted_by_source,
+            'multi_tf_enabled': mtf_ctx.enabled if mtf_ctx else False,
+            'available_tfs': available_tfs,
+        }
+        
+        self.logger.info(
+            "[Backtest] %s: %d entries → %d after activation (%d skipped)",
+            symbol, len(entries), len(filtered_entries),
+            len(entries) - len(filtered_entries)
+        )
+        
+        return filtered_entries, activation_stats
 
     def run_from_enriched(
         self,

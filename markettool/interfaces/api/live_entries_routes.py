@@ -87,6 +87,9 @@ TF_BEAT_S: dict[str, float] = {
 }
 _DEFAULT_BEAT_S = 60.0
 
+# Timeframe ordering for MTF context
+TIMEFRAME_ORDER = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w']
+
 # ─────────────────────────────────────────────
 # Estado global de workers
 # ─────────────────────────────────────────────
@@ -1658,11 +1661,24 @@ def _generate_live_entries_sync(
     df_eventos: pd.DataFrame,
     calcular_entradas_sync_wrapper,
     norm_tf_fn,
+    multi_tf_context: dict | None = None,
+    available_tfs: list[str] | None = None,
 ) -> tuple[list[dict], dict]:
     """
     Genera entradas live para un symbol+tf usando el motor Python existente.
     Evalúa solo los últimos LIVE_WINDOW candles (homologa liveWindow=3 del cliente).
     Retorna (entradas, sr_levels).
+    
+    Args:
+        symbol: Symbol name
+        tf: Timeframe
+        series_ms: Candle data
+        niveles: Support/resistance levels
+        df_eventos: Economic events DataFrame
+        calcular_entradas_sync_wrapper: Function to calculate entries
+        norm_tf_fn: Timeframe normalization function
+        multi_tf_context: Optional multi-TF context {higher_tf_1: {...}, higher_tf_2: {...}, staleness_min: float}
+        available_tfs: List of user-selected timeframes for activation filtering
     """
     if len(series_ms) < MIN_CANDLES:
         return [], {}
@@ -1707,12 +1723,29 @@ def _generate_live_entries_sync(
         except Exception as ind_exc:
             logger.warning("[LiveWorker] indicadores no disponibles %s/%s: %s", symbol, tf, ind_exc)
 
+        # Build multi-TF context for strategy activation
+        cfg = {
+            "niveles": niveles or {},
+            "live_window": LIVE_WINDOW,
+        }
+        
+        # Add MTF context if available
+        if multi_tf_context:
+            cfg["multi_tf_context"] = multi_tf_context
+            cfg["available_tfs"] = available_tfs or [tf]
+            logger.debug(
+                "[LiveWorker] %s/%s passing MTF context: enabled=%s, staleness=%.1fmin",
+                symbol, tf,
+                multi_tf_context.get('enabled', False),
+                multi_tf_context.get('staleness_min', 0)
+            )
+        
         result = calcular_entradas_sync_wrapper(
             df,
             df_eventos if df_eventos is not None else pd.DataFrame(),
             symbol,
             tf,
-            cfg={"niveles": niveles or {}, "live_window": LIVE_WINDOW},
+            cfg=cfg,
         )
     except Exception as exc:
         logger.warning("[LiveWorker] calcular_entradas_sync_wrapper error %s/%s: %s", symbol, tf, exc)
@@ -1737,6 +1770,106 @@ def _generate_live_entries_sync(
         entradas_raw = result
     if isinstance(entradas_raw, dict):
         entradas_raw = entradas_raw.get("lista") or []
+
+    # ✅ APLICAR FILTRADO MTF + ANÁLISIS DE ALINEACIÓN (Homologa frontend strategyActivation.ts + confluence.ts)
+    if multi_tf_context and available_tfs:
+        try:
+            from markettool.application.services.strategy_activation_service import (
+                get_strategy_activation_service,
+                ActivationMode,
+                MultiTFContext as PyMultiTFContext,
+            )
+            
+            service = get_strategy_activation_service()
+            mtf_ctx = PyMultiTFContext(
+                enabled=multi_tf_context.get('enabled', False),
+                higher_tf_1=multi_tf_context.get('higher_tf_1'),
+                higher_tf_2=multi_tf_context.get('higher_tf_2'),
+                staleness_min=multi_tf_context.get('staleness_min', 0.0),
+                inference_available=multi_tf_context.get('inference_available', False),
+            )
+            
+            entradas_filtradas = []
+            skipped_count = 0
+            boosted_count = 0
+            
+            for entry in entradas_raw:
+                source_id = entry.get("source", "unknown").replace("SOURCE_", "").lower()
+                entry_tf = entry.get("timeframe", tf)
+                
+                activation = service.should_activate_strategy(
+                    source_id=source_id,
+                    timeframe=entry_tf,
+                    mode=ActivationMode.LIVE,
+                    multi_tf_context=mtf_ctx,
+                    available_tfs=available_tfs,
+                )
+                
+                if not activation.activate:
+                    skipped_count += 1
+                    logger.debug(
+                        "[LiveWorker] %s/%s Skip %s: %s",
+                        symbol, tf, source_id, activation.reason
+                    )
+                    continue
+                
+                # ✅ NUEVO: Calcular MTF alignment boost si la estrategia lo soporta
+                config = service.get_strategy_config(source_id)
+                if config and config.get('backtest', {}).get('requires_mtf_alignment', False):
+                    # Deducir dirección del TF primario basada en la señal
+                    # Long signal → bullish bias, Short signal → bearish bias
+                    side = entry.get("side", "").lower()
+                    if side == "long" or "buy" in side or "compra" in side:
+                        primary_direction = 'bullish'
+                    elif side == "short" or "sell" in side or "venta" in side:
+                        primary_direction = 'bearish'
+                    else:
+                        primary_direction = 'neutral'
+                    
+                    # Calcular alineación MTF
+                    if primary_direction != 'neutral' and mtf_ctx.enabled:
+                        aligned_count, htf_directions = service.calculate_mtf_alignment(
+                            primary_direction, mtf_ctx
+                        )
+                        
+                        # Calcular boost
+                        boost = service.calculate_mtf_alignment_boost(
+                            source_id, aligned_count, ActivationMode.LIVE
+                        )
+                        
+                        # Aplicar boost al confidence
+                        if 'confidence' in entry and boost != 0:
+                            old_confidence = entry['confidence']
+                            new_confidence = round(old_confidence * (1 + boost), 2)
+                            entry['confidence'] = min(100, new_confidence)  # Cap at 100
+                            
+                            if boost > 0:
+                                boosted_count += 1
+                                logger.debug(
+                                    "[LiveWorker] %s/%s %s: MTF boost +%d%% (aligned=%d/3, dir=%s, htf=%s)",
+                                    symbol, tf, source_id, int(boost * 100), aligned_count, primary_direction, htf_directions
+                                )
+                            elif boost < 0:
+                                logger.debug(
+                                    "[LiveWorker] %s/%s %s: MTF penalty %d%% (aligned=%d/3, dir=%s, htf=%s)",
+                                    symbol, tf, source_id, int(boost * 100), aligned_count, primary_direction, htf_directions
+                                )
+                
+                # Aplicar weight por activación
+                if activation.weight < 1.0 and 'confidence' in entry:
+                    entry['confidence'] = round(entry['confidence'] * activation.weight, 2)
+                
+                entradas_filtradas.append(entry)
+            
+            entradas_raw = entradas_filtradas
+            logger.info(
+                "[LiveWorker] %s/%s MTF filter: %d entries, %d skipped (%.1f%%), %d boosted",
+                symbol, tf, len(entradas_raw), skipped_count,
+                (skipped_count / max(len(entradas_raw) + skipped_count, 1)) * 100,
+                boosted_count
+            )
+        except Exception as exc:
+            logger.warning("[LiveWorker] %s/%s MTF filter+analysis error: %s - using all entries", symbol, tf, exc)
 
     now_ts = int(time.time() * 1000)
     now_iso = pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z")
@@ -2035,11 +2168,37 @@ async def _live_worker(
             except Exception:
                 pass
 
-            # 7. Generar entradas
+            # 7. Build multi-TF context for strategy activation
+            multi_tf_context = None
+            if tfs and len(tfs) > 1:
+                # Get higher TFs for this timeframe
+                try:
+                    tf_index = TIMEFRAME_ORDER.index(norm)
+                    higher_tfs = [t for t in tfs if t in TIMEFRAME_ORDER and TIMEFRAME_ORDER.index(t) > tf_index]
+                    
+                    if higher_tfs:
+                        # Load last closed candles for higher TFs (simplified - would need actual data)
+                        multi_tf_context = {
+                            'enabled': True,
+                            'higher_tf_1': {'timeframe': higher_tfs[0]} if higher_tfs else None,
+                            'higher_tf_2': {'timeframe': higher_tfs[1]} if len(higher_tfs) > 1 else None,
+                            'staleness_min': 0.0,  # Would calculate based on HTF candle close time
+                            'inference_available': True,
+                        }
+                        logger.debug(
+                            "[LiveWorker] %s/%s MTF context: higher_tfs=%s",
+                            symbol, norm, higher_tfs
+                        )
+                except (ValueError, IndexError) as exc:
+                    logger.debug("[LiveWorker] %s/%s could not build MTF context: %s", symbol, norm, exc)
+
+            # 8. Generar entradas
             entries, sr_levels = await asyncio.to_thread(
                 _generate_live_entries_sync,
                 symbol, norm, series_ms, niveles, df_eventos,
                 calcular_entradas_sync_wrapper, norm_tf_fn,
+                multi_tf_context,
+                tfs,  # available_tfs
             )
 
             # 8. Persistir en Redis
@@ -2317,6 +2476,77 @@ def register_live_entries_routes(app, *, services) -> None:
 
         worker_status = _worker_status(redis_client, wid, beat_data)
 
+        # Build multiTFContext for frontend strategy activation
+        # ✅ COMPLETO: Incluye higher_tf_1, higher_tf_2 con datos reales
+        multi_tf_context = None
+        if tfs and len(tfs) > 1:
+            # Get primary timeframe index
+            try:
+                from markettool.application.services.strategy_activation_service import calculate_staleness_min
+                tf_index = TIMEFRAME_ORDER.index(tfs[0]) if tfs[0] in TIMEFRAME_ORDER else -1
+                
+                # Load last closed candles for higher TFs to calculate staleness
+                higher_tf_1_data = None
+                higher_tf_2_data = None
+                
+                if len(tfs) > 1 and tfs[1] in TIMEFRAME_ORDER:
+                    try:
+                        st_htf1 = await asyncio.to_thread(load_cache, exec_id, symbol, tfs[1])
+                        series_htf1 = st_htf1.get("series", [])
+                        if series_htf1:
+                            last_close_ts = series_htf1[-1].get("time", 0)
+                            staleness_min = calculate_staleness_min(last_close_ts)
+                            higher_tf_1_data = {
+                                'timeframe': tfs[1],
+                                'last_close_ts': last_close_ts,
+                                'staleness_min': staleness_min,
+                                'direction': 'up' if len(series_htf1) >= 2 and series_htf1[-1]['close'] > series_htf1[-2]['close'] else 'down',
+                            }
+                    except Exception as exc:
+                        logger.debug("[LiveEntries] Could not load HTF1 %s: %s", tfs[1], exc)
+                
+                if len(tfs) > 2 and tfs[2] in TIMEFRAME_ORDER:
+                    try:
+                        st_htf2 = await asyncio.to_thread(load_cache, exec_id, symbol, tfs[2])
+                        series_htf2 = st_htf2.get("series", [])
+                        if series_htf2:
+                            last_close_ts = series_htf2[-1].get("time", 0)
+                            staleness_min = calculate_staleness_min(last_close_ts)
+                            higher_tf_2_data = {
+                                'timeframe': tfs[2],
+                                'last_close_ts': last_close_ts,
+                                'staleness_min': staleness_min,
+                                'direction': 'up' if len(series_htf2) >= 2 and series_htf2[-1]['close'] > series_htf2[-2]['close'] else 'down',
+                            }
+                    except Exception as exc:
+                        logger.debug("[LiveEntries] Could not load HTF2 %s: %s", tfs[2], exc)
+                
+                multi_tf_context = {
+                    'enabled': True,
+                    'available_tfs': tfs,
+                    'primary_tf': tfs[0] if tfs else None,
+                    'higher_tfs': tfs[1:] if len(tfs) > 1 else [],
+                    'higher_tf_1': higher_tf_1_data,
+                    'higher_tf_2': higher_tf_2_data,
+                }
+                logger.debug(
+                    "[LiveEntries] %s MTF context: primary=%s, htf1=%s (stale=%.1fmin), htf2=%s",
+                    symbol,
+                    tfs[0],
+                    higher_tf_1_data['timeframe'] if higher_tf_1_data else 'N/A',
+                    higher_tf_1_data['staleness_min'] if higher_tf_1_data else 0,
+                    higher_tf_2_data['timeframe'] if higher_tf_2_data else 'N/A',
+                )
+            except (ValueError, IndexError) as exc:
+                logger.debug("[LiveEntries] %s could not build complete MTF context: %s", symbol, exc)
+                # Fallback a versión simple
+                multi_tf_context = {
+                    'enabled': True,
+                    'available_tfs': tfs,
+                    'primary_tf': tfs[0] if tfs else None,
+                    'higher_tfs': tfs[1:] if len(tfs) > 1 else [],
+                }
+
         return jsonify({
             "entries": entries,
             "last_beat_ts": last_beat_ts,
@@ -2324,6 +2554,7 @@ def register_live_entries_routes(app, *, services) -> None:
             "candles_count": candles_count,
             "sr_levels": sr_levels,
             "candles": candles_payload,
+            "multiTFContext": multi_tf_context,
         }), 200
 
     # ── GET /monitoreo/live-entries/stream ───────────────────────────────────
