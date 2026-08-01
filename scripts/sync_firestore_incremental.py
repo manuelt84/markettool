@@ -13,7 +13,7 @@ import json
 import math
 import os
 import time as time_module
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -241,7 +241,8 @@ def fetch_incremental_docs_from_ref(
 ) -> List[Tuple[str, str, Dict[str, Any]]]:
     """Fetch docs from a collection reference (for nested collections)."""
     docs = []
-    collection_name = collection_ref.path
+    # Obtener el path de la colección correctamente
+    collection_name = str(collection_ref._path)
     
     query = collection_ref.order_by("__name__").limit(page_size)
     last_snapshot = None
