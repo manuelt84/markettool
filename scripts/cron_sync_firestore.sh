@@ -5,9 +5,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="/opt/backups"
-PROJECT_DIR="/root/markettool"  # Asumiendo que markettool está en /root
+PROJECT_DIR="/root/markettool"
 LOG_DIR="/var/log/markettool"
 LOG_FILE="$LOG_DIR/firestore_sync.log"
+VENV_DIR="/opt/backups/firestore-sync-venv"
 
 # Crear directorio de logs si no existe
 mkdir -p "$LOG_DIR"
@@ -17,15 +18,42 @@ chmod 755 "$LOG_DIR"
 export GOOGLE_APPLICATION_CREDENTIALS="$PROJECT_DIR/trading-firestore.json"
 export MARKETTOOL_POSTGRES_DSN_FILE="/run/secrets/markettool_postgres_dsn"
 export MARKETTOOL_POSTGRES_SCHEMA="markettool"
-export PYTHONPATH="$PROJECT_DIR:$PYTHONPATH"
-
-# Cambiar al directorio del proyecto
-cd "$PROJECT_DIR" || { log "ERROR: Cannot cd to $PROJECT_DIR"; exit 1; }
 
 # Función de logging
 log() {
     echo "[$(date -Iseconds)] $*" >> "$LOG_FILE"
 }
+
+# Crear/activar entorno virtual con Python compatible
+if [ ! -d "$VENV_DIR" ]; then
+    log "Creando entorno virtual..."
+    # Usar get-pip.py para instalar pip moderno en Python 3.6
+    python3 -m venv "$VENV_DIR" || {
+        # Si venv falla, intentar con virtualenv
+        apt-get update -qq && apt-get install -y -qq virtualenv 2>/dev/null || true
+        virtualenv -p python3 "$VENV_DIR" || {
+            log "ERROR: No se pudo crear entorno virtual"
+            exit 1
+        }
+    }
+    
+    # Activar y actualizar pip
+    source "$VENV_DIR/bin/activate"
+    log "Actualizando pip..."
+    pip install --upgrade pip setuptools wheel >> "$LOG_FILE" 2>&1 || true
+    
+    # Instalar dependencias compatibles con Python 3.6
+    log "Instalando dependencias (versiones compatibles con Python 3.6)..."
+    pip install 'psycopg2-binary==2.9.9' 'google-cloud-firestore==2.7.2' >> "$LOG_FILE" 2>&1 || {
+        log "ERROR: Falló instalación de dependencias"
+        exit 1
+    }
+else
+    source "$VENV_DIR/bin/activate"
+fi
+
+# Cambiar al directorio del proyecto
+cd "$PROJECT_DIR" || { log "ERROR: Cannot cd to $PROJECT_DIR"; exit 1; }
 
 # Iniciar sync
 log "=== Starting Firestore incremental sync ==="

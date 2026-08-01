@@ -18,7 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import psycopg
+import psycopg2
 from google.api_core import exceptions as google_exceptions
 from google.cloud import firestore
 from google.oauth2 import service_account
@@ -276,7 +276,7 @@ def fetch_incremental_docs_from_ref(
     return docs
 
 
-def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
+def ensure_schema(conn: psycopg2.extensions.connection, schema: str) -> None:
     with conn.cursor() as cur:
         cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
         cur.execute(
@@ -302,7 +302,7 @@ def ensure_schema(conn: psycopg.Connection, schema: str) -> None:
     conn.commit()
 
 
-def flush(conn: psycopg.Connection, schema: str, rows: List[Tuple[str, str, Dict[str, Any]]]) -> int:
+def flush(conn: psycopg2.extensions.connection, schema: str, rows: List[Tuple[str, str, Dict[str, Any]]]) -> int:
     if not rows:
         return 0
     
@@ -335,7 +335,7 @@ def main() -> int:
     print()
     
     db = firestore_client(args)
-    conn = None if args.dry_run else psycopg.connect(read_dsn(args))
+    conn = None if args.dry_run else psycopg2.connect(read_dsn(args))
     
     if conn is not None:
         ensure_schema(conn, args.schema)
