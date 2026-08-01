@@ -34,11 +34,9 @@ log() {
 # Iniciar sync
 log "=== Starting PostgreSQL → Firestore sync ==="
 
-# Sincronizar colecciones específicas (últimas 6 horas)
+# Sincronizar todas las colecciones desde PostgreSQL (últimas 6 horas)
+# El script detecta automáticamente qué colecciones tienen datos nuevos
 python3 "$SCRIPT_DIR/sync_postgres_to_firestore.py" \
-    --collections backtest_results \
-    --collections configuraciones \
-    --collections logs_sistema \
     --hours 6 \
     --batch-size 100 \
     --verbose \

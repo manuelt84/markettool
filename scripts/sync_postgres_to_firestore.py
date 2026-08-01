@@ -9,7 +9,7 @@ import argparse
 import base64
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -87,6 +87,29 @@ def should_retry_firestore_error(exc: BaseException) -> bool:
     return "query timed out" in message or "quota exceeded" in message or "temporarily unavailable" in message
 
 
+def get_collections_from_postgres(
+    conn: psycopg2.extensions.connection,
+    schema: str,
+    since: datetime,
+) -> List[str]:
+    """Obtener lista única de colecciones con datos modificados desde 'since'."""
+    collections = []
+    
+    with conn.cursor() as cur:
+        # Convertir since a timestamp compatible con PostgreSQL
+        since_str = since.strftime('%Y-%m-%d %H:%M:%S')
+        cur.execute(
+            f"""SELECT DISTINCT collection_name 
+                FROM "{schema}".firestore_docs 
+                WHERE updated_at >= %s::timestamptz
+                ORDER BY collection_name""",
+            (since_str,)
+        )
+        collections = [row[0] for row in cur.fetchall()]
+    
+    return collections
+
+
 def fetch_from_postgres(
     conn: psycopg2.extensions.connection,
     schema: str,
@@ -98,28 +121,14 @@ def fetch_from_postgres(
     docs = []
     
     with conn.cursor() as cur:
-        # Verificar si la tabla existe
-        cur.execute(
-            f"""SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = %s AND table_name = %s
-            )""",
-            (schema, collection)
-        )
-        exists = cur.fetchone()[0]
-        
-        if not exists:
-            if verbose:
-                print(f"SKIP\t{collection}: tabla no existe en PostgreSQL", flush=True)
-            return []
-        
-        # Obtener documentos modificados desde 'since'
+        # Obtener documentos modificados desde 'since' para esta colección
+        # El nombre de colección puede ser simple ("ejecuciones") o compuesto ("('ejecuciones', 'id', 'live_data')")
         cur.execute(
             f"""SELECT doc_id, data, created_at, updated_at 
                 FROM "{schema}".firestore_docs 
                 WHERE collection_name = %s AND updated_at >= %s
                 ORDER BY updated_at""",
-            (collection, since)
+            (collection, since.strftime('%Y-%m-%d %H:%M:%S'))
         )
         
         rows = cur.fetchall()
@@ -184,17 +193,28 @@ def write_to_firestore(
 def main() -> int:
     args = parse_args()
     
-    collections = args.collections if args.collections else DEFAULT_COLLECTIONS
-    since = datetime.now(timezone.utc).replace(microsecond=0)
+    # Si no se especifican colecciones, obtenerlas dinámicamente desde PostgreSQL
+    collections = args.collections if args.collections else []
+    
+    since_dt = datetime.now(timezone.utc) - timedelta(hours=args.hours)
     
     print(f"=== PostgreSQL → Firestore Sync ===", flush=True)
-    print(f"Collections: {', '.join(collections)}", flush=True)
-    print(f"Since: {since.isoformat()} (últimas {args.hours} horas)", flush=True)
-    print(f"Dry run: {args.dry_run}", flush=True)
-    print()
     
     # Conectar a PostgreSQL
     conn = psycopg2.connect(read_dsn(args))
+    
+    # Obtener colecciones dinámicamente si no se especificaron
+    if not collections:
+        collections = get_collections_from_postgres(conn, args.schema, since_dt)
+        if not collections:
+            print(f"No hay datos modificados desde {since_dt.isoformat()}", flush=True)
+            return 0
+    
+    print(f"Collections: {', '.join(collections[:10])}{'...' if len(collections) > 10 else ''}", flush=True)
+    print(f"Total collections to sync: {len(collections)}", flush=True)
+    print(f"Since: {since_dt.isoformat()} (últimas {args.hours} horas)", flush=True)
+    print(f"Dry run: {args.dry_run}", flush=True)
+    print()
     
     # Conectar a Firestore
     db = firestore_client(args)
@@ -209,7 +229,7 @@ def main() -> int:
                 conn,
                 args.schema,
                 collection,
-                since,
+                since_dt,
                 verbose=args.verbose,
             )
             
