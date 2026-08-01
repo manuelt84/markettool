@@ -18,6 +18,7 @@ chmod 755 "$LOG_DIR"
 export GOOGLE_APPLICATION_CREDENTIALS="/root/markettool/trading-firestore.json"
 export MARKETTOOL_POSTGRES_DSN_FILE="/run/secrets/markettool_postgres_dsn"
 export MARKETTOOL_POSTGRES_SCHEMA="markettool"
+export PYTHONPATH="${PYTHONPATH:-}:$PROJECT_DIR"
 
 # Función de logging
 log() {
