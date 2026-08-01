@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="/opt/backups"
-LOCAL_DIR="/opt/markettool/data/archivos"
+LOCAL_DIR="/app/storage/markettool-json"
 LOG_DIR="/var/log/markettool"
 LOG_FILE="$LOG_DIR/gcs_files_sync.log"
 VENV_DIR="/opt/backups/firestore-sync-venv"

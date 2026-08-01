@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 # Configuración
-DEFAULT_LOCAL_DIR = "/opt/markettool/data/archivos"
+DEFAULT_LOCAL_DIR = "/app/storage/markettool-json"
 DEFAULT_BUCKET = os.getenv("GCS_BUCKET_NAME", "markettool_bucket")
 DEFAULT_CREDENTIALS = "/root/markettool/trading-firestore.json"
 STATE_FILE = "/opt/backups/gcs_sync_state.json"
