@@ -277,7 +277,7 @@ def compute_technical_indicators():
 # ==================== ENTRY SIGNALS ROUTES ====================
 
 @analysis_bp.route('/entry-signals', methods=['POST'])
-def calculate_entry_signals():
+async def calculate_entry_signals():
     """
     Calculate complete entry signals using hexagonal analysis.
     
