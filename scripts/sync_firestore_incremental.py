@@ -5,8 +5,6 @@ Este script sincroniza solo los documentos nuevos o modificados desde las últim
 Ideal para ejecutar periódicamente vía cron.
 """
 
-from __future__ import annotations
-
 import argparse
 import base64
 import json
@@ -123,7 +121,7 @@ def should_retry_firestore_error(exc: BaseException) -> bool:
     return "query timed out" in message or "quota exceeded" in message or "temporarily unavailable" in message
 
 
-def get_last_sync_times(conn: psycopg.Connection, schema: str, collections: List[str]) -> Dict[str, datetime]:
+def get_last_sync_times(conn: 'psycopg2.extensions.connection', schema: str, collections: List[str]) -> Dict[str, datetime]:
     """Obtener la última fecha de sync para cada colección."""
     result = {}
     with conn.cursor() as cur:

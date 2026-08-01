@@ -15,7 +15,7 @@ mkdir -p "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
 # Variables de entorno
-export GOOGLE_APPLICATION_CREDENTIALS="$PROJECT_DIR/trading-firestore.json"
+export GOOGLE_APPLICATION_CREDENTIALS="/root/markettool/trading-firestore.json"
 export MARKETTOOL_POSTGRES_DSN_FILE="/run/secrets/markettool_postgres_dsn"
 export MARKETTOOL_POSTGRES_SCHEMA="markettool"
 
@@ -27,14 +27,9 @@ log() {
 # Crear/activar entorno virtual con Python compatible
 if [ ! -d "$VENV_DIR" ]; then
     log "Creando entorno virtual..."
-    # Usar get-pip.py para instalar pip moderno en Python 3.6
     python3 -m venv "$VENV_DIR" || {
-        # Si venv falla, intentar con virtualenv
-        apt-get update -qq && apt-get install -y -qq virtualenv 2>/dev/null || true
-        virtualenv -p python3 "$VENV_DIR" || {
-            log "ERROR: No se pudo crear entorno virtual"
-            exit 1
-        }
+        log "ERROR: No se pudo crear entorno virtual con python3 -m venv"
+        exit 1
     }
     
     # Activar y actualizar pip
