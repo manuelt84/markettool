@@ -46,7 +46,30 @@ Sistema de sincronización implementado para mantener consistencia entre:
 
 ## 2. Archivos Físicos: Local ↔ GCS Bucket
 
-### Arquitectura
+### Estructura Completa del GCS Bucket
+
+```
+gs://markettool_bucket/
+├── analisis/              (34,697 archivos, 6.5 GB) - Resultados de análisis por exec_id
+├── archivos_generados/    (116 archivos, 300 MB)   - Archivos generados por MarketTool
+├── historicos/            (512 archivos, 64 MB)    - Datos históricos OHLCV ⭐
+├── historicos_backups/    (10 archivos, 1 MB)      - Backups de datos históricos
+└── indicators/            (512 archivos, 1.1 GB)   - Indicadores precalculados ⭐
+
+TOTAL: 35,847 archivos, 8.06 GB
+```
+
+### Directorios Sincronizados
+
+| Directorio | Archivos | Tamaño | Descripción | Sync |
+|------------|----------|--------|-------------|------|
+| `analisis/` | 34,697 | 6.5 GB | Resultados de análisis (por exec_id y timeframe) | ✅ |
+| `archivos_generados/` | 116 | 300 MB | Archivos de MarketTool (metadata en PG) | ✅ |
+| `historicos/` | 512 | 64 MB | Datos OHLCV: `{SYMBOL}__{TIMEFRAME}.json` | ✅ |
+| `historicos_backups/` | 10 | 1 MB | Backups puntuales de históricos | ✅ |
+| `indicators/` | 512 | 1.1 GB | Indicadores: `{SYMBOL}__{TIMEFRAME}.json` | ✅ |
+
+### Arquitectura Actualizada
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -55,8 +78,9 @@ Sistema de sincronización implementado para mantener consistencia entre:
 │  /home/mtoro/projects/localnginx_balancer/             │
 │    maquina-a/storage/markettool-json/                   │
 │      ├── analisis/{exec_id}/                            │
-│      ├── backtests/{exec_id}/                           │
-│      └── exports/{user_id}/                             │
+│      ├── archivos_generados/                            │
+│      ├── historicos/{SYMBOL}__{TIMEFRAME}.json          │
+│      └── indicators/{SYMBOL}__{TIMEFRAME}.json          │
 │                                                         │
 │  ↕ sync_archivos_gcs_local.py (cada 6 horas)           │
 └─────────────────────────────────────────────────────────┘
@@ -64,12 +88,14 @@ Sistema de sincronización implementado para mantener consistencia entre:
 ┌─────────────────────────────────────────────────────────┐
 │  GOOGLE CLOUD STORAGE                                   │
 │                                                         │
-│  gs://markettool_bucket/archivos_generados/             │
-│      ├── analisis/{exec_id}/resultado.json             │
-│      ├── backtests/{exec_id}/reporte.csv               │
-│      └── exports/{user_id}/archivo.pdf                 │
+│  gs://markettool_bucket/                                │
+│      ├── analisis/{exec_id}/{symbol}_{tf}_enriched.json│
+│      ├── archivos_generados/{tipo}/{exec_id}/...       │
+│      ├── historicos/{SYMBOL}__{TIMEFRAME}.json         │
+│      ├── historicos_backups/{timestamp}/...            │
+│      └── indicators/{SYMBOL}__{TIMEFRAME}.json         │
 │                                                         │
-│  URL pública:                                           │
+│  URLs públicas:                                         │
 │  https://storage.googleapis.com/markettool_bucket/...  │
 └─────────────────────────────────────────────────────────┘
          ↕ HTTPS
