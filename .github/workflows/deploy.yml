@@ -1,0 +1,39 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main, master]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Deploy to VPS via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: vpn.mtlabsx.com
+          username: root
+          port: 22222
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /opt/apps/markettool
+            git pull origin main
+            npm install --production
+            npm run build
+            pm2 restart markettool
+            pm2 save
+            echo "✅ Deploy completado - Markettool"
