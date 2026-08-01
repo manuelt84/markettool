@@ -9,6 +9,15 @@
 # AUTO-RESCUE: Por defecto, rescata cache desde containers antes de build
 # ============================================================
 
+set -euo pipefail
+
+# Soporte para Docker Desktop y Docker nativo
+if [ -S "$HOME/.docker/desktop/docker.sock" ]; then
+    export DOCKER_HOST="unix://$HOME/.docker/desktop/docker.sock"
+elif [ -S "/var/run/docker.sock" ]; then
+    export DOCKER_HOST="unix:///var/run/docker.sock"
+fi
+
 FORCE=false
 NO_CACHE=false
 SKIP_RESCUE=false
