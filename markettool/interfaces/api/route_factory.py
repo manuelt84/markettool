@@ -118,6 +118,12 @@ def register_all_routes(
     register_hexagonal_analysis_routes(app)
     register_risk_management_routes(app)
     register_signal_validation_routes(app)
+    
+    # ✅ MTF Results API (Opción C - Async MTF Processing)
+    from markettool.interfaces.api.mtf_results_routes import mtf_results_bp
+    app.register_blueprint(mtf_results_bp)
+    logger.info("✅ MTF Results API routes registered")
+    
     # Broker execution APIs disabled by default in production hardening mode.
     if _env_flag("ENABLE_BROKER_EXECUTION", default=False):
         register_mt5_routes(app)

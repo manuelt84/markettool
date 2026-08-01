@@ -237,13 +237,29 @@ class AsyncMTFProcessor:
 
 # Singleton instance
 _async_mtf_processor: Optional[AsyncMTFProcessor] = None
+_worker_started: bool = False
 
 
 def get_async_mtf_processor() -> AsyncMTFProcessor:
     """Obtener instancia singleton del procesador"""
-    global _async_mtf_processor
+    global _async_mtf_processor, _worker_started
+    
     if _async_mtf_processor is None:
         _async_mtf_processor = AsyncMTFProcessor()
+        # Iniciar worker automáticamente (no bloqueante)
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if not _worker_started and not loop.is_running():
+                # Si no hay loop corriendo, crear tarea que iniciará cuando haya loop
+                pass
+            elif not _worker_started:
+                asyncio.create_task(_async_mtf_processor.start())
+                _worker_started = True
+                logger.info("[MTF-Async] Worker auto-started")
+        except Exception as e:
+            logger.warning("[MTF-Async] Could not auto-start worker: %s", e)
+    
     return _async_mtf_processor
 
 
