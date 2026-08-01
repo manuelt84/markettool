@@ -213,7 +213,7 @@ def sync(
     logger.info(f"Local: {local_dir}")
     logger.info(f"GCS: gs://{bucket.name}/{prefix}")
     logger.info(f"Max age: {max_age_hours} horas")
-    logger.info()
+    logger.info("")
     
     # Obtener listas de archivos
     local_files = get_local_files(local_dir, max_age_hours)
@@ -221,7 +221,7 @@ def sync(
     
     logger.info(f"Archivos locales (últimas {max_age_hours}h): {len(local_files)}")
     logger.info(f"Archivos en GCS: {len(gcs_files)}")
-    logger.info()
+    logger.info("")
     
     # Subir archivos nuevos/modificados desde local a GCS
     if direction in ("upload", "both"):
@@ -239,7 +239,7 @@ def sync(
                 uploaded += 1
         
         logger.info(f"Subidos: {uploaded}, Saltados: {skipped}")
-        logger.info()
+        logger.info("")
     
     # Descargar archivos nuevos desde GCS a local
     if direction in ("download", "both"):
@@ -257,7 +257,7 @@ def sync(
                 downloaded += 1
         
         logger.info(f"Descargados: {downloaded}")
-        logger.info()
+        logger.info("")
     
     return uploaded, downloaded, skipped
 
@@ -297,7 +297,7 @@ def main() -> int:
             dry_run=args.dry_run,
         )
         
-        logger.info()
+        logger.info("")
         logger.info("=== Resumen ===")
         logger.info(f"Subidos: {uploaded}")
         logger.info(f"Descargados: {downloaded}")
