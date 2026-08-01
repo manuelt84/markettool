@@ -38,9 +38,40 @@ Wrapper para ejecución vía cron:
 - Sincroniza últimas 2 horas de datos
 - Logging en `/var/log/markettool/firestore_sync.log`
 
-## 📦 Instalación en VPS
+## 📦 Instalación
 
-### 1. Copiar scripts al VPS
+### Opción A: Ejecución Local (RECOMENDADA)
+
+La base de datos PostgreSQL está en tu red local VPN (10.8.0.1). Para sincronizar desde tu máquina:
+
+```bash
+cd /home/mtoro/projects/markettool
+python3 scripts/sync_firestore_incremental.py \
+    --collections ejecuciones \
+    --collections user_ids \
+    --hours 24 \
+    --verbose
+```
+
+**Ventajas:**
+- Sin necesidad de configurar acceso remoto a PostgreSQL
+- Más seguro (las credenciales de Firestore no salen de tu máquina)
+- Acceso directo a la BD local
+
+**Para automatizar:** Agregar al crontab local:
+```bash
+0 * * * * cd /home/mtoro/projects/markettool && python3 scripts/sync_firestore_incremental.py --hours 2 >> /var/log/firestore_sync.log 2>&1
+```
+
+### Opción B: Ejecución en VPS (Requiere configuración adicional)
+
+Si querés ejecutar en el VPS, necesitás:
+
+1. **Túnel SSH hacia tu red local** O **Habilitar acceso remoto a PostgreSQL**
+2. Copiar credenciales de Firestore al VPS
+3. Instalar dependencias Python
+
+⚠️ **Nota:** La opción B requiere exponer tu base de datos o mantener un túnel SSH permanente, lo cual añade complejidad y riesgos de seguridad.
 ```bash
 scp -P 22222 scripts/sync_firestore_incremental.py root@mtlabsx.com:/opt/backups/
 scp -P 22222 scripts/cron_sync_firestore.sh root@mtlabsx.com:/opt/backups/
