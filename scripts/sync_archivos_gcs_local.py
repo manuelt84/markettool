@@ -242,7 +242,7 @@ def sync(
     logger.info(f"GCS: gs://{bucket.name}/{prefix}")
     logger.info(f"Max age: {max_age_hours} horas")
     logger.info(f"Delete after upload: {delete_local_after_upload}")
-    logger.info()
+    logger.info("")
     
     # Obtener listas de archivos
     local_files = get_local_files(local_dir, max_age_hours)
@@ -250,7 +250,7 @@ def sync(
     
     logger.info(f"Archivos locales (últimas {max_age_hours}h): {len(local_files)}")
     logger.info(f"Archivos en GCS: {len(gcs_files)}")
-    logger.info()
+    logger.info("")
     
     # Leer DSN de PostgreSQL
     pg_dsn = None
@@ -291,7 +291,7 @@ def sync(
                         logger.warning(f"Failed to delete {rel_path}: {e}")
         
         logger.info(f"Subidos: {uploaded}, Saltados: {skipped}")
-        logger.info()
+        logger.info("")
     
     # Descargar archivos faltantes desde GCS a local
     if direction in ("download", "both"):
@@ -309,7 +309,7 @@ def sync(
                 downloaded += 1
         
         logger.info(f"Descargados: {downloaded}")
-        logger.info()
+        logger.info("")
     
     return uploaded, downloaded, skipped
 
@@ -352,7 +352,7 @@ def main() -> int:
             dry_run=args.dry_run,
         )
         
-        logger.info()
+        logger.info("")
         logger.info("=== Resumen ===")
         logger.info(f"Subidos: {uploaded}")
         logger.info(f"Descargados: {downloaded}")
