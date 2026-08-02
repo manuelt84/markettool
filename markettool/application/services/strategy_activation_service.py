@@ -17,8 +17,29 @@ import logging
 from typing import Dict, Optional, Any, Tuple, List
 from dataclasses import dataclass, field
 from enum import Enum
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+
+def calculate_staleness_min(last_close_ts: int) -> float:
+    """
+    Calculate minutes since the last candle closed.
+    
+    Args:
+        last_close_ts: Last candle close timestamp in milliseconds
+    
+    Returns:
+        Minutes since last close (float)
+    """
+    try:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        staleness_ms = max(0, now_ms - last_close_ts)
+        staleness_min = staleness_ms / 60000.0  # Convert ms to minutes
+        return round(staleness_min, 2)
+    except Exception as e:
+        logger.debug("[calculate_staleness_min] Error: %s", e)
+        return 0.0
 
 
 class MTFDependencyLevel(Enum):

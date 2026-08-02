@@ -957,8 +957,18 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
 # ======================================================================
 # Define how old a cache can be before we check GCS or go to FMP
 # Lower TFs (scalping) = stricter; Higher TFs (swing) = more tolerant
-# Format: timeframe -> seconds before cache is considered "stale"
+# Crypto 24/7 bases - same pattern as web/mobile apps
+CRYPTO_ALWAYS_ON_RE = re.compile(
+    r'^(BTC|XBT|ETH|XRP|LTC|BCH|ADA|SOL|DOT|DOGE|MATIC|AVAX|LINK|UNI|ATOM|ALGO|SHIB|BNB|XLM|TRX|EOS|FIL|AAVE|SUSHI|COMP|MKR|SNX|YFI|CRV|BAL|BAND|ZEC|DASH|XMR|ETC|NEO|IOTA|ONT|VET|ZIL|ICX|LSK|NANO|WAVES|QTUM|OMG|ZRX|BAT|KNC|REN|REP|NMR|LRC|GNT|MANA|ENJ|CHZ)([^A-Za-z]|[A-Za-z]{2,}|$)',
+    re.IGNORECASE
+)
 
+def _is_crypto_247(symbol: str) -> bool:
+    """Check if symbol is a crypto asset that trades 24/7."""
+    return bool(CRYPTO_ALWAYS_ON_RE.match(symbol.upper()))
+
+# Format: timeframe -> seconds before cache is considered "stale"
+# For crypto assets, these thresholds are multiplied by CRYPTO_FRESHNESS_MULTIPLIER
 CACHE_FRESHNESS_THRESHOLDS = {
     "1min": 90,               # 90s: intradia estricta
     "5min": 6 * 60,           # 6 min
@@ -969,6 +979,9 @@ CACHE_FRESHNESS_THRESHOLDS = {
     "1day": 12 * 3600,        # 12 hours (very tolerant)
     "1week": 24 * 3600,       # 24 hours (very tolerant)
 }
+
+# Crypto 24/7 freshness multiplier - allows longer delays for API hiccups
+CRYPTO_FRESHNESS_MULTIPLIER = 10  # 10x more tolerant for crypto
 
 ANALYSIS_STRICT_REFRESH_TFS = {"1min", "5min", "15min"}
 
@@ -1060,13 +1073,23 @@ _FMP_RANGE_STATS_LOCK = threading.Lock()
 _FMP_RANGE_STATS: dict[tuple[str, str], dict[str, Any]] = {}
 
 
-def _should_force_fresh_intraday(tf: str) -> bool:
+def _should_force_fresh_intraday(tf: str, symbol: str = "") -> bool:
+    """Check if timeframe requires strict freshness. Crypto assets are never 'strict'."""
+    if symbol and _is_crypto_247(symbol):
+        return False  # Crypto 24/7 - never force strict refresh
     return normalize_tf(tf) in ANALYSIS_STRICT_REFRESH_TFS
 
 
-def _get_analysis_freshness_max_seconds(tf: str) -> int:
+def _get_analysis_freshness_max_seconds(tf: str, symbol: str = "") -> int:
+    """Get freshness threshold for timeframe. Crypto gets 10x more tolerance."""
     tf_norm = normalize_tf(tf)
-    return CACHE_FRESHNESS_THRESHOLDS.get(tf_norm, 3600)
+    base_threshold = CACHE_FRESHNESS_THRESHOLDS.get(tf_norm, 3600)
+    
+    # Crypto 24/7 assets get much more tolerance for API delays
+    if symbol and _is_crypto_247(symbol):
+        return base_threshold * CRYPTO_FRESHNESS_MULTIPLIER
+    
+    return base_threshold
 
 
 def _analysis_df_to_bar_series(df: pd.DataFrame) -> list[dict]:
@@ -1122,14 +1145,14 @@ def _analysis_bar_series_to_df(series: list[dict]) -> pd.DataFrame:
 
 def _build_analysis_data_quality_diag(df: pd.DataFrame, symbol: str, tf: str) -> dict:
     tf_norm = normalize_tf(tf)
-    freshness_limit = _get_analysis_freshness_max_seconds(tf_norm)
+    freshness_limit = _get_analysis_freshness_max_seconds(tf_norm, symbol)
     diag = {
         "symbol": symbol,
         "timeframe": tf_norm,
         "last_candle_ts": None,
         "lag_seconds": None,
         "freshness_limit_seconds": freshness_limit,
-        "strict_intraday": _should_force_fresh_intraday(tf_norm),
+        "strict_intraday": _should_force_fresh_intraday(tf_norm, symbol),
         "recent_gap_count": 0,
         "largest_gap_bars": 0,
         "gaps_detected": 0,
@@ -1729,9 +1752,9 @@ class HistoryManager:
                 # This avoids waiting for FMP semaphore when not needed
                 ttl_min = _HISTORY_REFRESH_TTL_MINUTES.get(tf, 1)
                 age_min = max(0.0, (now - last).total_seconds() / 60.0)
-                strict_intraday = _should_force_fresh_intraday(tf)
+                strict_intraday = _should_force_fresh_intraday(tf, symbol)
                 last_candle_age_seconds = max(0, int((now - last).total_seconds()))
-                freshness_limit_seconds = _get_analysis_freshness_max_seconds(tf)
+                freshness_limit_seconds = _get_analysis_freshness_max_seconds(tf, symbol)
                 
                 if age_min < ttl_min:
                     if strict_intraday and last_candle_age_seconds > freshness_limit_seconds:
