@@ -16951,7 +16951,7 @@ async def procesar_resultado(
 
     # --- política de envío:
     send_to_tg = has_chat and (
-        (origen_norm == "telegram") or
+        origen_norm in ("telegram", "web") or
         (origen_norm == "app" and send_results)
     )
 
@@ -19298,7 +19298,7 @@ async def ejecutar_recurrente(
 
     # Política de envío a Telegram
     send_to_tg = has_chat and (
-        origen_norm == "telegram" or (origen_norm == "app" and send_results)
+        origen_norm in ("telegram", "web") or (origen_norm == "app" and send_results)
     )
 
     # Estado local por chat (protegido con lock)
