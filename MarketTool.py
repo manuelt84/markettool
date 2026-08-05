@@ -16736,6 +16736,19 @@ def _read_telegram_id_prefer_subscription(user_id: str) -> Optional[str]:
                 return str(tg)
     except Exception:
         pass
+    
+    # Búsqueda fallback por campo google_id (para user_ids desde Web)
+    import re
+    uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+    if not uuid_pattern.match(user_id):
+        try:
+            docs = db.collection('user_ids').where('google_id', '==', user_id).limit(1).get()
+            for doc in docs:
+                tg = (doc.to_dict() or {}).get('telegram_id')
+                if tg:
+                    return str(tg)
+        except Exception:
+            pass
 
     return None
 
@@ -16747,8 +16760,8 @@ def _resolve_chat_id(user_id: Optional[str], user_chat_id: Optional[str]) -> Opt
       2) suscripciones_user/{userId}.telegram_id
       3) user_ids/{userId}.telegram_id
     """
-    # 1) parámetro explícito
-    if user_chat_id and str(user_chat_id).strip():
+    # 1) Si user_chat_id es numérico, es telegram_id real (viene del bot TG)
+    if user_chat_id and str(user_chat_id).strip() and str(user_chat_id).isdigit():
         return str(user_chat_id).strip()
 
     # 2) buscar por user_id en Firestore
@@ -16948,6 +16961,7 @@ async def procesar_resultado(
     # --- resolver chat_id (telegram_id) usando la prioridad definida
     chat_id  = _resolve_chat_id(user_id, user_chat_id)
     has_chat = bool(chat_id)
+    # Override eliminado - usando resolución productiva desde Firestore
 
     # --- política de envío:
     send_to_tg = has_chat and (

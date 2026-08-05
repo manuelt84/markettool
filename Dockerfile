@@ -29,7 +29,7 @@ COPY scripts/download_easyocr_models.py scripts/
 RUN python scripts/download_easyocr_models.py || echo "⚠️  EasyOCR download falló, se descargará en runtime"
 
 # Install Playwright browsers at build time so runtime doesn't need downloads
-RUN python -m playwright install --with-deps
+# RUN python -m playwright install --with-deps  # Skip for faster build, installed at runtime if needed
 
 # 🚫 PASO 5: Validar modelos estan presentes
 RUN [ -f /app/patrones.pt ] && [ -f /app/ruido.pt ] && ls -lh /app/*.pt && echo "✅ Models present" || (echo "❌ Models missing" && exit 1)

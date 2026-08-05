@@ -134,7 +134,16 @@ class LegacyAnalisisUseCase:
                 requested_assets,
             )
 
-            origen = (data.get("origen") or "app").lower()
+            # Determinar origen: si user_id no es UUID, es web (google_id)
+            import re
+            uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+            user_id_raw = data.get("user_id", "")
+            if data.get("origen"):
+                origen = data.get("origen").lower()
+            elif user_id_raw and not uuid_pattern.match(str(user_id_raw)):
+                origen = "web"  # google_id indica que viene desde la Web
+            else:
+                origen = "app"
 
             n_transacciones_req = 1
             try:
