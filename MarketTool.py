@@ -16960,6 +16960,7 @@ async def procesar_resultado(
 
     # --- resolver chat_id (telegram_id) usando la prioridad definida
     chat_id  = _resolve_chat_id(user_id, user_chat_id)
+    print(f"[DEBUG chat_id] user_id={user_id}, user_chat_id={user_chat_id}, chat_id_resuelto={chat_id}")
     has_chat = bool(chat_id)
     # Override eliminado - usando resolución productiva desde Firestore
 
@@ -16968,6 +16969,7 @@ async def procesar_resultado(
         origen_norm in ("telegram", "web") or
         (origen_norm == "app" and send_results)
     )
+    print(f"[DEBUG send_to_tg] user_id={user_id}, chat_id={chat_id}, has_chat={has_chat}, origen={origen}, origen_norm={origen_norm}, send_results={send_results}, send_to_tg={send_to_tg}")
 
     # --- ¿podemos archivar?
     can_archive = bool(exec_id)

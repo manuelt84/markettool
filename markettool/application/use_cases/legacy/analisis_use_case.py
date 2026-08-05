@@ -215,7 +215,7 @@ class LegacyAnalisisUseCase:
                 self._services.mark_user_state, user_id=user_id or chat_id, estado="ocupado"
             )
 
-            opciones_usuario = await self._services.obtener_opciones_usuario(user_id, origen="app")
+            opciones_usuario = await self._services.obtener_opciones_usuario(user_id, origen=origen)
             if (not opciones_usuario) and chat_id:
                 try:
                     opciones_usuario = await self._services.obtener_opciones_usuario(
@@ -247,7 +247,7 @@ class LegacyAnalisisUseCase:
                 user_id=user_id,
                 chat_id=chat_id or None,
                 activos_solicitados=requested_assets,
-                origen="app",
+                origen=origen,
                 opciones_usuario=opciones_usuario,
             )
 
@@ -308,7 +308,7 @@ class LegacyAnalisisUseCase:
                         chat_id,
                         opciones_usuario,
                         user_id=user_id,
-                        origen="app",
+                        origen=origen,
                         exec_id=exec_id,
                         lock_id=lock_id,
                         operatoria_cfg=op_cfg,
@@ -757,7 +757,7 @@ class LegacyAnalisisUseCase:
             acquired_lock = True
 
             estado_sub = await self._services.estado_suscripcion(
-                user_id=user_id, numero_transacciones=1, origen="app"
+                user_id=user_id, numero_transacciones=1, origen=origen
             )
             if not self._services.es_administrador(user_id or chat_id):
                 if estado_sub == "transacciones_insuficientes":
