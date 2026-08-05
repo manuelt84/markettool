@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Login Telegram - MarketTool</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      margin: 0;
+      background: #0a0a0a;
+      color: #fff;
+      font-family: system-ui, -apple-system, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .container {
+      text-align: center;
+      padding: 2rem;
+      max-width: 400px;
+    }
+    h1 {
+      font-size: 1.5rem;
+      margin-bottom: 1.5rem;
+      color: #22d3ee;
+    }
+    .spinner {
+      border: 3px solid rgba(255,255,255,0.2);
+      border-top-color: #22d3ee;
+      border-radius: 50%;
+      width: 32px;
+      height: 32px;
+      animation: spin 1s linear infinite;
+      margin: 1rem auto;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .success {
+      color: #22c55e;
+      margin-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Vincular Telegram</h1>
+    <div id="widget-container"></div>
+    <div id="status"></div>
+  </div>
+
+  <!-- Telegram Login Widget -->
+  <script async src="https://telegram.org/js/telegram-widget.js?22"
+          data-telegram-login="MarketToolUser_Bot"
+          data-size="large"
+          data-radius="12"
+          data-request-access="write"
+          data-onauth="onTelegramAuth(user)"
+          data-lang="es"></script>
+
+  <script>
+    function onTelegramAuth(user) {
+      console.log('[Telegram] Auth successful:', user);
+      
+      // Store auth data in sessionStorage
+      sessionStorage.setItem('tg_auth_data', JSON.stringify(user));
+      
+      // Show success message
+      document.getElementById('status').innerHTML = 
+        '<p class="success">✅ Autenticado correctamente</p>' +
+        '<p>Redirigiendo a MarketTool...</p>';
+      
+      // Redirect back to MarketTool web
+      setTimeout(function() {
+        // Try to redirect to the main app
+        window.location.replace('https://markettool.mtlabsx.com/analysis');
+      }, 1500);
+    }
+  </script>
+</body>
+</html>
