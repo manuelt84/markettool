@@ -30,6 +30,7 @@ from markettool.interfaces.api.whatsapp_routes import register_whatsapp_routes
 from markettool.interfaces.api.live_entries_routes import register_live_entries_routes
 from markettool.interfaces.api.fmp_ledger_routes import register_fmp_ledger_routes
 from markettool.interfaces.api.firestore_vps_routes import register_firestore_vps_routes
+from markettool.interfaces.api.telegram_routes import register_telegram_routes
 from markettool.infra.storage.vps_json_store import VpsJsonStore, vps_storage_routes_enabled
 # backtest_routes removed — backtest is now 100% client-side
 
@@ -158,6 +159,10 @@ def register_all_routes(
     # Firestore-compatible REST routes for VPS/PostgreSQL mode.
     register_firestore_vps_routes(app)
     logger.info("✅ Firestore VPS compatibility routes registered")
+
+    # Telegram login/link routes
+    register_telegram_routes(app)
+    logger.info("✅ Telegram routes registered")
 
     # Legacy routes migrated into hexagonal registration
     legacy_services = getattr(container, "legacy_services", None)
