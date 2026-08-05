@@ -161,7 +161,7 @@ def register_all_routes(
     logger.info("✅ Firestore VPS compatibility routes registered")
 
     # Telegram login/link routes
-    register_telegram_routes(app)
+    register_telegram_routes(app, url_prefix="/api/telegram")
     logger.info("✅ Telegram routes registered")
 
     # Legacy routes migrated into hexagonal registration

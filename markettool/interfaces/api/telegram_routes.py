@@ -11,7 +11,7 @@ from flask import Blueprint, jsonify, request
 if TYPE_CHECKING:
     from google.cloud import firestore
 
-telegram_bp = Blueprint("telegram", __name__, prefix="/api/telegram")
+telegram_bp = Blueprint("telegram", __name__)
 logger = logging.getLogger(__name__)
 
 
@@ -121,7 +121,7 @@ def link_telegram():
         }), 500
 
 
-def register_telegram_routes(app):
+def register_telegram_routes(app, url_prefix="/api/telegram"):
     """Register Telegram routes."""
-    app.register_blueprint(telegram_bp)
+    app.register_blueprint(telegram_bp, url_prefix=url_prefix)
     logger.info("✅ Telegram routes registered")
